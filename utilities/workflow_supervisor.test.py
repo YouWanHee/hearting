@@ -1758,6 +1758,32 @@ class TestSealedRoutes(unittest.TestCase):
             ROUTE.verify_route(direct, td)
 
 
+class OwnerInputIdentityLineageTest(unittest.TestCase):
+    def test_pinned_resource_owner_accepts_attempt_lineage_only(self):
+        jobs = "/tmp/workflow-owner-lineage/jobs.log"
+        parent = SimpleNamespace(status="open", metadata={
+            "attempt_id": "att-owner", "pid": "555", "pid_start": "300",
+            "owner_identity_lineage": "444:200+333:100",
+        })
+        input_module = SimpleNamespace(
+            _target=lambda _jobs, _attempt: (parent, "target"),
+            supervisor_lease_is_held=lambda *_args: True,
+        )
+        value = {"target": "target", "thread_id": "thread-1", "requests": []}
+        armed = {"jobs": jobs, "route_id": "rt-owner", "route_hash": "sha256:owner"}
+        resource = {"owner_wait": {
+            "session_id": "thread-1", "route_id": "rt-owner", "route_hash": "sha256:owner",
+            "jobs": str(Path(jobs).resolve()), "parent_attempt_id": "att-owner",
+            "owner_pid": 444, "owner_start": "200",
+        }}
+        self.assertTrue(SUP._owner_input_matches_locked(
+            armed, resource, "att-owner", "thread-1", value, input_module))
+        resource["owner_wait"]["owner_pid"] = 222
+        resource["owner_wait"]["owner_start"] = "99"
+        self.assertFalse(SUP._owner_input_matches_locked(
+            armed, resource, "att-owner", "thread-1", value, input_module))
+
+
 class TestCapabilityIntegration(WorkflowFixture):
     """One end-to-end pass per capability family, on the real compiled graphs."""
 

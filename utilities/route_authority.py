@@ -523,11 +523,41 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                                     next_action="observe" if registered else "start")
     stopped = answerable_owner_end(status, metadata) if action in {"owner", "owner-input"} else ""
     if action == "owner-input":
-        # Keeping an answer cannot spawn an owner or disturb uncertain transport.
+        from route_parent_close import row_requested
+        closing = (metadata.get("parent_close_requested") == "1"
+                   or status in {"cancelled", "killed"}
+                   or jobs is not None and metadata.get("attempt_id")
+                   and row_requested(metadata, jobs))
+        if closing:
+            return ContinuationDecision(False, "protected", "cancelled-by-parent", "settle")
+        # Ended owners keep their answer for the existing terminal continuation.
         if stopped:
             return ContinuationDecision(True, "retained", next_action="correct")
         if status in {"open", "running"} and facts.get("accepting", True) and facts.get("reachable"):
             return ContinuationDecision(True, "queued", next_action="handback")
+        # A bound, open channel is durable admission even when its consumer or
+        # process observation is unavailable. The caller may recover only after
+        # a second, complete observation; this branch itself never starts it.
+        if (status in {"open", "running"} and facts.get("bound")
+                and not facts.get("lease_held")):
+            process = facts.get("process")
+            continuation = facts.get("owner_continuation")
+            recover = (
+                facts.get("recoverable") is True
+                and facts.get("queued") is True
+                and facts.get("thread_match") is True
+                and facts.get("caller_owns") is True
+                and facts.get("harness") == "codex"
+                and metadata.get("harness") == "codex"
+                and metadata.get("launch_claimed") == "1"
+                and metadata.get("launch_started") == "1"
+                and process is not None and process.state == "quiescent"
+                and continuation is not None
+                and continuation.state == "quiescent"
+                and continuation.reason == "registered-resources-preserved"
+            )
+            return ContinuationDecision(True, "recover" if recover else "stored",
+                next_action="start", detail="" if recover else str(facts.get("store_reason") or "consumer-unavailable"))
     parked, cancellation = facts.get("parked"), None
     if action == "owner":
         from route_parent_close import row_requested

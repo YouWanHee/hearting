@@ -389,7 +389,7 @@ class WrapperCommonTest(unittest.TestCase):
                 route_file=str(route), worktree=temp, artifact_root=temp,
                 capability='autopilot-code', intensity='standard', unit='dev/backend',
                 action='start', model_role='fast implementer', model_profile='balanced',
-                attempt_id=None)
+                attempt_id=None, jobs=str(Path(temp) / 'jobs.log'), agent_home=Path(temp))
             result = subprocess.CompletedProcess([], 65, '',
                 '{"status":"blocked","reason":"unsafe-git-operation","detail":"cherry-pick"}\n')
             out = io.StringIO()
@@ -892,6 +892,9 @@ class ValidateRouteRecordTest(unittest.TestCase):
                         rc = wrapper.validate_route_record(self.args(tmp))
                     self.assertEqual(rc, 0)
                     self.assertIn("--launch-phase", proc.run.call_args.args[0])
+                    command = proc.run.call_args.args[0]
+                    self.assertEqual(command[command.index("--jobs") + 1], "/j/jobs.log")
+                    self.assertEqual(completion.call_args.args[3], Path("/j/jobs.log"))
                     self.assertIs(completion.call_args.kwargs["gate"], marker)
 
 

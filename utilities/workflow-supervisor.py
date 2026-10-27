@@ -510,6 +510,73 @@ def resource_evidence(armed, *, compute_observation=None):
     }
 
 
+def resource_recorded_evidence(armed):
+    """Read terminal intent history without observing or settling a host process."""
+    import dispatch_resource_wait as OWNER_RESOURCE
+    registry = Path(armed["resource_registry"])
+    run_id = armed["predecessor_id"]
+    try:
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        row = (data.get("runs") or {}).get(run_id)
+    except (OSError, ValueError) as exc:
+        return {"terminal": False, "reason": f"resource-registry-unreadable:{exc}"}
+    if not isinstance(row, dict):
+        return {"terminal": False, "reason": "resource-run-absent"}
+    execution = row.get("execution")
+    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+        return {"terminal": False, "reason": "compute-resource-observation-required"}
+    resume = row.get("resource_policy") in {"verified-resume", "supervised-owner"}
+    if (resume and (row.get("route") != armed.get("route_file")
+                    or row.get("node") != armed.get("node")
+                    or row.get("jobs") != armed.get("jobs"))):
+        return {"terminal": False, "reason": "resource-binding-mismatch"}
+    if (row.get("resource_policy") == "supervised-owner"
+            and not OWNER_RESOURCE.resource_binding_matches(armed, row)):
+        return {"terminal": False, "reason": "resource-body-binding-mismatch"}
+
+    identity_present = any(row.get(key) is not None for key in RR.IDENTITY_KEYS)
+    # resource_never_started may classify an identity-bearing row. Intent arm
+    # accepts only the identity-free recorded form and never probes that path.
+    never_started = not identity_present and RR.resource_never_started(row)
+    sentinel_code = runner().read_sentinel(row.get("sentinel"))
+    status = row.get("status")
+    recorded_exit = (
+        status in {"succeeded", "failed"}
+        and row.get("exit_code") is not None
+        and sentinel_code == row.get("exit_code")
+        and not (status == "failed" and sentinel_code == 0)
+        and not (status == "succeeded" and sentinel_code != 0)
+        and row.get("launch_state") not in {"queued", "claimed"}
+    )
+    settled_cancel = (
+        row.get("cancel_requested") is True
+        and status == "failed"
+        and row.get("ended_at") is not None
+        and not row.get("parent_close_requested")
+        and row.get("launch_state") not in {"queued", "claimed", "launching"}
+    )
+    if not (never_started or recorded_exit or settled_cancel):
+        return {"terminal": False, "reason": "resource-recorded-nonterminal"}
+
+    return {
+        "terminal": True,
+        "succeeded": status == "succeeded",
+        "identity": f"{run_id}:{row.get('pid')}:{row.get('starttime')}:{row.get('exit_code')}",
+        "liveness": None,
+        "quiescent": None,
+        "exit_code": row.get("exit_code"),
+        "sentinel": row.get("sentinel"),
+        "sentinel_present": bool(row.get("sentinel")) and Path(str(row["sentinel"])).is_file(),
+        "ended_at": row.get("ended_at"),
+        "failure_class": row.get("failure_class"),
+        "never_started": never_started,
+        "reason": "recorded-terminal-host-unobserved",
+        "log": row.get("log"),
+        "parent_attempt_id": row.get("parent_attempt_id"),
+        "resource_sha256": RESOURCE_RESUME.row_digest(row),
+    }
+
+
 def _registry_rows(jobs_path):
     try:
         raw = Path(jobs_path).read_text(encoding="utf-8", errors="replace")
@@ -698,8 +765,11 @@ def cmd_arm(args):
     }
     if args.predecessor_kind == "resource":
         resource = json.loads(Path(args.resource_registry).read_text())["runs"][args.predecessor_id]
+        import dispatch_resource_wait as OWNER_RESOURCE
+        queued_intent = (resource.get("resource_policy") == "supervised-owner"
+                         and OWNER_RESOURCE.controller_intent(resource)
+                         and resource.get("launch_state") == "queued")
         if resource.get("resource_policy") == "supervised-owner":
-            import dispatch_resource_wait as OWNER_RESOURCE
             if (resource.get("route") != record["route_file"] or resource.get("node") != args.node
                     or resource.get("jobs") != record["jobs"]):
                 raise SupervisorError("resource-watch-binding-mismatch")
@@ -754,7 +824,10 @@ def cmd_arm(args):
                     }
             def require_arm_predecessors():
                 try:
-                    require_resource_predecessors(prior_rows, resource, observations=observations)
+                    if queued_intent:
+                        require_resource_intent_predecessors(prior_rows, resource)
+                    else:
+                        require_resource_predecessors(prior_rows, resource, observations=observations)
                 except ValueError as error:
                     if str(error) in {"resource-route-body-conflict",
                                       "resource-operation-authorization-required"}:
@@ -779,7 +852,7 @@ def cmd_arm(args):
                         preobserved = (prior_operation, captured[1])
                     require_arm_predecessors()
                     replace_resource_predecessor(route, ledger, prior_operation, record, resource,
-                                                  preobserved=preobserved)
+                                                  preobserved=preobserved, intent=queued_intent)
                     queued_owner_launch = (resource.get("resource_policy") == "supervised-owner"
                                            and resource.get("launch_state") == "queued")
                     target = (armed_dir(ledger) / f"{args.node}.json"
@@ -818,7 +891,7 @@ def cmd_arm(args):
                     preobserved = ((prior, captured[1]) if captured and captured[0] == prior
                                    and captured[2] == prior_row and captured[1] is not None else None)
                     replace_resource_predecessor(route, ledger, prior, record, resource,
-                                                  preobserved=preobserved)
+                                                  preobserved=preobserved, intent=queued_intent)
                 else:
                     target = resource_watch_storage_path(ledger, record)
             else:
@@ -910,18 +983,21 @@ def _claim_successors(route, ledger, armed, node_id, successors, evidence=None):
     return started
 
 
-def _checked_resource_row(armed, evidence, *, require_success=True):
+def _checked_resource_row(armed, evidence, *, require_success=True, require_finished=True):
     """Recheck the existing exit tuple at the resource admission boundary."""
     from route_authority import resource_predecessor_finished
     row = json.loads(Path(armed["resource_registry"]).read_text())["runs"][armed["predecessor_id"]]
-    execution = row.get("execution") if isinstance(row, dict) else None
-    if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
-        # The fresh observation is captured before writer locks. Under a lock,
-        # revalidate its row digest and receipt tuple without probing the host.
-        observation = evidence.get("execution_observation") or {}
-        finished = observation.get("state") == "quiescent"
+    if not require_finished:
+        finished = True
     else:
-        finished = resource_predecessor_finished(row)
+        execution = row.get("execution") if isinstance(row, dict) else None
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            # The fresh observation is captured before writer locks. Under a lock,
+            # revalidate its row digest and receipt tuple without probing the host.
+            observation = evidence.get("execution_observation") or {}
+            finished = observation.get("state") == "quiescent"
+        else:
+            finished = resource_predecessor_finished(row)
     if (RESOURCE_RESUME.row_digest(row) != evidence.get("resource_sha256")
             or runner().read_sentinel(row.get("sentinel")) != evidence.get("exit_code")
             or (require_success and evidence.get("exit_code") != 0)
@@ -1069,8 +1145,11 @@ def _resource_owner_matches(left, right):
 
 def _owner_input_matches_locked(armed, resource_row, owner_attempt_id, owner_session_id,
                                 value, input_module):
+    import dispatch_contract as DC
     parent, target = input_module._target(armed["jobs"], owner_attempt_id)
     owner = resource_row.get("owner_wait") or {}
+    pinned_owner_identity = (str(owner.get("owner_pid", "")),
+                             str(owner.get("owner_start", "")))
     return not (
         value is None or value.get("target") != target
         or value.get("thread_id") != owner_session_id
@@ -1081,8 +1160,7 @@ def _owner_input_matches_locked(armed, resource_row, owner_attempt_id, owner_ses
         or parent.status not in {"open", "running"}
         or parent.metadata.get("attempt_id") != owner_attempt_id
         or owner.get("parent_attempt_id") != owner_attempt_id
-        or str(owner.get("owner_pid")) != parent.metadata.get("pid")
-        or owner.get("owner_start") != parent.metadata.get("pid_start")
+        or pinned_owner_identity not in DC.attempt_identity_lineage(parent.metadata)
         or not input_module.supervisor_lease_is_held(armed["jobs"], parent.metadata)
         or any(item.get("state") == "queued" for item in value.get("requests", []))
     )
@@ -1481,7 +1559,32 @@ def reconcile_legacy_supervised_resource_success(route, ledger, armed, *, candid
     return _resume_legacy_resource_retraction(route, ledger, armed, event)
 
 
-def replace_resource_predecessor(route, ledger, prior, record, resource, *, preobserved=None):
+def resource_stage_blocked(ledger, node):
+    """Keep the existing other-failure and claimed-successor blockers in one place."""
+    state = ledger.state()
+    if any(row.get("state") in WS.vocabulary()["failure_states"]
+           for other, row in state["nodes"].items() if other != node):
+        return True
+    return any(claim.get("predecessor") == node for claim in ledger.claims().values())
+
+
+def require_resource_intent_predecessors(rows, candidate):
+    """Preserve evidence addresses for an intent without deciding execution admission."""
+    import dispatch_resource_wait as OWNER_RESOURCE
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        if key in seen:
+            continue
+        seen.add(key)
+        if OWNER_RESOURCE.resource_evidence_paths_conflict(row, candidate):
+            raise ValueError("resource-route-body-conflict")
+
+
+def replace_resource_predecessor(route, ledger, prior, record, resource, *, preobserved=None,
+                                 intent=False):
     """Called under the ledger lock, with the old run and journal preserved."""
     import dispatch_resource_wait as OWNER_RESOURCE
     changing = {"predecessor_id", "resource_registry", "resource_binding", "resource_current_binding",
@@ -1513,8 +1616,11 @@ def replace_resource_predecessor(route, ledger, prior, record, resource, *, preo
         execution = recorded.get("execution") if isinstance(recorded, dict) else None
         if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
             raise SupervisorError("resource-compute-observation-unavailable")
-        evidence = resource_evidence(prior)
-    old = _checked_resource_row(prior, evidence, require_success=False) if evidence.get("terminal") else None
+        evidence = (resource_recorded_evidence(prior)
+                    if intent else resource_evidence(prior))
+    old = (_checked_resource_row(prior, evidence, require_success=False,
+                                 require_finished=not intent)
+           if evidence.get("terminal") else None)
     missing = artifact_evidence(prior)
     state = ledger.state()
     stage = state["nodes"].get(prior["node"], {})
@@ -1524,22 +1630,22 @@ def replace_resource_predecessor(route, ledger, prior, record, resource, *, preo
             and (stage.get("state") == "STAGE_SUCCEEDED"
                  or (stage.get("state") == "FAILED_RETRYABLE"
                      and latest.get("actor") == "resource-false-success-reconciliation"))):
+        observed_evidence = (resource_evidence(prior) if intent and preobserved is None else evidence)
         reconcile_legacy_supervised_resource_success(route, ledger, prior, candidate=resource,
-                                                       observed_evidence=evidence)
+                                                       observed_evidence=observed_evidence)
         state = ledger.state()
         stage = state["nodes"].get(prior["node"], {})
     execution = old.get("execution") if isinstance(old, dict) else None
     compute_finished = (isinstance(execution, dict) and execution.get("kind") == "compute-hosts"
                         and evidence.get("execution_observation", {}).get("state") == "quiescent")
-    if (old is None or (not compute_finished and not OWNER_RESOURCE.resource_execution_finished(old))
+    if (old is None or (not (intent or compute_finished or
+                            OWNER_RESOURCE.resource_execution_finished(old)))
             or (evidence.get("succeeded") and old.get("resource_policy") != "supervised-owner"
                 and (not missing.get("checked") or
                 (not missing.get("missing") and not (stage.get("evidence") or {}).get("runtime_only_output"))))
             or stage.get("state") not in {"RUNNING", "FAILED_RETRYABLE"}
             or state["workflow_state"] not in {"RUNNING", "STAGE_SUCCEEDED", "NEXT_REGISTERED", "NEXT_RUNNING", "FAILED_RETRYABLE"}
-            or any(row.get("state") in WS.vocabulary()["failure_states"]
-                   for node, row in state["nodes"].items() if node != prior["node"])
-            or any(claim.get("predecessor") == prior["node"] for claim in ledger.claims().values())
+            or resource_stage_blocked(ledger, prior["node"])
             or any(OWNER_RESOURCE.resource_evidence_paths_conflict(row, resource)
                    for _, row in resource_predecessors(ledger, prior["node"]))):
         raise SupervisorError("resource-watch-binding-conflict")

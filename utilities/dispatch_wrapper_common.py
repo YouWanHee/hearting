@@ -962,8 +962,10 @@ def validate_route_record(args: argparse.Namespace, *, marker_gate, runtime_harn
         validate_route_mode_axes(args, route_record)
     except DispatchModeContractError as exc:
         return fail(exc.reason, 65, **exc.fields, child_spawned="0")
+    jobs = route_authority.prelaunch_registry(args)
     command = [sys.executable, str(ROOT / "utilities" / "worker-route-guard.py"), "validate",
         "--route", args.route_file, "--node", args.route_node, "--cwd", args.worktree,
+        "--jobs", str(jobs),
         "--artifact-root", args.artifact_root, "--capability", args.capability,
         "--intensity", args.intensity, "--write-scope", args.write_scope,
         "--route-id", args.route_id, "--route-hash", args.route_hash,
@@ -992,7 +994,7 @@ def validate_route_record(args: argparse.Namespace, *, marker_gate, runtime_harn
     # diagnostics so an invalid DAG edge is the stable first failure. The
     # authoritative registry path is revalidated immediately before claim.
     refusal = route_authority.completion_gate(
-        args, args.action, args.agent_home, route_authority.prelaunch_registry(args), gate=marker_gate)
+        args, args.action, args.agent_home, jobs, gate=marker_gate)
     if refusal:
         reason, code, fields = refusal
         return fail(reason, code, **fields)

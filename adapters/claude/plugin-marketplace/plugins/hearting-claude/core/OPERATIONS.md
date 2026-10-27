@@ -1302,7 +1302,7 @@ reports its own obligation.
 file to inspect) targets only a registered dispatch-depth-1 owner attempt (else
 `correction-target-not-owner`). Any session can send it; `correction_source_session`
 records the sender without checking it. The runtime supervisor delivers it; only
-launching a replacement owner is parent-only (below).
+restoring an unavailable consumer requires the route's effective parent (below).
 The exact attempt binds one durable input receipt; repeating
 a request ID returns that receipt. Every registered dispatch-depth-1 owner —
 quick and solo as well as standard+ — runs under its harness supervisor, so the
@@ -1318,16 +1318,28 @@ the existing supervision notice carrier. A host whose supervisor probe does not
 report support runs the owner as the existing one-shot, creates no input state,
 and `correct` reports `owner-input-unsupported` before queueing; an owner
 already running under an older supervisor behaves the same way.
-An interrupted launched supervisor with no terminal event also accepts the existing
-`correct` request once its owner execution and unregistered children are quiescent.
-Registered resource/compute payloads stay under their existing run records when
-the owner is replaced; their survival is not surviving owner execution. The
-shared parent-close classification separates them, with exact route/attempt
-binding and complete observation of the remaining process set. Recovery context
-passes their record locations to the new owner without relaunching or editing
-them. This is an answered continuation on the same route: keep the
-original failure, completed stages, permissions and review budgets. A valid
-terminal result, cancellation or unknown execution retains its existing path.
+For an open launched owner whose input state is bound to the same native thread,
+`correct` stores one queued correction even when its input consumer is unavailable;
+storage is not delivery. `consumer_recovery` reports whether the live consumer can
+receive it, the same attempt's supervisor was restored, recovery is waiting for the
+effective parent, or recovery did not start. A positive quiescence observation
+shows the exact owner execution and every unregistered child gone, with only
+registered resources remaining and the supervisor lease free. Then the
+effective parent may use the normal `correct` or `start` path to restore the supervisor
+on the same attempt from its recorded launch settings and resume the bound thread.
+This does not create a replacement owner or thread and does not relaunch registered
+resource payloads. A live or unknown consumer, held lease, changed target or thread,
+or uncertain execution does not start another consumer. A `sending` or
+`delivery-unknown` correction is not retransmitted; a non-parent sender leaves the
+existing undelivered notice for the route parent to handle through normal `start`.
+
+Registered resource/compute payloads stay under their existing run records across
+same-attempt consumer recovery; their survival is not surviving owner execution. The
+shared parent-close classification separates them, with exact route/attempt binding
+and complete observation of the remaining process set. Recovery context recognizes
+the recorded owner identity lineage and passes existing resource record locations to
+the restored supervisor without relaunching or editing the records. A valid terminal
+result, cancellation or unknown execution retains its existing path.
 Resource registration settles a positively observed previous-boot execution as
 retryable failure even when power loss left no exit sentinel. The same observation
 admits its successor while preserving logs, checkpoints and settled results; a

@@ -96,7 +96,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                     with open(trace, 'a', encoding='utf-8') as h:
                         h.write(json.dumps({'event': event, 'time': time.monotonic(), **extra}) + '\\n')
                 if any(arg.startswith('model_context_window=') for arg in sys.argv):
-                    record('server-start', argv=sys.argv[1:])
+                    record('server-start', argv=sys.argv[1:],
+                           runtime_dir=os.environ.get('AGENT_RUNTIME_DIR'))
                 def send(value):
                     print(json.dumps(value), flush=True)
                 for line in sys.stdin:
@@ -109,6 +110,12 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                     elif method in ('thread/start', 'thread/resume'):
                         if method == 'thread/resume':
                             record('thread-resume', thread=value['params']['threadId'])
+                            if os.environ.get('FAKE_FAIL_THREAD_RESUME') == '1':
+                                send({'jsonrpc':'2.0','id':value['id'],
+                                      'error':{'code':-32000,'message':'fixture resume failure'}})
+                                continue
+                        else:
+                            record('thread-start')
                         send({'jsonrpc':'2.0','id':value['id'],'result':{'thread':{'id':'thread-1'}}})
                     elif method == 'turn/start':
                         turns += 1
@@ -138,6 +145,12 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                                lease_held=lease_held, phase=state['phase'], outbox=state.get('outbox'))
                         turn_id = f'turn-{turns}'
                         send({'jsonrpc':'2.0','id':value['id'],'result':{'turn':{'id':turn_id}}})
+                        if turns == 2 and os.environ.get('FAKE_HOLD_SECOND_TURN') == '1':
+                            open(os.environ['FAKE_SECOND_TURN_READY'], 'w').close()
+                            deadline = time.monotonic() + 30
+                            while (not os.path.exists(os.environ['FAKE_SECOND_TURN_RELEASE'])
+                                   and time.monotonic() < deadline):
+                                time.sleep(.01)
                         send({'jsonrpc':'2.0','method':'thread/tokenUsage/updated','params':{
                             'threadId':'thread-1','turnId':turn_id,'tokenUsage':{
                                 'last':{'inputTokens':80000,'cachedInputTokens':10000,
@@ -897,6 +910,729 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(sum(t["event"]=="turn-start" for t in trace),1)
         self.assertNotIn("registration-required",result.stdout)
 
+    def test_bound_consumer_resume_failure_leaves_open_row_and_state_untouched(self):
+        import dispatch_owner_input as owner_input
+        from dispatch_contract import hold_supervisor_lease
+
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        owner_input.initialize_owner_input(self.jobs, PARENT, "codex-active-turn")
+        with hold_supervisor_lease(self.jobs, PARENT, self.lease):
+            owner_input.OwnerInput(self.jobs, PARENT, "thread-1", "codex-active-turn", lambda _e: None)
+        resource = {"session_id": "thread-1", "delivered": [], "outbox": None}
+        module = load_supervisor_module()
+        module.write_supervisor_state(self.state, PARENT, set(), phase="recovery")
+        with module.RESOURCE_WAIT.JOIN._supervisor_state_lock(self.state):
+            module.RESOURCE_WAIT.JOIN._write_supervisor_state_unlocked(
+                self.state, PARENT, set(), phase="recovery", resource=resource)
+        jobs_before = self.jobs.read_bytes()
+        state_before = self.state.read_bytes()
+
+        result = self.run_supervisor(FAKE_FAIL_THREAD_RESUME="1")
+
+        self.assertEqual(result.returncode, 75, result.stderr + result.stdout)
+        self.assertIn("dispatch.supervisor.consumer-recovery-failed", result.stdout)
+        self.assertEqual(self.jobs.read_bytes(), jobs_before)
+        self.assertEqual(self.state.read_bytes(), state_before)
+        self.assertFalse(owner_input.supervisor_lease_is_held(self.jobs, owner_input._target(
+            self.jobs, PARENT)[0].metadata))
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(sum(row.get("event") == "thread-resume" for row in trace), 1)
+        self.assertEqual(sum(row.get("event") == "turn-start" for row in trace), 0)
+        self.assertEqual(sum(row.get("event") == "thread-start" for row in trace), 0)
+
+    def test_bound_consumer_lease_contention_leaves_open_row_and_state_untouched(self):
+        import dispatch_owner_input as owner_input
+        from dispatch_contract import hold_supervisor_lease
+
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        owner_input.initialize_owner_input(self.jobs, PARENT, "codex-active-turn")
+        with hold_supervisor_lease(self.jobs, PARENT, self.lease):
+            owner_input.OwnerInput(self.jobs, PARENT, "thread-1", "codex-active-turn", lambda _e: None)
+        resource = {"session_id": "thread-1", "delivered": [], "outbox": None}
+        module = load_supervisor_module()
+        module.write_supervisor_state(self.state, PARENT, set(), phase="recovery")
+        with module.RESOURCE_WAIT.JOIN._supervisor_state_lock(self.state):
+            module.RESOURCE_WAIT.JOIN._write_supervisor_state_unlocked(
+                self.state, PARENT, set(), phase="recovery", resource=resource)
+        jobs_before = self.jobs.read_bytes()
+        state_before = self.state.read_bytes()
+        with hold_supervisor_lease(self.jobs, PARENT, self.lease):
+            result = self.run_supervisor(FAKE_NO_CHILD="1")
+        self.assertEqual(result.returncode, 75, result.stderr + result.stdout)
+        self.assertIn("dispatch.supervisor.consumer-recovery-failed", result.stdout)
+        self.assertEqual(self.jobs.read_bytes(), jobs_before)
+        self.assertEqual(self.state.read_bytes(), state_before)
+        self.assertFalse(self.trace.exists())
+
+    def test_first_resource_receipt_after_restart_uses_next_durable_ordinal(self):
+        import dispatch_owner_input as owner_input
+        import dispatch_budget_record as budget_record
+        from dispatch_contract import hold_supervisor_lease
+
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        owner_input.initialize_owner_input(self.jobs, PARENT, "codex-active-turn")
+        with hold_supervisor_lease(self.jobs, PARENT, self.lease):
+            owner_input.OwnerInput(self.jobs, PARENT, "thread-1", "codex-active-turn", lambda _e: None)
+        module = load_supervisor_module()
+        resource = {"session_id": "thread-1", "delivered": [], "outbox": None}
+        module.write_supervisor_state(self.state, PARENT, set(), phase="recovery")
+        with module.RESOURCE_WAIT.JOIN._supervisor_state_lock(self.state):
+            module.RESOURCE_WAIT.JOIN._write_supervisor_state_unlocked(
+                self.state, PARENT, set(), phase="recovery", resource=resource)
+        remaining = {"gross_remaining": 12, "stall_remaining": 12,
+                     "reserved_remaining": 1}
+        self.assertTrue(budget_record.reserve(
+            self.jobs.parent, parent_attempt_id=PARENT, route_id="rt-ledger",
+            route_hash="sha256:" + "c" * 64, ordinal=0, purpose="ordinary",
+            klass="gross", remaining=remaining)[0])
+        self.assertTrue(budget_record.reserve(
+            self.jobs.parent, parent_attempt_id=PARENT, route_id="rt-ledger",
+            route_hash="sha256:" + "c" * 64, ordinal=1, purpose="ordinary",
+            klass="gross", remaining=remaining)[0])
+
+        turns = []
+        resource_waits = []
+        injected_outbox = [False]
+        original_read = module.read_supervisor_phase_state
+
+        class FakeServer:
+            process = None
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def request(self, method, _params):
+                if method == "thread/resume":
+                    return {"thread": {"id": "thread-1"}}
+                return {"ok": True}
+
+            def notification(self, *_args, **_kwargs):
+                pass
+
+            def close(self):
+                pass
+
+        def fake_read(path, attempt):
+            if injected_outbox[0]:
+                return SimpleNamespace(resource={"outbox": {"receipt_id": "resource-fixture"}},
+                                       delivered_attempt_ids=set(), outbox=None)
+            return original_read(path, attempt)
+
+        def fake_wait(*_args, **_kwargs):
+            resource_waits.append(True)
+            if len(resource_waits) == 2:
+                injected_outbox[0] = True
+                return "fixture resource receipt"
+            return None
+
+        def fake_turn(_server, *, thread_id, prompt, args, activity):
+            turns.append((thread_id, prompt))
+            if len(turns) == 1:
+                return "runtime_wait: registered-children", None
+            return "artifact: -\nverdict: PASS\nblocker: none", None
+
+        argv = self.command() [2:] + ["--route-id", "rt-ledger",
+                                     "--route-hash", "sha256:" + "c" * 64]
+        with mock.patch.object(module, "AppServer", FakeServer), \
+             mock.patch.object(module, "run_turn", side_effect=fake_turn), \
+             mock.patch.object(module, "read_supervisor_phase_state", side_effect=fake_read), \
+             mock.patch.object(module.RESOURCE_WAIT, "wait", side_effect=fake_wait), \
+             mock.patch.object(module.RESOURCE_WAIT, "pending_prompt", return_value="receipt prompt"), \
+             mock.patch.object(module.RESOURCE_WAIT, "acknowledge", return_value=True), \
+             mock.patch.object(module.RESOURCE_WAIT, "needs_recovery", return_value=True), \
+             mock.patch.object(module, "reconcile", return_value=False), \
+             mock.patch.object(module, "emit", lambda _event: None), \
+             mock.patch("foreground_activity.owner_turn_activity", return_value=None), \
+             mock.patch("sys.stdin", io.StringIO("same-thread recovery prompt")):
+            result = module.main(argv)
+
+        self.assertEqual(result, 70)
+        self.assertEqual([thread for thread, _prompt in turns], ["thread-1", "thread-1"])
+        rows = budget_record.read_rows(self.jobs.parent, PARENT)
+        reservations = [row for row in rows if row.get("record_kind") == "reservation"]
+        self.assertEqual([row["ordinal"] for row in reservations], [0, 1, 2])
+        self.assertEqual(reservations[-1]["purpose"], "ordinary")
+
+    def test_public_correct_respawns_and_completes_on_same_thread_without_touching_resource(self):
+        self._public_correct_respawn_fixture(legacy_record=False)
+
+    def test_legacy_v3532_public_correct_respawns_from_bound_provenance(self):
+        self._public_correct_respawn_fixture(legacy_record=True)
+
+    def test_legacy_public_correct_preserves_runtime_with_additional_writable_grant(self):
+        self._public_correct_respawn_fixture(legacy_record=True, additional_grant=True)
+
+    def _public_correct_respawn_fixture(self, *, legacy_record, additional_grant=False):
+        import contextlib
+        import dispatch_completion_join as join
+        import dispatch_budget_record as budget_record
+        import dispatch_contract as contract
+        import dispatch_owner_input as owner_input
+        import dispatch_replacement
+        import dispatch_resource_wait as owner_resource
+        import execution_access
+        import route_authority
+        import route_parent_close
+        from types import SimpleNamespace
+        from worker_runtime_home import prepare_worker_home
+
+        base = self.base
+        jobs = base / "dispatch" / "jobs.log"
+        jobs.parent.mkdir(parents=True, exist_ok=True)
+        artifact_root = base / ".agent_reports"
+        artifact_root.mkdir(exist_ok=True)
+        runtime_dir = base / ".agent_runtime"
+        runtime_dir.mkdir(exist_ok=True)
+        compute_root = None
+        if additional_grant:
+            compute_scratch = tempfile.TemporaryDirectory(prefix="hearting-compute-grant-")
+            self.addCleanup(compute_scratch.cleanup)
+            compute_root = Path(compute_scratch.name) / "opaque-output"
+            compute_root.mkdir()
+            self.assertFalse(compute_root.is_relative_to(base))
+        home = base / "home"
+        home.mkdir(exist_ok=True)
+        xdg_state = base / "xdg-state"
+        xdg_state.mkdir(exist_ok=True)
+        logs = jobs.parent / "logs"
+        logs.mkdir(exist_ok=True)
+        native_codex_home = home / ".codex" if legacy_record else base / "native-codex"
+        native_codex_home.mkdir(exist_ok=True)
+        (native_codex_home / "config.toml").write_text('model = "gpt-fixture"\n', encoding="utf-8")
+        worker_home = (jobs.parent / "codex-owner-home" if legacy_record
+                       else runtime_dir / "codex-owner-home")
+        route_path = base / "owner-route.json"
+        attempt = PARENT
+        parent_session = "fixture-parent"
+        log_path = logs / f"owner.{attempt}.codex.jsonl"
+        summary_prompt = logs / f"owner.{attempt}.codex.prompt.txt"
+        summary_prompt.write_text("sealed original task prompt", encoding="utf-8")
+        correction_path = base / "correction.txt"
+        correction_path.write_text("resume the existing checkpoint on the same GPU", encoding="utf-8")
+        second_turn_ready = base / "second-turn-ready"
+        second_turn_release = base / "second-turn-release"
+        resource_process = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        def stop_resource_fixture():
+            if resource_process.poll() is None:
+                resource_process.terminate()
+                resource_process.wait(timeout=5)
+        self.addCleanup(stop_resource_fixture)
+        resource_results = base / "resource-results.json"
+        resource_results.write_text('{"checkpoint":"same-live-result"}\n', encoding="utf-8")
+        resource_registry = base / "resource-registry.json"
+        resource_registry.write_text(json.dumps({"runs": {"cpu-run": {
+            "run_id": "cpu-run", "pid": resource_process.pid,
+            "starttime": contract.process_start_ticks(resource_process.pid),
+            "status": "running", "result_file": str(resource_results),
+            "outputs_sha256": hashlib.sha256(resource_results.read_bytes()).hexdigest(),
+        }}}), encoding="utf-8")
+        resource_registry_before = hashlib.sha256(resource_registry.read_bytes()).hexdigest()
+        resource_results_before = hashlib.sha256(resource_results.read_bytes()).hexdigest()
+
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home), "XDG_STATE_HOME": str(xdg_state),
+            "AGENT_HOME": str(ROOT),
+            "AGENT_RUNTIME_DIR": str(base / ".caller-runtime" if legacy_record else runtime_dir),
+            "AGENT_DISPATCH_JOBS": str(jobs),
+            "AGENT_MODEL_GOVERNOR_ROOT": str(artifact_root / ".runtime/model-worker-governor"),
+            "FLEET_TITLE_STATE_DIR": str(base / "fleet-titles"),
+            "CODEX_THREAD_ID": parent_session,
+            "CODEX_APP_SERVER_COMMAND": f"{sys.executable} {self.app}",
+            "FAKE_TRACE": str(self.trace), "FAKE_HOLD_SECOND_TURN": "1",
+            "FAKE_SECOND_TURN_READY": str(second_turn_ready),
+            "FAKE_SECOND_TURN_RELEASE": str(second_turn_release),
+            "TMPDIR": str(base),
+        }
+        def load_local(name, path):
+            spec = importlib.util.spec_from_file_location(name, path)
+            loaded = importlib.util.module_from_spec(spec)
+            sys.modules[name] = loaded
+            spec.loader.exec_module(loaded)
+            return loaded
+
+        route_compiler = load_local("respawn_route_compiler", ROOT / "utilities/capability-route.py")
+        with mock.patch.dict(os.environ, env, clear=True):
+            route = route_compiler.compile_route(
+                capability="autopilot-code", capability_mode="dev", requested_intensity="direct",
+                cwd=str(base), artifact_root=str(artifact_root),
+                predicates=["atomic-outcome", "known-scope", "no-shared-contract", "no-resource-run",
+                            "no-artifact-handoff", "no-independent-verifier", "focused-verification"],
+                signals=[], transport=None, inline_reason="atomic-direct", tracking="tracked",
+                tracked_gate_evidence={
+                    "spec_read": {"satisfied": True, "source": "fixture-prd"},
+                    "drift_verdict": "within-spec", "workflow_mode": "tracked",
+                    "artifact_guard": {"satisfied": True, "source": "fixture-prechecked"},
+                },
+            )
+            route_path.write_text(json.dumps(route), encoding="utf-8")
+            route_compiler.verify_route(route, str(base))
+
+            prepare_worker_home(
+                ROOT, "codex", "owner", attempt,
+                env={"HOME": str(home), "CODEX_HOME": str(native_codex_home),
+                     "AGENT_DISPATCH_JOBS": str(jobs)},
+                destination=worker_home,
+            )
+            if legacy_record:
+                # v3.53.2 schema-2 homes omitted both derived paths. The
+                # existing absolute config symlink remains the provenance.
+                manifest_path = worker_home / "worker-home.json"
+                legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(legacy_manifest.get("schema"), 2)
+                legacy_manifest.pop("codex_config_home", None)
+                legacy_manifest.pop("home_environment", None)
+                manifest_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
+                self.assertTrue((worker_home / "config.toml").is_symlink())
+                self.assertFalse(worker_home.is_relative_to(runtime_dir))
+            def home_snapshot():
+                snapshot = {}
+                for path in sorted(worker_home.rglob("*")):
+                    rel = str(path.relative_to(worker_home))
+                    if path.is_symlink():
+                        snapshot[rel] = ("link", os.readlink(path))
+                    elif path.is_file():
+                        snapshot[rel] = ("file", path.read_bytes())
+                return snapshot
+            worker_home_before = home_snapshot()
+            lease = contract.supervisor_lease_path(jobs, attempt)
+            model_settings = {"source": "explicit", "model": "gpt-fixture", "reasoning": "high",
+                              "context_window": "200000", "role": "owner", "profile": "balanced",
+                              "tier": "balanced", "granularity": "model"}
+            binding = SimpleNamespace(route_file=str(route_path), route_id=route["route_id"],
+                                      route_hash=route["route_hash"])
+            default_writable_roots = (artifact_root, runtime_dir, jobs.parent)
+            access_grant = None
+            access_argv = []
+            if additional_grant:
+                access_file = base / "execution-access-request.json"
+                access_file.write_text(json.dumps({
+                    "schema_version": 1, "writable_roots": [str(compute_root)],
+                    "read_roots": [],
+                    "network": {"required": False, "reason": "", "hosts": []},
+                    "enforcement_required": "os-sandbox",
+                    "justification": {str(compute_root): "fixture compute output"},
+                }), encoding="utf-8")
+                access_context = execution_access.AccessContext.build(
+                    worktree=base, artifact_root=artifact_root, dispatch_state_root=jobs.parent,
+                    agent_home=ROOT, environ=env)
+                access_request = execution_access.load_request(access_file, context=access_context)
+                access_grant = execution_access.build_grant(
+                    access_request, runtime="codex-app-server",
+                    default_writable_roots=default_writable_roots,
+                    effective_sandbox="workspace-write")
+                self.assertEqual(access_grant.additional_writable_roots, (compute_root,))
+                self.assertEqual(access_grant.absorbed_writable_roots, ())
+                access_argv = ["--execution-access-file", str(access_file)]
+            launch_args = SimpleNamespace(
+                attempt_id=attempt, jobs_path=jobs, worktree=str(base), replacement_input_argv=[
+                    "--approval", "never", "--sandbox", "workspace-write", "--max-continuations", "20",
+                    *access_argv],
+                capability="autopilot-code", capability_mode="dev", unit="", worker_type="owner",
+                worker_mode="", assigned_contract="capability-owner", dispatch_depth=1,
+                intensity="standard", qa="standard", sandbox="workspace-write", permission_mode="sandboxed",
+                parent_harness="codex", parent_transport="headless", parent_sandbox="workspace-write",
+                launch_authority="conductor", parent_session_id=parent_session, parent_attempt_id=None,
+                execution_surface="registered-headless", registered_worker=True,
+                fallback_hop="same-harness-headless", model_role="owner", model_profile="balanced",
+                model="gpt-fixture", reasoning="high", resolved_model_settings=model_settings,
+                runtime_dir=str(runtime_dir), resolved_completion_delivery="app-server-supervised",
+                parent_completion_delivery="codex-managed-gateway", approval="never",
+                launch_lifecycle="detached", nested_headless_network=False, profile=None,
+                owner_route_binding=binding, route_id=route["route_id"], route_node="",
+                route_file=str(route_path), route_hash=route["route_hash"], artifact_root=str(artifact_root),
+                replacement_retry_brief="", execution_access_grant=access_grant,
+            )
+            input_fragment = dispatch_replacement.seal_launch_input(
+                launch_args, "codex", "ORIGINAL_TASK_SENTINEL must not be replayed")
+            launch_input_path = (dispatch_replacement._directory(jobs) / "inputs"
+                                 / f"{attempt}.json")
+            sealed_launch = json.loads(launch_input_path.read_text(encoding="utf-8"))
+            if additional_grant:
+                recorded_access = sealed_launch["applied_permissions"]["execution_access"]
+                self.assertEqual(recorded_access["additional_writable_roots"], [str(compute_root)])
+                self.assertEqual(recorded_access["request_sha256"], access_request.request_sha256)
+                self.assertEqual(recorded_access["source_path"], str(access_file))
+            if legacy_record:
+                sealed_launch["resolved"].pop("runtime_dir")
+                sealed_launch["applied_permissions"].pop("approval", None)
+                sealed_launch["applied_permissions"].pop("commit_policy", None)
+                launch_input_path.write_bytes(dispatch_replacement._bytes(sealed_launch))
+                old_digest = input_fragment.split("replacement_input_digest=", 1)[1].split(",", 1)[0]
+                input_fragment = input_fragment.replace(
+                    old_digest, dispatch_replacement._digest(sealed_launch), 1)
+            effective_path, effective_digest = execution_access.publish_effective_grant(
+                jobs=jobs, attempt_id=attempt, route_id=route["route_id"],
+                route_hash=route["route_hash"], runtime="codex-app-server",
+                sandbox="workspace-write", grant=access_grant,
+                default_writable_roots=default_writable_roots,
+                network_allowed=False,
+            )
+            verified_effective = json.loads(effective_path.read_text(encoding="utf-8"))
+            if additional_grant:
+                self.assertEqual(verified_effective["request_sha256"], access_request.request_sha256)
+                self.assertEqual(verified_effective["request_path"], str(access_file))
+                self.assertEqual(set(verified_effective["writable_roots"]),
+                                 {str(root) for root in (*default_writable_roots, compute_root)})
+            old_pid = "99999999"
+            old_start = "100"
+            metadata = {
+                "attempt_schema_version": "2", "dispatch_depth": "1", "transport": "headless",
+                "execution_surface": "registered-headless", "registered_worker": "1",
+                "fallback_hop": "same-harness-headless", "worker_type": "owner", "harness": "codex",
+                "completion_delivery": "app-server-supervised", "supervisor_lease": contract.SUPERVISOR_LEASE_KIND,
+                "supervisor_lease_file": str(lease), "supervisor_lease_nonce": "d" * 64,
+                "attempt_id": attempt, "launch_claimed": "1", "launch_started": "1",
+                "launch_lifecycle": "detached", "launch_fence": "registry-v1",
+                "pid": old_pid, "pid_start": old_start,
+                "pid_ns": os.readlink("/proc/self/ns/pid"),
+                "pid_observer_ns": os.readlink("/proc/self/ns/pid"), "pgid": old_pid,
+                "runtime_sandbox": "workspace-write", "runtime_home": str(worker_home),
+                "launch_home": str(ROOT.resolve()), "artifact_root": str(artifact_root),
+                "log_file": str(log_path), "approval": "never", "parent_sid": parent_session,
+                "parent_harness": "codex", "parent_transport": "headless",
+                "parent_sandbox": "workspace-write", "parent_cwd": str(base),
+                "capability": "autopilot-code", "capability_mode": "dev", "intensity": "standard",
+                "qa": "standard", "assigned_contract": "capability-owner", "owner": "autopilot-code",
+                "owner_harness": "codex", "owner_route_file": str(route_path),
+                "owner_route_id": route["route_id"], "owner_route_hash": route["route_hash"],
+                "route_file": str(route_path), "route_id": route["route_id"],
+                "route_hash": route["route_hash"], "model_source": "explicit", "model_role": "owner",
+                "model_profile": "balanced", "model": "gpt-fixture", "reasoning": "high",
+                "completion_delivery_reason": "not-applicable",
+                "execution_access_effective_file": str(effective_path),
+                "execution_access_effective_sha256": effective_digest,
+            }
+            row_line = (f"2026-10-27T00:00:00Z\topen\t{base}\t{base}\towner\t"
+                        + ",".join(f"{key}={value}" for key, value in metadata.items())
+                        + input_fragment)
+            jobs.write_text(row_line + "\n", encoding="utf-8")
+            remaining = {"gross_remaining": 12, "stall_remaining": 12,
+                         "reserved_remaining": 1}
+            self.assertTrue(budget_record.reserve(
+                jobs.parent, parent_attempt_id=attempt, route_id=route["route_id"],
+                route_hash=route["route_hash"], ordinal=0, purpose="ordinary", klass="gross",
+                remaining=remaining)[0])
+            self.assertTrue(budget_record.reserve(
+                jobs.parent, parent_attempt_id=attempt, route_id=route["route_id"],
+                route_hash=route["route_hash"], ordinal=1, purpose="ordinary", klass="gross",
+                remaining=remaining)[0])
+
+            def settle_owned_attempt():
+                try:
+                    current = join.exact_attempt_row(jobs, attempt)
+                    current_meta = current.metadata
+                except Exception:
+                    return
+                pid = current_meta.get("pid", "")
+                start = current_meta.get("pid_start", "")
+                if not pid.isdigit() or not start or pid == old_pid:
+                    return
+                for _ in range(40):
+                    if contract.process_start_ticks(int(pid)) != start:
+                        break
+                    time.sleep(0.05)
+                if contract.process_start_ticks(int(pid)) == start:
+                    pgid = current_meta.get("pgid", "")
+                    if pgid == pid:
+                        try:
+                            os.killpg(int(pgid), 15)
+                        except ProcessLookupError:
+                            pass
+                        for _ in range(20):
+                            if contract.process_start_ticks(int(pid)) != start:
+                                break
+                            time.sleep(0.05)
+                        if contract.process_start_ticks(int(pid)) == start:
+                            try:
+                                os.killpg(int(pgid), 9)
+                            except ProcessLookupError:
+                                pass
+                summary_pid = current_meta.get("summary_owner_pid", "")
+                summary_start = current_meta.get("summary_owner_pid_start", "")
+                if (summary_pid.isdigit() and summary_start
+                        and contract.process_start_ticks(int(summary_pid)) == summary_start):
+                    try:
+                        os.kill(int(summary_pid), 15)
+                    except ProcessLookupError:
+                        pass
+                    for _ in range(40):
+                        if contract.process_start_ticks(int(summary_pid)) != summary_start:
+                            break
+                        time.sleep(0.05)
+                    if contract.process_start_ticks(int(summary_pid)) == summary_start:
+                        try:
+                            os.kill(int(summary_pid), 9)
+                        except ProcessLookupError:
+                            pass
+                        for _ in range(20):
+                            if contract.process_start_ticks(int(summary_pid)) != summary_start:
+                                break
+                            time.sleep(0.05)
+                helper_ids = []
+                for proc_dir in Path("/proc").iterdir():
+                    if not proc_dir.name.isdigit():
+                        continue
+                    try:
+                        if proc_dir.stat().st_uid != os.getuid():
+                            continue
+                        argv = [part.decode(errors="replace") for part in
+                                (proc_dir / "cmdline").read_bytes().split(b"\0") if part]
+                        stat_fields = (proc_dir / "stat").read_text().rsplit(") ", 1)[1].split()
+                        start_ticks = stat_fields[19]
+                    except (OSError, IndexError):
+                        continue
+                    joined = " ".join(argv)
+                    if (str(log_path) in joined and attempt in joined
+                            and ("/utilities/dispatch_summary.py" in joined
+                                 or "/tools/fleet/refresh_title.py" in joined)):
+                        helper_ids.append((int(proc_dir.name), start_ticks))
+                for helper_pid, helper_start in helper_ids:
+                    if contract.process_start_ticks(helper_pid) != helper_start:
+                        continue
+                    try:
+                        os.kill(helper_pid, 15)
+                    except ProcessLookupError:
+                        continue
+                    for _ in range(40):
+                        if contract.process_start_ticks(helper_pid) != helper_start:
+                            break
+                        time.sleep(0.05)
+                    if contract.process_start_ticks(helper_pid) == helper_start:
+                        try:
+                            os.kill(helper_pid, 9)
+                        except ProcessLookupError:
+                            pass
+                        for _ in range(20):
+                            if contract.process_start_ticks(helper_pid) != helper_start:
+                                break
+                            time.sleep(0.05)
+
+            self.addCleanup(settle_owned_attempt)
+            owner_input.initialize_owner_input(jobs, attempt, "codex-active-turn")
+            with contract.hold_supervisor_lease(jobs, attempt, lease):
+                owner_input.OwnerInput(jobs, attempt, "thread-1", "codex-active-turn", lambda _e: None)
+            headless = load_local("respawn_legacy_dispatch_headless",
+                                  ROOT / "adapters/codex/bin/dispatch-headless.py")
+            if legacy_record and not additional_grant:
+                effective = json.loads(effective_path.read_text(encoding="utf-8"))
+                row_fields = row_line.rstrip("\n").split("\t")
+                state_path = lease.with_suffix(".json")
+
+                rendered = headless.recorded_supervisor_command(
+                    sealed_launch, row_fields, metadata, jobs, state_path, lease,
+                    None, log_path, effective, recorded_home=str(home))
+                self.assertIn(str(runtime_dir), rendered)
+                self.assertIn("--primary-git-commit", rendered)
+
+                alternate_scratch = tempfile.TemporaryDirectory(prefix="hearting-alternate-runtime-")
+                self.addCleanup(alternate_scratch.cleanup)
+                alternate_runtime = Path(alternate_scratch.name) / "runtime"
+                alternate_runtime.mkdir()
+                absent = {**effective, "writable_roots": [
+                    root for root in effective["writable_roots"] if root != str(runtime_dir)]}
+                ambiguous = {**effective, "writable_roots": [
+                    *effective["writable_roots"], str(alternate_runtime)]}
+                explicit_conflict = json.loads(json.dumps(sealed_launch))
+                explicit_conflict["resolved"]["runtime_dir"] = str(alternate_runtime)
+                commit_conflict = json.loads(json.dumps(sealed_launch))
+                commit_conflict["applied_permissions"]["commit_policy"] = {"may_commit": False}
+                refusal_cases = (
+                    (sealed_launch, absent, "runtime_dir"),
+                    (sealed_launch, ambiguous, "runtime_dir-ambiguous"),
+                    (explicit_conflict, effective, "execution_access_writable_roots:runtime_dir"),
+                    (commit_conflict, effective, "commit_policy.may_commit-changed"),
+                )
+                refusal_launches = []
+                refusal_real_popen = subprocess.Popen
+
+                def refuse_only_launch_fence(*popen_args, **popen_kwargs):
+                    command = popen_kwargs.get("args", popen_args[0] if popen_args else [])
+                    parts = [command] if isinstance(command, (str, bytes)) else list(command)
+                    if any(str(part).endswith("launch-fence.py") for part in parts):
+                        refusal_launches.append(parts)
+                    return refusal_real_popen(*popen_args, **popen_kwargs)
+
+                with mock.patch.object(headless.subprocess, "Popen",
+                                       side_effect=refuse_only_launch_fence):
+                    for candidate_record, candidate_effective, expected_detail in refusal_cases:
+                        with self.subTest(legacy_refusal=expected_detail):
+                            with self.assertRaises(headless.DispatchContractError) as raised:
+                                headless.recorded_supervisor_command(
+                                    candidate_record, row_fields, metadata, jobs, state_path, lease,
+                                    None, log_path, candidate_effective, recorded_home=str(home))
+                            self.assertEqual(raised.exception.detail, expected_detail)
+                self.assertEqual(refusal_launches, [])
+                self.assertEqual(owner_input.inspect(jobs, attempt)["requests"], [])
+                self.assertFalse(self.trace.exists())
+            state_path = lease.with_suffix(".json")
+            supervisor_module = load_supervisor_module()
+            supervisor_module.write_supervisor_state(state_path, attempt, set(), phase="recovery")
+            with join._supervisor_state_lock(state_path):
+                join._write_supervisor_state_unlocked(
+                    state_path, attempt, set(), phase="recovery",
+                    resource={"session_id": "thread-1", "delivered": [], "outbox": None})
+
+            route_authority_module = route_authority
+            preserved = [{"kind": "resource", "run_id": "cpu-run",
+                          "registry": str(resource_registry), "record": "cpu-run"}]
+            cap = load_local("respawn_public_capability_route", ROOT / "utilities/capability-route.py")
+            output = io.StringIO()
+            respawn_outcomes = []
+            launch_environments = []
+            prompt_temp_dirs = []
+            rendered_commands = []
+            original_recover_consumer = owner_input.recover_consumer
+            real_popen = subprocess.Popen
+            real_temporary_file = tempfile.TemporaryFile
+            real_recorded_command = headless.recorded_supervisor_command
+
+            def capture_recovery(jobs_arg, attempt_arg, *, session=None, spawn=None):
+                def capture_spawn(*spawn_args, **spawn_kwargs):
+                    outcome = headless.respawn_supervised_owner(*spawn_args, **spawn_kwargs)
+                    respawn_outcomes.append(outcome)
+                    return outcome
+                return original_recover_consumer(
+                    jobs_arg, attempt_arg, session=session, spawn=spawn or capture_spawn)
+
+            def capture_popen(*popen_args, **popen_kwargs):
+                command = popen_kwargs.get("args", popen_args[0] if popen_args else [])
+                parts = [command] if isinstance(command, (str, bytes)) else list(command)
+                if any(str(part).endswith("launch-fence.py") for part in parts):
+                    launch_environments.append(dict(popen_kwargs.get("env") or {}))
+                return real_popen(*popen_args, **popen_kwargs)
+
+            def capture_temporary_file(*file_args, **file_kwargs):
+                if "dir" in file_kwargs:
+                    prompt_temp_dirs.append(str(file_kwargs["dir"]))
+                return real_temporary_file(*file_args, **file_kwargs)
+
+            def capture_recorded_command(*command_args, **command_kwargs):
+                rendered = real_recorded_command(*command_args, **command_kwargs)
+                rendered_commands.append(rendered)
+                return rendered
+
+            with mock.patch.object(route_authority_module, "owns", return_value=True), \
+                 mock.patch.object(contract, "attempt_governed_process_quiescence",
+                                   return_value=contract.ProcessQuiescence("quiescent", "fixture")), \
+                 mock.patch.object(contract, "supervisor_lease_is_held", return_value=False), \
+                 mock.patch.object(route_parent_close, "row_requested", return_value=False), \
+                 mock.patch.object(route_parent_close, "owner_continuation_processes",
+                                   return_value=(contract.ProcessQuiescence(
+                                       "quiescent", "registered-resources-preserved"), preserved)), \
+                 mock.patch.object(join, "settle_finished_attempt", return_value={}), \
+                 mock.patch.object(owner_input, "recover_consumer", side_effect=capture_recovery), \
+                 mock.patch.object(headless.subprocess, "Popen", side_effect=capture_popen), \
+                 mock.patch.object(headless.tempfile, "TemporaryFile", side_effect=capture_temporary_file), \
+                 mock.patch.object(headless, "recorded_supervisor_command", side_effect=capture_recorded_command), \
+                 contextlib.redirect_stdout(output), \
+                 mock.patch.object(sys, "argv", [str(ROOT / "utilities/capability-route.py"),
+                     "correct", "--attempt-id", attempt, "--jobs", str(jobs),
+                     "--message-file", str(correction_path)]):
+                public_status = cap.main()
+            receipt = json.loads(output.getvalue())
+            if additional_grant and receipt.get("consumer_recovery") != "respawned":
+                pending = owner_input.inspect(jobs, attempt)["requests"]
+                diagnostic = json.dumps({
+                    "receipt": receipt,
+                    "request_states": [item["state"] for item in pending],
+                    "consumer_launches": len(launch_environments),
+                    "rendered_commands": len(rendered_commands),
+                }, sort_keys=True)
+                self.assertEqual(len(pending), 1, diagnostic)
+                self.assertEqual(pending[0]["state"], "queued", diagnostic)
+                self.assertEqual(launch_environments, [], diagnostic)
+                self.assertFalse(self.trace.exists(), diagnostic)
+                self.assertIsNone(resource_process.poll(), diagnostic)
+                self.assertEqual(hashlib.sha256(resource_registry.read_bytes()).hexdigest(),
+                                 resource_registry_before, diagnostic)
+                self.assertEqual(hashlib.sha256(resource_results.read_bytes()).hexdigest(),
+                                 resource_results_before, diagnostic)
+                self.assertEqual(home_snapshot(), worker_home_before, diagnostic)
+                self.fail("public correction did not restore the recorded runtime: " + diagnostic)
+
+            deadline = time.monotonic() + 15
+            requests = []
+            while time.monotonic() < deadline and not second_turn_ready.exists():
+                requests = owner_input.inspect(jobs, attempt)["requests"]
+                time.sleep(0.05)
+            requests = owner_input.inspect(jobs, attempt)["requests"]
+            if not requests or requests[0]["state"] != "turn-completed":
+                self.fail("same-thread correction did not reach turn-completed: " +
+                          self.trace.read_text() if self.trace.exists() else "no App Server trace")
+            self.assertTrue(second_turn_ready.exists(), "the same owner did not remain live for resource registration")
+            current_meta = join.exact_attempt_row(jobs, attempt).metadata
+            resource_env = {
+                **env, "AGENT_DISPATCH_COMPLETION_MODE": "supervised",
+                "AGENT_DISPATCH_ATTEMPT_ID": attempt, "AGENT_DISPATCH_DEPTH": "1",
+                "AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION": "2",
+                "AGENT_DISPATCH_WORKER_TYPE": "owner",
+                "AGENT_DISPATCH_EXECUTION_SURFACE": "registered-headless",
+                "AGENT_DISPATCH_REGISTERED_WORKER": "1",
+                "AGENT_DISPATCH_JOBS": str(jobs),
+                "AGENT_DISPATCH_COMPLETION_STATE_FILE": str(state_path),
+                "AGENT_OWNER_ROUTE_FILE": str(route_path),
+                "AGENT_OWNER_ROUTE_ID": route["route_id"],
+                "AGENT_OWNER_ROUTE_HASH": route["route_hash"],
+            }
+            resource_binding = owner_resource.start_binding(
+                route, route_path, SimpleNamespace(jobs=None, parent_attempt_id=None), resource_env)
+            self.assertEqual(resource_binding["parent_attempt_id"], attempt)
+            self.assertEqual(resource_binding["session_id"], "thread-1")
+            self.assertEqual(resource_binding["owner_pid"], int(current_meta["pid"]))
+            reservations = [row for row in budget_record.read_rows(jobs.parent, attempt)
+                            if row.get("record_kind") == "reservation"]
+            self.assertEqual([row["ordinal"] for row in reservations], [0, 1, 2])
+            second_turn_release.touch()
+
+        self.assertEqual(public_status, 0)
+        self.assertEqual(receipt["consumer_recovery"], "respawned", receipt)
+        self.assertEqual(len(respawn_outcomes), 1)
+        self.assertEqual(respawn_outcomes[0]["runtime_dir"], str(runtime_dir))
+        self.assertEqual(prompt_temp_dirs, [str(runtime_dir)])
+        self.assertEqual(len(launch_environments), 1)
+        self.assertEqual(launch_environments[0]["AGENT_RUNTIME_DIR"], str(runtime_dir))
+        if additional_grant:
+            self.assertEqual(len(rendered_commands), 1)
+            rendered = shlex.split(rendered_commands[0])
+            writable_roots = [rendered[index + 1] for index, part in enumerate(rendered)
+                              if part == "--writable-root"]
+            self.assertEqual(writable_roots, verified_effective["writable_roots"])
+            self.assertIn(str(runtime_dir), writable_roots)
+            self.assertIn(str(compute_root), writable_roots)
+            for key, value in (("request_sha256", "0" * 64),
+                               ("source_path", str(access_file) + ".other")):
+                with self.subTest(changed_access_binding=key):
+                    changed = json.loads(json.dumps(sealed_launch))
+                    changed["applied_permissions"]["execution_access"][key] = value
+                    with self.assertRaises(headless.DispatchContractError) as raised:
+                        real_recorded_command(
+                            changed, row_line.rstrip("\n").split("\t"), metadata, jobs,
+                            lease.with_suffix(".json"), lease, None, log_path,
+                            verified_effective, recorded_home=str(home))
+                    self.assertEqual(raised.exception.detail, "execution_access_request")
+        self.assertFalse(receipt.get("duplicate"))
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["state"], "turn-completed")
+        self.assertEqual([event["state"] for event in requests[0]["events"]],
+                         ["queued", "sending", "accepted", "turn-completed"])
+        self.assertIsNone(resource_process.poll())
+        self.assertFalse((base / "payload-start-count").exists())
+        final_rows = jobs.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(final_rows), 1)
+        self.assertEqual(join.exact_attempt_row(jobs, attempt).metadata["attempt_id"], attempt)
+        trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        server_start = next(row for row in trace if row.get("event") == "server-start")
+        self.assertEqual(server_start["runtime_dir"], str(runtime_dir))
+        self.assertEqual(sum(row.get("event") == "thread-resume" for row in trace), 1)
+        self.assertEqual(sum(row.get("event") == "thread-start" for row in trace), 0)
+        turn = next(row for row in trace if row.get("event") == "turn-start")
+        self.assertIn("resume the existing checkpoint", turn["prompt"])
+        self.assertNotIn("ORIGINAL_TASK_SENTINEL", turn["prompt"])
+        self.assertEqual(hashlib.sha256(resource_registry.read_bytes()).hexdigest(), resource_registry_before)
+        self.assertEqual(hashlib.sha256(resource_results.read_bytes()).hexdigest(), resource_results_before)
+        self.assertEqual(home_snapshot(), worker_home_before)
+
     def test_runtime_wait_has_no_model_activity_until_exact_join_is_ready(self):
         self.jobs.write_text(
             owner_row(self.lease)
@@ -908,19 +1644,25 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
         events = [item["event"] for item in trace]
-        self.assertEqual(events, ["turn-start", "join-start", "join-end", "turn-start"])
-        self.assertEqual(trace[0]["delivered"], [])
-        self.assertEqual(trace[0]["phase"], "running-turn")
-        self.assertEqual(trace[3]["phase"], "running-turn")
-        self.assertEqual(set(trace[3]["outbox"]["attempt_ids"]), {"att-child-a", "att-child-b"})
-        self.assertEqual(trace[3]["outbox"]["consumed_attempt_ids"], [])
+        self.assertEqual(events, [
+            "thread-start", "turn-start", "join-start", "join-end", "turn-start",
+        ])
+        self.assertEqual(events.count("thread-start"), 1)
+        self.assertEqual(events.count("thread-resume"), 0)
+        turns = [item for item in trace if item["event"] == "turn-start"]
+        self.assertEqual(turns[0]["delivered"], [])
+        self.assertEqual(turns[0]["phase"], "running-turn")
+        self.assertEqual(turns[1]["phase"], "running-turn")
+        self.assertEqual(set(turns[1]["outbox"]["attempt_ids"]), {"att-child-a", "att-child-b"})
+        self.assertEqual(turns[1]["outbox"]["consumed_attempt_ids"], [])
         self.assertTrue(all(item.get("lease_held") for item in trace if item["event"] == "turn-start"))
         self.assertEqual(
-            set(trace[3]["delivered"]), {"att-child-a", "att-child-b"}
+            set(turns[1]["delivered"]), {"att-child-a", "att-child-b"}
         )
-        self.assertLess(trace[1]["time"], trace[2]["time"])
-        self.assertLessEqual(trace[2]["time"], trace[3]["time"])
-        self.assertEqual(trace[1]["phase"], "parked")
+        joins = [item for item in trace if item["event"].startswith("join-")]
+        self.assertLess(joins[0]["time"], joins[1]["time"])
+        self.assertLessEqual(joins[1]["time"], turns[1]["time"])
+        self.assertEqual(joins[0]["phase"], "parked")
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(sum(row.get("type") == "turn.completed" for row in rows), 1)
         self.assertEqual(
@@ -957,7 +1699,7 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertIsInstance(observed[0]["join_completed_ns"], int)
         # This transport fixture supplies no marker/committed child receipt.
         # A bare done/pass word must arrive as attention, not proved success.
-        self.assertIn('"delivery_classification":"attention"', trace[3]["prompt"])
+        self.assertIn('"delivery_classification":"attention"', turns[1]["prompt"])
         timing_events = [
             row for row in rows
             if row.get("type") == "dispatch.supervisor.delivery-timing"
@@ -1058,7 +1800,9 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         result = self.run_supervisor(FAKE_NO_CHILD="1")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
-        self.assertEqual([item["event"] for item in trace], ["turn-start"])
+        self.assertEqual([item["event"] for item in trace], ["thread-start", "turn-start"])
+        self.assertEqual(sum(item["event"] == "thread-start" for item in trace), 1)
+        self.assertEqual(sum(item["event"] == "thread-resume" for item in trace), 0)
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(sum(row.get("type") == "turn.completed" for row in rows), 1)
         self.assertEqual(
@@ -1118,6 +1862,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             FAKE_NO_CHILD="1", FAKE_GIT_ITEM_FILE=str(item_file), FAKE_EXPECT_STEER="1")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(sum(row.get("event") == "thread-start" for row in trace), 1, trace)
+        self.assertEqual(sum(row.get("event") == "thread-resume" for row in trace), 0, trace)
         steer_rows = [row for row in trace if row.get("event") == "turn-steer"]
         self.assertEqual(len(steer_rows), 1, trace)
         request = steer_rows[0]["request"]
@@ -1164,6 +1910,11 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertTrue(any(row.get("status") == "observation-limit"
                             and row.get("reason") == "feedback-rejected"
                             for row in rejected_feedback), rejected_feedback)
+        rejected_trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(sum(row.get("event") == "thread-start" for row in rejected_trace), 1,
+                         rejected_trace)
+        self.assertEqual(sum(row.get("event") == "thread-resume" for row in rejected_trace), 0,
+                         rejected_trace)
         self.assertEqual(sum(row.get("type") == "dispatch.supervisor.turn.started"
                              for row in rejected_events), 1)
         self.assertIn("verdict: PASS", rejected.stdout)
@@ -1285,8 +2036,11 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         result = self.run_supervisor(FAKE_NO_CHILD="1")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
-        self.assertEqual(len(trace), 1)
-        self.assertIn("early word", trace[0]["prompt"])
+        self.assertEqual([item["event"] for item in trace], ["thread-start", "turn-start"])
+        self.assertEqual(sum(item["event"] == "thread-start" for item in trace), 1)
+        self.assertEqual(sum(item["event"] == "thread-resume" for item in trace), 0)
+        turn = next(item for item in trace if item["event"] == "turn-start")
+        self.assertIn("early word", turn["prompt"])
         receipt = owner_input.inspect(self.jobs, PARENT)
         self.assertEqual(receipt["requests"][0]["state"], "turn-completed")
         self.assertEqual(receipt["requests"][0]["thread_id"], "thread-1")
@@ -1406,12 +2160,46 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
         self.assertEqual([event["event"] for event in trace], [
-            "turn-start", "join-start", "join-end", "turn-start",
+            "thread-start", "turn-start", "join-start", "join-end", "turn-start",
             "join-start", "join-end", "turn-start",
         ])
-        self.assertEqual(trace[3]["delivered"], ["att-child"])
-        self.assertEqual(set(trace[-1]["delivered"]), {"att-child", "att-pending"})
+        self.assertEqual(sum(event["event"] == "thread-start" for event in trace), 1)
+        self.assertEqual(sum(event["event"] == "thread-resume" for event in trace), 0)
+        turns = [event for event in trace if event["event"] == "turn-start"]
+        self.assertEqual(turns[1]["delivered"], ["att-child"])
+        self.assertEqual(set(turns[-1]["delivered"]), {"att-child", "att-pending"})
         self.assertNotIn('"state": "registration-required"', result.stdout)
+
+    def test_unavailable_state_for_pending_bound_input_never_starts_replacement_thread(self):
+        import dispatch_owner_input as owner_input
+        from dispatch_contract import hold_supervisor_lease
+
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        owner_input.initialize_owner_input(self.jobs, PARENT, "codex-active-turn")
+        with hold_supervisor_lease(self.jobs, PARENT, self.lease):
+            owner_input.OwnerInput(self.jobs, PARENT, "thread-1", "codex-active-turn", lambda _e: None)
+            owner_input.submit(self.jobs, PARENT, "keep this correction", "pending-correction")
+        jobs_before = self.jobs.read_bytes()
+
+        for saved_state in (None, "{unreadable"):
+            with self.subTest(saved_state="missing" if saved_state is None else "unreadable"):
+                if saved_state is None:
+                    self.state.unlink(missing_ok=True)
+                else:
+                    self.state.write_text(saved_state, encoding="utf-8")
+                state_before = self.state.read_bytes() if self.state.exists() else None
+                self.trace.unlink(missing_ok=True)
+
+                result = self.run_supervisor(FAKE_NO_CHILD="1")
+
+                self.assertEqual(result.returncode, 75, result.stderr + result.stdout)
+                self.assertIn("dispatch.supervisor.consumer-recovery-failed", result.stdout)
+                self.assertEqual(self.jobs.read_bytes(), jobs_before)
+                self.assertEqual(self.state.read_bytes() if self.state.exists() else None,
+                                 state_before)
+                self.assertFalse(self.trace.exists())
+                receipt = owner_input.inspect(self.jobs, PARENT)
+                self.assertEqual(receipt["requests"][0]["state"], "queued")
 
     def test_bound_long_route_survives_thirteen_continuations_and_completes(self):
         route = self.base / "long-route.json"

@@ -119,34 +119,54 @@ def capture_parent_lifetime(args):
 
 
 def _confirmed_parent_successor(args, attempts, *, current_session=None):
-    """Use only the exact seat-handover bindings already sealed to these attempts."""
+    """Use only a deliverable seat-handover successor sealed to these attempts.
+
+    Raises when the evidence is unreadable so the observer keeps its duty.
+    """
+    return batch_obligations.parent_successor(
+        args.jobs, args.parent_session_id, attempts, current_session=current_session)
+
+
+def _session_tui_stop_reason(args, attempts, namespace):
+    """Stop only when no live TUI carries the session and no successor can receive it."""
     try:
-        import dispatch_seat_handover as handover
-        rows = handover.latest_rows(args.jobs)
-        for attempt in attempts:
-            row = rows.get(attempt)
-            if row is None:
-                continue
-            successor = handover.effective_parent(row[1], args.jobs)
-            if (successor and successor != args.parent_session_id
-                    and (current_session is None or successor == current_session)):
-                return successor
+        from pane_ownership import codex_tui_processes_for_session
+        bindings = codex_tui_processes_for_session(args.parent_session_id)
+        matches = [item for item in bindings
+                   if item.get("session_id") == args.parent_session_id
+                   and process_namespace_identity(item.get("pid")) == namespace]
     except Exception:
         return ""
-    return ""
+    if len(matches) == 1:
+        args.parent_lifetime = {**matches[0], "pid_namespace": namespace}
+        return ""
+    if len(matches) > 1:
+        return ""
+    try:
+        if _confirmed_parent_successor(args, attempts):
+            return ""
+    except Exception:
+        return ""
+    return PARENT_SESSION_ENDED
 
 
 def parent_session_stop_reason(args, attempts):
-    """Return a stop reason only after the exact parent lifetime is disproved.
+    """Return a stop reason only after the parent's lifetime is disproved.
 
-    Missing process/session evidence remains unknown. A current same-seat
-    successor with exact attempt bindings keeps the delivery obligation alive.
+    Missing process/session evidence remains unknown. A deliverable successor
+    with exact attempt bindings keeps the delivery obligation alive. A duty
+    without a recorded TUI binding is judged by the session's live TUI.
     """
-    binding = getattr(args, "parent_lifetime", None)
-    if not isinstance(binding, dict) or not args.parent_session_id:
+    if not getattr(args, "parent_session_id", None):
         return ""
-    namespace = binding.get("pid_namespace")
-    if not namespace or process_namespace_identity() != namespace:
+    binding = getattr(args, "parent_lifetime", None)
+    try:
+        namespace = process_namespace_identity()
+    except Exception:
+        return ""
+    if not isinstance(binding, dict):
+        return _session_tui_stop_reason(args, attempts, namespace) if namespace else ""
+    if binding.get("pid_namespace") != namespace or not namespace:
         return ""
     try:
         pid = int(binding.get("pid"))
@@ -164,28 +184,16 @@ def parent_session_stop_reason(args, attempts):
             return ""
         if not current_session or current_session == args.parent_session_id:
             return ""
-        if _confirmed_parent_successor(args, attempts, current_session=current_session):
+        try:
+            if _confirmed_parent_successor(args, attempts, current_session=current_session):
+                return ""
+        except Exception:
             return ""
         return PARENT_SESSION_ENDED
 
     # The recorded PID/start no longer names the original TUI. A new live TUI
     # for the same native session is a normal resume and retains the duty.
-    try:
-        from pane_ownership import codex_tui_processes_for_session
-        bindings = codex_tui_processes_for_session(args.parent_session_id)
-        matches = [item for item in bindings
-                   if item.get("session_id") == args.parent_session_id
-                   and process_namespace_identity(item.get("pid")) == namespace]
-    except Exception:
-        return ""
-    if len(matches) == 1:
-        args.parent_lifetime = {**matches[0], "pid_namespace": namespace}
-        return ""
-    if len(matches) > 1:
-        return ""
-    if _confirmed_parent_successor(args, attempts):
-        return ""
-    return PARENT_SESSION_ENDED
+    return _session_tui_stop_reason(args, attempts, namespace)
 
 
 def _join_checkpoint(args, attempts):
@@ -929,7 +937,9 @@ def queue_target(jobs: Path, attempts: set[str], registered: str) -> str:
     again on every pass, so a handover that happens while waiting is seen before the send."""
     try:
         import dispatch_seat_handover as handover
-        rows = handover.latest_rows(jobs)
+        from dispatch_registry_cache import registry_view
+        view = registry_view(Path(jobs))
+        rows = {a: row for a in attempts if (row := view.handover_attempt(a)) is not None}
         owners = {(handover.effective_parent(rows[a][1], jobs),
                    handover.effective_parent_harness(rows[a][1], jobs))
                   for a in attempts if a in rows}

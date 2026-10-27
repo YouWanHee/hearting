@@ -45,11 +45,30 @@ from dispatch_completion_join import (
     materialize_after_terminal_close,
 )
 from dispatch_degradation import record_degradation
+from dispatch_registry_cache import registry_view
 from dispatch_supervisor_terminal import missing_result_terminal
 from dispatch_contract import launched_attempt_identity
 
 
 def attempt_record(
+    jobs: Path, attempt_id: str
+) -> tuple[list[str], dict[str, str]] | None:
+    # The watcher polls this for the life of its owner; read the one row through
+    # the shared generation view instead of parsing every historical row.
+    try:
+        view = registry_view(jobs)
+    except OSError:
+        return None
+    if not view._prefix_reuse_eligible:
+        return _attempt_record_from_text(jobs, attempt_id)
+    rows = view.select_rows(attempt_id=attempt_id)
+    if not rows:
+        return None
+    fields, _metadata = rows[-1]
+    return list(fields), parse_registry_metadata(fields[5])
+
+
+def _attempt_record_from_text(
     jobs: Path, attempt_id: str
 ) -> tuple[list[str], dict[str, str]] | None:
     found = None

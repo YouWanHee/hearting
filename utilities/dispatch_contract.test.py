@@ -2277,6 +2277,140 @@ class DispatchContractTest(unittest.TestCase):
     self.assertFalse(D.terminal_attempt_never_started("done",{**base,**extra}))
   self.assertTrue(D.terminal_attempt_never_started("done",base))
 
+ def _respawn_owner_row(self, jobs, attempt, pid="99999999", start="100"):
+  lease=D.supervisor_lease_path(jobs,attempt)
+  extra=(",harness=codex,runtime_sandbox=workspace-write,"
+         "completion_delivery=app-server-supervised,"
+         f"supervisor_lease={D.SUPERVISOR_LEASE_KIND},"
+         f"supervisor_lease_file={lease},supervisor_lease_nonce={'a'*64},"
+         "launch_claimed=1,launch_started=1,launch_lifecycle=detached,"
+         f"pid_scope=namespace-local,pid_ns={D.process_namespace_identity(os.getpid())},"
+         f"pid_observer_ns={D.process_namespace_identity(os.getpid())}")
+  return self.owner_row(attempt,pid,start,extra=extra)
+
+ def test_attempt_identity_lineage_contains_only_exact_pid_start_pairs(self):
+  self.assertEqual(D.attempt_identity_lineage({
+   "pid":"333","pid_start":"30",
+   "owner_identity_lineage":"111:10+222:20+bad+333:x",
+  }), {("111","10"),("222","20"),("333","30")})
+
+ def test_respawn_claim_rechecks_dead_identity_and_publishes_lineage_once(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-owner-respawn"
+   jobs.write_text(self._respawn_owner_row(jobs,attempt)+"\n")
+   children=[]
+   def spawn(gate_fd):
+    child=subprocess.Popen(
+     [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+      "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+      "sleep","60"],pass_fds=(gate_fd,),start_new_session=True)
+    children.append(child)
+    return child
+   try:
+    with mock.patch("route_parent_close.row_requested",return_value=False), \
+         mock.patch("route_authority.owns",return_value=True), \
+         mock.patch.object(D,"attempt_governed_process_quiescence",
+                           return_value=D.ProcessQuiescence("quiescent","gone")), \
+         mock.patch.object(D,"supervisor_lease_is_held",return_value=False):
+     proc,identity=D.spawn_claimed_attempt(
+      jobs,attempt,parent_binding=None,spawn=spawn,respawn_of=("99999999","100"),
+      pre_release=lambda _identity:{"summary_owner":"dispatch-v1"})
+     rows=jobs.read_text().splitlines()
+     self.assertEqual(len(rows),1)
+     meta=D.parse_registry_metadata(rows[0].split("\t",5)[5])
+     self.assertEqual((meta["pid"],meta["pid_start"]),
+                      (str(proc.pid),identity["pid_start"]))
+     self.assertEqual(meta["owner_identity_lineage"],"99999999:100")
+     self.assertEqual(meta["launch_claimed"],"1")
+     self.assertEqual(meta["summary_owner"],"dispatch-v1")
+     self.assertEqual(D.attempt_identity_lineage(meta),
+                      {("99999999","100"),(str(proc.pid),identity["pid_start"])})
+    binding=D.resolve_live_parent_attempt(
+     jobs,parent_slug="owner",repo="/repo",worktree="/wt",expected_attempt_id=attempt)
+    child_attempt="att-owner-respawn-child"
+    child_row=(f"2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t"
+               f"{CURRENT},worker_type=stage,parent=owner,parent_attempt_id={attempt},"
+               f"attempt_id={child_attempt}")
+    self.assertTrue(D.claim_attempt_row(jobs,child_attempt,child_row,launch=False))
+    child=None
+    try:
+     child,_=D.spawn_claimed_attempt(
+      jobs,child_attempt,parent_binding=binding,spawn=self._fence_spawn)
+     child_meta=D.parse_registry_metadata(jobs.read_text().splitlines()[1].split("\t",5)[5])
+     self.assertEqual(child_meta["parent_attempt_id"],attempt)
+    finally:
+     if child is not None and child.poll() is None: child.kill()
+     if child is not None: child.wait()
+   finally:
+    for child in children:
+     if child.poll() is None: child.kill()
+     child.wait()
+
+ def test_respawn_claim_refuses_live_lease_or_changed_identity_before_spawn(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-owner-respawn-refuse"
+   jobs.write_text(self._respawn_owner_row(jobs,attempt)+"\n")
+   spawned=[]
+   spawn=lambda _fd:spawned.append(True)
+   with mock.patch("route_parent_close.row_requested",return_value=False), \
+        mock.patch("route_authority.owns",return_value=True):
+    with mock.patch.object(D,"attempt_governed_process_quiescence",
+                           return_value=D.ProcessQuiescence("live","still-running")), \
+         mock.patch.object(D,"supervisor_lease_is_held",return_value=False):
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D.spawn_claimed_attempt(jobs,attempt,parent_binding=None,spawn=spawn,
+                              respawn_of=("99999999","100"))
+     self.assertEqual(caught.exception.reason,"attempt-respawn-consumer-live")
+    with mock.patch.object(D,"attempt_governed_process_quiescence",
+                           return_value=D.ProcessQuiescence("quiescent","gone")), \
+         mock.patch.object(D,"supervisor_lease_is_held",return_value=True):
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D.spawn_claimed_attempt(jobs,attempt,parent_binding=None,spawn=spawn,
+                              respawn_of=("99999999","100"))
+     self.assertEqual(caught.exception.reason,"attempt-respawn-lease-held")
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.spawn_claimed_attempt(jobs,attempt,parent_binding=None,spawn=spawn,
+                            respawn_of=("88888888","100"))
+   self.assertEqual(caught.exception.reason,"attempt-respawn-identity-changed")
+   self.assertEqual(spawned,[])
+
+ def test_concurrent_respawn_claims_publish_one_new_identity(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-owner-respawn-race"
+   jobs.write_text(self._respawn_owner_row(jobs,attempt)+"\n")
+   children=[];results=[];errors=[]
+   def spawn(gate_fd):
+    child=subprocess.Popen(
+     [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+      "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+      "sleep","60"],pass_fds=(gate_fd,),start_new_session=True)
+    children.append(child);return child
+   def run():
+    try:
+     results.append(D.spawn_claimed_attempt(
+      jobs,attempt,parent_binding=None,spawn=spawn,respawn_of=("99999999","100")))
+    except D.DispatchContractError as exc:
+     errors.append(exc.reason)
+   try:
+    with mock.patch("route_parent_close.row_requested",return_value=False), \
+         mock.patch("route_authority.owns",return_value=True), \
+         mock.patch.object(D,"attempt_governed_process_quiescence",
+                           return_value=D.ProcessQuiescence("quiescent","gone")), \
+         mock.patch.object(D,"supervisor_lease_is_held",return_value=False):
+     threads=[threading.Thread(target=run) for _ in range(2)]
+     for thread in threads:thread.start()
+     for thread in threads:thread.join(timeout=10)
+    self.assertTrue(all(not thread.is_alive() for thread in threads))
+    self.assertEqual(len(results),1)
+    self.assertEqual(len(children),1)
+    self.assertEqual(len(errors),1)
+    meta=D.parse_registry_metadata(jobs.read_text().splitlines()[0].split("\t",5)[5])
+    self.assertEqual(meta["owner_identity_lineage"],"99999999:100")
+   finally:
+    for child in children:
+     if child.poll() is None:child.kill()
+     child.wait()
+
  def test_claimed_spawn_rechecks_parent_and_publishes_identity_under_lock(self):
   with tempfile.TemporaryDirectory() as td:
    jobs=Path(td)/"jobs.log"

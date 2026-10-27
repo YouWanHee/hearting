@@ -5,11 +5,13 @@ import json
 import os
 from pathlib import Path
 import struct
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 import resource_metric_sources as metrics
+import resource_progress as progress
 
 
 def vi(value):
@@ -595,6 +597,392 @@ class MetricSourcesTest(unittest.TestCase):
         binding = (result["cursor"]["scan"][str(root)]["bundle_cursors"]["bundle"]
                    ["binding_state"])
         self.assertNotIn("decisions", binding)
+
+    def test_slow_cached_listing_revalidation_resumes_after_persisted_prefix(self):
+        root = self.root / "slow-cached-revalidation"
+        bundle = root / "selected-bundle"
+        sibling = root / "competing-sibling"
+        bundle.mkdir(parents=True)
+        sibling.mkdir()
+        (sibling / "unrelated.md").write_text("foreign sibling context\n")
+        registry = root / "resource-runs.json"
+        run_id = "ami-leg2__leg2-run-config__8ec838ee14c4__a8"
+        registry.write_text(json.dumps({"runs": {run_id: {
+            "run_id": run_id, "started_at": 1}}}) + "\n")
+        for index in range(4):
+            (bundle / f"admission-000{index}-00.json").write_text(json.dumps({
+                "admitted": index % 2 == 0,
+                "snapshot": {"t": 100 + index},
+                "shared_admission": {"authorized_run_id": "other-smoke-run"},
+                "preceding_evaluation_leases": [{"run_id": "unrelated-lease-run",
+                    "task": "evaluation"}],
+            }))
+        (bundle / "entry.json").write_text(json.dumps({
+            "run_id": run_id, "selection_sha256": "a" * 64,
+            "selection_replay_sha256": "b" * 64}))
+
+        seed = metrics.read_admission_sources([root], run_id=run_id, row_key="run",
+            registry_path=registry, started_at=1, now=200)
+        self.assertEqual(seed["coverage"], "observed")
+        root_key = str(root)
+        cursor = copy.deepcopy(seed["cursor"])
+        root_state = cursor["scan"][root_key]
+        bundle_progress = root_state["bundle_cursors"][bundle.name]
+        listing = bundle_progress["listing"]
+        binding = bundle_progress["binding_state"]
+        bundle_identity = bundle_progress["identity"]
+        bundle_progress["last_file"] = ""
+        bundle_progress["binding_state"] = {
+            "bundle": bundle.name, "identity": bundle_identity,
+            "target_seen": False, "foreign_seen": False,
+            "generation_fields": [], "source_files": {}, "binding_sources": {},
+            "phase": "binding", "page_decisions": [], "latest": None,
+            "recovery_latest": None, "decisions_seen": False,
+            "binding_complete": False, "partial": False, "overflow": False,
+        }
+        self.assertTrue(binding["target_seen"])
+        for index, item in enumerate(listing["files"]):
+            item.pop("p", None)
+            item.pop("d", None)
+            if index < 2:
+                item["p"] = 1
+        cursor["sample_ids"] = []
+        cursor["source_latest"] = {}
+        cursor["latest_at"] = None
+        cursor["historical_latest_at"] = None
+        cursor["historical_latest_ids"] = []
+
+        # Model the selected installed cursor's JSON state round-trip before
+        # each normal reader continuation/re-adoption.
+        cursor = progress._restore_special_numbers(json.loads(json.dumps(
+            progress._json_safe(cursor))))
+        clock = [0.0]
+        original_lstat = Path.lstat
+
+        def slow_cached_lstat(path):
+            result = original_lstat(path)
+            if (sys._getframe(1).f_code.co_name == "revalidate_listing_entries"
+                    and path.parent == bundle):
+                clock[0] += 0.1
+            return result
+
+        previous = {}
+        trace = []
+        samples = {}
+        result = None
+        with mock.patch.object(Path, "lstat", slow_cached_lstat):
+            for turn in range(6):
+                clock[0] = 0.0
+                result = metrics.read_admission_sources([root], run_id=run_id,
+                    row_key="run", registry_path=registry, started_at=1,
+                    now=201 + turn, cursor=cursor, monotonic=lambda: clock[0],
+                    time_budget=0.25)
+                _summary, state = progress._admission_summary(previous, result,
+                    201 + turn, run_id, "run", 1)
+                previous = {**previous, **state}
+                samples.update({sample["sample_id"]: sample
+                                for sample in result["samples"]})
+                cursor = progress._restore_special_numbers(json.loads(json.dumps(
+                    progress._json_safe(state["admission_cursor"]))))
+                saved = cursor["scan"][root_key]["bundle_cursors"][bundle.name]
+                saved_binding = saved["binding_state"]
+                trace.append({"turn": turn, "coverage": result["coverage"],
+                    "revalidation_after": saved["listing"].get("revalidation_after"),
+                    "last_file": saved.get("last_file"),
+                    "target_seen": saved_binding.get("target_seen"),
+                    "foreign_seen": saved_binding.get("foreign_seen"),
+                    "binding_complete": saved_binding.get("binding_complete"),
+                    "samples": len(result["samples"])})
+                if turn == 0:
+                    changed_decision = bundle / "admission-0003-00.json"
+                    replacement = json.loads(changed_decision.read_text())
+                    replacement["admitted"] = True
+                    changed_decision.write_text(json.dumps(replacement))
+                if (result["coverage"] == "observed"
+                        and saved_binding.get("target_seen") is True
+                        and len(samples) == 4):
+                    break
+
+        self.assertEqual(result["coverage"], "observed",
+            f"warnings={result['warnings']} continuation={trace!r}")
+        self.assertEqual(len(trace), 2,
+            f"unexpected bounded poll count: {trace!r}")
+        self.assertEqual([item["coverage"] for item in trace],
+                         ["partial", "observed"])
+        self.assertEqual([item["samples"] for item in trace], [0, 4])
+        self.assertFalse(trace[0]["target_seen"])
+        final_binding = cursor["scan"][root_key]["bundle_cursors"][bundle.name][
+            "binding_state"]
+        self.assertTrue(final_binding["target_seen"])
+        self.assertFalse(final_binding["foreign_seen"])
+        self.assertTrue(final_binding["binding_complete"])
+        self.assertEqual(len(samples), 4,
+            f"warnings={result['warnings']} continuation={trace!r}")
+        self.assertEqual({sample["state"] for sample in samples.values()},
+                         {"admitted", "denied"})
+        self.assertEqual(previous["admission_counts"],
+                         {"admitted": 3, "denied": 1, "unknown": 0})
+        self.assertTrue(trace[0]["revalidation_after"])
+        self.assertEqual(trace[0]["revalidation_after"], "admission-0002-00.json")
+        self.assertTrue(trace[1]["target_seen"])
+        self.assertFalse(trace[1]["foreign_seen"])
+        self.assertTrue(trace[1]["binding_complete"])
+        self.assertIsNone(trace[1]["revalidation_after"])
+        listing_row = next(item for item in cursor["scan"][root_key][
+            "bundle_cursors"][bundle.name]["listing"]["files"]
+            if item["name"] == "admission-0003-00.json")
+        self.assertEqual(listing_row["token"], metrics._admission_stat_token(
+            (bundle / "admission-0003-00.json").lstat()))
+
+    def test_resumed_listing_revalidates_prefix_before_current_admission(self):
+        root = self.root / "slow-cached-prefix-mutation"
+        bundle = root / "selected-bundle"
+        bundle.mkdir(parents=True)
+        registry = root / "resource-runs.json"
+        run_id = "ami-leg2__leg2-run-config__8ec838ee14c4__a8"
+        registry.write_text(json.dumps({"runs": {run_id: {
+            "run_id": run_id, "started_at": 1}}}) + "\n")
+        for index in range(4):
+            (bundle / f"admission-{index:04d}.json").write_text(json.dumps({
+                "admitted": index in {1, 2},
+                "snapshot": {"t": 10 + index},
+                "shared_admission": {"authorized_run_id": "other-smoke-run"},
+            }))
+        (bundle / "entry.json").write_text(json.dumps({
+            "run_id": run_id, "selection_sha256": "a" * 64,
+            "selection_replay_sha256": "b" * 64}))
+
+        cursor = metrics.read_admission_sources([root], run_id=run_id,
+            row_key="run", registry_path=registry, started_at=1, now=200)["cursor"]
+        previous = {}
+        clock = [0.0]
+        original_lstat = Path.lstat
+
+        def slow_cached_lstat(path):
+            result = original_lstat(path)
+            if (sys._getframe(1).f_code.co_name == "revalidate_listing_entries"
+                    and path.parent == bundle):
+                clock[0] += 0.1
+            return result
+
+        trace = []
+        results = []
+        with mock.patch.object(Path, "lstat", slow_cached_lstat):
+            for turn in range(6):
+                clock[0] = 0.0
+                result = metrics.read_admission_sources([root], run_id=run_id,
+                    row_key="run", registry_path=registry, started_at=1,
+                    now=201 + turn, cursor=cursor, monotonic=lambda: clock[0],
+                    time_budget=0.25)
+                summary, state = progress._admission_summary(previous, result,
+                    201 + turn, run_id, "run", 1)
+                previous = {**previous, **state}
+                results.append(result)
+                trace.append({"turn": turn, "coverage": result["coverage"],
+                    "latest": result["latest"], "current": summary["state"],
+                    "freshness_seconds": summary["freshness_seconds"],
+                    "revalidation_after": state["admission_cursor"]["scan"][
+                        str(root)]["bundle_cursors"][bundle.name]["listing"].get(
+                            "revalidation_after")})
+                # Re-adopt exactly as resource_progress does at each poll boundary.
+                cursor = progress._restore_special_numbers(json.loads(json.dumps(
+                    progress._json_safe(state["admission_cursor"]))))
+                if turn == 0:
+                    self.assertEqual(result["coverage"], "partial")
+                    listing = cursor["scan"][str(root)]["bundle_cursors"][
+                        bundle.name]["listing"]
+                    self.assertEqual(listing.get("revalidation_after"),
+                                     "admission-0002.json")
+                    directory_token = metrics._admission_stat_token(bundle.lstat())
+                    prefix = bundle / "admission-0000.json"
+                    replacement = json.loads(prefix.read_text())
+                    replacement["admitted"] = True
+                    replacement["snapshot"]["t"] = 99
+                    prefix.write_text(json.dumps(replacement))
+                    self.assertEqual(metrics._admission_stat_token(bundle.lstat()),
+                                     directory_token)
+
+                latest = result.get("latest")
+                if (result["coverage"] == "observed"
+                        and isinstance(latest, dict)
+                        and latest.get("state") == "admitted"
+                        and latest.get("at") == 99):
+                    break
+
+        resumed = results[1]
+        self.assertEqual(len(results), 2,
+            f"continuation did not retain bounded progress: {trace!r}")
+        resumed_summary, _ = progress._admission_summary({}, resumed,
+            202, run_id, "run", 1)
+        self.assertFalse(resumed["coverage"] == "observed"
+            and resumed.get("latest") is not None
+            and resumed["latest"].get("state") == "denied"
+            and resumed["latest"].get("at") == 13
+            and resumed_summary["state"] == "waiting"
+            and resumed_summary["freshness_seconds"] == 202 - 13,
+            f"stale prefix decision escaped continuation: {trace!r}")
+        self.assertNotEqual((resumed_summary["state"],
+                             resumed_summary["freshness_seconds"]),
+                            ("waiting", 202 - 13),
+            f"stale current freshness escaped continuation: {trace!r}")
+        self.assertEqual(results[-1]["coverage"], "observed",
+            f"bounded prefix continuation did not finish: {trace!r}")
+        self.assertEqual(resumed["coverage"], "observed")
+        self.assertEqual(results[-1]["latest"]["state"], "admitted",
+            f"current prefix decision was not selected: {trace!r}")
+        self.assertEqual(results[-1]["latest"]["at"], 99,
+            f"prefix rewrite was not adopted: {trace!r}")
+        self.assertEqual(previous["admission_current_state"], "admitted")
+        self.assertEqual(resumed_summary["state"], "admitted")
+        self.assertEqual(resumed_summary["freshness_seconds"], 202 - 99)
+        final_listing = cursor["scan"][str(root)]["bundle_cursors"][
+            bundle.name]["listing"]
+        prefix_entry = next(item for item in final_listing["files"]
+                            if item["name"] == "admission-0000.json")
+        self.assertEqual(prefix_entry["token"], metrics._admission_stat_token(
+            (bundle / "admission-0000.json").lstat()))
+        emitted_ids = [sample["sample_id"] for result in results
+                       for sample in result["samples"]]
+        self.assertEqual(len(emitted_ids), len(set(emitted_ids)),
+            f"continued prefix sample was emitted more than once: {trace!r}")
+
+    def test_root_listing_prefix_invalidates_cached_latest_and_recovery(self):
+        root = self.root / "flat-root-cached-prefix-mutation"
+        root.mkdir()
+        registry = root / "resource-runs.json"
+        run_id = "ami-leg2__leg2-run-config__8ec838ee14c4__a8"
+        registry.write_text(json.dumps({"runs": {run_id: {
+            "run_id": run_id, "row_key": "run", "started_at": 1}}}) + "\n")
+        (root / "entry.json").write_text(json.dumps({
+            "run_id": run_id, "selection_sha256": "a" * 64,
+            "selection_replay_sha256": "b" * 64}))
+        (root / "command-01.json").write_text(json.dumps({"argv": [
+            "runner", "--run-id", run_id, "--raw-results", str(root)]}))
+        for index, stamp in enumerate((110, 80, 70, 60, 50)):
+            (root / f"admission-{index:04d}.json").write_text(json.dumps({
+                "admitted": index == 0,
+                "snapshot": {"t": stamp},
+                "shared_admission": {"authorized_run_id": "other-smoke-run"},
+            }))
+
+        seed = metrics.read_admission_sources([root], run_id=run_id,
+            row_key="run", registry_path=registry, started_at=1, now=200)
+        self.assertEqual(seed["coverage"], "observed")
+        self.assertEqual(seed["latest"]["at"], 110)
+        self.assertEqual(seed["latest"]["source_file"], "admission-0000.json")
+        _previous_summary, previous = progress._admission_summary({}, seed,
+            200, run_id, "run", 1)
+        cursor = progress._restore_special_numbers(json.loads(json.dumps(
+            progress._json_safe(previous["admission_cursor"]))))
+        root_state = cursor["scan"][str(root)]
+        root_cursor = root_state["bundle_cursors"]["@root"]
+        binding = root_cursor["binding_state"]
+        self.assertTrue(binding["target_seen"])
+        self.assertFalse(binding["foreign_seen"])
+
+        # Retain a plausible old latest and a generation-recovery candidate
+        # for the exact same flat-root source, as a normal continued cursor can.
+        stale = copy.deepcopy(seed["latest"])
+        binding["latest"] = copy.deepcopy(stale)
+        binding["recovery_latest"] = copy.deepcopy(stale)
+        cursor["generation_revalidation_required"] = True
+        cursor["generation_baseline_at"] = 100
+        cursor["generation_baseline_ids"] = ["f" * 16]
+        cursor["generation_baseline_overflow"] = False
+        cursor["generation_baseline_ready"] = True
+        cursor["historical_latest_at"] = 100
+        cursor["historical_latest_ids"] = ["f" * 16]
+        cursor["historical_latest_overflow"] = False
+        cursor["latest_at"] = 100
+        cursor["source_latest"] = {}
+        # Re-adopt the exact JSON-safe normalizer representation before the
+        # saved listing marker is produced by a bounded ordinary reader poll.
+        cursor = progress._restore_special_numbers(json.loads(json.dumps(
+            progress._json_safe(cursor))))
+
+        clock = [0.0]
+        original_lstat = Path.lstat
+        trace = []
+        results = []
+        directory_token = metrics._admission_stat_token(root.lstat())
+
+        def slow_root_cached_lstat(path):
+            result = original_lstat(path)
+            if (sys._getframe(1).f_code.co_name == "revalidate_listing_entries"
+                    and path.parent == root):
+                clock[0] += 0.1
+            return result
+
+        with mock.patch.object(Path, "lstat", slow_root_cached_lstat):
+            for turn in range(8):
+                clock[0] = 0.0
+                result = metrics.read_admission_sources([root], run_id=run_id,
+                    row_key="run", registry_path=registry, started_at=1,
+                    now=201 + turn, cursor=cursor, monotonic=lambda: clock[0],
+                    time_budget=0.25)
+                summary, state = progress._admission_summary(previous, result,
+                    201 + turn, run_id, "run", 1)
+                previous = {**previous, **state}
+                results.append(result)
+                cursor = progress._restore_special_numbers(json.loads(json.dumps(
+                    progress._json_safe(state["admission_cursor"]))))
+                saved_root = cursor["scan"][str(root)]
+                saved_listing = saved_root["root_listing"]
+                saved_binding = saved_root["bundle_cursors"]["@root"][
+                    "binding_state"]
+                trace.append({"turn": turn, "coverage": result["coverage"],
+                    "latest": result.get("latest"), "current": summary["state"],
+                    "freshness_seconds": summary["freshness_seconds"],
+                    "revalidation_after": saved_listing.get("revalidation_after"),
+                    "latest_cache": saved_binding.get("latest"),
+                    "recovery_latest": saved_binding.get("recovery_latest")})
+                if turn == 0:
+                    self.assertEqual(result["coverage"], "partial")
+                    marker = saved_listing.get("revalidation_after")
+                    self.assertEqual(marker, "admission-0002.json")
+                    self.assertLessEqual("admission-0000.json", marker)
+                    source = root / "admission-0000.json"
+                    replacement = json.loads(source.read_text())
+                    replacement["snapshot"]["t"] = 90
+                    source.write_text(json.dumps(replacement))
+                    self.assertEqual(metrics._admission_stat_token(root.lstat()),
+                                     directory_token)
+                if result["coverage"] == "observed":
+                    break
+
+        self.assertEqual(metrics._admission_stat_token(root.lstat()), directory_token)
+        self.assertEqual(results[-1]["coverage"], "observed",
+            f"flat-root bounded continuation did not finish: {trace!r}")
+        final = results[-1]
+        summary, _state = progress._admission_summary({}, final,
+            201 + len(results) - 1, run_id, "run", 1)
+        self.assertEqual(summary["state"], "unknown",
+            f"flat-root source regression did not stay unknown: {trace!r}")
+        self.assertEqual(final["latest"]["state"], "unknown")
+        self.assertEqual(final["latest"]["at"], 90)
+        self.assertEqual(summary["freshness_seconds"],
+            201 + len(results) - 1 - 90,
+            f"flat-root stale evidence supplied freshness: {trace!r}")
+        self.assertFalse(final.get("latest", {}).get("at") == 110
+            and final["latest"].get("state") in {"admitted", "denied"},
+            f"stale flat-root latest authorized current state: {trace!r}")
+        self.assertFalse(summary["state"] in {"admitted", "denied"}
+            and summary["freshness_seconds"] == 201 + len(results) - 1 - 110,
+            f"stale flat-root latest authorized freshness: {trace!r}")
+        final_binding = cursor["scan"][str(root)]["bundle_cursors"]["@root"][
+            "binding_state"]
+        self.assertTrue(final_binding["target_seen"])
+        self.assertFalse(final_binding["foreign_seen"])
+        recovery_latest = final_binding.get("recovery_latest")
+        self.assertFalse(isinstance(recovery_latest, dict)
+                         and recovery_latest.get("at") == 110,
+            f"stale flat-root recovery evidence survived: {trace!r}")
+        self.assertTrue(cursor["generation_revalidation_required"],
+            f"stale recovery evidence completed generation validation: {trace!r}")
+        emitted_ids = [sample["sample_id"] for item in results
+                       for sample in item["samples"]]
+        self.assertEqual(len(emitted_ids), len(set(emitted_ids)),
+            f"flat-root continuation duplicated samples: {trace!r}")
 
     def test_evicted_listing_cursor_resumes_exact_binding_without_restarting(self):
         root = self.root / "installed-cursor-without-bundle-cache"

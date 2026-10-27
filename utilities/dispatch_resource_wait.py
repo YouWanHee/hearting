@@ -262,6 +262,7 @@ def resource_needs_attention(row, evidence):
 def context(args, control):
     """Read only exact armed records under the current owner route and registry."""
     import owner_route_binding as OWNER
+    import dispatch_contract as DC
     from resource_run_registry import (
         compute_execution_identity, resource_never_started,
     )
@@ -303,6 +304,8 @@ def context(args, control):
                 raise JOIN.JoinContractError("resource-owner-route-changed")
         expected = {"parent_attempt_id": args.parent_attempt_id, "session_id": control.thread_id,
             "route_id": args.route_id, "route_hash": args.route_hash, "jobs": str(jobs)}
+        pinned_owner_identity = (str(owner.get("owner_pid", "")),
+                                 str(owner.get("owner_start", "")))
         remote_identity = compute_execution_identity(row)
         execution = row.get("execution") if isinstance(row, dict) else None
         identity_valid = (bool(remote_identity) and isinstance(execution, dict)
@@ -316,8 +319,7 @@ def context(args, control):
             raise JOIN.JoinContractError("resource-owner-not-open")
         OWNER._owner_row_proof(parent.raw.split("\t"), parent.metadata, route=route, environ={})
         if (any(owner.get(key) != value for key, value in expected.items())
-                or str(owner.get("owner_pid")) != parent.metadata.get("pid")
-                or owner.get("owner_start") != parent.metadata.get("pid_start")
+                or pinned_owner_identity not in DC.attempt_identity_lineage(parent.metadata)
                 or row.get("parent_attempt_id") != args.parent_attempt_id
                 or row.get("route") != binding.route_file or row.get("node") != node
                 or row.get("jobs") != str(jobs) or not row.get("command")

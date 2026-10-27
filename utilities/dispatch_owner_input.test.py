@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +65,51 @@ class OwnerInputTest(unittest.TestCase):
         with self.assertRaisesRegex(I.InputError, 'content-conflict'):
             I.submit(self.jobs, self.attempt, 'different', 'same')
         self.assertEqual(self.state()[0]['state'], 'queued')
+
+    def test_held_lease_stores_once_without_starting_a_second_consumer(self):
+        with mock.patch.object(I, 'recover_consumer') as recover:
+            receipt = I.submit(self.jobs, self.attempt, 'keep for the live consumer', 'lease')
+        self.assertEqual(receipt['consumer_recovery'], 'live')
+        self.assertEqual(self.state()[0]['state'], 'queued')
+        recover.assert_not_called()
+
+    def test_unknown_owner_process_and_changed_resume_thread_never_start_a_consumer(self):
+        import dispatch_contract as contract
+        import dispatch_completion_join as join
+        import route_authority
+        import route_parent_close
+
+        I.submit(self.jobs, self.attempt, 'pending correction', 'pending')
+        self.jobs.write_text(self.jobs.read_text().replace(
+            'attempt_id=' + self.attempt,
+            'launch_claimed=1,launch_started=1,launch_fence=registry-v1,'
+            'pid=99999999,pid_start=100,attempt_id=' + self.attempt))
+        launch = mock.Mock()
+        patches = (
+            mock.patch.object(contract, 'supervisor_lease_is_held', return_value=False),
+            mock.patch.object(route_authority, 'owns', return_value=True),
+            mock.patch.object(route_parent_close, 'row_requested', return_value=False),
+            mock.patch.object(route_parent_close, 'owner_continuation_processes', return_value=(
+                contract.ProcessQuiescence('quiescent', 'registered-resources-preserved'),
+                [{'kind': 'resource', 'run_id': 'cpu'}])),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with mock.patch.object(contract, 'attempt_governed_process_quiescence',
+                               return_value=contract.ProcessQuiescence(
+                                   'unverifiable', 'identity-missing')):
+            unknown = I.recover_consumer(self.jobs, self.attempt, session='parent', spawn=launch)
+        self.assertEqual(unknown['consumer_recovery'], 'not-started:owner-process-unverifiable')
+        launch.assert_not_called()
+
+        with mock.patch.object(contract, 'attempt_governed_process_quiescence',
+                               return_value=contract.ProcessQuiescence('quiescent', 'gone')), \
+             mock.patch.object(join, 'read_supervisor_phase_state',
+                               return_value=SimpleNamespace(resource={'session_id': 'different-thread'})):
+            changed = I.recover_consumer(self.jobs, self.attempt, session='parent', spawn=launch)
+        self.assertEqual(changed['consumer_recovery'], 'not-started:owner-input-thread-mismatch')
+        launch.assert_not_called()
 
     def test_terminal_admission_race_and_completed_receipt_are_separate(self):
         I.submit(self.jobs, self.attempt, 'reuse')
@@ -162,11 +208,13 @@ class OwnerInputTest(unittest.TestCase):
         self.assertTrue(supervision.notice_is_current(record))
         self.assertEqual(len(list((self.root/'pending-delivery').glob('*/*.json'))), 1)
 
-    def test_actual_consumer_death_preserves_unknown_send_without_replay(self):
+    def test_actual_consumer_death_stores_new_input_without_replaying_unknown_send(self):
         child_root = self.root/'dead-consumer'; child_root.mkdir()
         jobs = child_root/'jobs.log'
         lease = supervisor_lease_path(jobs, self.attempt)
-        jobs.write_text(FIXTURE.owner_row(lease))
+        jobs.write_text(FIXTURE.owner_row(lease).rstrip() +
+            ",parent_sid=01a0971c-b5b2-7a62-ab10-0dfb6d2b4e79,"
+            "parent_completion_delivery=codex-managed-gateway,managed_sealed_batch_id=batch-test\n")
         script = child_root/'consumer.py'
         script.write_text("""import sys
 from pathlib import Path
@@ -185,15 +233,21 @@ with hold_supervisor_lease(jobs,attempt,supervisor_lease_path(jobs,attempt)):
                                  stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
         try:
             self.assertEqual(child.stdout.readline().strip(), 'sending')
-            before = I._path(jobs,self.attempt).read_bytes()
+            before = json.loads(I._path(jobs,self.attempt).read_text())
             child.kill(); child.wait(timeout=5)
             observed = I.inspect(jobs,self.attempt)
             self.assertFalse(observed['supervisor_live'])
             self.assertEqual(observed['requests'][0]['delivery_observation'], 'delivery-unknown')
             self.assertTrue(I.unresolved(jobs,self.attempt))
-            self.assertEqual(I._path(jobs,self.attempt).read_bytes(), before)
-            with self.assertRaisesRegex(I.InputError,'unavailable'):
-                I.submit(jobs,self.attempt,'another correction')
+            receipt = I.submit(jobs,self.attempt,'another correction')
+            requests = I.inspect(jobs,self.attempt)['requests']
+            self.assertEqual([item['state'] for item in requests], ['sending', 'queued'])
+            self.assertEqual(requests[0]['delivery_observation'], 'delivery-unknown')
+            self.assertEqual(requests[0]['id'], before['requests'][0]['id'])
+            self.assertEqual(requests[0]['events'], before['requests'][0]['events'])
+            self.assertIn(receipt['consumer_recovery'], {
+                'awaiting-parent', 'not-started:owner-launch-not-claimed'})
+            self.assertTrue(I.unresolved(jobs,self.attempt))
         finally:
             if child.poll() is None: child.kill(); child.wait(timeout=5)
             child.stdin.close(); child.stdout.close()
@@ -391,18 +445,56 @@ class RegisteredOwnerInputTest(unittest.TestCase):
                     self.assertEqual(receipt['requests'][0]['thread_id'],
                                      'ses_real' if thread == I.PLACEHOLDER_THREAD else thread)
 
-    def test_consumer_that_attached_and_died_does_not_reopen_admission(self):
+    def test_consumer_that_attached_and_died_stores_for_parent_recovery(self):
+        self.jobs.write_text(self.jobs.read_text().rstrip() +
+            ",parent_sid=01a0971c-b5b2-7a62-ab10-0dfb6d2b4e79,"
+            "parent_completion_delivery=codex-managed-gateway,managed_sealed_batch_id=batch-test\n")
         I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
         with hold_supervisor_lease(self.jobs, self.attempt, self.lease):
             I.OwnerInput(self.jobs, self.attempt, 'thread-1', 'codex-active-turn', self.events.append)
         # The consumer is gone but the row is still open.
-        with self.assertRaisesRegex(I.InputError, 'unavailable'):
-            I.submit(self.jobs, self.attempt, 'too late')
+        first = I.submit(self.jobs, self.attempt, 'queued for same attempt')
+        self.assertEqual(first['consumer_recovery'], 'awaiting-parent')
+        self.assertEqual(I.inspect(self.jobs, self.attempt)['requests'][0]['state'], 'queued')
         before = self.state_file().read_bytes()
         I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
         self.assertEqual(self.state_file().read_bytes(), before)
-        with self.assertRaisesRegex(I.InputError, 'unavailable'):
-            I.submit(self.jobs, self.attempt, 'still too late')
+        second = I.submit(self.jobs, self.attempt, 'another queued correction')
+        self.assertEqual(second['consumer_recovery'], 'awaiting-parent')
+        self.assertEqual([item['state'] for item in I.inspect(self.jobs, self.attempt)['requests']],
+                         ['queued', 'queued'])
+
+    def test_duplicate_delivery_unknown_is_not_retransmitted_or_used_to_start(self):
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        with hold_supervisor_lease(self.jobs, self.attempt, self.lease):
+            control = I.OwnerInput(self.jobs, self.attempt, 'thread-1', 'codex-active-turn', self.events.append)
+            I.submit(self.jobs, self.attempt, 'possibly delivered', 'uncertain')
+            control.take('active-turn')
+            control.close()
+            before = self.state_file().read_bytes()
+            with mock.patch.object(I, 'recover_consumer') as recover:
+                receipt = I.submit(self.jobs, self.attempt, 'possibly delivered', 'uncertain')
+            recover.assert_not_called()
+        self.assertEqual(receipt['consumer_recovery'], 'not-started:delivery-unknown-no-replay')
+        self.assertEqual(self.state_file().read_bytes(), before)
+
+    def test_non_parent_stores_once_and_leaves_existing_parent_notice(self):
+        self.jobs.write_text(self.jobs.read_text().rstrip() +
+            ",parent_sid=01a0971c-b5b2-7a62-ab10-0dfb6d2b4e79,"
+            "parent_completion_delivery=codex-managed-gateway,managed_sealed_batch_id=batch-test\n")
+        I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
+        I.OwnerInput(self.jobs, self.attempt, 'thread-1', 'codex-active-turn', self.events.append)
+        import route_authority
+        import dispatch_completion_join as join
+        with mock.patch.object(I, 'supervisor_lease_is_held', return_value=False), \
+             mock.patch.object(join, 'settle_finished_attempt'), \
+             mock.patch.object(route_authority, 'owns', return_value=False), \
+             mock.patch.object(I, 'recover_consumer', wraps=I.recover_consumer) as recover:
+            receipt = I.submit(self.jobs, self.attempt, 'keep for effective parent', 'parent-only')
+        recover.assert_called_once()
+        self.assertEqual(receipt['consumer_recovery'], 'awaiting-parent')
+        self.assertEqual(I.inspect(self.jobs, self.attempt)['requests'][0]['state'], 'queued')
+        self.assertEqual(len(list((self.root/'pending-delivery').glob('*/*.json'))), 1)
 
     def test_consumer_that_never_attached_leaves_an_unresolved_undelivered_input(self):
         I.initialize_owner_input(self.jobs, self.attempt, 'codex-active-turn')
@@ -559,7 +651,9 @@ class OwnerFinishCorrectionRegressionTest(OwnerInputTest):
         notice = result.get('delivery_notice', '').lower()
         self.assertIn('next owner turn', notice)
         self.assertIn('delay', notice)
-        self.assertIn('does not wake or cancel', notice)
+        self.assertIn('effective parent', notice)
+        self.assertIn('never replayed', notice)
+        self.assertNotIn('does not wake or cancel', notice)
         # BC rt-96bab699: read as "after the whole chain"; the chain stops at the running sub-session.
         self.assertIn('starts no further sub-session', notice)
         self.assertNotIn('private correction text', json.dumps(result))
