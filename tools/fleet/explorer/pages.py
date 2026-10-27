@@ -395,35 +395,44 @@ def _edge_style(stage):
     return ("g", 0, 1)
 
 
+_JOINTS = {(1, 1, 1, 1): "┼", (1, 1, 0, 1): "├", (1, 1, 1, 0): "┤", (0, 1, 1, 1): "┬",
+           (0, 1, 0, 1): "┌", (0, 1, 1, 0): "┐", (1, 0, 1, 1): "┴", (1, 0, 0, 1): "└",
+           (1, 0, 1, 0): "┘"}
+
+
+def _flow_steps(stages):
+    """Stage indices per flow step: one stage each, or one recorded DAG level each.
+
+    A recorded route graph keeps the horizontal stage flow; stages that share a
+    level stack inside one step, so parallel work never reads as a serial chain.
+    """
+    if not any(stage.get("graph_known") for stage in stages):
+        return [[index] for index in range(len(stages))]
+    by_level = {}
+    for index, stage in enumerate(stages):
+        level = stage.get("level")
+        level = int(level) if isinstance(level, int) and not isinstance(level, bool) else 0
+        by_level.setdefault(level, []).append(index)
+    return [by_level[level] for level in sorted(by_level)]
+
+
+def _stage_status(stage):
+    states = [item.get("st") for item in stage.get("group", ())] if "group" in stage else [stage.get("st")]
+    return ("active" if "active" in states else
+            "todo" if all(value == "todo" for value in states) else "done")
+
+
 def _stage_grid(grid, x0, y, stages, room, bottom, loops=()):
     gap = 4
-    per = max(3, min(6, (room + gap) // (36 + gap)))
-    if loops and (room + gap) // (_LOOP_MIN_W + gap) >= len(stages):
-        per = len(stages)
-    per = min(per, len(stages))
     graph_known = any(stage.get("graph_known") for stage in stages)
-    rows_for, columns_for = {}, {}
-    if graph_known:
-        by_level = {}
-        for index, stage in enumerate(stages):
-            level = stage.get("level")
-            level = int(level) if isinstance(level, int) and not isinstance(level, bool) else 0
-            by_level.setdefault(level, []).append(index)
-        row_base = 0
-        for level in sorted(by_level):
-            members = by_level[level]
-            row_count = (len(members) - 1) // per + 1
-            for local, index in enumerate(members):
-                row_in_level, slot = divmod(local, per)
-                rows_for[index] = row_base + row_in_level
-                columns_for[index] = slot if (row_base + row_in_level) % 2 == 0 else per - 1 - slot
-            row_base += row_count
-        nrows = row_base
-        last_row_size = sum(1 for row in rows_for.values() if row == nrows - 1)
-        spare = per - last_row_size
-    else:
-        nrows = (len(stages) - 1) // per + 1
-        spare = per - (len(stages) - (nrows - 1) * per)
+    steps = _flow_steps(stages)
+    units = [sum(2 if "group" in stages[index] else 1 for index in step) for step in steps]
+    per = max(3, min(6, (room + gap) // (36 + gap)))
+    if loops and (room + gap) // (_LOOP_MIN_W + gap) >= len(steps):
+        per = len(steps)
+    per = min(per, len(steps))
+    nrows = (len(steps) - 1) // per + 1
+    spare = per - (len(steps) - (nrows - 1) * per)
     w = (room - gap * (per - 1)) // per
     pitch_gap = 1
     lanes = len(loops) + 1 if loops and nrows == 1 else 0
@@ -431,26 +440,37 @@ def _stage_grid(grid, x0, y, stages, room, bottom, loops=()):
     avail = bottom - y - lanes - listed
     if avail - (nrows - 1) < 6 * nrows:
         pitch_gap = 0
-    h = max(4, min(10, (avail - pitch_gap * (nrows - 1)) // nrows))
+    h = max(4, min(max(10, 3 * max(units) - 1), (avail - pitch_gap * (nrows - 1)) // nrows))
     pos = [None] * len(stages)
-    hh = (h - 1) // 2
-    for index, stage in enumerate(stages):
-        row, k = ((rows_for[index], columns_for[index]) if graph_known else divmod(index, per))
-        col = k if graph_known or row % 2 == 0 else per - 1 - k
-        pos[index] = (x0 + col * (w + gap), y + row * (h + pitch_gap), row)
-        bx, by = pos[index][0], pos[index][1]
-        if "group" in stage:
-            group = stage["group"]
-            _stage_box(grid, bx, by, w, hh, index, group[0])
-            _stage_box(grid, bx, by + h - hh, w, hh, index, group[1])
-            grid.put(bx + 2, by + hh, "∥ 2-way · %s" % (
-                "both pass" if all(item.get("st") == "done" for item in group) else "…"), "dim",
-                limit=bx + w - 1)
-        else:
-            _stage_box(grid, bx, by, w, h, index, stage)
-
-    def mids(stage, by):
-        return [by + hh // 2, by + h - hh + hh // 2] if "group" in stage else [by + h // 2]
+    step_at, step_of, mids_of = [], {}, {}
+    for number, step in enumerate(steps):
+        row, k = divmod(number, per)
+        col = k if row % 2 == 0 else per - 1 - k
+        bx, by = x0 + col * (w + gap), y + row * (h + pitch_gap)
+        step_at.append((bx, by, row))
+        # Stacked boxes split the step height evenly; a lone stage or 2-way group keeps its old cut.
+        count = units[number]
+        unit = (h - (count - 1)) // count
+        tops = [by + j * unit + (j * (h - count * unit)) // max(1, count - 1) for j in range(count)]
+        middle = unit // 2 if unit > 2 else 0
+        slot = 0
+        for index in step:
+            stage = stages[index]
+            pos[index] = (bx, by, row)
+            step_of[index] = number
+            if "group" in stage:
+                group = stage["group"]
+                _stage_box(grid, bx, tops[slot], w, unit, index, group[0])
+                _stage_box(grid, bx, tops[slot + 1], w, unit, index, group[1])
+                grid.put(bx + 2, tops[slot] + unit, "∥ 2-way · %s" % (
+                    "both pass" if all(item.get("st") == "done" for item in group) else "…"), "dim",
+                    limit=bx + w - 1)
+                mids_of[index] = [tops[slot] + middle, tops[slot + 1] + middle]
+                slot += 2
+            else:
+                _stage_box(grid, bx, tops[slot], w, unit, index, stage)
+                mids_of[index] = [tops[slot] + middle]
+                slot += 1
 
     if graph_known:
         visual_for = {}
@@ -459,29 +479,48 @@ def _stage_grid(grid, x0, y, stages, room, bottom, loops=()):
             for member in members:
                 if member:
                     visual_for[str(member)] = index
+        links = {}
         for target_index, target in enumerate(stages):
             dependencies = set(str(item) for item in (target.get("depends_on") or ()))
             for dependency in dependencies:
                 source_index = visual_for.get(dependency)
                 if source_index is None or source_index == target_index:
                     continue
-                bx, by, row = pos[source_index]
-                nx, ny, nrow = pos[target_index]
-                target_states = ([item.get("st") for item in target.get("group", ())]
-                                 if "group" in target else [target.get("st")])
-                status = ("active" if "active" in target_states else
-                          "todo" if all(value == "todo" for value in target_states) else "done")
-                style = _edge_style({"st": status})
-                if nrow == row and abs(target_index - source_index) == 1:
-                    gx = (bx + w if nx > bx else nx + w) + gap // 2 - 1
-                    for my in sorted(set(mids(stages[source_index], by)) |
-                                     set(mids(target, ny))):
-                        grid.put(gx, my, _ARROWS[0] if nx > bx else _ARROWS[1], style)
-                elif nrow == row + 1:
-                    arrow_y, arrow_x = by + h, bx + w // 2
-                    if 0 <= arrow_y < grid.rows and 0 <= arrow_x < grid.cols and \
-                            grid.cells[arrow_y][arrow_x][0] in (" ", "─"):
-                        grid.put(arrow_x, arrow_y, _ARROWS[2], style)
+                # Only neighbouring steps share a gap; a skipped level stays in the stage's own text.
+                if step_of[target_index] != step_of[source_index] + 1:
+                    continue
+                sources, targets = links.setdefault(step_of[source_index], (set(), {}))
+                sources.update(mids_of[source_index])
+                targets.update((my, _stage_status(target)) for my in mids_of[target_index])
+        rank = ("todo", "done", "active")
+        for number, (sources, targets) in sorted(links.items()):
+            (bx, by, row), (nx, _ny, nrow) = step_at[number], step_at[number + 1]
+            if nrow != row:
+                arrow_y, arrow_x = by + h, bx + w // 2
+                if 0 <= arrow_y < grid.rows and 0 <= arrow_x < grid.cols and \
+                        grid.cells[arrow_y][arrow_x][0] in (" ", "─"):
+                    grid.put(arrow_x, arrow_y, _ARROWS[2], _edge_style(
+                        {"st": max(targets.values(), key=rank.index)}))
+                continue
+            forward = nx > bx
+            arrow = _ARROWS[0] if forward else _ARROWS[1]
+            gx = (bx + w if forward else nx + w) + gap // 2 - 1
+            if sources == set(targets):
+                for my in sorted(targets):
+                    grid.put(gx, my, arrow, _edge_style({"st": targets[my]}))
+                continue
+            # Thin branch lines join a step to stacked parallel stages (fan-out or fan-in).
+            stub_x, joint_x, head_x = (gx - 1, gx, gx + 1) if forward else (gx + 2, gx + 1, gx)
+            joint_style = _edge_style({"st": max(targets.values(), key=rank.index)})
+            low, high = min(sources | set(targets)), max(sources | set(targets))
+            for my in sources:
+                grid.put(stub_x, my, "─", joint_style)
+            for my in range(low, high + 1):
+                left, right = (my in sources, my in targets) if forward else (my in targets, my in sources)
+                grid.put(joint_x, my, _JOINTS.get((int(my > low), int(my < high), int(left), int(right)),
+                                                  "│"), joint_style)
+            for my in targets:
+                grid.put(head_x, my, arrow, _edge_style({"st": targets[my]}))
     if lanes:
         _loop_lanes(grid, pos, w, y, h, stages, loops)
         return y + h + lanes
@@ -763,15 +802,16 @@ def draw_route_detail(grid, vm, route, x, use, y, state=None, bottom=None):
     grid.put(centre, panel_y, "┴", ("v", 0, 0))
     stages = [dict(item) if hasattr(item, "keys") else item for item in (node.get("detail") or ())]
     stage_room = panel_right - panel_left - 4
-    if len(stages) < 3:
-        stage_room = min(stage_room, 64 * len(stages))
+    flow = len(_flow_steps(stages))
+    if flow < 3:
+        stage_room = min(stage_room, 64 * flow)
     stage_bottom = bottom
     attempts = vm.attempts or {}
     raw_lines = (tuple(attempts.get("lines", ()))
                  if str(attempts.get("route") or "") == ident and node.get("kind") == "leg" else ())
     if raw_lines:
-        per = min(len(stages), max(3, min(6, (stage_room + 4) // 40)))
-        need = ((len(stages) - 1) // per + 1) * 4
+        per = min(flow, max(3, min(6, (stage_room + 4) // 40)))
+        need = ((flow - 1) // per + 1) * 4
         raw_rows = min(_RAW_ROWS, stage_bottom - panel_y - 3 - need)
         if raw_rows >= 2:
             from .transcript import dialogue_rows
