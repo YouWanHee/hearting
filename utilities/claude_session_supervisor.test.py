@@ -328,7 +328,8 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
         run = {"run_id":"finished-resource","pid":555,"starttime":"201","command":["approved"],
                "node":"full-run","status":"succeeded","sentinel":"/fixture-exit"}
         stage = {"state":"STAGE_SUCCEEDED","evidence":{"resource_sha256":RESOURCE.RESUME.row_digest(run)}}
-        sup = SimpleNamespace(poll_once=mock.Mock(),resource_evidence=lambda _: {"terminal":True,"succeeded":True,"liveness":"exited","exit_code":0},
+        sup = SimpleNamespace(poll_once=mock.Mock(),read_resource_watches=lambda *_: [{"node":"full-run"}],
+            resource_evidence=lambda _: {"terminal":True,"quiescent":True,"succeeded":True,"liveness":"exited","exit_code":0},
             artifact_evidence=lambda _: {"checked":True,"missing":[]},runner=lambda:SimpleNamespace(read_sentinel=lambda _:0))
         ctx = (sup,route,SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}}),
                [({"node":"full-run","successors":["verify"]},run)])

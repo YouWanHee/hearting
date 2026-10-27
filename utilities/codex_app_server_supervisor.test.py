@@ -701,7 +701,9 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         error = {"type": "GPUUnavailable", "message": "Local GPU admission on controller: GPU in use"}
         stage = {"state": "FAILED_RETRYABLE"}
         sup = SimpleNamespace(runner=lambda: runner, poll_once=mock.Mock(),
-            resource_evidence=lambda _: {"terminal": True, "succeeded": False, "liveness": "exited", "exit_code": None},
+            read_resource_watches=lambda *_: [armed],
+            resource_evidence=lambda _: {"terminal": True, "quiescent": True, "succeeded": False,
+                                         "liveness": "exited", "exit_code": None},
             artifact_evidence=lambda _: {"missing": ["run.json"]})
         def context(*_):
             actual = json.loads(registry.read_text())["runs"]["queued"]

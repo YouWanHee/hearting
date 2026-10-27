@@ -1720,7 +1720,9 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         jobs = self.jobs
         jobs.write_text("")
         path = self.root / "route.json"
-        path.write_text("{}")
+        route = {"route_id":"rt-resource","route_hash":"sha256:route",
+                 "nodes":[{"id":"full-run","kind":"resource-runner"}]}
+        path.write_text(json.dumps(route))
         registry = self.root / "resources.json"
         args = SimpleNamespace(jobs=str(jobs),route_file=str(path),route_id="rt-resource",
                                route_hash="sha256:route",parent_attempt_id="att-parent")
@@ -1734,11 +1736,15 @@ class DispatchCompletionJoinTest(unittest.TestCase):
         armed = {"predecessor_kind":"resource","predecessor_id":"approved","resource_registry":str(registry),
                  "node":"full-run","route_id":"rt-resource","route_hash":"sha256:route",
                  "route_file":str(path),"jobs":str(jobs),"successor_external":True,"successor_command":None,
-                 "resource_binding":RESOURCE.resource_body_digest(row)}
+                 "resource_binding":RESOURCE.resource_legacy_body_digest(row)}
         parent = SimpleNamespace(status="open",raw="time\topen\t/repo\t/wt\towner\tmeta",
                                  metadata={"pid":"444","pid_start":"200"})
-        sup = SimpleNamespace(load_route=lambda _: {"route_id":"rt-resource","route_hash":"sha256:route"},
-                              ledger_for=lambda *_:None,read_armed=lambda _:{"full-run":armed})
+        sup = SimpleNamespace(load_route=lambda _: route, ledger_for=lambda *_:None,
+                              resource_predecessors=lambda *_: [(armed,row)],
+                              resource_watch_key=lambda record: (
+                                  record.get("node"),
+                                  str(Path(record.get("resource_registry") or "").resolve(strict=False)),
+                                  record.get("predecessor_id")))
         binding = SimpleNamespace(route_file=str(path),route_id="rt-resource",route_hash="sha256:route")
         def write(value): registry.write_text(json.dumps({"runs":{"approved":value}}))
         write(row)
