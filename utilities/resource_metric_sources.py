@@ -1137,32 +1137,94 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
         return result
 
     def revalidate_listing_entries(listing, key, directory, root_entries=False):
-        """Retain progress only while each cached path still has its token."""
+        """Retain progress only while each cached path still has its token.
+
+        A cached listing can be larger than one poll's time budget. Keep a
+        lexical continuation inside that listing so repeated bounded polls do
+        not restart validation at its first child.
+        """
         rows = listing.get(key, []) if isinstance(listing, dict) else []
         if not isinstance(rows, list):
-            return "refresh", []
+            return "refresh", [], []
+        resume_after = listing.get("revalidation_after")
+        if not isinstance(resume_after, str) or not any(
+                isinstance(item, dict) and item.get("name") == resume_after
+                for item in rows):
+            resume_after = ""
+            listing.pop("revalidation_after", None)
+        resume_pending = bool(resume_after)
+        last_revalidated = resume_after
         changed = []
+        invalidated_prefix = []
         for item in rows:
             if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                return "refresh", changed
+                listing.pop("revalidation_after", None)
+                return "refresh", changed, invalidated_prefix
+            if resume_pending:
+                name = item["name"]
+                if name <= resume_after:
+                    if type(item.get("p")) is int or isinstance(item.get("d"), list):
+                        item.pop("p", None)
+                        item.pop("d", None)
+                        invalidated_prefix.append(name)
+                    if name == resume_after:
+                        resume_pending = False
+                    continue
+                resume_pending = False
             if monotonic() >= deadline:
-                return "deadline", changed
+                if last_revalidated:
+                    listing["revalidation_after"] = last_revalidated
+                else:
+                    listing.pop("revalidation_after", None)
+                return "deadline", changed, invalidated_prefix
             try:
                 info = (directory / item["name"]).lstat()
             except OSError:
-                return "refresh", [*changed, item["name"]]
+                listing.pop("revalidation_after", None)
+                return "refresh", [*changed, item["name"]], invalidated_prefix
             is_directory = (root_entries and item.get("directory") is True)
             if (stat.S_ISLNK(info.st_mode)
                     or not (stat.S_ISDIR(info.st_mode) if is_directory
                             else stat.S_ISREG(info.st_mode))):
-                return "refresh", [*changed, item["name"]]
+                listing.pop("revalidation_after", None)
+                return "refresh", [*changed, item["name"]], invalidated_prefix
             token = _admission_stat_token(info)
             if token != item.get("token"):
                 changed.append(item["name"])
                 item["token"] = token
                 item.pop("p", None)
                 item.pop("d", None)
-        return "ok", changed
+            last_revalidated = item["name"]
+        listing.pop("revalidation_after", None)
+        return "ok", changed, invalidated_prefix
+
+    def rewind_invalidated_listing_prefix(binding_state, progress, listing, key,
+                                           resume_after, invalidated_prefix):
+        """Drop cached evidence from a skipped prefix and resume its file cursor."""
+        invalidated = {name for name in invalidated_prefix
+                       if isinstance(name, str)}
+        if isinstance(resume_after, str):
+            rows = listing.get(key, []) if isinstance(listing, dict) else []
+            skipped_prefix = {item.get("name") for item in rows
+                if isinstance(item, dict) and isinstance(item.get("name"), str)
+                and item["name"] <= resume_after}
+            if isinstance(binding_state, dict):
+                for field in ("latest", "recovery_latest"):
+                    evidence = binding_state.get(field)
+                    source_name = (evidence.get("source_file")
+                        if isinstance(evidence, dict) else None)
+                    if source_name in skipped_prefix:
+                        binding_state[field] = None
+                        invalidated.add(source_name)
+                        if field == "latest":
+                            binding_state.pop("latest_source_token", None)
+                binding_state["page_decisions"] = []
+        if invalidated and isinstance(progress, dict):
+            # Re-read invalidated sources with the existing bounded no-follow
+            # file cursor. The listing validation frontier remains independent.
+            progress["last_file"] = ""
+            progress.pop("scan_prefix", None)
+        return invalidated
 
     def listing_entry_token(listing, key, name):
         rows = listing.get(key, []) if isinstance(listing, dict) else []
@@ -1474,8 +1536,13 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                     if isinstance(root_binding, dict) else {}
                 root_latest_name = root_latest.get("source_file") \
                     if isinstance(root_latest, dict) else None
-                root_revalidation, changed_root_entries = revalidate_listing_entries(
-                    root_listing, "entries", root, root_entries=True)
+                root_resume_marker = root_listing.get("revalidation_after")
+                root_revalidation, changed_root_entries, invalidated_root_prefix = \
+                    revalidate_listing_entries(root_listing, "entries", root,
+                                               root_entries=True)
+                rewind_invalidated_listing_prefix(root_binding, root_cursor,
+                    root_listing, "entries", root_resume_marker,
+                    invalidated_root_prefix)
                 if (root_latest_name in changed_root_entries
                         and valid_latest_evidence(root_latest)):
                     note_generation_change("admission-bundle-generation-changed")
@@ -1909,11 +1976,25 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                         and bundle_listing.get("identity") == bundle_identity \
                         and bundle_listing.get("generation") == bundle_listing_generation \
                         and bundle_listing.get("partial") is not True:
-                    listing_revalidation, changed_file_names = revalidate_listing_entries(
-                        bundle_listing, "files", bundle)
+                    resume_marker = bundle_listing.get("revalidation_after")
+                    listing_revalidation, changed_file_names, invalidated_prefix = \
+                        revalidate_listing_entries(bundle_listing, "files", bundle)
+                    if isinstance(resume_marker, str):
+                        invalidated_prefix = rewind_invalidated_listing_prefix(
+                            binding_state, bundle_progress, bundle_listing, "files",
+                            resume_marker, invalidated_prefix)
+                        if invalidated_prefix:
+                            file_cursor = ""
                     if (latest_source_name in changed_file_names
                             and valid_latest_evidence(latest_row_prior)):
                         note_generation_change("admission-bundle-generation-changed")
+                    if latest_source_name in changed_file_names:
+                        binding_state["latest"] = None
+                        binding_state.pop("latest_source_token", None)
+                    recovery_latest = binding_state.get("recovery_latest")
+                    if (isinstance(recovery_latest, dict)
+                            and recovery_latest.get("source_file") in changed_file_names):
+                        binding_state["recovery_latest"] = None
                     if listing_revalidation == "deadline":
                         files = []
                         bundle_incomplete = True
@@ -2182,10 +2263,22 @@ def read_admission_sources(roots, *, run_id, row_key=None, registry_path=None,
                             warnings.append("admission-json-not-object")
                             partial = True
                             invalid_bundle_record = True
-                        if _admission_stat_token(read_info) == listed_token:
+                        current_token = _admission_stat_token(read_info)
+                        if current_token == expected_token:
+                            row = row_by_name.get(file_name)
+                            if (current_token != listed_token and row is not None
+                                    and row.get("token") == listed_token):
+                                # A skipped prefix entry is read under the
+                                # current no-follow token before its cached
+                                # progress can be restored. Bind this read to
+                                # that token so it does not remain perpetually
+                                # partial on the next poll.
+                                row["token"] = current_token
+                                row.pop("p", None)
+                                row.pop("d", None)
                             mark_listing_entry(bundle_listing, listing_key, file_name,
-                                               listed_token, 1)
-                            processed_files.append((file_name, listed_token))
+                                               current_token, 1)
+                            processed_files.append((file_name, current_token))
                     except (OSError, ValueError, TypeError, UnicodeError,
                             OverflowError, RecursionError) as exc:
                         warnings.append("admission-record-unavailable:" + str(exc))
