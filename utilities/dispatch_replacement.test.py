@@ -4688,4 +4688,21 @@ class NamespaceExtinctDeathProofTest(unittest.TestCase):
         self.assertEqual(refused.exception.reason, 'replacement-not-silent-death')
 
 
+class RegistryRowsTest(unittest.TestCase):
+    """Read-only lookups reuse one parse per registry file generation."""
+
+    def test_an_unchanged_registry_is_not_read_again_and_an_append_is_seen(self):
+        row = lambda aid: f'2026-10-28T00:00:00Z\topen\th\t/w\ts-{aid}\tattempt_id={aid}\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / 'jobs.log'
+            jobs.write_text(row('att-a'), encoding='utf-8')
+            first = R.registry_rows(jobs)
+            self.assertEqual(set(first), {'att-a'})
+            with mock.patch.object(Path, 'read_text', side_effect=AssertionError('re-read')):
+                self.assertIs(R.registry_rows(jobs), first)
+            with jobs.open('a', encoding='utf-8') as handle:
+                handle.write(row('att-b'))
+            self.assertEqual(set(R.registry_rows(jobs)), {'att-a', 'att-b'})
+
+
 if __name__=='__main__':unittest.main()
