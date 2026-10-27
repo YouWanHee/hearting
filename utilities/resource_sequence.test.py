@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -1621,6 +1622,15 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         with tempfile.TemporaryDirectory(dir=self.base) as directory, mock.patch.object(self, 'base', Path(directory)):
             yield
 
+    @contextlib.contextmanager
+    def retained_subfixture(self):
+        """Retire owner leases before removing their fixture directory."""
+        import tempfile
+        directory = tempfile.TemporaryDirectory(dir=self.base)
+        self.addCleanup(directory.cleanup)
+        with mock.patch.object(self, 'base', Path(directory.name)):
+            yield
+
     def test_existing_missing_output_failure_can_follow_but_other_failure_cannot(self):
         for other in (False, True):
             with self.subTest(other=other), self.subfixture():
@@ -2026,6 +2036,477 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             for proc in payloads:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5)
+
+    def test_codex_public_intent_arms_without_tool_observation_and_controller_releases_once(self):
+        """Exercise public intent, real arm/discovery/claim, and bounded refusals."""
+        import artifact_producer
+        import resource_run_registry as RR
+
+        def recorded_failure(ledger, prior):
+            evidence = {
+                'identity': f"{prior['run_id']}:{prior.get('pid')}:{prior.get('starttime')}:{prior.get('exit_code')}",
+                'succeeded': False,
+                'exit_code': prior.get('exit_code'),
+                'resource_sha256': SUP.RESOURCE_RESUME.row_digest(prior),
+            }
+            ledger.record('full-run', 'FAILED_RETRYABLE', evidence=evidence,
+                          actor='fixture-recorded-prior-failure')
+            ledger.set_workflow_state('FAILED_RETRYABLE', evidence={'node': 'full-run'},
+                                      actor='fixture-recorded-prior-failure')
+
+        def make_world(*, live_group=False, contradictory=False, claimed_crash=False):
+            route, path, jobs, registry, output, ledger = self.fixture()
+            owner_attempt, owner_input = self.live_owner(route, jobs, registry, harness='codex')
+            live_proc = None
+            identity = None
+            if live_group:
+                # The group leader exits while its forked child remains in the group.
+                code = 'import os,time\nchild=os.fork()\nif child: os._exit(0)\ntime.sleep(120)\n'
+                live_proc = subprocess.Popen([sys.executable, '-c', code], start_new_session=True)
+                identity = RR.proc_identity(live_proc.pid)
+                self.assertIsNotNone(identity)
+                live_proc.wait(timeout=5)
+
+                def stop_group(proc=live_proc):
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(timeout=5)
+                self.addCleanup(stop_group)
+
+            data = json.loads(registry.read_text())
+            prior = data['runs']['fixture-run']
+            prior.update(status='failed', workflow_state='FAILED_RETRYABLE',
+                         failure_class='resource-exit', ended_at=time.time(),
+                         launch_state='started', exit_code=1,
+                         pid=identity['pid'] if identity else 4_000_000_000,
+                         starttime=identity['starttime'] if identity else '1',
+                         process_group=identity['pid'] if identity else 4_000_000_000,
+                         pid_namespace=os.readlink('/proc/self/ns/pid'))
+            prior['parent_attempt_id'] = 'att-old-owner'
+            prior['owner_wait'].update(parent_attempt_id='att-old-owner', session_id='old-native')
+            sentinel = Path(prior['sentinel'])
+            if claimed_crash:
+                with contextlib.suppress(FileNotFoundError):
+                    sentinel.unlink()
+                prior.update(exit_code=None, launch_state='claimed',
+                             launch_controller={'pid': 70001, 'starttime': 'old-claim'},
+                             failure_class='resource-launch-incomplete')
+            else:
+                sentinel.write_text('0\n' if contradictory else '1\n')
+            registry.write_text(json.dumps(data))
+            armed_path = ledger.root / 'armed' / 'full-run.json'
+            armed = json.loads(armed_path.read_bytes())
+            armed['resource_binding'] = WAIT.resource_body_digest(prior)
+            armed_path.write_text(json.dumps(armed))
+
+            if live_group:
+                self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'wait-draining')
+                recorded_failure(ledger, prior)
+            elif contradictory or claimed_crash:
+                recorded_failure(ledger, prior)
+            else:
+                self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'halt-failed')
+
+            prior = json.loads(registry.read_text())['runs']['fixture-run']
+            state_path = DC.dispatch_state_root(jobs) / 'supervisor-state' / f'{owner_attempt}.json'
+            WAIT.JOIN.write_supervisor_state(state_path, owner_attempt, set(), phase='running-turn')
+            env = dict(os.environ)
+            for key in ('AGENT_DISPATCH_WORKER_TYPE', 'AGENT_DISPATCH_DEPTH',
+                        'AGENT_DISPATCH_ATTEMPT_SCHEMA_VERSION', 'AGENT_DISPATCH_EXECUTION_SURFACE',
+                        'AGENT_DISPATCH_REGISTERED_WORKER'):
+                env.pop(key, None)
+            env.update({
+                'CUDA_VISIBLE_DEVICES': '',
+                'AGENT_DISPATCH_COMPLETION_MODE': 'supervised',
+                'AGENT_DISPATCH_ATTEMPT_ID': owner_attempt,
+                'AGENT_OWNER_ROUTE_FILE': str(path),
+                'AGENT_DISPATCH_JOBS': str(jobs),
+                'AGENT_DISPATCH_COMPLETION_STATE_FILE': str(state_path),
+            })
+            smoke = self.base / 'public-smoke.json'
+            smoke.write_text('{"fixture":true}\n')
+            return SimpleNamespace(route=route, path=path, jobs=jobs, registry=registry,
+                output=output, ledger=ledger, owner_attempt=owner_attempt, owner_input=owner_input,
+                state_path=state_path, env=env, smoke=smoke, prior=copy.deepcopy(prior),
+                prior_row_bytes=json.dumps(prior, sort_keys=True, separators=(',', ':')).encode(),
+                sentinel_bytes=sentinel.read_bytes() if sentinel.exists() else None,
+                live_proc=live_proc)
+
+        def public_start(world, run_id, log_path=None, command=None, *, observe_ids=()):
+            runner = SUP.runner()
+            log_path = Path(log_path or (self.base / f'{run_id}.log'))
+            command = command or [sys.executable, '-c', 'pass']
+            argv = ['--registry', str(world.registry), 'start', '--run-id', run_id,
+                    '--cwd', str(self.base), '--log', str(log_path), '--route', str(world.path),
+                    '--node', 'full-run', '--smoke-attestation', str(world.smoke),
+                    '--parent-attempt-id', world.owner_attempt, '--jobs', str(world.jobs), '--', *command]
+            output = io.StringIO()
+            payloads = []
+            real_run, real_popen = runner.subprocess.run, subprocess.Popen
+            real_readlink = os.readlink
+
+            def arm_transport(argv, *args, **kwargs):
+                command_argv = argv[0] if isinstance(argv, tuple) and len(argv) == 1 else argv
+                if (isinstance(command_argv, list) and len(command_argv) > 2
+                        and Path(command_argv[1]).name == 'workflow-supervisor.py'
+                        and command_argv[2] == 'arm'):
+                    # arm-transport stand-in; SUP.main executes the real arm implementation.
+                    code = SUP.main(command_argv[2:])
+                    result = subprocess.CompletedProcess(command_argv, code)
+                    if kwargs.get('check') and code:
+                        raise subprocess.CalledProcessError(code, command_argv)
+                    return result
+                return real_run(argv, *args, **kwargs)
+
+            def capture_popen(*args, **kwargs):
+                proc = real_popen(*args, **kwargs)
+                command_argv = args[0] if args else kwargs.get('args')
+                if isinstance(command_argv, list) and command_argv[:2] == ['/bin/bash', '-p']:
+                    payloads.append(proc)
+                return proc
+
+            def tool_namespace(path_value):
+                # tool-namespace stand-in applies to public intent and in-process arm only.
+                if path_value == '/proc/self/ns/pid':
+                    return 'pid:[codex-tool-sandbox-stand-in]'
+                return real_readlink(path_value)
+
+            error = None
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, world.env, clear=True))
+                # source-proof stand-in: command and smoke verifiers are outside this fixture's scope.
+                stack.enter_context(mock.patch.object(runner, 'verify_launch_input'))
+                # artifact-env stand-in: keep route artifact setup inside the test fixture.
+                stack.enter_context(mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
+                    return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(world.output)}))
+                stack.enter_context(mock.patch.object(runner, 'register_registry'))
+                # watch stand-in: the CPU payload and supervisor arm remain real.
+                stack.enter_context(mock.patch.object(runner, 'start_watch', return_value=(
+                    mock.Mock(poll=lambda: None), RR.proc_identity(os.getpid()))))
+                stack.enter_context(mock.patch.object(runner.os, 'readlink', side_effect=tool_namespace))
+                stack.enter_context(mock.patch.object(runner.subprocess, 'run', side_effect=arm_transport))
+                stack.enter_context(mock.patch.object(runner.subprocess, 'Popen', side_effect=capture_popen))
+                if observe_ids:
+                    def track(name, row):
+                        if isinstance(row, dict) and row.get('run_id') in observe_ids:
+                            calls.append((name, row['run_id']))
+                    settle = runner.settle
+                    classify = RR.classify_identity
+                    quiescent = RR.resource_process_group_quiescent
+
+                    def spy_settle(registry_arg, run_id_arg, row_arg, *args, **kwargs):
+                        track('settle', row_arg)
+                        return settle(registry_arg, run_id_arg, row_arg, *args, **kwargs)
+
+                    def spy_classify(row_arg, *args, **kwargs):
+                        track('classify_identity', row_arg)
+                        return classify(row_arg, *args, **kwargs)
+
+                    def spy_quiescent(row_arg, *args, **kwargs):
+                        track('resource_process_group_quiescent', row_arg)
+                        return quiescent(row_arg, *args, **kwargs)
+
+                    stack.enter_context(mock.patch.object(runner, 'settle', side_effect=spy_settle))
+                    stack.enter_context(mock.patch.object(RR, 'classify_identity', side_effect=spy_classify))
+                    stack.enter_context(mock.patch.object(RR, 'resource_process_group_quiescent',
+                                                          side_effect=spy_quiescent))
+                with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                    try:
+                        runner.main(argv)
+                    except (Exception, SystemExit) as caught:
+                        error = caught
+            for proc in payloads:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=10)
+            receipt = None
+            for line in output.getvalue().splitlines():
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(value, dict) and value.get('run_id') == run_id:
+                    receipt = value
+            return SimpleNamespace(error=error, output=output.getvalue(), receipt=receipt,
+                                   payloads=payloads, observation_calls=calls)
+
+        def discover(world):
+            args = SimpleNamespace(parent_attempt_id=world.owner_attempt,
+                route_file=str(world.path), route_id=world.route['route_id'],
+                route_hash=world.route['route_hash'], jobs=str(world.jobs),
+                # command-builder stand-in labels a local CPU command for the existing controller.
+                resource_launch_command=lambda row: (row['command'], 'fixture-local-cpu'))
+            control = SimpleNamespace(thread_id='same-native', pending=lambda: False)
+            return args, control, WAIT.context(args, control)
+
+        def controller_release(world, *, found=None, unknown_prior=None):
+            args, control, context_value = found if found is not None else discover(world)
+            runner = WAIT.supervisor().runner()
+            payloads = []
+            output = io.StringIO()
+            real_run, real_popen = runner.subprocess.run, subprocess.Popen
+
+            def arm_transport(argv, *args, **kwargs):
+                command_argv = argv[0] if isinstance(argv, tuple) and len(argv) == 1 else argv
+                if (isinstance(command_argv, list) and len(command_argv) > 2
+                        and Path(command_argv[1]).name == 'workflow-supervisor.py'
+                        and command_argv[2] == 'arm'):
+                    # arm-transport stand-in; the actual controller is still calling SUP.main.
+                    code = SUP.main(command_argv[2:])
+                    result = subprocess.CompletedProcess(command_argv, code)
+                    if kwargs.get('check') and code:
+                        raise subprocess.CalledProcessError(code, command_argv)
+                    return result
+                return real_run(argv, *args, **kwargs)
+
+            def capture_popen(*args, **kwargs):
+                proc = real_popen(*args, **kwargs)
+                command_argv = args[0] if args else kwargs.get('args')
+                if isinstance(command_argv, list) and command_argv[:2] == ['/bin/bash', '-p']:
+                    payloads.append(proc)
+                return proc
+
+            real_quiescent = RR.resource_process_group_quiescent
+            def unknown_observation(row, *args, **kwargs):
+                # unknown-observation stand-in is confined to this controller claim.
+                if row.get('run_id') == unknown_prior:
+                    return False
+                return real_quiescent(row, *args, **kwargs)
+
+            error = None
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': ''}, clear=False))
+                # source-proof stand-in for verifier subprocesses, not the payload.
+                stack.enter_context(mock.patch.object(runner, 'verify_launch_input'))
+                # artifact-env stand-in keeps only fixture artifact paths.
+                stack.enter_context(mock.patch.object(artifact_producer, 'prepare_route_artifact_env',
+                    return_value={'AGENT_ARTIFACT_OUTPUT_DIR': str(world.output)}))
+                stack.enter_context(mock.patch.object(runner, 'register_registry'))
+                # watch stand-in avoids a separate observer process.
+                stack.enter_context(mock.patch.object(runner, 'start_watch', return_value=(
+                    mock.Mock(poll=lambda: None), RR.proc_identity(os.getpid()))))
+                stack.enter_context(mock.patch.object(runner.subprocess, 'run', side_effect=arm_transport))
+                stack.enter_context(mock.patch.object(runner.subprocess, 'Popen', side_effect=capture_popen))
+                if unknown_prior is not None:
+                    stack.enter_context(mock.patch.object(RR, 'resource_process_group_quiescent',
+                                                          side_effect=unknown_observation))
+                try:
+                    if context_value is None or not context_value[3]:
+                        raise AssertionError('controller discovery returned no queued candidate')
+                    candidates = [pair for pair in context_value[3] if WAIT.controller_intent(pair[1])]
+                    if len(candidates) != 1:
+                        raise AssertionError(f'expected one queued controller candidate, got '
+                                             f'{[r[1]["run_id"] for r in candidates]}')
+                    armed, row = candidates[0]
+                    WAIT.admit_controller_launch(args, control, armed, row, [])
+                except Exception as caught:
+                    error = caught
+            for proc in payloads:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=10)
+            actual = json.loads(world.registry.read_text())['runs']
+            return SimpleNamespace(error=error, payloads=payloads,
+                row=actual.get(candidates[0][1]['run_id']) if context_value and context_value[3]
+                    and candidates else None,
+                context=context_value, output=output.getvalue())
+
+        def assert_never_started(world, run_id, reason):
+            row = json.loads(world.registry.read_text())['runs'][run_id]
+            self.assertTrue(RR.resource_never_started(row), row)
+            self.assertEqual(row.get('launch_state'), 'not-started')
+            self.assertEqual(row.get('failure_class'), 'resource-launch-incomplete')
+            self.assertIn(reason, row.get('launch_error', {}).get('message', ''))
+            return row
+
+        def assert_prior_unchanged(world):
+            row = json.loads(world.registry.read_text())['runs']['fixture-run']
+            self.assertEqual(json.dumps(row, sort_keys=True, separators=(',', ':')).encode(),
+                             world.prior_row_bytes)
+            sentinel = Path(world.prior['sentinel'])
+            self.assertEqual(sentinel.read_bytes() if sentinel.exists() else None,
+                             world.sentinel_bytes)
+
+        # d1: public queue -> real in-process arm -> existing WAIT.context -> fenced host release.
+        world = make_world()
+        h0_bytes = world.prior_row_bytes
+        h0_sentinel = world.sentinel_bytes
+        calls = []
+        intent = public_start(world, 'h0-a2', observe_ids={'fixture-run'})
+        self.assertIsNone(intent.error, intent.output)
+        self.assertEqual(intent.payloads, [])
+        self.assertEqual(intent.observation_calls, [])
+        queued = intent.receipt
+        self.assertIsNotNone(queued, intent.output)
+        self.assertEqual(queued['launch_state'], 'queued')
+        self.assertFalse(queued['payload_spawned'])
+        self.assertEqual(queued['required_action'], 'yield-owner-turn')
+        self.assertEqual(SUP.read_armed(world.ledger)['full-run']['predecessor_id'], 'h0-a2')
+        history = SUP.resource_predecessors(world.ledger, 'full-run')
+        self.assertEqual({row['run_id'] for _, row in history}, {'fixture-run', 'h0-a2'})
+        self.assertTrue(any(((entry.get('evidence') or {}).get('previous_resource') or {}).get(
+            'predecessor_id') == 'fixture-run' for entry in world.ledger.journal()))
+        assert_prior_unchanged(world)
+
+        replay = public_start(world, 'h0-a2', observe_ids={'fixture-run'})
+        self.assertIsNone(replay.error, replay.output)
+        self.assertTrue(replay.receipt['replayed'])
+        self.assertFalse(replay.receipt['payload_spawned'])
+        self.assertEqual(replay.payloads, [])
+        self.assertEqual(replay.observation_calls, [])
+        queued_registry = world.registry.read_bytes()
+        queued_arm = (world.ledger.root / 'armed' / 'full-run.json').read_bytes()
+        queued_journal_len = len(world.ledger.journal())
+        changed = public_start(world, 'h0-a2', command=[sys.executable, '-c', 'print("changed")'])
+        self.assertIsNotNone(changed.error)
+        self.assertIn('resource-route-body-conflict', str(changed.error) + changed.output)
+        self.assertEqual(changed.payloads, [])
+        self.assertEqual(world.registry.read_bytes(), queued_registry)
+        self.assertEqual((world.ledger.root / 'armed' / 'full-run.json').read_bytes(), queued_arm)
+        self.assertEqual(len(world.ledger.journal()), queued_journal_len)
+
+        discovery = discover(world)
+        self.assertEqual([row['run_id'] for _, row in discovery[2][3]], ['h0-a2'])
+        released = controller_release(world, found=discovery)
+        self.assertIsNone(released.error, released.output)
+        self.assertEqual(len(released.payloads), 1)
+        self.assertEqual(released.payloads[0].wait(timeout=10), 0)
+        started = json.loads(world.registry.read_text())['runs']['h0-a2']
+        self.assertEqual(started['launch_state'], 'started')
+        self.assertTrue(started.get('launch_controller'))
+        replay_args, replay_control, replay_context = discover(world)
+        self.assertEqual(len(replay_context[3]), 1)
+        WAIT.admit_controller_launch(replay_args, replay_control, *replay_context[3][0], [])
+        self.assertEqual(len(released.payloads), 1)
+        self.assertEqual(SUP.poll_once(world.route, world.ledger)[0]['action'], 'wait-next-resource')
+
+        next_intent = public_start(world, 'h0-a3', observe_ids={'fixture-run', 'h0-a2'})
+        self.assertIsNone(next_intent.error, next_intent.output)
+        self.assertEqual(next_intent.receipt['launch_state'], 'queued')
+        self.assertEqual(next_intent.payloads, [])
+        self.assertEqual(next_intent.observation_calls, [])
+        self.assertEqual(SUP.read_armed(world.ledger)['full-run']['predecessor_id'], 'h0-a3')
+        next_discovery = discover(world)
+        self.assertEqual([row['run_id'] for _, row in next_discovery[2][3]
+                          if WAIT.controller_intent(row)], ['h0-a3'])
+        next_release = controller_release(world, found=next_discovery)
+        self.assertIsNone(next_release.error, next_release.output)
+        self.assertEqual(len(next_release.payloads), 1)
+        self.assertEqual(next_release.payloads[0].wait(timeout=10), 0)
+        self.assertEqual(SUP.poll_once(world.route, world.ledger)[0]['action'], 'wait-next-resource')
+        self.assertEqual(len(released.payloads) + len(next_release.payloads), 2)
+        assert_prior_unchanged(world)
+        self.assertTrue(any(row['run_id'] == 'fixture-run'
+                            for _, row in SUP.resource_predecessors(world.ledger, 'full-run')))
+
+        # C1 live residual group: intent arms, host claim refuses, and only a new explicit intent retries.
+        with self.retained_subfixture():
+            live = make_world(live_group=True)
+            live_intent = public_start(live, 'h0-c1')
+            self.assertIsNone(live_intent.error, live_intent.output)
+            self.assertEqual(live_intent.receipt['launch_state'], 'queued')
+            failed_claim = controller_release(live)
+            self.assertIsNone(failed_claim.error, failed_claim.output)
+            self.assertEqual(failed_claim.payloads, [])
+            assert_never_started(live, 'h0-c1', 'resource-route-body-conflict')
+            assert_prior_unchanged(live)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(live.live_proc.pid, signal.SIGTERM)
+            for _ in range(100):
+                if RR.resource_process_group_quiescent(live.prior):
+                    break
+                time.sleep(0.01)
+            self.assertTrue(RR.resource_process_group_quiescent(live.prior))
+            retry_intent = public_start(live, 'h0-c1-retry')
+            self.assertIsNone(retry_intent.error, retry_intent.output)
+            self.assertEqual(retry_intent.receipt['launch_state'], 'queued')
+            retry_release = controller_release(live)
+            self.assertIsNone(retry_release.error, retry_release.output)
+            self.assertEqual(len(retry_release.payloads), 1)
+            self.assertEqual(retry_release.payloads[0].wait(timeout=10), 0)
+            assert_prior_unchanged(live)
+
+        # C2 unknown host observation is a typed refusal at claim, with no payload.
+        with self.retained_subfixture():
+            unknown = make_world()
+            queued_unknown = public_start(unknown, 'h0-c2')
+            self.assertIsNone(queued_unknown.error, queued_unknown.output)
+            unknown_claim = controller_release(unknown, unknown_prior='fixture-run')
+            self.assertIsNone(unknown_claim.error, unknown_claim.output)
+            self.assertEqual(unknown_claim.payloads, [])
+            assert_never_started(unknown, 'h0-c2', 'resource-route-body-conflict')
+            assert_prior_unchanged(unknown)
+
+        # C3 evidence path aliases (symlink and .partial) fail before changing owned records.
+        for alias_kind in ('symlink', 'partial'):
+            with self.subTest(alias=alias_kind), self.retained_subfixture():
+                aliased = make_world()
+                before_registry = aliased.registry.read_bytes()
+                before_arm = (aliased.ledger.root / 'armed' / 'full-run.json').read_bytes()
+                before_journal = len(aliased.ledger.journal())
+                target = Path(aliased.prior['sentinel'])
+                log = self.base / f'{alias_kind}-candidate.log'
+                if alias_kind == 'symlink':
+                    log.symlink_to(target)
+                else:
+                    log = Path(str(target) + '.partial')
+                refusal = public_start(aliased, f'h0-c3-{alias_kind}', log_path=log)
+                self.assertIsNotNone(refusal.error)
+                self.assertIn('resource-route-body-conflict', str(refusal.error) + refusal.output)
+                self.assertEqual(refusal.payloads, [])
+                self.assertEqual(aliased.registry.read_bytes(), before_registry)
+                self.assertEqual((aliased.ledger.root / 'armed' / 'full-run.json').read_bytes(), before_arm)
+                self.assertEqual(len(aliased.ledger.journal()), before_journal)
+                assert_prior_unchanged(aliased)
+
+        # C5 queued arm refusal settles its exact row instead of stranding queued.
+        with self.retained_subfixture():
+            arm_blocked = make_world()
+            arm_blocked.ledger.record('run-verify', 'FAILED_TERMINAL', evidence={'reason': 'fixture-failure'},
+                                      actor='fixture-other-stage-failure')
+            result = public_start(arm_blocked, 'h0-c5')
+            self.assertIsNone(result.error, result.output)
+            self.assertEqual(result.payloads, [])
+            assert_never_started(arm_blocked, 'h0-c5', 'resource-watch-binding-conflict')
+            args, control, found = discover(arm_blocked)
+            self.assertFalse(found and any(row.get('run_id') == 'h0-c5' for _, row in found[3]))
+            assert_prior_unchanged(arm_blocked)
+
+        # C6 claim-time stage failure and claimed successor remain blockers after a successful arm.
+        for blocker in ('other-stage-failure', 'claimed-successor'):
+            with self.subTest(blocker=blocker), self.retained_subfixture():
+                blocked = make_world()
+                queued_blocked = public_start(blocked, f'h0-c6-{blocker}')
+                self.assertIsNone(queued_blocked.error, queued_blocked.output)
+                if blocker == 'other-stage-failure':
+                    blocked.ledger.record('run-verify', 'FAILED_TERMINAL', evidence={'reason': 'fixture-failure'},
+                                          actor='fixture-other-stage-failure')
+                else:
+                    blocked.ledger.claim('c' * 64, {
+                        'route_id': blocked.route['route_id'], 'predecessor': 'full-run',
+                        'successor': 'run-verify'})
+                claimed = controller_release(blocked)
+                self.assertIsNone(claimed.error, claimed.output)
+                self.assertEqual(claimed.payloads, [])
+                assert_never_started(blocked, f'h0-c6-{blocker}', 'resource-watch-binding-conflict')
+                assert_prior_unchanged(blocked)
+
+        # C7 contradictory sentinel and C8 claimed crash are not record-terminal.
+        for case, options in (('contradictory-sentinel', {'contradictory': True}),
+                              ('claimed-crash', {'claimed_crash': True})):
+            with self.subTest(case=case), self.retained_subfixture():
+                nonterminal = make_world(**options)
+                result = public_start(nonterminal, f'h0-{case}')
+                self.assertIsNone(result.error, result.output)
+                self.assertEqual(result.payloads, [])
+                assert_never_started(nonterminal, f'h0-{case}', 'resource-watch-binding-conflict')
+                args, control, found = discover(nonterminal)
+                self.assertFalse(found and any(row.get('run_id') == f'h0-{case}'
+                                               for _, row in found[3]))
+                assert_prior_unchanged(nonterminal)
+
+        print('STAND_INS=tool-namespace stand-in; arm-transport stand-in; source-proof stand-in; '
+              'command-builder stand-in; watch stand-in; artifact-env stand-in; '
+              'unknown-observation stand-in (C2 only).')
 
     def test_same_operation_body_with_a_new_request_id_cannot_overlap(self):
         route, path, jobs, registry, output, ledger = self.fixture()
