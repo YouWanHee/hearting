@@ -7679,10 +7679,13 @@ class ComposeRouteTest(TestRoute):
    (parent/".git").write_text("gitdir: /definitely-missing-hearting-gitdir\n")
    diagnosis=R._compose_git_diagnosis(cwd)
    decision=R._decide_non_git_compose({**diagnosis,"cwd":str(cwd)},None,0,False,None)
+   self.assertEqual(diagnosis["state"],"error",diagnosis)
    self.assertEqual(decision["kind"],"error",diagnosis)
-   self.assertIn(str(cwd),decision["detail"])
-   # Git versions differ on naming the missing gitdir (some print "(null)"); keep the raw error.
-   self.assertIn("not a git repository",decision["detail"])
+   self.assertEqual(decision["cwd"],str(cwd),decision)
+   raw_error=diagnosis.get("detail")
+   self.assertIsInstance(raw_error,str,diagnosis)
+   self.assertTrue(raw_error,diagnosis)
+   self.assertEqual(decision["detail"],f"{cwd}: {raw_error}")
 
  def test_compose_git_diagnosis_accepts_mount_boundary_exhaustion_message(self):
   completed=subprocess.CompletedProcess(["git"],128,"",
