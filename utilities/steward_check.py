@@ -576,7 +576,11 @@ def reconcile_self(store=None, *, identity=None) -> None:
 
 
 def reconcile_all(store) -> None:
-    """Once per runner start: register every held, not-ended holder; retire the rest."""
+    """Once per runner start: register every held, not-ended holder.
+
+    It reads only the role relations and one record per holder, never a store
+    listing, so the runner's cold pass keeps its I/O shape; a duty whose holder
+    lost the role retires at its own next due point (`_due`)."""
     try:
         relations = _relations()
     except Exception:  # noqa: BLE001
@@ -586,21 +590,13 @@ def reconcile_all(store) -> None:
         holder = relation.get("holder") or {}
         if relation.get("released") is not True and holder.get("harness") and holder.get("sid"):
             holders[(holder["harness"], holder["sid"])] = relation
+    if not holders:
+        return
     agents = _agents()
     for (harness, session_id) in holders:
         try:
             if _session_liveness(harness, session_id, agents) != "ended":
                 register(harness, session_id, store=store, ensure_runner=False)
-        except Exception:  # noqa: BLE001
-            continue
-    try:
-        duties = store.list(kinds=[DUTY_KIND])
-    except Exception:  # noqa: BLE001
-        return
-    for duty in duties:
-        try:
-            if _active(duty) and _identity_of(duty) not in holders:
-                _retire_for_role(duty, store, _role_held(*_identity_of(duty)))
         except Exception:  # noqa: BLE001
             continue
 

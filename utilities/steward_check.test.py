@@ -583,20 +583,32 @@ class StewardCheckReactivationTest(CheckBase):
         SC.reconcile_self(self.store, identity=SimpleNamespace(harness=HARNESS, session_id=SID))
         self.assertEqual(self.duty()["state"], "complete")
 
-    def test_reconcile_all_registers_holders_and_retires_orphans(self):
+    def test_reconcile_all_registers_holders_and_leaves_orphans_to_their_due(self):
         orphan = SC.register("claude", "sid-orphan", now=T0, store=self.store, ensure_runner=False)
         relations = [{"released": False, "origin": {"harness": "claude", "sid": SID},
                       "holder": {"harness": "claude", "sid": SID}, "targets": [{"name": "w"}]},
                      {"released": False, "origin": {"harness": "claude", "sid": "sid-ended"},
                       "holder": {"harness": "claude", "sid": "sid-ended"}, "targets": [{"name": "w"}]}]
-        self.role = {"held": False, "reason": "role-released", "successor": None}
         with mock.patch.object(SC, "_relations", return_value=relations), \
              mock.patch.object(SC, "_session_liveness",
-                               side_effect=lambda h, s, agents=None: "ended" if s == "sid-ended" else "live"):
+                               side_effect=lambda h, s, agents=None: "ended" if s == "sid-ended" else "live"), \
+             mock.patch.object(peer_obligations.ObligationStore, "list",
+                               side_effect=AssertionError("no store listing at runner start")):
             SC.reconcile_all(self.store)
         self.assertEqual(self.duty()["state"], "pending")
         self.assertIsNone(self.store.get(SC.duty_id("claude", "sid-ended")))
+        self.assertEqual(self.store.get(orphan["id"])["state"], "pending")
+        self.role = {"held": False, "reason": "role-released", "successor": None}
+        SC.advance(self.store.get(orphan["id"]), self.store, now=T0 + INTERVAL)
         self.assertEqual(self.store.get(orphan["id"])["state"], "complete")
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_reconcile_all_without_holders_touches_nothing(self):
+        with mock.patch.object(SC, "_relations", return_value=[]), \
+             mock.patch.object(SC, "_agents", side_effect=AssertionError("no herdr call")), \
+             mock.patch.object(peer_obligations.ObligationStore, "get",
+                               side_effect=AssertionError("no record read")):
+            SC.reconcile_all(self.store)
 
 
 class StewardCheckEscTest(CheckBase):
