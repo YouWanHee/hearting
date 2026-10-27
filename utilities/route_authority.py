@@ -1534,7 +1534,9 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
                 and new.get("model_profile") == transition["to"]
                 and (key != "resolved_model_settings" or (new.get(key) or {}).get("profile") == transition["to"])):
             continue
-        if not (drift and key in RELEASE_DERIVED_VALUES):
+        # A key the sealing release never recorded has no stored value to keep;
+        # after a release move the current release supplies it.
+        if not (drift and (key in RELEASE_DERIVED_VALUES or key not in old)):
             raise _contract_error("replacement-input-tuple-mismatch", "resolved")
     # Sealing includes the raw argv as history. Check what the candidate will
     # actually receive against its own checked current binding, rather than
