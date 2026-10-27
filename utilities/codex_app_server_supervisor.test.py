@@ -96,7 +96,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                     with open(trace, 'a', encoding='utf-8') as h:
                         h.write(json.dumps({'event': event, 'time': time.monotonic(), **extra}) + '\\n')
                 if any(arg.startswith('model_context_window=') for arg in sys.argv):
-                    record('server-start', argv=sys.argv[1:])
+                    record('server-start', argv=sys.argv[1:],
+                           runtime_dir=os.environ.get('AGENT_RUNTIME_DIR'))
                 def send(value):
                     print(json.dumps(value), flush=True)
                 for line in sys.stdin:
@@ -1053,6 +1054,12 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(reservations[-1]["purpose"], "ordinary")
 
     def test_public_correct_respawns_and_completes_on_same_thread_without_touching_resource(self):
+        self._public_correct_respawn_fixture(legacy_record=False)
+
+    def test_legacy_v3532_public_correct_respawns_from_bound_provenance(self):
+        self._public_correct_respawn_fixture(legacy_record=True)
+
+    def _public_correct_respawn_fixture(self, *, legacy_record):
         import contextlib
         import dispatch_completion_join as join
         import dispatch_budget_record as budget_record
@@ -1079,10 +1086,11 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         xdg_state.mkdir(exist_ok=True)
         logs = jobs.parent / "logs"
         logs.mkdir(exist_ok=True)
-        native_codex_home = base / "native-codex"
+        native_codex_home = home / ".codex" if legacy_record else base / "native-codex"
         native_codex_home.mkdir(exist_ok=True)
         (native_codex_home / "config.toml").write_text('model = "gpt-fixture"\n', encoding="utf-8")
-        worker_home = runtime_dir / "codex-owner-home"
+        worker_home = (jobs.parent / "codex-owner-home" if legacy_record
+                       else runtime_dir / "codex-owner-home")
         route_path = base / "owner-route.json"
         attempt = PARENT
         parent_session = "fixture-parent"
@@ -1114,7 +1122,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(home), "XDG_STATE_HOME": str(xdg_state),
-            "AGENT_HOME": str(ROOT), "AGENT_RUNTIME_DIR": str(runtime_dir),
+            "AGENT_HOME": str(ROOT),
+            "AGENT_RUNTIME_DIR": str(base / ".caller-runtime" if legacy_record else runtime_dir),
             "AGENT_DISPATCH_JOBS": str(jobs),
             "AGENT_MODEL_GOVERNOR_ROOT": str(artifact_root / ".runtime/model-worker-governor"),
             "FLEET_TITLE_STATE_DIR": str(base / "fleet-titles"),
@@ -1155,6 +1164,17 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                      "AGENT_DISPATCH_JOBS": str(jobs)},
                 destination=worker_home,
             )
+            if legacy_record:
+                # v3.53.2 schema-2 homes omitted both derived paths. The
+                # existing absolute config symlink remains the provenance.
+                manifest_path = worker_home / "worker-home.json"
+                legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(legacy_manifest.get("schema"), 2)
+                legacy_manifest.pop("codex_config_home", None)
+                legacy_manifest.pop("home_environment", None)
+                manifest_path.write_text(json.dumps(legacy_manifest), encoding="utf-8")
+                self.assertTrue((worker_home / "config.toml").is_symlink())
+                self.assertFalse(worker_home.is_relative_to(runtime_dir))
             def home_snapshot():
                 snapshot = {}
                 for path in sorted(worker_home.rglob("*")):
@@ -1191,6 +1211,17 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             )
             input_fragment = dispatch_replacement.seal_launch_input(
                 launch_args, "codex", "ORIGINAL_TASK_SENTINEL must not be replayed")
+            launch_input_path = (dispatch_replacement._directory(jobs) / "inputs"
+                                 / f"{attempt}.json")
+            sealed_launch = json.loads(launch_input_path.read_text(encoding="utf-8"))
+            if legacy_record:
+                sealed_launch["resolved"].pop("runtime_dir")
+                sealed_launch["applied_permissions"].pop("approval", None)
+                sealed_launch["applied_permissions"].pop("commit_policy", None)
+                launch_input_path.write_bytes(dispatch_replacement._bytes(sealed_launch))
+                old_digest = input_fragment.split("replacement_input_digest=", 1)[1].split(",", 1)[0]
+                input_fragment = input_fragment.replace(
+                    old_digest, dispatch_replacement._digest(sealed_launch), 1)
             effective_path, effective_digest = execution_access.publish_effective_grant(
                 jobs=jobs, attempt_id=attempt, route_id=route["route_id"],
                 route_hash=route["route_hash"], runtime="codex-app-server",
@@ -1336,6 +1367,59 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             owner_input.initialize_owner_input(jobs, attempt, "codex-active-turn")
             with contract.hold_supervisor_lease(jobs, attempt, lease):
                 owner_input.OwnerInput(jobs, attempt, "thread-1", "codex-active-turn", lambda _e: None)
+            headless = load_local("respawn_legacy_dispatch_headless",
+                                  ROOT / "adapters/codex/bin/dispatch-headless.py")
+            if legacy_record:
+                effective = json.loads(effective_path.read_text(encoding="utf-8"))
+                row_fields = row_line.rstrip("\n").split("\t")
+                state_path = lease.with_suffix(".json")
+
+                rendered = headless.recorded_supervisor_command(
+                    sealed_launch, row_fields, metadata, jobs, state_path, lease,
+                    None, log_path, effective, recorded_home=str(home))
+                self.assertIn(str(runtime_dir), rendered)
+                self.assertIn("--primary-git-commit", rendered)
+
+                alternate_scratch = tempfile.TemporaryDirectory(prefix="hearting-alternate-runtime-")
+                self.addCleanup(alternate_scratch.cleanup)
+                alternate_runtime = Path(alternate_scratch.name) / "runtime"
+                alternate_runtime.mkdir()
+                absent = {**effective, "writable_roots": [
+                    root for root in effective["writable_roots"] if root != str(runtime_dir)]}
+                ambiguous = {**effective, "writable_roots": [
+                    *effective["writable_roots"], str(alternate_runtime)]}
+                explicit_conflict = json.loads(json.dumps(sealed_launch))
+                explicit_conflict["resolved"]["runtime_dir"] = str(alternate_runtime)
+                commit_conflict = json.loads(json.dumps(sealed_launch))
+                commit_conflict["applied_permissions"]["commit_policy"] = {"may_commit": False}
+                refusal_cases = (
+                    (sealed_launch, absent, "runtime_dir"),
+                    (sealed_launch, ambiguous, "runtime_dir-ambiguous"),
+                    (explicit_conflict, effective, "execution_access_writable_roots:runtime_dir"),
+                    (commit_conflict, effective, "commit_policy.may_commit-changed"),
+                )
+                refusal_launches = []
+                refusal_real_popen = subprocess.Popen
+
+                def refuse_only_launch_fence(*popen_args, **popen_kwargs):
+                    command = popen_kwargs.get("args", popen_args[0] if popen_args else [])
+                    parts = [command] if isinstance(command, (str, bytes)) else list(command)
+                    if any(str(part).endswith("launch-fence.py") for part in parts):
+                        refusal_launches.append(parts)
+                    return refusal_real_popen(*popen_args, **popen_kwargs)
+
+                with mock.patch.object(headless.subprocess, "Popen",
+                                       side_effect=refuse_only_launch_fence):
+                    for candidate_record, candidate_effective, expected_detail in refusal_cases:
+                        with self.subTest(legacy_refusal=expected_detail):
+                            with self.assertRaises(headless.DispatchContractError) as raised:
+                                headless.recorded_supervisor_command(
+                                    candidate_record, row_fields, metadata, jobs, state_path, lease,
+                                    None, log_path, candidate_effective, recorded_home=str(home))
+                            self.assertEqual(raised.exception.detail, expected_detail)
+                self.assertEqual(refusal_launches, [])
+                self.assertEqual(owner_input.inspect(jobs, attempt)["requests"], [])
+                self.assertFalse(self.trace.exists())
             state_path = lease.with_suffix(".json")
             supervisor_module = load_supervisor_module()
             supervisor_module.write_supervisor_state(state_path, attempt, set(), phase="recovery")
@@ -1349,6 +1433,33 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                           "registry": str(resource_registry), "record": "cpu-run"}]
             cap = load_local("respawn_public_capability_route", ROOT / "utilities/capability-route.py")
             output = io.StringIO()
+            respawn_outcomes = []
+            launch_environments = []
+            prompt_temp_dirs = []
+            original_recover_consumer = owner_input.recover_consumer
+            real_popen = subprocess.Popen
+            real_temporary_file = tempfile.TemporaryFile
+
+            def capture_recovery(jobs_arg, attempt_arg, *, session=None, spawn=None):
+                def capture_spawn(*spawn_args, **spawn_kwargs):
+                    outcome = headless.respawn_supervised_owner(*spawn_args, **spawn_kwargs)
+                    respawn_outcomes.append(outcome)
+                    return outcome
+                return original_recover_consumer(
+                    jobs_arg, attempt_arg, session=session, spawn=spawn or capture_spawn)
+
+            def capture_popen(*popen_args, **popen_kwargs):
+                command = popen_kwargs.get("args", popen_args[0] if popen_args else [])
+                parts = [command] if isinstance(command, (str, bytes)) else list(command)
+                if any(str(part).endswith("launch-fence.py") for part in parts):
+                    launch_environments.append(dict(popen_kwargs.get("env") or {}))
+                return real_popen(*popen_args, **popen_kwargs)
+
+            def capture_temporary_file(*file_args, **file_kwargs):
+                if "dir" in file_kwargs:
+                    prompt_temp_dirs.append(str(file_kwargs["dir"]))
+                return real_temporary_file(*file_args, **file_kwargs)
+
             with mock.patch.object(route_authority_module, "owns", return_value=True), \
                  mock.patch.object(contract, "attempt_governed_process_quiescence",
                                    return_value=contract.ProcessQuiescence("quiescent", "fixture")), \
@@ -1358,6 +1469,9 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
                                    return_value=(contract.ProcessQuiescence(
                                        "quiescent", "registered-resources-preserved"), preserved)), \
                  mock.patch.object(join, "settle_finished_attempt", return_value={}), \
+                 mock.patch.object(owner_input, "recover_consumer", side_effect=capture_recovery), \
+                 mock.patch.object(headless.subprocess, "Popen", side_effect=capture_popen), \
+                 mock.patch.object(headless.tempfile, "TemporaryFile", side_effect=capture_temporary_file), \
                  contextlib.redirect_stdout(output), \
                  mock.patch.object(sys, "argv", [str(ROOT / "utilities/capability-route.py"),
                      "correct", "--attempt-id", attempt, "--jobs", str(jobs),
@@ -1401,6 +1515,11 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
 
         self.assertEqual(public_status, 0)
         self.assertEqual(receipt["consumer_recovery"], "respawned", receipt)
+        self.assertEqual(len(respawn_outcomes), 1)
+        self.assertEqual(respawn_outcomes[0]["runtime_dir"], str(runtime_dir))
+        self.assertEqual(prompt_temp_dirs, [str(runtime_dir)])
+        self.assertEqual(len(launch_environments), 1)
+        self.assertEqual(launch_environments[0]["AGENT_RUNTIME_DIR"], str(runtime_dir))
         self.assertFalse(receipt.get("duplicate"))
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0]["state"], "turn-completed")
@@ -1412,6 +1531,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(len(final_rows), 1)
         self.assertEqual(join.exact_attempt_row(jobs, attempt).metadata["attempt_id"], attempt)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        server_start = next(row for row in trace if row.get("event") == "server-start")
+        self.assertEqual(server_start["runtime_dir"], str(runtime_dir))
         self.assertEqual(sum(row.get("event") == "thread-resume" for row in trace), 1)
         self.assertEqual(sum(row.get("event") == "thread-start" for row in trace), 0)
         turn = next(row for row in trace if row.get("event") == "turn-start")

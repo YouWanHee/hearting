@@ -1320,11 +1320,16 @@ def _recorded_argv_value(argv, option):
     return None if value.startswith("--") else value
 
 
-def recorded_supervisor_command(record: dict, fields: list[str], metadata: dict[str, str],
-                                jobs: Path, state_path: Path, lease_path: Path,
-                                prompt_path: Path | None, log_path: Path,
-                                effective: dict) -> str:
-    """Render the normal supervised-owner command from its sealed launch tuple."""
+def _resolve_recorded_supervisor_values(record: dict, fields: list[str],
+                                        metadata: dict[str, str], jobs: Path,
+                                        effective: dict, *, recorded_home: str = "") -> dict:
+    """Resolve the bound values needed to render a recorded owner launch.
+
+    New records carry ``runtime_dir`` and ``commit_policy.may_commit``. For
+    older records, recover the normal runtime root only when the verified grant
+    and launch relationships leave one consistent candidate. Never consult the
+    recovering caller's environment for either value.
+    """
     from types import SimpleNamespace
     import commit_policy
 
@@ -1336,35 +1341,11 @@ def recorded_supervisor_command(record: dict, fields: list[str], metadata: dict[
     if (not worktree.is_absolute() or str(worktree.resolve(strict=False)) != record.get("worktree")
             or not worktree.is_dir()):
         raise DispatchContractError("consumer-respawn-launch-record-unavailable", "worktree")
-    sandbox = metadata.get("runtime_sandbox", "")
-    if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
-        raise DispatchContractError("consumer-respawn-launch-record-unavailable", "runtime_sandbox")
-    approval = metadata.get("approval") or applied.get("approval")
-    if approval is None:
-        approval = _recorded_argv_value(record.get("argv"), "--approval")
-    if approval not in {"untrusted", "on-request", "never", "inherit"}:
-        raise DispatchContractError("consumer-respawn-launch-record-unavailable", "approval")
-
-    settings = resolved.get("resolved_model_settings")
-    if (not isinstance(settings, dict)
-            or any(not isinstance(settings.get(key), str) or not settings.get(key)
-                   for key in ("source", "model", "reasoning", "context_window"))):
-        raise DispatchContractError("consumer-respawn-launch-record-unavailable",
-                                    "resolved_model_settings")
-    runtime_dir_value = resolved.get("runtime_dir")
-    if not isinstance(runtime_dir_value, str) or not Path(runtime_dir_value).is_absolute():
-        raise DispatchContractError("consumer-respawn-launch-record-unavailable", "runtime_dir")
-    runtime_dir = Path(runtime_dir_value)
-    if (not runtime_dir.is_dir() or runtime_dir.is_symlink()
-            or str(runtime_dir.resolve(strict=False)) != runtime_dir_value):
-        raise DispatchContractError("consumer-respawn-launch-record-unavailable", "runtime_dir")
     artifact_root = Path(metadata.get("artifact_root", ""))
     if not artifact_root.is_absolute() or not artifact_root.is_dir():
         raise DispatchContractError("consumer-respawn-launch-record-unavailable", "artifact_root")
-    if runtime_dir not in {Path(root) for root in effective["writable_roots"]}:
-        raise DispatchContractError("consumer-respawn-launch-record-unavailable",
-                                    "execution_access_writable_roots:runtime_dir")
-    if artifact_root not in {Path(root) for root in effective["writable_roots"]}:
+    roots = {Path(root) for root in effective["writable_roots"]}
+    if artifact_root not in roots:
         raise DispatchContractError("consumer-respawn-launch-record-unavailable",
                                     "execution_access_writable_roots:artifact_root")
 
@@ -1385,14 +1366,152 @@ def recorded_supervisor_command(record: dict, fields: list[str], metadata: dict[
     sealed_route_id = record.get("owner_route_id") or record.get("route_id")
     if sealed_route_id and sealed_route_id != route_id:
         raise DispatchContractError("consumer-respawn-launch-record-unavailable", "route_id")
-    commit_record = applied.get("commit_policy")
-    if not isinstance(commit_record, dict) or type(commit_record.get("may_commit")) is not bool:
-        raise DispatchContractError("consumer-respawn-launch-record-unavailable", "commit_policy.may_commit")
+
+    runtime_roots = roots - {artifact_root}
+    if "runtime_dir" in resolved:
+        runtime_value = resolved["runtime_dir"]
+        if not isinstance(runtime_value, str) or not Path(runtime_value).is_absolute():
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable", "runtime_dir")
+        runtime_dir = Path(runtime_value)
+        if (not runtime_dir.is_dir() or runtime_dir.is_symlink()
+                or str(runtime_dir.resolve(strict=False)) != runtime_value):
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable", "runtime_dir")
+        if runtime_dir not in runtime_roots:
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable",
+                                        "execution_access_writable_roots:runtime_dir")
+    else:
+        if Path(str(route.get("cwd") or "")).resolve(strict=False) != worktree:
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable", "runtime_dir")
+        # The normal tracked-worktree choice is artifact-root's sibling
+        # ``.agent_runtime``. Unversioned routes use the same generated
+        # project-runtimes location under the sealed dispatch state namespace.
+        normal_runtime = None
+        worktree_git_dirs = commit_policy.worktree_git_dirs(worktree)
+        if route.get("source_commit") == "unversioned" and not worktree_git_dirs:
+            state_root = dispatch_state_root(jobs)
+            if state_root.name == "dispatch":
+                digest = hashlib.sha256(str(artifact_root.resolve(strict=False)).encode("utf-8")).hexdigest()
+                normal_runtime = state_root.parent / "project-runtimes" / digest
+        else:
+            normal_runtime = artifact_root.resolve(strict=False).parent / ".agent_runtime"
+        if normal_runtime is not None:
+            normal_runtime = normal_runtime.resolve(strict=False)
+
+        git_roots = set(worktree_git_dirs or ())
+        git_roots.update(commit_policy.commit_git_metadata_dirs(SimpleNamespace(
+            worktree=str(worktree), worker_type="owner", dispatch_depth=1,
+            route_file=route_file, owner_route_file=route_file,
+        )))
+        dispatch_root = dispatch_state_root(jobs).resolve(strict=False)
+        recorded_home_path = Path(recorded_home).resolve(strict=False) if recorded_home else None
+        candidates = set()
+        if normal_runtime is not None and normal_runtime in runtime_roots:
+            candidates.add(normal_runtime)
+        for candidate in runtime_roots:
+            if candidate == normal_runtime:
+                continue
+            if (candidate == Path("/") or candidate in git_roots
+                    or candidate == dispatch_root or candidate.is_relative_to(dispatch_root)
+                    or dispatch_root.is_relative_to(candidate)
+                    or candidate == worktree or candidate.is_relative_to(worktree)
+                    or worktree.is_relative_to(candidate)
+                    or candidate == artifact_root or candidate.is_relative_to(artifact_root)
+                    or artifact_root.is_relative_to(candidate)
+                    or (recorded_home_path is not None
+                        and (candidate == recorded_home_path
+                             or candidate.is_relative_to(recorded_home_path)
+                             or recorded_home_path.is_relative_to(candidate)))
+                    or "releases" in candidate.parts or ".harness" in candidate.parts):
+                continue
+            if (candidate.is_dir() and not candidate.is_symlink()
+                    and str(candidate.resolve(strict=False)) == str(candidate)):
+                candidates.add(candidate)
+
+        home_value = metadata.get("runtime_home", "")
+        home_matches = []
+        if home_value and Path(home_value).is_absolute():
+            home = Path(home_value).resolve(strict=False)
+            home_matches = [candidate for candidate in candidates
+                            if home == candidate or home.is_relative_to(candidate)]
+        if len(home_matches) == 1:
+            runtime_dir = home_matches[0]
+        elif len(home_matches) > 1:
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable",
+                                        "runtime_dir-ambiguous")
+        elif len(candidates) == 1:
+            runtime_dir = next(iter(candidates))
+        elif not candidates:
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable", "runtime_dir")
+        else:
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable",
+                                        "runtime_dir-ambiguous")
+        if (not runtime_dir.is_dir() or runtime_dir.is_symlink()
+                or str(runtime_dir.resolve(strict=False)) != str(runtime_dir)
+                or runtime_dir not in runtime_roots):
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable", "runtime_dir")
+
     projection_args = SimpleNamespace(worktree=str(worktree), worker_type="owner", dispatch_depth=1,
                                       route_file=route_file, owner_route_file=route_file)
-    if commit_policy.may_commit(projection_args) != commit_record["may_commit"]:
+    projected_may_commit = commit_policy.may_commit(projection_args)
+    if "commit_policy" not in applied:
+        may_commit = projected_may_commit
+    else:
+        commit_record = applied["commit_policy"]
+        if not isinstance(commit_record, dict) or type(commit_record.get("may_commit")) is not bool:
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable",
+                                        "commit_policy.may_commit")
+        if projected_may_commit != commit_record["may_commit"]:
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable",
+                                        "commit_policy.may_commit-changed")
+        may_commit = commit_record["may_commit"]
+    if may_commit:
+        required_git_roots = set(commit_policy.commit_git_metadata_dirs(projection_args))
+        if not required_git_roots.issubset(roots):
+            raise DispatchContractError("consumer-respawn-launch-record-unavailable",
+                                        "execution_access_writable_roots:commit_policy")
+
+    return {"runtime_dir": runtime_dir, "may_commit": may_commit,
+            "route_file": route_file, "route_id": route_id, "route_hash": route_hash,
+            "route": route}
+
+
+def recorded_supervisor_command(record: dict, fields: list[str], metadata: dict[str, str],
+                                jobs: Path, state_path: Path, lease_path: Path,
+                                prompt_path: Path | None, log_path: Path,
+                                effective: dict, *, recorded_values: dict | None = None,
+                                recorded_home: str = "") -> str:
+    """Render the normal supervised-owner command from its sealed launch tuple."""
+
+    resolved = record.get("resolved")
+    applied = record.get("applied_permissions")
+    if not isinstance(resolved, dict) or not isinstance(applied, dict):
+        raise DispatchContractError("consumer-respawn-launch-record-unavailable", "resolved")
+    worktree = Path(fields[3])
+    if recorded_values is None:
+        recorded_values = _resolve_recorded_supervisor_values(
+            record, fields, metadata, jobs, effective, recorded_home=recorded_home)
+    sandbox = metadata.get("runtime_sandbox", "")
+    if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
+        raise DispatchContractError("consumer-respawn-launch-record-unavailable", "runtime_sandbox")
+    approval = metadata.get("approval") or applied.get("approval")
+    if approval is None:
+        approval = _recorded_argv_value(record.get("argv"), "--approval")
+    if approval not in {"untrusted", "on-request", "never", "inherit"}:
+        raise DispatchContractError("consumer-respawn-launch-record-unavailable", "approval")
+
+    settings = resolved.get("resolved_model_settings")
+    if (not isinstance(settings, dict)
+            or any(not isinstance(settings.get(key), str) or not settings.get(key)
+                   for key in ("source", "model", "reasoning", "context_window"))):
         raise DispatchContractError("consumer-respawn-launch-record-unavailable",
-                                    "commit_policy.may_commit-changed")
+                                    "resolved_model_settings")
+    runtime_dir = recorded_values["runtime_dir"]
+    if runtime_dir not in {Path(root) for root in effective["writable_roots"]}:
+        raise DispatchContractError("consumer-respawn-launch-record-unavailable",
+                                    "execution_access_writable_roots:runtime_dir")
+    route_file = recorded_values["route_file"]
+    route_id = recorded_values["route_id"]
+    route_hash = recorded_values["route_hash"]
 
     command = [sys.executable, str(ROOT / "utilities" / "codex-app-server-supervisor.py"),
                "--worktree", str(worktree), "--jobs", str(jobs),
@@ -1409,7 +1528,7 @@ def recorded_supervisor_command(record: dict, fields: list[str], metadata: dict[
     maximum = _recorded_argv_value(record.get("argv"), "--max-continuations")
     if maximum is not None:
         command.extend(("--max-continuations", maximum))
-    if commit_record["may_commit"]:
+    if recorded_values["may_commit"]:
         command.append("--primary-git-commit")
     if settings["source"] != "inherit":
         command.extend(("--model", settings["model"], "--reasoning", settings["reasoning"]))
@@ -1490,14 +1609,18 @@ def respawn_supervised_owner(jobs, attempt_id, *, expected_identity):
     route_hash = metadata.get("owner_route_hash") or metadata.get("route_hash") or ""
     effective = _recorded_effective_grant(jobs, attempt_id, metadata, route_id, route_hash)
     try:
+        recorded_values = _resolve_recorded_supervisor_values(
+            launch, row_fields, metadata, jobs, effective,
+            recorded_home=worker_env.get("HOME", ""))
         shell = recorded_supervisor_command(
             launch, row_fields, metadata, jobs, state_path, lease_path,
-            None, log_path, effective,
+            None, log_path, effective, recorded_values=recorded_values,
         )
     except DispatchContractError as exc:
         return {"state": "not-started", "reason": exc.reason + ":" + exc.detail}
 
     artifact_root = str(Path(metadata["artifact_root"]).resolve(strict=False))
+    runtime_dir = str(recorded_values["runtime_dir"])
     try:
         artifact_env = prepare_route_artifact_env(
             Path(route_file), start=False, jobs=jobs, require_cycle=False)
@@ -1507,15 +1630,10 @@ def respawn_supervised_owner(jobs, attempt_id, *, expected_identity):
     if artifact_env.get("AGENT_ARTIFACT_ROOT") != artifact_root:
         return {"state": "not-started",
                 "reason": "consumer-respawn-launch-record-unavailable:artifact_root"}
-    runtime_dir = str(resolved.get("runtime_dir") or "")
-    if not runtime_dir:
-        return {"state": "not-started",
-                "reason": "consumer-respawn-launch-record-unavailable:runtime_dir"}
-    runtime_path = Path(runtime_dir)
-    if (not runtime_path.is_absolute() or not runtime_path.is_dir() or runtime_path.is_symlink()
-            or str(runtime_path.resolve(strict=False)) != runtime_dir):
-        return {"state": "not-started",
-                "reason": "consumer-respawn-launch-record-unavailable:runtime_dir"}
+    # Artifact-cycle selection has no runtime-root input. Bind its returned
+    # environment to the one path resolved above before any recovery prompt or
+    # child environment is constructed.
+    artifact_env["AGENT_RUNTIME_DIR"] = runtime_dir
 
     parent_session = resolved.get("parent_session_id") or metadata.get("parent_sid", "")
     if metadata.get("parent_sid") and parent_session != metadata.get("parent_sid"):
@@ -1619,6 +1737,7 @@ def respawn_supervised_owner(jobs, attempt_id, *, expected_identity):
     else:
         dispatch_env.pop("AGENT_DISPATCH_EXECUTION_ACCESS_FILE", None)
     dispatch_env.update(worker_env)
+    dispatch_env["AGENT_RUNTIME_DIR"] = runtime_dir
     dispatch_env.update(parent_completion.worker_runtime_identity("codex"))
     dispatch_env.update(git_optional_locks_env())
     permission_args = SimpleNamespace(
@@ -1703,12 +1822,13 @@ def respawn_supervised_owner(jobs, attempt_id, *, expected_identity):
         reason = str(failure.get("reason")) if failure else exc.reason
         detail = str(failure.get("detail")) if failure else exc.detail
         return {"state": "not-started", "reason": reason, "detail": detail,
-                "launch_home": launch_home, "respawn_release": str(ROOT)}
+                "launch_home": launch_home, "respawn_release": str(ROOT),
+                "runtime_dir": runtime_dir}
     except (OSError, ValueError, TypeError) as exc:
         cancel_governor_reservation(governor, governor_root, token)
         return {"state": "not-started", "reason": "consumer-respawn-launch-failed",
                 "detail": type(exc).__name__, "launch_home": launch_home,
-                "respawn_release": str(ROOT)}
+                "respawn_release": str(ROOT), "runtime_dir": runtime_dir}
     finally:
         for fd in (failure_read_fd, failure_write_fd):
             try:
@@ -1726,6 +1846,7 @@ def respawn_supervised_owner(jobs, attempt_id, *, expected_identity):
         "pid_start": current.get("pid_start"),
         "owner_identity_lineage": current.get("owner_identity_lineage", ""),
         "launch_home": launch_home, "respawn_release": str(ROOT),
+        "runtime_dir": runtime_dir,
     }
 
 
