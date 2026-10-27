@@ -286,7 +286,7 @@ def _resource_json_object(pairs):
 
 
 def _resource_payload_input_hashes(request, launch_request_value, argv, command):
-    """Validate and return all declared input hashes for an operation payload."""
+    """Validate execution inputs; request bytes retain descriptive provenance."""
     provenance = request.get("provenance")
     if provenance is None:
         provenance = {}
@@ -338,10 +338,7 @@ def _resource_payload_input_hashes(request, launch_request_value, argv, command)
         "config_sha256": "--config",
         "data_lock_sha256": "--data-lock",
         "gpu_smoke_sha256": "--smoke",
-    }
-    recognized_provenance_hashes = {
-        *argv_hash_fields, "smoke_attestation_sha256", "config_manifest_sha256",
-        "bridge_sha256", "bridge_base_sha256",
+        "resume_checkpoint_sha256": "--resume",
     }
     for field, flag in argv_hash_fields.items():
         expected = provenance.get(field)
@@ -373,14 +370,20 @@ def _resource_payload_input_hashes(request, launch_request_value, argv, command)
             return None
         hashes["bridge_sha256"] = bridge_hash
 
-    for field, expected in provenance.items():
-        if field.endswith("_sha256") and field not in recognized_provenance_hashes:
-            return None
+    # Source-bridge/cache history is part of the exact request, not another
+    # executable input. Only hashes tied to the effective payload are checked
+    # above; arbitrary provenance names cannot add new launch requirements.
     for field, expected in request.items():
         if not field.endswith("_sha256") or field in {
                 "smoke_attestation_sha256", "config_manifest_sha256"}:
             continue
         path = request.get(field[:-7]) or request.get(field[:-7] + "_path")
+        if field == "resume_checkpoint_sha256":
+            selected = option_path("--resume")
+            if not selected or not path or Path(selected).resolve() != Path(path).resolve():
+                return None
+            if hashes.get(field) == expected:
+                continue
         if not add_hash(field, path, expected):
             return None
     return hashes
@@ -525,10 +528,21 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
     command_record = None
     command_record_path = None
     command_record_bytes = None
-    evidence_path = request.get("Dev_admission_evidence")
-    if isinstance(evidence_path, str) and Path(evidence_path).is_absolute():
-        directory = Path(evidence_path).resolve(strict=False).parent
-        command_records = []
+    # Existing artifact paths locate records for Dev, resume and other normal
+    # owner requests alike. They grant no authority: the exact request digest
+    # and command/options below still have to identify one matching record.
+    directories = {request_path.parent}
+    for value in request.values():
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            continue
+        try:
+            directory = Path(value).resolve(strict=False).parent
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if directory.is_relative_to(artifact_root):
+            directories.add(directory)
+    command_records = []
+    for directory in sorted(directories):
         for candidate_path in sorted(directory.glob("*resource-start-command.json")):
             if candidate_path.is_symlink():
                 continue
@@ -542,8 +556,8 @@ def resource_operation_binding(route, route_file, node, run_id, command, cwd,
                     and record_value.get("request_sha256") == hashlib.sha256(request_bytes).hexdigest()
                     and isinstance(record_value.get("argv"), list)):
                 command_records.append((candidate_path.resolve(strict=True), raw_record, record_value))
-        if len(command_records) == 1:
-            command_record_path, command_record_bytes, command_record = command_records[0]
+    if len(command_records) == 1:
+        command_record_path, command_record_bytes, command_record = command_records[0]
     if command_record is None:
         return None
     argv = command_record["argv"]
@@ -830,9 +844,29 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                     raise ValueError("resource-reservation-changed")
         current = data["runs"].get(args.run_id)
         if current is not None:
-            if any(current.get(k) != placeholder.get(k) for k in keys):
+            immutable_keys = tuple(k for k in keys if k != "resource_operation")
+            if any(current.get(k) != placeholder.get(k) for k in immutable_keys):
                 raise ValueError("resource-route-body-conflict")
-            return False, current
+            operation = placeholder.get("resource_operation")
+            reprepare = (ledger is not None and owner_wait
+                and isinstance(operation, dict)
+                and current.get("resource_operation") in (None, operation)
+                and current.get("session") == placeholder.get("session")
+                and current.get("launch_state") == "not-started"
+                and current.get("payload_spawned") is not True
+                and not any(current.get(k) is not None for k in (
+                    "pid", "starttime", "command_hash", "process_group", "pid_namespace",
+                    "launch_controller", "launch_argv", "supervision", "execution"))
+                and RR.resource_never_started(current)
+                and supervisor_resource_watch_for_run(
+                    sup, ledger, args.node, registry, args.run_id) is None)
+            if not reprepare:
+                if current.get("resource_operation") != operation:
+                    raise ValueError("resource-route-body-conflict")
+                return False, current
+            # The launcher positively recorded no execution and never armed
+            # this run. Re-prepare its same reservation, not a replacement run.
+            matches = [row for row in matches if row is not current]
         for previous in matches:
             if reboot_evidence(previous):
                 settle(registry, previous['run_id'], previous, data=data)
@@ -844,6 +878,10 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                                           observations=captured_compute)
         else:
             require_resource_predecessors([*matches, *history], placeholder)
+        if current is not None:
+            ledger._append({"at": WS.now_iso(), "route_id": route["route_id"],
+                "route_hash": route.get("route_hash"), "actor": "resource-prelaunch-retry",
+                "evidence": {"previous_resource": current, "next_resource": args.run_id}})
         data["runs"][args.run_id] = placeholder
         return True, placeholder
     with ledger.lock() if ledger else contextlib.nullcontext():
