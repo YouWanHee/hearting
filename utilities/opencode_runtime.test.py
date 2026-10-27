@@ -48,7 +48,9 @@ class OpenCodeRunCodecTest(unittest.TestCase):
             script.write_text(
                 "#!/usr/bin/env python3\n"
                 "import os, pathlib, sys\n"
-                "assert pathlib.Path(os.environ['HOME']).is_relative_to(pathlib.Path(os.environ['TMPDIR']))\n"
+                f"store = pathlib.Path({str(root)!r})\n"
+                "assert pathlib.Path(os.environ['HOME']).is_relative_to(store)\n"
+                "assert pathlib.Path(os.environ['TMPDIR']).is_relative_to(store)\n"
                 "assert os.environ['XDG_DATA_HOME'] != '/user/data'\n"
                 "assert 'secret' not in os.environ\n"
                 "print('opencode 2.0.32')\n",
@@ -82,7 +84,7 @@ class OpenCodeRunCodecTest(unittest.TestCase):
             script = Path(temp) / "opencode"
             script.write_text(
                 "#!/usr/bin/env python3\nimport os, pathlib, sys, time\n"
-                "target = pathlib.Path(os.environ['TMPDIR']) / 'version.out'\n"
+                "target = pathlib.Path(os.environ['HOME']).parent / 'version.out'\n"
                 "sys.stdout.write('opencode 2.0.32\\n'); sys.stdout.flush()\n"
                 "deadline = time.monotonic() + 1\n"
                 "while target.stat().st_size < 16 and time.monotonic() < deadline: time.sleep(.001)\n"

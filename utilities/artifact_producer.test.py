@@ -2044,6 +2044,61 @@ class SelfExclusionPayloadTest(ProducerTestBase):
 
 
 class DirectoryBundleFinalizeTest(ProducerTestBase):
+    def test_first_seal_excludes_raw_cache_links_and_keeps_result_files(self):
+        self.activate()
+        route, route_file, result = self.begin()
+        cycle = Path(result["cycle_dir"])
+        raw = cycle / "artifacts" / "raw-results"
+        raw.mkdir(parents=True)
+        kept = raw / "result.csv"
+        kept.write_bytes(b"measured result\n")
+        self.write_output(result, "reports/final_report.md", b"report\n")
+        external = Path(self._tmp.name) / "external-cache"
+        external.mkdir()
+        target = external / "payload.bin"
+        target.write_bytes(b"runtime data remains outside the cycle\n")
+        links = [raw / "cache", raw / "cached-file", raw / "missing-cache"]
+        links[0].symlink_to(external, target_is_directory=True)
+        links[1].symlink_to(target)
+        links[2].symlink_to(external / "absent")
+        before = {link: (link.lstat().st_ino, os.readlink(link)) for link in links}
+        self.close(route, route_file)
+
+        scandir = os.scandir
+        stream_facts = P._stream_file_facts
+
+        def reject_target(path):
+            if isinstance(path, (str, os.PathLike)):
+                candidate = Path(path)
+                self.assertFalse(any(candidate == forbidden or forbidden in candidate.parents
+                                     for forbidden in [external, *links]), candidate)
+
+        def no_target_scandir(path):
+            reject_target(path)
+            return scandir(path)
+
+        def no_target_hash(path):
+            reject_target(path)
+            return stream_facts(path)
+
+        with mock.patch.object(os, "scandir", side_effect=no_target_scandir), \
+                mock.patch.object(P, "_stream_file_facts", side_effect=no_target_hash):
+            sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed")
+        document = json.loads((cycle / "manifest.json").read_text())
+        revisions = {row["locator"]["path"]: row for row in document["artifact_revisions"]}
+        self.assertIn("artifacts/raw-results/result.csv", revisions)
+        self.assertEqual(revisions["artifacts/raw-results/result.csv"]["content_digest"],
+                         m.digest_bytes(b"measured result\n"))
+        self.assertFalse(any(row["type"] == "directory-bundle" for row in document["artifacts"]))
+        record = P.read_cycle_record(self.root, result["cycle_id"])
+        self.assertEqual(set(record["excluded_symlinks"]),
+                         {link.relative_to(cycle).as_posix() for link in links})
+        self.assertEqual({link: (link.lstat().st_ino, os.readlink(link)) for link in links}, before)
+        self.assertEqual(target.read_bytes(), b"runtime data remains outside the cycle\n")
+        self.assertEqual(kept.read_bytes(), b"measured result\n")
+        self.assertEqual(P.artifact_lifecycle.verify_artifact_revisions(document, cycle), ())
+
     def test_bundle_cardinality_1_100_10000(self):
         self.activate()
         observed = []

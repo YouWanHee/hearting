@@ -289,9 +289,18 @@ class HerdrCollectorTest(unittest.TestCase):
                 "foreground_processes": [{"pid": 2438296, "name": "codex"}]}}}))
 
         tui = Session(harness="codex", pid=2438296, cwd="/project", proc_start="123")
+
+        def current_thread(pane, pid, *, process_info=None):
+            self.assertEqual((pane, pid), ("wB:p13", tui.pid))
+            self.assertEqual(process_info, {
+                "shell_pid": 2437902,
+                "foreground_processes": [{"pid": 2438296, "name": "codex"}],
+            })
+            return sid
+
         with mock.patch.object(procscan, "read_proc_start", return_value="123"), \
                 mock.patch.object(pane_ownership, "current_codex_thread",
-                                  side_effect=lambda pane, pid: sid if pane == "wB:p13" and pid == tui.pid else ""):
+                                  side_effect=current_thread):
             found = herdr.codex_pane_sessions([tui], panes=panes, runner=runner)
         self.assertEqual(found, {2438296: sid})
         self.assertEqual(calls, ["wB:p13"])

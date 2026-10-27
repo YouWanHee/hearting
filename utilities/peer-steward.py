@@ -420,8 +420,8 @@ def _prompt_inventory_panes(agents):
             and isinstance(agent.get("pane_id"), str) and agent["pane_id"]}
 
 
-def _prompt_candidate_snapshot():
-    """Join the complete selected-endpoint pane census to herdr's agent list."""
+def _prompt_candidate_snapshot(target, *, wanted_tag=None):
+    """Discover address candidates before proving their exact native identities."""
     agents, inventory_error = _prompt_agent_inventory()
     census = herdr_observation.pane_census(session=_HERDR_SESSION)
     endpoint = herdr_observation.endpoint_name(_HERDR_SESSION)
@@ -484,33 +484,75 @@ def _prompt_candidate_snapshot():
             continue
         row = listed[0]
         census_session = item.get("agent_session")
+        census_sid, census_error = None, None
         if census_session is not None:
             if (not isinstance(census_session, dict)
                     or census_session.get("kind") not in (None, "id")):
-                unknown_panes.add(pane)
-                unknown_reason = unknown_reason or "pane-census-malformed"
-                continue
-            census_sid = peer_message.usable_session_id(census_session.get("value"))
-            if census_session.get("value") not in (None, "", "-") and not census_sid:
-                unknown_panes.add(pane)
-                unknown_reason = unknown_reason or "pane-census-malformed"
-                continue
-            if census_sid and row.get("session_id") and census_sid != row["session_id"]:
-                unknown_panes.add(pane)
-                unknown_reason = unknown_reason or "target-identity-changed"
-                continue
-        else:
-            census_sid = None
+                census_error = "pane-census-malformed"
+            else:
+                census_sid = peer_message.usable_session_id(census_session.get("value"))
+                if census_session.get("value") not in (None, "", "-") and not census_sid:
+                    census_error = "pane-census-malformed"
+
+        # Names, selected-pane metadata, and shared tags locate candidates. They
+        # do not establish identity; only matching panes reach native proof.
+        observed = _retire_target(pane)
+        observed_ident = (observed[1] if isinstance(observed, tuple)
+                          and len(observed) > 1 and isinstance(observed[1], dict) else {})
+        observed_sid = peer_message.usable_session_id(observed_ident.get("session_id"))
+        sid_hints = list(dict.fromkeys(
+            sid for sid in (census_sid, row.get("session_id"), observed_sid) if sid))
+        name_values = [row.get("name"), observed_ident.get("name"),
+                       item.get("display_agent"), item.get("title"),
+                       item.get("terminal_title_stripped")]
+        names = {value for value in name_values
+                 if isinstance(value, str) and value and value != "-"}
+        for sid_hint in sid_hints:
+            try:
+                registry_name = _from_name(harness, sid_hint)
+            except Exception:
+                registry_name = None
+            if isinstance(registry_name, str) and registry_name and registry_name != "-":
+                names.add(registry_name)
+
+        name_match = target in names
+        name_unresolved = not names and not sid_hints
+        tag_match, tag_unresolved = False, False
+        if wanted_tag is not None:
+            if not sid_hints:
+                tag_unresolved = True
+            for sid_hint in sid_hints:
+                current_tag, tag_error = _prompt_fleet_tag(
+                    harness, sid_hint, pane=pane,
+                    cwd=item.get("cwd") or item.get("foreground_cwd"))
+                if tag_error:
+                    tag_unresolved = True
+                elif current_tag == wanted_tag:
+                    tag_match = True
+        if (not name_match and not name_unresolved
+                and not tag_match and not tag_unresolved):
+            continue
+
+        if census_error:
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or census_error
+            continue
+        if (census_sid and row.get("session_id")
+                and census_sid != row["session_id"]):
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "target-identity-changed"
+            continue
         if row["harness"] != harness:
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or "target-identity-changed"
             continue
-        if row.get("session_id") and census_sid and row["session_id"] != census_sid:
+        expected_sid = census_sid or row.get("session_id") or observed_sid
+        if (observed_ident.get("harness") not in (None, harness)
+                or observed_ident.get("pane") not in (None, pane)
+                or (expected_sid and observed_sid and expected_sid != observed_sid)):
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or "target-identity-changed"
             continue
-        expected_sid = census_sid or row.get("session_id")
-        observed = _retire_target(pane)
         candidate, reason = _prompt_current_candidate(
             pane, expected_harness=harness, expected_sid=expected_sid,
             require_process_session=True, target_observation=observed)
@@ -518,19 +560,28 @@ def _prompt_candidate_snapshot():
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or reason or "target-identity-unverified"
             continue
-        names = {value for value in (row.get("name"), candidate.get("name"),
-                 item.get("display_agent"), item.get("title"),
-                 item.get("terminal_title_stripped"))
-                 if isinstance(value, str) and value and value != "-"}
+        if isinstance(candidate.get("name"), str) and candidate["name"] != "-":
+            names.add(candidate["name"])
         try:
             registry_name = _from_name(harness, candidate["session_id"])
         except Exception:
             registry_name = None
         if isinstance(registry_name, str) and registry_name and registry_name != "-":
             names.add(registry_name)
+        name_match = name_match or target in names
         if not names:
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or "target-name-observation-unavailable"
+            continue
+        if wanted_tag is not None and (tag_match or tag_unresolved):
+            current_tag, tag_error = _prompt_fleet_tag(
+                candidate["harness"], candidate["session_id"], pane=candidate["pane"],
+                cwd=item.get("cwd") or item.get("foreground_cwd"))
+            if tag_error or current_tag != wanted_tag:
+                unknown_panes.add(pane)
+                unknown_reason = unknown_reason or tag_error or "target-identity-changed"
+                continue
+        elif not name_match:
             continue
         row_cwd = item.get("cwd") or item.get("foreground_cwd")
         rows.append({**candidate, "names": names, "cwd": row_cwd,
@@ -569,10 +620,11 @@ def _resolve_prompt_target(target):
         candidate, reason = _prompt_current_candidate(target)
         return (candidate, None, [target]) if candidate else (None, reason, [target])
 
-    rows, snapshot_error, unknown_panes = _prompt_candidate_snapshot()
+    wanted_tag = tag_match.group(1).lower() if is_tag else None
+    rows, snapshot_error, unknown_panes = _prompt_candidate_snapshot(
+        target, wanted_tag=wanted_tag)
     if rows is None:
         return None, snapshot_error or "target-observation-unavailable", unknown_panes
-    wanted_tag = tag_match.group(1).lower() if is_tag else None
     matches = {}
     uncertain = set(unknown_panes)
     uncertainty_reason = snapshot_error

@@ -203,6 +203,54 @@ class DurableOverTest(_TmpStoreCase):
         result = memcol.collect(now=datetime.datetime(2026, 7, 11, 12, 0, 0))
         self.assertEqual(result["alerts"]["durable_over"], [])
 
+
+class BacklogMetadataReadTest(_TmpStoreCase):
+    def test_database_extension_is_opt_in_and_default_journal_contract_is_unchanged(self):
+        with mock.patch.object(memcol, "_read_backlog_records",
+                               side_effect=AssertionError("default collector must not query DB")):
+            self.assertIsNone(memcol.collect(include_summary=False))
+
+    def test_backlog_reads_only_active_explicit_metadata_in_read_only_mode(self):
+        db = self.store / "memory.db"
+        con = sqlite3.connect(str(db))
+        con.execute("""CREATE TABLE records (
+            id TEXT, tier TEXT, scope TEXT, cwd_origin TEXT, type TEXT, source TEXT,
+            tags TEXT, links TEXT, body TEXT, headline TEXT, artifact_refs TEXT,
+            status TEXT, canonical_id TEXT, superseded_by TEXT, updated TEXT,
+            delivery_state TEXT, injection_flag INTEGER)""")
+        con.executemany("INSERT INTO records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [
+            ("todo-1", "durable", "project", "git:github.com/team/repo", "project",
+             "user-backlog:fixture", '["fleet","backlog"]', '["rt-0123456789abcdef"]',
+             "PRIVATE-BODY-SENTINEL", "[Backlog] fix repo view", '["rt-0123456789abcdef"]',
+             "active", "todo-1", None, "2026-10-26", "ordinary", 0),
+            ("note-1", "durable", "project", "git:github.com/team/repo", "fact",
+             "manual", '["fleet"]', "[]", "NOT-A-BACKLOG", "fact", "[]",
+             "active", "note-1", None, "2026-10-25", "ordinary", 0),
+            ("old-1", "durable", "project", "git:github.com/team/repo", "project",
+             "user-backlog:old", '["backlog"]', "[]", "SUPERSEDED-BODY", "old", "[]",
+             "superseded", "old-1", "todo-1", "2026-10-24", "ordinary", 0),
+        ])
+        con.commit()
+        con.close()
+        before = db.read_bytes()
+
+        result = memcol.collect(include_summary=False, include_backlog=True)
+
+        self.assertEqual(result["database"]["state"], "success")
+        records = result["database"]["by_repo"]["repo"]
+        self.assertEqual([item["id"] for item in records], ["todo-1"])
+        self.assertEqual(records[0]["canonical_id"], "todo-1")
+        self.assertEqual(records[0]["artifact_refs"], ("rt-0123456789abcdef",))
+        self.assertNotIn("body", records[0])
+        self.assertNotIn("PRIVATE-BODY-SENTINEL", repr(result))
+        self.assertNotIn("SUPERSEDED-BODY", repr(result))
+        self.assertEqual(db.read_bytes(), before)
+
+    def test_database_unavailable_is_not_reported_as_empty_backlog(self):
+        result = memcol.collect(include_summary=False, include_backlog=True)
+        self.assertEqual(result["database"]["state"], "unavailable")
+        self.assertIsNone(result["database"]["record_count"])
+
     def test_corrupt_db_degrades_to_empty(self):
         (self.store / "memory.db").write_text("not a sqlite file", encoding="utf-8")
         _write_lines(self.journal, [_event("2026-07-11T09:00:00", "add")])
