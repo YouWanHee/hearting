@@ -2,7 +2,9 @@
 
 from dataclasses import dataclass, field, replace
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 import json
+import math
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,55 @@ class NavState:
 
 
 VIEWS = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE", "MEMORY", "MODELS", "SYSTEM")
+
+
+_MODEL_FIND_FOLDS = ("ui:mfind", "ui:mfocus", "ui:mcursor")
+
+
+def models_finding(state):
+    """The MODELS model list holds the keyboard: typed characters filter it instead of acting."""
+    return (getattr(state, "view", None) == "MODELS" and getattr(state, "scope", "-") == "-"
+            and state.fold_map().get("ui:mfocus") == "1")
+
+
+def _models_find_hit(frame):
+    return next((hit for hit in getattr(frame, "hits", ())
+                 if hit.action[:1] == ("models.find",) and len(hit.action) >= 6), None)
+
+
+def _models_find_key(state, key, hit):
+    """One key while the model list is focused; ``None`` leaves the key to the shared handling."""
+    _name, count, item, cursor, top, rows = hit.action[:6]
+    count, cursor, top, rows = int(count), int(cursor), int(top), max(1, int(rows))
+    folds = state.fold_map()
+    offsets = dict(state.scroll)
+    if key in ("escape", "esc"):
+        folds.pop("ui:mfocus", None)
+    elif key in ("enter", "\n"):
+        if not item:
+            return state
+        folds["ui:model"] = str(item)
+    elif key == "backspace" or (isinstance(key, str) and key.startswith("text:")):
+        text = folds.get("ui:mfind", "")
+        text = text[:-1] if key == "backspace" else (text + key[5:])[:80]
+        folds["ui:mfind"] = text
+        folds["ui:mcursor"] = "0"
+        offsets["mpick"] = 0
+    elif key in ("up", "down", "pageup", "pagedown", "home", "end"):
+        if not count:
+            return state
+        cursor = {"up": cursor - 1, "down": cursor + 1, "pageup": cursor - rows,
+                  "pagedown": cursor + rows, "home": 0, "end": count - 1}[key]
+        cursor = max(0, min(count - 1, cursor))
+        if cursor < top:
+            top = cursor
+        elif cursor >= top + rows:
+            top = cursor - rows + 1
+        folds["ui:mcursor"] = str(cursor)
+        offsets["mpick"] = max(0, min(max(0, count - rows), top))
+    else:
+        return None
+    return replace(state, folds=tuple(sorted(folds.items())), scroll=tuple(sorted(offsets.items())))
 
 
 def _scroll_region(frame, name):
@@ -89,8 +140,8 @@ def _question_supports_reply(detail):
     return isinstance(detail.get("native_ref"), Mapping)
 
 
-def question_items(detail):
-    """Normalize native single and multi-question detail for the private editor."""
+def _question_schema_items(detail):
+    """Return every field from the exact selected schema, before UI visibility rules."""
     if not isinstance(detail, Mapping):
         return ()
     body = detail.get("detail")
@@ -108,12 +159,18 @@ def question_items(detail):
                 continue
             item = dict(question)
             item["id"] = str(question_id)
-            if detail.get("harness") == "opencode" and isinstance(native_ref, Mapping):
+            if (detail.get("harness") == "opencode" and isinstance(native_ref, Mapping)
+                    and len(questions) == 1):
                 for source, target in (("field_type", "field_type"), ("custom", "custom"),
                                        ("min_items", "min_items"),
-                                       ("max_items", "max_items")):
-                    if source in native_ref:
+                                       ("max_items", "max_items"),
+                                       ("option_values", "option_values")):
+                    if target not in item and source in native_ref:
                         item[target] = native_ref[source]
+            if (detail.get("harness") == "opencode" and item.get("field_type") == "boolean"
+                    and not item.get("choices")):
+                item["choices"] = [{"value": "true", "label": "Yes"},
+                                    {"value": "false", "label": "No"}]
             result.append(item)
         return tuple(result)
     question_id = detail.get("question_id")
@@ -129,14 +186,73 @@ def question_items(detail):
         item["is_other"] = bool(body.get("is_other"))
     native_ref = detail.get("native_ref")
     if detail.get("harness") == "opencode" and isinstance(native_ref, Mapping):
-        for key in ("field_type", "custom", "min_items", "max_items"):
-            if key in native_ref:
+        for key in ("field_type", "custom", "min_items", "max_items", "option_values"):
+            if key not in item and key in native_ref:
                 item[key] = native_ref[key]
+    if detail.get("harness") == "opencode" and item.get("field_type") == "boolean":
+        item["choices"] = [{"value": "true", "label": "Yes"},
+                            {"value": "false", "label": "No"}]
     return (item,)
 
 
+def question_items(detail):
+    """Return visible fields, hiding hidden fields and unsatisfied conditions."""
+    if not isinstance(detail, Mapping):
+        return ()
+    questions = _question_schema_items(detail)
+    native = detail.get("native_ref") if isinstance(detail, Mapping) else None
+    if (detail.get("harness") != "opencode" or not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"):
+        return questions
+    active = detail.get("_fleet_active_field_keys")
+    if not isinstance(active, (list, tuple)):
+        active = _question_active_field_keys(detail, {})
+    active = set(active)
+    return tuple(question for question in questions
+                 if question.get("id") in active and question.get("hidden") is not True)
+
+
+def _question_empty_hidden_optional_v2_form(detail):
+    """Allow explicit empty submission only for a complete optional hidden V2 schema."""
+    if (not isinstance(detail, Mapping) or detail.get("kind") != "question"
+            or detail.get("state") != "open"
+            or detail.get("harness") != "opencode"):
+        return False
+    native = detail.get("native_ref")
+    if (not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"):
+        return False
+    fields = _question_schema_items(detail)
+    field_keys = native.get("field_keys")
+    if (not fields or not isinstance(field_keys, (list, tuple))
+            or len(field_keys) != len(fields)
+            or tuple(field_keys) != tuple(item["id"] for item in fields)
+            or len(set(field_keys)) != len(field_keys)):
+        return False
+    if question_items(detail):
+        return False
+    supported_types = {"string", "number", "integer", "boolean", "multiselect"}
+    return all(item.get("hidden") is True
+               and item.get("required") is False
+               and item.get("field_type") in supported_types
+               for item in fields)
+
+
 def question_answer_supported(detail):
-    return _question_supports_reply(detail) and bool(question_items(detail))
+    if not isinstance(detail, Mapping):
+        return False
+    if not _question_supports_reply(detail):
+        return False
+    questions = question_items(detail)
+    if questions:
+        if (detail.get("harness") == "opencode"
+                and isinstance(detail.get("native_ref"), Mapping)
+                and detail["native_ref"].get("transport") == "opencode-http-v2"
+                and any(item.get("hidden") is True and item.get("required") is True
+                        for item in _question_schema_items(detail))):
+            return False
+        return True
+    return _question_empty_hidden_optional_v2_form(detail)
 
 
 def question_draft_supported(detail):
@@ -195,13 +311,14 @@ def question_free_text_supported(detail, question_id):
                 or choices is None
                 or isinstance(choices, (list, tuple)) and not choices)
     if detail.get("harness") == "opencode":
-        field_type = (native_ref.get("field_type") if isinstance(native_ref, Mapping)
-                      else question.get("field_type"))
+        field_type = question.get("field_type")
         if field_type == "string":
+            return (question.get("options_present") is not True
+                    or question.get("custom") is True)
+        if field_type in {"number", "integer"}:
             return True
         if field_type == "multiselect":
-            return bool(native_ref.get("custom", question.get("custom", False))
-                        if isinstance(native_ref, Mapping) else question.get("custom", False))
+            return question.get("custom") is True
         return False
     choices = question.get("choices", question.get("options"))
     if question.get("is_other") is True:
@@ -213,43 +330,28 @@ def question_multiple_select(detail, question_id):
     question = next((item for item in question_items(detail) if item["id"] == question_id), None)
     if question is None or detail.get("harness") != "opencode":
         return False
-    native_ref = detail.get("native_ref")
-    if not isinstance(native_ref, Mapping):
+    if question.get("field_type") != "multiselect":
         return False
-    if native_ref.get("field_type") != "multiselect":
-        return False
-    minimum, maximum = native_ref.get("min_items"), native_ref.get("max_items")
+    minimum, maximum = question.get("min_items"), question.get("max_items")
     return ((minimum is not None and type(minimum) is int and minimum > 1)
             or maximum is None or (type(maximum) is int and maximum > 1))
 
 
 def question_values_valid(detail, question_id, values):
-    question = next((item for item in question_items(detail) if item["id"] == question_id), None)
-    if (question is None or not isinstance(values, (list, tuple)) or not values
-            or any(not isinstance(value, str) or not value.strip() for value in values)):
+    question = next((item for item in _question_schema_items(detail)
+                     if item["id"] == question_id), None)
+    if question is None:
         return False
     workflow = _question_uses_workflow_transport(detail)
-    if detail.get("harness") == "opencode" and not workflow:
-        native_ref = detail.get("native_ref")
-        if not isinstance(native_ref, Mapping):
-            return False
-        field_type = native_ref.get("field_type")
-        if field_type == "string":
-            return len(values) == 1
-        if field_type != "multiselect":
-            return False
-        minimum, maximum = native_ref.get("min_items"), native_ref.get("max_items")
-        if ((minimum is not None and (type(minimum) is not int or minimum < 0))
-                or (maximum is not None and (type(maximum) is not int or maximum < 0))
-                or (minimum is not None and maximum is not None and minimum > maximum)):
-            return False
-        if ((minimum is not None and len(values) < minimum)
-                or (maximum is not None and len(values) > maximum)
-                or len(set(values)) != len(values)):
-            return False
-        allowed = native_ref.get("option_values")
-        return (isinstance(allowed, list)
-                and (native_ref.get("custom") is True or all(value in allowed for value in values)))
+    if (detail.get("harness") == "opencode" and not workflow
+            and isinstance(detail.get("native_ref"), Mapping)
+            and detail["native_ref"].get("transport") == "opencode-http-v2"):
+        return _question_values_valid_item(question, values)
+    if (values is None or isinstance(values, (list, tuple)) and not values):
+        return False
+    if (not isinstance(values, (list, tuple))
+            or any(not isinstance(value, str) or not value.strip() for value in values)):
+        return False
     choices = question.get("choices", question.get("options"))
     if (isinstance(choices, (list, tuple)) and (choices or not workflow)
             and question.get("is_other") is not True):
@@ -258,18 +360,178 @@ def question_values_valid(detail, question_id, values):
     return True
 
 
+def _question_decimal(value):
+    if type(value) not in (int, float, str):
+        return None
+    if type(value) is float and not math.isfinite(value):
+        return None
+    try:
+        number = Decimal(value.strip() if isinstance(value, str) else str(value))
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+    return number if number.is_finite() else None
+
+
+def _question_values_valid_item(question, values):
+    if values is None or isinstance(values, (list, tuple)) and not values:
+        return question.get("required") is not True
+    if not isinstance(values, (list, tuple)):
+        return False
+    field_type = question.get("field_type")
+    required = question.get("required") is True
+    if field_type == "string":
+        if len(values) != 1 or not isinstance(values[0], str):
+            return False
+        value = values[0]
+        if value == "":
+            return not required
+        try:
+            length = len(value.encode("utf-16-le")) // 2
+        except UnicodeEncodeError:
+            return False
+        minimum, maximum = question.get("min_length"), question.get("max_length")
+        if ((minimum is not None and length < minimum)
+                or (maximum is not None and length > maximum)):
+            return False
+        if (question.get("options_present") and question.get("custom") is not True
+                and value not in question.get("option_values", ())):
+            return False
+        return True
+    if field_type in {"number", "integer"}:
+        if len(values) != 1:
+            return False
+        raw = values[0]
+        if isinstance(raw, str) and not raw.strip():
+            return not required
+        number = _question_decimal(raw)
+        minimum = (_question_decimal(question.get("minimum"))
+                   if question.get("minimum") is not None else None)
+        maximum = (_question_decimal(question.get("maximum"))
+                   if question.get("maximum") is not None else None)
+        if ((question.get("minimum") is not None and minimum is None)
+                or (question.get("maximum") is not None and maximum is None)
+                or number is None):
+            return False
+        if ((minimum is not None and number < minimum)
+                or (maximum is not None and number > maximum)):
+            return False
+        if field_type == "integer":
+            return (-9007199254740991 <= number <= 9007199254740991
+                    and number == number.to_integral_value())
+        native = float(number)
+        return math.isfinite(native) and Decimal(str(native)) == number
+    if field_type == "boolean":
+        if len(values) != 1:
+            return False
+        value = values[0]
+        return (type(value) is bool or value in ("true", "false"))
+    if field_type == "multiselect":
+        if any(not isinstance(value, str) or not value for value in values):
+            return False
+        minimum, maximum = question.get("min_items"), question.get("max_items")
+        if ((minimum is not None and (type(minimum) is not int or minimum < 0))
+                or (maximum is not None and (type(maximum) is not int or maximum < 0))
+                or (minimum is not None and maximum is not None and minimum > maximum)
+                or (minimum is not None and len(values) < minimum)
+                or (maximum is not None and len(values) > maximum)
+                or len(set(values)) != len(values)):
+            return False
+        allowed = question.get("option_values", ())
+        return question.get("custom") is True or all(value in allowed for value in values)
+    return False
+
+
+def _question_native_answer(question, values):
+    if not values or not _question_values_valid_item(question, values):
+        return None
+    field_type = question.get("field_type")
+    if field_type == "string":
+        return values[0] if values[0] != "" else None
+    if field_type in {"number", "integer"}:
+        if isinstance(values[0], str) and not values[0].strip():
+            return None
+        number = _question_decimal(values[0])
+        if number is None:
+            return None
+        return int(number) if field_type == "integer" else float(number)
+    if field_type == "boolean":
+        value = values[0]
+        if type(value) is bool:
+            return value
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+        return None
+    if field_type == "multiselect":
+        return list(values)
+    return None
+
+
+def _question_active_field_keys(detail, answers):
+    fields = _question_schema_items(detail)
+    active, native_answers = [], {}
+    for question in fields:
+        conditions = question.get("when", ())
+        matches = True
+        for condition in conditions if isinstance(conditions, (list, tuple)) else ():
+            if not isinstance(condition, Mapping):
+                matches = False
+                break
+            key = condition.get("key")
+            if key not in native_answers or condition.get("op") not in {"eq", "neq"}:
+                matches = False
+                break
+            value = native_answers[key]
+            wanted = condition.get("value")
+            hit = (any(item == wanted for item in value) if isinstance(value, list)
+                   else value == wanted)
+            if ((condition.get("op") == "eq" and not hit)
+                    or (condition.get("op") == "neq" and hit)):
+                matches = False
+                break
+        if not matches:
+            continue
+        question_id = question["id"]
+        if question.get("hidden") is not True:
+            active.append(question_id)
+        values = answers.get(question_id) if isinstance(answers, Mapping) else None
+        if (question.get("hidden") is not True and values is not None
+                and _question_values_valid_item(question, values)):
+            native_value = _question_native_answer(question, values)
+            if native_value is not None:
+                native_answers[question_id] = native_value
+    return active
+
+
+def question_ui_detail(detail, draft=None):
+    """Attach only active field IDs to a private envelope for the question table."""
+    if not isinstance(detail, Mapping):
+        return detail
+    native = detail.get("native_ref")
+    if (detail.get("harness") != "opencode" or not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"):
+        return detail
+    if isinstance(draft, str):
+        draft = question_draft_from_backend(detail, draft)
+    answers = draft.get("answers", {}) if isinstance(draft, Mapping) else {}
+    result = dict(detail)
+    result["_fleet_active_field_keys"] = _question_active_field_keys(detail, answers)
+    return result
+
+
 def question_free_text_available(detail, question_id, values=()):
     if not question_free_text_supported(detail, question_id):
         return False
     if not question_multiple_select(detail, question_id):
         return True
-    native_ref = detail.get("native_ref")
-    maximum = native_ref.get("max_items") if isinstance(native_ref, Mapping) else None
+    question = next((item for item in question_items(detail) if item["id"] == question_id), None)
+    maximum = question.get("max_items") if question else None
     if maximum is None:
         return True
     if type(maximum) is not int:
         return False
-    allowed = set(native_ref.get("option_values", ()))
+    allowed = set(question.get("option_values", ())) if question else set()
     has_custom = any(value not in allowed for value in values)
     return has_custom or len(values) < maximum
 
@@ -277,10 +539,10 @@ def question_free_text_available(detail, question_id, values=()):
 def question_choice_click_allowed(detail, question_id, answer, values=()):
     if not question_multiple_select(detail, question_id):
         return True
-    native_ref = detail.get("native_ref")
-    if not isinstance(native_ref, Mapping):
+    question = next((item for item in question_items(detail) if item["id"] == question_id), None)
+    if question is None:
         return False
-    maximum = native_ref.get("max_items")
+    maximum = question.get("max_items")
     maximum = maximum if type(maximum) is int else None
     if answer in values:
         return True
@@ -334,9 +596,18 @@ def _question_draft_for_backend(draft, detail=None):
     if isinstance(answers, Mapping):
         for question_id, values in answers.items():
             if isinstance(values, (tuple, list)):
-                normalized[str(question_id)] = [value for value in values if isinstance(value, str)]
-    if (len(question_items(detail)) <= 1 and len(normalized) == 1
-            and len(next(iter(normalized.values()))) <= 1):
+                normalized[str(question_id)] = [
+                    value for value in values
+                    if (isinstance(value, (str, bool, int))
+                        or isinstance(value, float) and math.isfinite(value))]
+    fields = _question_schema_items(detail)
+    native = detail.get("native_ref") if isinstance(detail, Mapping) else None
+    v2_form = isinstance(native, Mapping) and native.get("transport") == "opencode-http-v2"
+    single_string = (not v2_form or bool(fields)
+                     and fields[0].get("field_type") == "string")
+    if (len(fields) == 1 and single_string
+            and len(normalized) == 1 and len(next(iter(normalized.values()))) <= 1
+            and all(isinstance(value, str) for value in next(iter(normalized.values())))):
         values = next(iter(normalized.values()))
         return values[0] if values else ""
     if not normalized:
@@ -356,10 +627,13 @@ def question_draft_from_backend(detail, draft):
         answers = value.get("answers") if isinstance(value, Mapping) else None
         if not isinstance(answers, Mapping):
             return None
-        return {"answers": {str(key): [item for item in values if isinstance(item, str)]
+        return {"answers": {str(key): [
+                            item for item in values
+                            if (isinstance(item, (str, bool, int))
+                                or isinstance(item, float) and math.isfinite(item))]
                             for key, values in answers.items()
                             if isinstance(values, (list, tuple))}}
-    questions = question_items(detail)
+    questions = _question_schema_items(detail)
     if not questions:
         return None
     return {"answers": {questions[0]["id"]: [draft]}}
@@ -400,17 +674,24 @@ def _question_draft_response(overlay, *, require_complete=False):
     if not isinstance(answers, Mapping):
         return None
     questions = question_items(overlay.get("detail"))
-    question_ids = [item["id"] for item in questions]
-    if not question_ids:
+    if not questions:
         return None
     normalized = {}
-    for question_id in question_ids:
+    missing_required = False
+    for question in questions:
+        question_id = question["id"]
         values = answers.get(question_id, ())
         if isinstance(values, (list, tuple)):
-            clean = [value for value in values if isinstance(value, str) and value.strip()]
+            clean = [value for value in values if (
+                isinstance(value, str) and value != ""
+                or type(value) is bool
+                or isinstance(value, (int, float)) and not isinstance(value, bool)
+                and (not isinstance(value, float) or math.isfinite(value)))]
             if clean:
                 normalized[question_id] = clean
-    if require_complete and set(normalized) != set(question_ids):
+        if question.get("required") is True and question_id not in normalized:
+            missing_required = True
+    if require_complete and missing_required:
         return None
     return {"answers": normalized} if normalized else None
 
@@ -426,11 +707,8 @@ def _question_text_draft(overlay, question_id=None):
         question = next((item for item in questions if item["id"] == question_id), None)
         if question and question_multiple_select(overlay.get("detail"), question_id):
             allowed = set(question.get("option_values", ()))
-            native_ref = overlay["detail"].get("native_ref")
-            if isinstance(native_ref, Mapping):
-                allowed = set(native_ref.get("option_values", ()))
-            return next((value for value in values if value not in allowed), "")
-    return values[0] if values else ""
+            return str(next((value for value in values if value not in allowed), ""))
+    return str(values[0]) if values else ""
 
 
 def _question_store_answers(state, question_id, values, *, editing=False):
@@ -444,8 +722,9 @@ def _question_store_answers(state, question_id, values, *, editing=False):
                for key, value in answers.items()} if isinstance(answers, Mapping) else {}
     answers[question_id] = list(values)
     draft["answers"] = answers
+    detail = question_ui_detail(detail, draft)
     supported = question_answer_supported(detail)
-    overlay.update(draft=draft, editing=editing, editing_question_id=question_id,
+    overlay.update(detail=detail, draft=draft, editing=editing, editing_question_id=question_id,
                    status=("Draft updated; submit explicitly to send." if supported else
                            "Private draft saved; use the native prompt to respond."))
     ref = _question_action_ref(overlay)
@@ -468,10 +747,10 @@ def _question_set_answer(state, question_id, answer):
         return state, ()
     existing = ((_question_draft_response(overlay) or {}).get("answers", {}).get(question_id, ()))
     if question_multiple_select(detail, question_id):
-        native_ref = detail.get("native_ref")
-        allowed = set(native_ref.get("option_values", ())) if isinstance(native_ref, Mapping) else set()
+        question = next(item for item in question_items(detail) if item["id"] == question_id)
+        allowed = set(question.get("option_values", ()))
         values = [value for value in existing if value in allowed]
-        maximum = native_ref.get("max_items") if isinstance(native_ref, Mapping) else None
+        maximum = question.get("max_items")
         if answer and type(maximum) is int and len(values) >= maximum:
             return state, ()
         if answer:
@@ -505,16 +784,47 @@ def _question_submit(state, response=None):
             or detail.get("state") != "open" or not _question_supports_reply(detail)):
         return state, ()
     if not _question_is_approval(detail):
+        native = detail.get("native_ref")
+        opencode_form = (detail.get("harness") == "opencode" and isinstance(native, Mapping)
+                         and native.get("transport") == "opencode-http-v2")
         if response is None:
             response = _question_draft_response(overlay, require_complete=True)
-        question_ids = {item["id"] for item in question_items(detail)}
+            if response is None and opencode_form:
+                # Only this explicit submit action can send an optional-only empty form.
+                response = {"answers": {}}
+        questions = question_items(detail)
         if (not question_answer_supported(detail) or not isinstance(response, Mapping)
-                or not response.get("answers")
-                or set(response.get("answers", {})) != question_ids):
+                or not isinstance(response.get("answers"), Mapping)):
             return state, ()
-        if any(not question_values_valid(detail, question_id, response["answers"].get(question_id))
-               for question_id in question_ids):
-            return state, ()
+        answers = response["answers"]
+        if opencode_form:
+            question_ids = {item["id"] for item in questions}
+            if set(answers).difference(question_ids):
+                return state, ()
+            typed_answers = {}
+            for question in questions:
+                question_id = question["id"]
+                values = answers.get(question_id)
+                if values is None or isinstance(values, (list, tuple)) and not values:
+                    if question.get("required") is True:
+                        return state, ()
+                    continue
+                if not question_values_valid(detail, question_id, values):
+                    return state, ()
+                value = _question_native_answer(question, values)
+                if value is None:
+                    if question.get("required") is True:
+                        return state, ()
+                    continue
+                typed_answers[question_id] = value if question.get("field_type") == "multiselect" else [value]
+            response = {"answers": typed_answers}
+        else:
+            question_ids = {item["id"] for item in questions}
+            if (not answers or set(answers) != question_ids
+                    or any(not question_values_valid(detail, question_id,
+                                                     answers.get(question_id))
+                           for question_id in question_ids)):
+                return state, ()
     elif (not isinstance(response, Mapping)
           or response.get("decision") not in question_decisions(detail)
           or response.get("decision") == "defer"):
@@ -620,12 +930,21 @@ def _reduce(state, event, frame=None):
             return state, ()
         if action[0] == "ui" and len(action) > 2:
             folds = state.fold_map()
+            offsets = dict(state.scroll)
             if action[1] == "sel":
                 folds = {key: value for key, value in folds.items()
-                         if key not in ("ui:sel", "ui:model", "ui:effort")}
+                         if key not in ("ui:sel", "ui:model", "ui:effort") + _MODEL_FIND_FOLDS}
+                offsets.pop("mpick", None)
             folds["ui:" + str(action[1])] = str(action[2])
+            return replace(state, folds=tuple(sorted(folds.items())),
+                           scroll=tuple(sorted(offsets.items()))), ()
+        if action[0] == "models.find":
+            folds = state.fold_map()
+            folds["ui:mfocus"] = "1"
             return replace(state, folds=tuple(sorted(folds.items()))), ()
         if action[0] == "models.apply" and len(action) in (5, 7):
+            return state, (action,)
+        if action[0] == "alloc.apply" and len(action) == 3:
             return state, (action,)
         if action[0] == "usage":
             return replace(state, usage_open=not state.usage_open), ()
@@ -825,6 +1144,14 @@ def _reduce(state, event, frame=None):
                     return _question_selection(state, ref)
             if refs:
                 return _question_selection(state, refs[0])
+    if state.view == "MODELS" and state.scope == "-":
+        found = _models_find_hit(frame)
+        if found is not None and models_finding(state):
+            handled = _models_find_key(state, key, found)
+            if handled is not None:
+                return handled, ()
+        elif found is not None and key in ("e", "E"):
+            return _reduce(state, {"type": "click", "action": found.action}, frame)
     if key in ("tab", "shift-tab", "left", "right"):
         if state.scope != "-":
             return replace(state, scope="-", opened=""), ()

@@ -30,6 +30,7 @@ try:
 except ImportError:  # native Windows without windows-curses: plain --once / --json still work
     curses = None
 import glob
+import json
 import math
 import os
 import re
@@ -214,9 +215,11 @@ _HUE_OF = {
     "h_claude": ("c", _A_D), "h_codex": ("m", _A_D), "h_opencode": ("l", _A_D),
     "hb_claude": ("c", 0), "hb_codex": ("m", 0), "hb_opencode": ("l", 0), "hb_other": ("d", 0),
     "fam_opus": ("c", 0), "fam_sonnet": ("l", 0), "fam_haiku": ("g", 0),
-    "fam_fable": ("m", 0), "fam_gpt": ("y", 0), "fam_other": ("d", 0),
+    "fam_fable": ("m", 0), "fam_sol": ("y", 0), "fam_astra": ("o", 0),
+    "fam_luna": ("w", 0), "fam_gpt": ("y", 0), "fam_other": ("d", 0),
     "famd_opus": ("c", _A_D), "famd_sonnet": ("l", _A_D), "famd_haiku": ("g", _A_D),
-    "famd_fable": ("m", _A_D), "famd_gpt": ("y", _A_D), "famd_other": ("d", _A_D),
+    "famd_fable": ("m", _A_D), "famd_sol": ("y", _A_D), "famd_astra": ("o", _A_D),
+    "famd_luna": ("w", _A_D), "famd_gpt": ("y", _A_D), "famd_other": ("d", _A_D),
     "gpu_rtx6000": ("l", _A_D), "gpu_rtx4090": ("c", _A_D),
     "gpu_rtx5090": ("g", _A_D),
     "gpu_blackwell": ("g", _A_D), "gpu_hopper": ("m", _A_D),
@@ -375,10 +378,18 @@ def _init_colors():
     # per-MODEL family colors, in TWO intensities (2026-07-02: main↔dispatch contrast = whole-row
     # brightness): fam_* = BRIGHT (main session rows) / famd_* = DIM (dispatch rows recede).
     _hue = {h: _COLOR.get("h_" + h, 0) for h in ("claude", "codex", "opencode")}
+    # The three named Codex models are separate families, not one `gpt` bucket (user
+    # 2026-10-27: "codex 모델들 전부 같은 컬러"). Sol keeps the old gpt yellow, Astra
+    # takes the unused orange, and Luna takes soft white; a bare gpt-* id still lands
+    # on the shared `gpt` key. Names stay the primary identifier — the 8-color
+    # fallback folds orange into yellow — but the 256-color board separates them.
     _fam = {"opus": _palette_fg("cyan", curses.COLOR_CYAN),
             "sonnet": _palette_fg("blue", curses.COLOR_BLUE),
             "haiku": _palette_fg("green", curses.COLOR_GREEN),
             "fable": _palette_fg("magenta", curses.COLOR_MAGENTA),
+            "sol": _palette_fg("yellow", curses.COLOR_YELLOW),
+            "astra": _palette_fg("orange", curses.COLOR_YELLOW),
+            "luna": _palette_fg("soft", curses.COLOR_WHITE),
             "gpt": _palette_fg("yellow", curses.COLOR_YELLOW)}
     n_pair = 10                                     # pairs 1-9 reserved above; families from 10
     for fam, fg in _fam.items():
@@ -643,17 +654,24 @@ def _flat_level(key):
     return "lvl_r_flat" if key == "lvl_r" else key
 
 
-_FAMILIES = ("opus", "sonnet", "haiku", "fable", "gpt")
+_FAMILIES = ("sol", "astra", "luna", "opus", "sonnet", "haiku", "fable", "gpt")
 
 
 def _model_family(model):
     """Model-family token from a model/bucket name: 'Opus 4.8'→opus, 'gpt-5.5'→gpt, 'fable'→fable.
-    Unknown (glm/deepseek/…) → 'other' (default fg — distinct from the colored families)."""
+    The named Codex models keep their own tokens ('gpt-6.1-sol'→sol, 'Astra'→astra,
+    'gpt-6-luna'→luna) so each gets one stable identity colour in every view; any
+    other gpt id stays on the shared 'gpt' token. Unknown (glm/deepseek/…) → 'other'
+    (default fg — distinct from the colored families)."""
     m = (model or "").lower()
-    if re.fullmatch(r"\s*(?:sol|astra)\s*", m) or re.search(r"\bgpt(?:[-_ ]\d+(?:\.\d+)?)?[-_ /]*(?:sol|astra)\b", m):
-        return "gpt"
     for fam in _FAMILIES:
-        if fam in m:
+        if fam in ("sol", "astra", "luna"):
+            matched = re.search(r"\b%s\b" % fam, m)
+        elif fam == "gpt":
+            matched = "gpt" in m
+        else:
+            matched = fam in m
+        if matched:
             return fam
     return "other"
 
@@ -680,7 +698,13 @@ def _clean_model(name):
     name = name.split(" (", 1)[0]
     if "/" in name:
         name = name.split("/", 1)[1]
-    return _shorten_model_suffix(_ROLE_MODEL_NAME.get(name.lower(), name))
+    role = _ROLE_MODEL_NAME.get(name.lower())
+    if role:
+        # Only the bare lowercase alias the configs/dispatch env actually export is
+        # resolved against the catalog; a proper-noun value already came from an
+        # observed display name and is not rewritten by today's catalog.
+        name = (_resolved_alias_model(name) if name == name.lower() else None) or role
+    return _shorten_model_suffix(name)
 
 
 # Variant/effort tokens that carry no information: the runtime picked its own default and
@@ -734,10 +758,105 @@ def _short_model_id(name):
     return "%s %s" % (fam, major + ("." + minor if minor else ""))
 
 
+# A bare role alias names a family, not one model. The Claude runtime's own catalog is
+# the checked source for which concrete id this account currently resolves that family
+# to; a version is never written into this file. A missing, malformed, or ambiguous
+# catalog keeps the family word (the honest fallback this table always had).
+_ALIAS_FAMILIES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku", "fable": "fable"}
+_MODEL_CATALOG_MAX_BYTES = 16 * 1024 * 1024
+_ALIAS_MODEL_CACHE = {"stamp": None, "models": {}}
+
+
+def _claude_catalog_paths():
+    """The runtime's already-written catalog caches, in the same root order the explorer uses."""
+    config = (os.environ.get("HEARTING_MODEL_CONFIG_HOME")
+              or os.environ.get("CLAUDE_CONFIG_DIR")
+              or os.path.join(os.path.expanduser("~"), ".claude"))
+    return tuple(sorted(glob.glob(os.path.join(config, "cache", "model-catalog", "*.json"))))
+
+
+def _catalog_model_records(document):
+    """The model records in the runtime catalogs' bounded public shapes."""
+    if not isinstance(document, dict):
+        return ()
+    catalog = document.get("catalog")
+    config = catalog.get("config") if isinstance(catalog, dict) else None
+    records = config.get("models") if isinstance(config, dict) else None
+    if not isinstance(records, list):
+        records = document.get("models")
+    if not isinstance(records, list):
+        return ()
+    return tuple(item for item in records if isinstance(item, dict))
+
+
+def _resolved_alias_models():
+    """Role family → the one concrete id the account's runtime catalog marks ``main``.
+
+    Reads only the cache files the runtime already wrote. A family with no record,
+    zero ``main`` entries, or two different ``main`` ids across accounts stays
+    unresolved, so display never guesses. Cached by each file's (mtime, size) so a
+    frame never re-reads an unchanged catalog.
+    """
+    paths = _claude_catalog_paths()
+    stamps = []
+    for path in paths:
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        stamps.append((path, info.st_mtime_ns, info.st_size))
+    stamp = tuple(stamps)
+    cached = _ALIAS_MODEL_CACHE
+    if cached["stamp"] == stamp:
+        return cached["models"]
+    found = {}
+    for path, _mtime, size in stamps:
+        if size > _MODEL_CATALOG_MAX_BYTES:
+            continue
+        try:
+            with open(path, encoding="utf-8") as stream:
+                document = json.load(stream)
+        except (OSError, ValueError, UnicodeError, TypeError):
+            continue
+        for item in _catalog_model_records(document):
+            if item.get("section") != "main":
+                continue
+            runtime = item.get("runtime")
+            family = runtime.get("family") if isinstance(runtime, Mapping) else None
+            model_id = item.get("id")
+            if not isinstance(family, str) or not isinstance(model_id, str) or not model_id:
+                continue
+            found.setdefault(family.lower(), []).append(model_id)
+    resolved = {}
+    for family, ids in found.items():
+        distinct = tuple(dict.fromkeys(ids))
+        if family in _ALIAS_FAMILIES.values() and len(distinct) == 1:
+            resolved[family] = distinct[0]
+    cached["stamp"] = stamp
+    cached["models"] = resolved
+    return resolved
+
+
+def _resolved_alias_model(name):
+    """Versioned display for a bare role alias, or None when the catalog cannot confirm it."""
+    family = _ALIAS_FAMILIES.get(str(name).strip().lower())
+    if family is None:
+        return None
+    model_id = _resolved_alias_models().get(family)
+    if not model_id:
+        return None
+    return _short_model_id(model_id)
+
+
 def _dispatch_display_model(name):
     if not name:
         return name
-    return _short_model_id(_ROLE_MODEL_NAME.get(str(name).strip().lower(), name))
+    raw = str(name).strip()
+    token = raw.lower()
+    role = _ROLE_MODEL_NAME.get(token)
+    if role:
+        return (_resolved_alias_model(raw) if raw == token else None) or role
+    return _short_model_id(name)
 
 
 def _job_display_model(job, parent_model=None):
@@ -7192,10 +7311,10 @@ def _explorer_apply_effects(effects, vm):
     for effect in question_effects:
         _explorer_queue_question_effect(effect)
     model_actions = tuple(effect for effect in effects
-                          if effect and effect[0] == "models.apply")
+                          if effect and effect[0] in ("models.apply", "alloc.apply"))
     if _EXPLORER_REPLAY_ACTIVE:
         effects = tuple(effect for effect in effects
-                        if not effect or effect[0] != "models.apply")
+                        if not effect or effect[0] not in ("models.apply", "alloc.apply"))
         result = None
         if effects:
             result = _explorer_runtime().apply_effects(effects, vm)
@@ -7370,6 +7489,149 @@ def _explorer_question_has_workflow_binding(ref, envelope):
     return False
 
 
+def _explorer_opencode_form_binding(ref, envelope):
+    """Accept a turnless native form only with its exact OpenCode HTTP binding."""
+    row_ref = ref.get("_fleet_row_ref") if isinstance(ref, Mapping) else None
+    row_ref = row_ref if isinstance(row_ref, Mapping) else ref
+    native = envelope.get("native_ref")
+    request_id = envelope.get("request_id")
+    selected_id = envelope.get("selected_id")
+    if (not isinstance(row_ref, Mapping) or row_ref.get("harness") != "opencode"
+            or not isinstance(row_ref.get("id"), str)
+            or not row_ref["id"].startswith("S1:")
+            or selected_id != row_ref.get("id")
+            or type(request_id) is not str or not request_id.startswith("frm_")
+            or row_ref.get("request_id") != request_id
+            or not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"
+            or native.get("request_id") != request_id
+            or type(native.get("generation")) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", native["generation"])
+            or type(native.get("server_pid")) is not int or native["server_pid"] <= 0
+            or type(native.get("proc_start")) is not str
+            or not native["proc_start"].isdigit()
+            or not isinstance(native.get("socket_inodes"), list)
+            or not native["socket_inodes"]
+            or any(type(inode) is not str or not inode.isdigit()
+                   for inode in native["socket_inodes"])):
+        return False
+    if ((row_ref.get("route_id") is not None or envelope.get("route_id") is not None)
+            and row_ref.get("route_id") != envelope.get("route_id")):
+        return False
+    if (native.get("session_id") is not None
+            and native.get("session_id") != envelope.get("session_id")):
+        return False
+    detail = envelope.get("detail")
+    fields = detail.get("questions") if isinstance(detail, Mapping) else None
+    if fields is None and envelope.get("state") in {
+            "submitted", "received", "applied", "cancelled", "expired", "unknown"}:
+        return True
+    if (type(native.get("schema_binding")) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", native["schema_binding"])):
+        return False
+    field_keys = native.get("field_keys")
+    if (not isinstance(field_keys, list) or not field_keys
+            or any(type(key) is not str or not key for key in field_keys)
+            or len(set(field_keys)) != len(field_keys)):
+        return False
+    if not isinstance(fields, list) or not fields:
+        return False
+    seen = set()
+    fields_by_id = {}
+    supported_types = {"string", "number", "integer", "boolean", "multiselect"}
+    for field in fields:
+        if not isinstance(field, Mapping):
+            return False
+        field_id = field.get("id", field.get("key"))
+        field_type = field.get("field_type", field.get("type"))
+        if (type(field_id) is not str or not field_id or field_id in seen
+                or field_type not in supported_types
+                or type(field.get("required")) is not bool
+                or type(field.get("hidden")) is not bool
+                or field.get("hidden") and field.get("required")):
+            return False
+        conditions = field.get("when", [])
+        if not isinstance(conditions, list):
+            return False
+        for condition in conditions:
+            if (not isinstance(condition, Mapping)
+                    or condition.get("op") not in {"eq", "neq"}
+                    or condition.get("key") not in fields_by_id
+                    or "value" not in condition):
+                return False
+            target = fields_by_id[condition["key"]]
+            target_type = target.get("field_type", target.get("type"))
+            value = condition["value"]
+            if target_type == "boolean":
+                valid_condition = type(value) is bool
+            elif target_type in {"number", "integer"}:
+                try:
+                    valid_condition = (type(value) in (int, float, str)
+                                       and math.isfinite(float(value)))
+                except (TypeError, ValueError, OverflowError):
+                    valid_condition = False
+            else:
+                valid_condition = isinstance(value, str)
+                options = target.get("option_values", ())
+                if (valid_condition and target.get("options_present")
+                        and target.get("custom") is not True):
+                    valid_condition = value in options
+            if not valid_condition:
+                return False
+        seen.add(field_id)
+        fields_by_id[field_id] = field
+        choices = field.get("choices", field.get("options"))
+        if choices is not None:
+            if not isinstance(choices, list):
+                return False
+            values = []
+            for choice in choices:
+                if (not isinstance(choice, Mapping)
+                        or type(choice.get("value")) is not str
+                        or not choice["value"]
+                        or type(choice.get("label")) is not str):
+                    return False
+                values.append(choice["value"])
+            if len(set(values)) != len(values):
+                return False
+        if field_type == "multiselect":
+            minimum, maximum = field.get("min_items"), field.get("max_items")
+            if ((minimum is not None and (type(minimum) is not int or minimum < 0))
+                    or (maximum is not None and (type(maximum) is not int or maximum < 0))
+                    or (minimum is not None and maximum is not None and minimum > maximum)):
+                return False
+        elif field_type in {"number", "integer"}:
+            for bound in ("minimum", "maximum"):
+                value = field.get(bound)
+                if (value is not None and (type(value) not in (int, float)
+                                           or not math.isfinite(value))):
+                    return False
+            if (field.get("minimum") is not None and field.get("maximum") is not None
+                    and field["minimum"] > field["maximum"]):
+                return False
+        elif field_type == "boolean" and (
+                "default" in field and type(field.get("default")) is not bool):
+            return False
+    return field_keys == [field.get("id", field.get("key")) for field in fields]
+
+
+def _explorer_opencode_form_ui_supported(envelope):
+    """Accept only backend-approved native schemas the private form editor can express."""
+    detail = envelope.get("detail") if isinstance(envelope, Mapping) else None
+    native = envelope.get("native_ref") if isinstance(envelope, Mapping) else None
+    questions = detail.get("questions") if isinstance(detail, Mapping) else None
+    support = envelope.get("support") if isinstance(envelope, Mapping) else None
+    supported = (support is True or isinstance(support, Mapping)
+                 and support.get("supported") is True)
+    if (envelope.get("state") != "open" or not supported
+            or not isinstance(questions, list) or not questions
+            or not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"):
+        return False
+    return native.get("field_keys") == [question.get("id") for question in questions
+                                          if isinstance(question, Mapping)]
+
+
 def _explorer_question_envelope(ref, value):
     if not isinstance(value, Mapping):
         return None
@@ -7399,8 +7661,13 @@ def _explorer_question_envelope(ref, value):
             return None
     if state != "unknown":
         workflow = isinstance(ref.get("id"), str) and ref["id"].startswith(("S2:", "S3:", "S4:"))
-        turn_bound = (_explorer_question_has_workflow_binding(ref, envelope) if workflow else
-                      isinstance(envelope.get("turn_id"), str) and bool(envelope["turn_id"]))
+        if workflow:
+            turn_bound = _explorer_question_has_workflow_binding(ref, envelope)
+        elif envelope.get("turn_id") is None:
+            turn_bound = (envelope.get("harness") == "opencode"
+                          and _explorer_opencode_form_binding(ref, envelope))
+        else:
+            turn_bound = isinstance(envelope.get("turn_id"), str) and bool(envelope["turn_id"])
         if (envelope.get("v") != 1 or envelope.get("harness") != ref.get("harness")
                 or envelope.get("session_id") != ref.get("session_id")
                 or type(envelope.get("request_id")) not in (str, int)
@@ -7441,10 +7708,24 @@ def _explorer_accept_question_result(update):
                            status=_explorer_question_status(
                                result, "Exact current request unavailable; use the native prompt."))
         else:
-            from .explorer.state import question_draft_from_backend
+            native_ref = envelope.get("native_ref")
+            if (envelope.get("harness") == "opencode" and envelope.get("turn_id") is None
+                    and isinstance(native_ref, Mapping)
+                    and native_ref.get("transport") == "opencode-http-v2"
+                    and envelope.get("state") == "open"
+                    and not _explorer_opencode_form_ui_supported(envelope)):
+                envelope = dict(envelope)
+                support = envelope.get("support")
+                support = dict(support) if isinstance(support, Mapping) else {}
+                support.update({"supported": False,
+                                "reason": "opencode-form-editor-capability-unavailable"})
+                envelope["support"] = support
+                envelope["actions"] = []
+            from .explorer.state import question_draft_from_backend, question_ui_detail
             draft = question_draft_from_backend(envelope, envelope.get("draft"))
             if draft is None:
                 draft = overlay.get("draft")
+            envelope = question_ui_detail(envelope, draft)
             overlay.update(detail=envelope, draft=draft, state=envelope["state"],
                            pending=False, editing=False,
                            status=_explorer_question_status(
@@ -7452,10 +7733,11 @@ def _explorer_accept_question_result(update):
                                else "Request state: " + envelope["state"]))
     elif operation == "questions.draft":
         if envelope is not None and envelope.get("state") == "open":
-            from .explorer.state import question_draft_from_backend
+            from .explorer.state import question_draft_from_backend, question_ui_detail
             draft = question_draft_from_backend(envelope, envelope.get("draft"))
             if draft is None:
                 draft = overlay.get("draft")
+            envelope = question_ui_detail(envelope, draft)
             overlay.update(detail=envelope, draft=draft,
                            state="open", status="Private draft saved; submit explicitly to send.")
         else:
@@ -7464,10 +7746,11 @@ def _explorer_accept_question_result(update):
                                result, "Draft remains on screen; persistence was not confirmed."))
     elif operation == "questions.submit":
         if envelope is not None:
-            from .explorer.state import question_draft_from_backend
+            from .explorer.state import question_draft_from_backend, question_ui_detail
             draft = question_draft_from_backend(envelope, envelope.get("draft"))
             if draft is None:
                 draft = overlay.get("draft")
+            envelope = question_ui_detail(envelope, draft)
             overlay.update(detail=envelope, draft=draft,
                            state=envelope["state"], pending=False, editing=False,
                            status=_explorer_question_status(
@@ -11600,6 +11883,12 @@ def _explorer_question_editing():
                 and isinstance(overlay, Mapping) and overlay.get("editing"))
 
 
+def _explorer_text_input():
+    """Typed characters are text, not commands: a question is being edited or the MODELS list filtered."""
+    from .explorer.state import models_finding
+    return _explorer_question_editing() or models_finding(_EXPLORER_STATE)
+
+
 def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     """Apply one decoded event to the explorer's view-local reducer."""
     global _EXPLORER_STATE, _EXPLORER_TEXT
@@ -11643,7 +11932,8 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
             _EXPLORER_STATE = state
             _explorer_apply_effects(_effects, _EXPLORER_MODEL)
         return
-    editing = (state.view == "QUESTIONS" and _explorer_question_editing())
+    from .explorer.state import models_finding
+    editing = (state.view == "QUESTIONS" and _explorer_question_editing()) or models_finding(state)
     if editing and isinstance(ch, int) and (32 <= ch < 127 or 128 <= ch < 256):
         key = _explorer_text_key(ch)
     else:
@@ -12052,7 +12342,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _EXPLORER_RESULT = focus_result
                     _HIT_VALID = False
 
-            question_editing = _explorer_question_editing()
+            question_editing = _explorer_text_input()
             if (ch in (ord("q"), ord("Q")) and not _explorer_searching()
                     and not question_editing):
                 return 0

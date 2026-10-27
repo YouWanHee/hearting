@@ -27,6 +27,7 @@ def load(name: str, path: Path):
 
 
 PROFILE = load("portable_model_profile", ROOT / "utilities" / "model_profile.py")
+import model_config  # noqa: E402
 WRAPPERS = {
     adapter: load(
         f"{adapter}_profile_wrapper",
@@ -377,7 +378,8 @@ class ModelProfileTest(unittest.TestCase):
                 args(adapter, "deep", capacity_retry=1, **concrete)
             )
             self.assertEqual(resolved["source"], "profile+capacity")
-            self.assertEqual(resolved["context_window"], "800000")
+            shipped = model_config.parse_config(model_config.shipped_path(adapter, source_root=ROOT))
+            self.assertEqual(resolved["context_window"], shipped[model_config.CONTEXT_WINDOW_KEY])
             self.assertEqual(resolved["model"], concrete["model"])
 
     def test_context_fields_survive_role_explicit_pin_and_capacity_selection(self):

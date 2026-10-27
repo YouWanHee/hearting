@@ -4,6 +4,7 @@ import os
 import json
 from pathlib import Path
 import sys
+import stat
 import tempfile
 import unittest
 from dataclasses import replace
@@ -1356,6 +1357,689 @@ class FleetQuestionBackendIntegrationTests(unittest.TestCase):
         self.assertFalse(self.replies)
 
 
+class FleetOpenCodeFormsIntegrationTests(unittest.TestCase):
+    """Exercise V2 form HTTP data through the real selected-question UI path."""
+
+    def setUp(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from time import time
+
+        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.root = Path(self.tmp.name)
+        self.env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "xdg")})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.sid = "session_form_ui8223"
+        self.form_id = "frm_ui8223"
+        self.item_id = "S1:opencode-form-ui8223"
+        self.now = time()
+        self.posts = []
+        self.post_status = 204
+        self.post_terminal_state = "answered"
+        self.http_paths = []
+        self._set_form(self._single_multiselect())
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format, *_args):
+                return
+
+            def _json(self, status, value=None):
+                body = b"" if value is None else json.dumps(value).encode("utf-8")
+                self.send_response(status)
+                if value is not None:
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def do_GET(self):
+                from urllib.parse import unquote, urlsplit
+
+                path = urlsplit(self.path).path
+                owner.http_paths.append(("GET", path))
+                if path == "/global/health":
+                    # Compatibility surface required by the current local adapter.
+                    self._json(200, {"healthy": True, "version": "2.0.32"})
+                    return
+                if path == "/api/info":
+                    self._json(200, {"data": {
+                        "version": "2.0.32", "pid": 7001, "urls": [],
+                        "paths": {"tmp": "/tmp"}, "capabilities": None,
+                    }})
+                    return
+                prefix = "/api/session/" + owner.sid + "/form"
+                if path == prefix:
+                    form = {key: value for key, value in owner.form.items() if key != "state"}
+                    self._json(200, {"data": [form] if owner.form["state"]["status"] == "pending"
+                                     else []})
+                    return
+                if path == prefix + "/" + owner.form_id:
+                    self._json(200, {"data": owner.form})
+                    return
+                self._json(404, {"_tag": "NotFoundError", "message": "fixture path"})
+
+            def do_POST(self):
+                from urllib.parse import urlsplit
+
+                path = urlsplit(self.path).path
+                length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    payload = None
+                owner.http_paths.append(("POST", path))
+                owner.posts.append((path, payload))
+                if path != (f"/api/session/{owner.sid}/form/{owner.form_id}/reply"):
+                    self._json(404, {"_tag": "NotFoundError", "message": "fixture path"})
+                    return
+                if owner.post_status == 204:
+                    owner.form["state"] = {"status": owner.post_terminal_state,
+                                            "answer": payload.get("answer")
+                                            if isinstance(payload, dict) else None}
+                self._json(owner.post_status, None if owner.post_status == 204 else {
+                    "_tag": "FixtureTransportError", "message": "reply was not confirmed"})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+        self.addCleanup(self._stop_http)
+        self.endpoint = {
+            "url": f"http://127.0.0.1:{self.server.server_port}",
+            "generation": "a" * 64, "pid": 7001, "proc_start": "700100",
+            "server_pid": 7001, "server_proc_start": "700100",
+            "frontend_pid": 7002, "frontend_proc_start": "700200",
+            "server_urls": [f"http://127.0.0.1:{self.server.server_port}"],
+            "socket_inodes": ["7001001"],
+        }
+        self.endpoint_patch = mock.patch.object(
+            human_wait_state, "_opencode_endpoint",
+            side_effect=lambda session: dict(self.endpoint) if session == self.sid else None)
+        self.endpoint_patch.start()
+        self.addCleanup(self.endpoint_patch.stop)
+        self._publish_wait()
+
+    def _stop_http(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=2)
+
+    def _set_form(self, fields, *, state="pending"):
+        self.form = {"id": self.form_id, "sessionID": self.sid,
+                     "title": "Private form title", "metadata": {},
+                     "fields": fields, "state": {"status": state}}
+
+    @staticmethod
+    def _single_multiselect():
+        return [{"key": "colors", "type": "multiselect", "title": "Choose colors",
+                 "description": "Private form description", "required": True,
+                 "hidden": False, "when": [],
+                 "options": [{"value": "red-native", "label": "Red label"},
+                             {"value": "blue-native", "label": "Blue label"}],
+                 "minItems": 1, "maxItems": 3, "custom": True,
+                 "default": ["blue-native"]}]
+
+    def _publish_wait(self):
+        self.assertTrue(human_wait_state.publish_cache({
+            "items": [{"id": self.item_id, "source": "S1", "kind": "elicitation",
+                       "since": self.now, "stale": False, "attribution": "exact",
+                       "owner": {"harness": "opencode", "session_id": self.sid},
+                       "request_id": self.form_id}],
+            "complete": True, "observed_at": self.now, "total": 1, "health": [],
+        }))
+
+    def _row(self):
+        from fleet.explorer.live import build_view_model
+
+        waits = human_wait_state.cached_fleet_view(now=self.now, request=False)
+        vm = build_view_model({
+            "sessions": [{"harness": "opencode", "session_id": self.sid,
+                          "session_tag": "OC/ui8223", "cwd": str(self.root),
+                          "liveness": "idle"}],
+            "answer_waits": waits, "project_of": lambda _cwd: "repo",
+            "resources": [], "jobs": [],
+        }, now=self.now)
+        return next(row for row in vm.questions if row["id"] == self.item_id), vm
+
+    def _read_and_adopt(self, *, expected_state="open"):
+        from fleet import render
+        from fleet.explorer.runtime import ExplorerRuntime
+        from fleet.explorer.state import NavState, reduce
+
+        row, vm = self._row()
+        state, effects = reduce(NavState(view="QUESTIONS"), {
+            "type": "click", "action": ("question.select", self.item_id, row["ref"]),
+        })
+        self.assertEqual(effects[0][0], "questions.read")
+        envelope = ExplorerRuntime.execute_question_action(effects[0])
+        with mock.patch.object(render, "_EXPLORER_STATE", state), \
+             mock.patch.object(render, "_EXPLORER_MODEL", vm), \
+             mock.patch.object(render, "_EXPLORER_QUESTION_REFRESH_AT", 0):
+            render._explorer_accept_question_result({"effect": effects[0],
+                                                     "result": envelope})
+            state = render._EXPLORER_STATE
+        self.assertEqual(state.question_overlay["state"], expected_state, envelope)
+        return state, envelope, row, vm
+
+    def _adopt(self, state, effect, result, row, vm):
+        from fleet import render
+
+        with mock.patch.object(render, "_EXPLORER_STATE", state), \
+             mock.patch.object(render, "_EXPLORER_MODEL", vm), \
+             mock.patch.object(render, "_EXPLORER_QUESTION_REFRESH_AT", 0), \
+             mock.patch.object(render, "_explorer_queue_question_effect"):
+            render._explorer_accept_question_result({"effect": effect, "result": result})
+            return render._EXPLORER_STATE
+
+    def _run_effect(self, state, effect, row, vm):
+        from fleet.explorer.runtime import ExplorerRuntime
+
+        result = ExplorerRuntime.execute_question_action(effect)
+        return self._adopt(state, effect, result, row, vm)
+
+    def _ui_action(self, state, action, row, vm):
+        from fleet.explorer.state import reduce
+
+        state, effects = reduce(state, {"type": "click", "action": action})
+        for effect in effects:
+            state = self._run_effect(state, effect, row, vm)
+        return state, effects
+
+    def _ui_text(self, state, question_id, text, row, vm):
+        from fleet.explorer.state import _question_text_draft, reduce
+
+        state, _ = reduce(state, {"type": "click", "action": ("question.edit", question_id)})
+        current = _question_text_draft(state.question_overlay, question_id)
+        latest = None
+        for _ in current:
+            state, effects = reduce(state, {"type": "key", "key": "backspace"})
+            if effects:
+                latest = effects[-1]
+        state, effects = reduce(state, {"type": "key", "key": "text:" + text})
+        if effects:
+            latest = effects[-1]
+        if latest is not None:
+            state = self._run_effect(state, latest, row, vm)
+        return state
+
+    def _rendered_submit_hit(self, state, vm):
+        from fleet.explorer.grid import CellGrid
+        from fleet.explorer.tables import draw_questions
+
+        grid = CellGrid(140, 45)
+        draw_questions(grid, vm, state)
+        hit = next((item for item in grid.hits
+                    if item.action == ("question.submit",)), None)
+        return hit, grid
+
+    def test_turnless_multifield_schema_is_exact_and_private_in_live_render(self):
+        from fleet import render
+        from fleet.explorer.state import serialize
+
+        fields = [
+            {"key": "choice", "type": "string", "title": "Color",
+             "required": True, "hidden": False, "when": [],
+             "options": [{"value": "red-native", "label": "Red label"}]},
+            {"key": "notes", "type": "string", "title": "Notes",
+             "description": "PRIVATE-FORM-QUESTION", "required": True,
+             "hidden": False, "when": []},
+        ]
+        self._set_form(fields)
+        state, envelope, row, _vm = self._read_and_adopt()
+        self.assertIsNone(envelope["turn_id"])
+        self.assertEqual(envelope["native_ref"]["field_keys"], ["choice", "notes"])
+        self.assertRegex(envelope["native_ref"]["schema_binding"], r"^[0-9a-f]{64}$")
+        self.assertEqual(envelope["detail"]["questions"][0]["choices"],
+                         [{"value": "red-native", "label": "Red label", "description": ""}])
+        self.assertEqual(state.question_overlay["detail"]["support"]["supported"], True)
+        self.assertTrue(render._explorer_opencode_form_ui_supported(envelope))
+        self.assertEqual(state.question_overlay["detail"]["detail"]["questions"],
+                         envelope["detail"]["questions"])
+        self.assertIsNone(render._explorer_question_envelope(row["ref"],
+                                                              {**envelope, "turn_id": ""}))
+        for changed in (
+            {"session_id": "another-session"}, {"request_id": "frm_other"},
+            {"selected_id": "S1:another"},
+            {"native_ref": {**envelope["native_ref"], "field_keys": ["choice", "other"]}},
+            {"native_ref": {**envelope["native_ref"], "socket_inodes": []}},
+        ):
+            self.assertIsNone(render._explorer_question_envelope(row["ref"],
+                                                                  {**envelope, **changed}))
+        public = json.dumps(human_wait_state.cached_fleet_view(now=self.now, request=False))
+        serialized = json.dumps(serialize(state), ensure_ascii=False)
+        self.assertNotIn("PRIVATE-FORM-QUESTION", public)
+        self.assertNotIn("PRIVATE-FORM-QUESTION", serialized)
+        self.assertNotIn("PRIVATE-FORM-QUESTION", human_wait_state._fleet_cache_path().read_text())
+        self.assertFalse(self.posts)
+
+    def test_multiselect_choice_and_free_text_submit_once_with_native_values(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+        from fleet.explorer.state import _QUESTION_DRAFT_PREFIX, reduce, serialize
+
+        state, envelope, row, vm = self._read_and_adopt()
+        self.assertEqual(envelope["detail"]["questions"][0]["id"], "colors")
+        self.assertTrue(envelope["support"]["supported"])
+        state, effects = reduce(state, {"type": "click", "action":
+                                        ("question.choice", "colors", "red-native")})
+        self.assertEqual(effects[0][0], "questions.draft")
+        self.assertTrue(effects[0][2].startswith(_QUESTION_DRAFT_PREFIX))
+        self.assertEqual(json.loads(effects[0][2][len(_QUESTION_DRAFT_PREFIX):]),
+                         {"answers": {"colors": ["red-native"]}})
+        drafted = ExplorerRuntime.execute_question_action(effects[0])
+        state = self._adopt(state, effects[0], drafted, row, vm)
+        state, _ = reduce(state, {"type": "click", "action": ("question.edit", "colors")})
+        state, effects = reduce(state, {"type": "key", "key": "text:custom private value"})
+        self.assertIn("custom private value", effects[0][2])
+        drafted = ExplorerRuntime.execute_question_action(effects[0])
+        state = self._adopt(state, effects[0], drafted, row, vm)
+        private_state = json.dumps(serialize(state), ensure_ascii=False)
+        public_cache = human_wait_state._fleet_cache_path().read_text(encoding="utf-8")
+        self.assertNotIn("custom private value", private_state)
+        self.assertNotIn("custom private value", public_cache)
+        self.assertNotIn("custom private value", json.dumps(
+            human_wait_state.cached_fleet_view(now=self.now, request=False)))
+        state, effects = reduce(state, {"type": "click", "action": ("question.submit",)})
+        receipt = ExplorerRuntime.execute_question_action(effects[0])
+        self.assertEqual(receipt["state"], "applied")
+        self.assertEqual(self.posts, [(
+            f"/api/session/{self.sid}/form/{self.form_id}/reply",
+            {"answer": {"colors": ["red-native", "custom private value"]}},
+        )])
+        duplicate = ExplorerRuntime.execute_question_action(effects[0])
+        self.assertEqual(duplicate["state"], "applied")
+        self.assertEqual(len(self.posts), 1)
+
+    def test_number_and_integer_answers_are_typed_and_invalid_bounds_do_not_post(self):
+        self._set_form([
+            {"key": "amount", "type": "number", "minimum": 0, "maximum": 10,
+             "required": True, "hidden": False, "when": []},
+            {"key": "count", "type": "integer", "minimum": 0, "maximum": 8,
+             "required": True, "hidden": False, "when": []},
+        ])
+        state, _envelope, row, vm = self._read_and_adopt()
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertFalse(effects)
+        self.assertFalse(self.posts)
+        state = self._ui_text(state, "amount", "11", row, vm)
+        state = self._ui_text(state, "count", "3", row, vm)
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertFalse(effects)
+        self.assertFalse(self.posts)
+        self.assertEqual(state.question_overlay["draft"]["answers"]["amount"], ["11"])
+        state = self._ui_text(state, "amount", "2.5", row, vm)
+        state = self._ui_text(state, "count", "0", row, vm)
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertEqual(len(effects), 1)
+        self.assertEqual(effects[0][0], "questions.submit")
+        self.assertEqual(self.posts, [(
+            f"/api/session/{self.sid}/form/{self.form_id}/reply",
+            {"answer": {"amount": 2.5, "count": 0}},
+        )])
+
+    def test_invalid_required_answer_keeps_private_draft_without_claim_or_post(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+
+        self._set_form([{"key": "name", "type": "string", "required": True,
+                         "hidden": False, "when": []}])
+        _state, envelope, row, _vm = self._read_and_adopt()
+        action_ref = {**envelope, "id": self.item_id, "_fleet_row_ref": row["ref"]}
+        drafted = ExplorerRuntime.execute_question_action((
+            "questions.draft", action_ref, "private invalid draft"))
+        self.assertEqual(drafted["state"], "open")
+        invalid = ExplorerRuntime.execute_question_action((
+            "questions.submit", action_ref, {"answers": {"name": [""]}}))
+        self.assertEqual(invalid["state"], "open")
+        self.assertEqual(invalid["draft"], "private invalid draft")
+        self.assertNotIn("action_id", invalid)
+        self.assertFalse(self.posts)
+
+    def test_cancelled_receipt_is_adopted_and_never_resubmitted(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+        from fleet.explorer.state import reduce
+
+        state, _envelope, row, vm = self._read_and_adopt()
+        state, effects = reduce(state, {"type": "click", "action":
+                                        ("question.choice", "colors", "red-native")})
+        draft = ExplorerRuntime.execute_question_action(effects[0])
+        state = self._adopt(state, effects[0], draft, row, vm)
+        self.post_terminal_state = "cancelled"
+        state, effects = reduce(state, {"type": "click", "action": ("question.submit",)})
+        receipt = ExplorerRuntime.execute_question_action(effects[0])
+        self.assertEqual(receipt["state"], "cancelled")
+        state = self._adopt(state, effects[0], receipt, row, vm)
+        self.assertEqual(state.question_overlay["state"], "cancelled")
+        duplicate = ExplorerRuntime.execute_question_action(effects[0])
+        self.assertEqual(duplicate["state"], "cancelled")
+        self.assertEqual(len(self.posts), 1)
+
+    def test_schema_change_and_lost_reply_do_not_retarget_or_replay(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+
+        _state, envelope, row, _vm = self._read_and_adopt()
+        ref = {**envelope, "id": self.item_id, "_fleet_row_ref": row["ref"]}
+        self._set_form([{**self._single_multiselect()[0], "maxItems": 2}])
+        changed = ExplorerRuntime.execute_question_action((
+            "questions.submit", ref, {"answers": {"colors": ["red-native"]}},
+        ))
+        self.assertIn(changed["state"], {"open", "unknown"})
+        self.assertFalse(self.posts)
+
+        self._set_form(self._single_multiselect())
+        self.post_status = 500
+        _state, envelope, row, _vm = self._read_and_adopt()
+        ref = {**envelope, "id": self.item_id, "_fleet_row_ref": row["ref"]}
+        effect = ("questions.submit", ref, {"answers": {"colors": ["red-native"]}})
+        ambiguous = ExplorerRuntime.execute_question_action(effect)
+        self.assertEqual(ambiguous["state"], "unknown")
+        duplicate = ExplorerRuntime.execute_question_action(effect)
+        self.assertEqual(duplicate["state"], "unknown")
+        self.assertEqual(len(self.posts), 1)
+
+    def test_boolean_field_and_optional_omission_never_get_defaulted(self):
+        self._set_form([{"key": "confirm", "type": "boolean", "required": True,
+                         "hidden": False, "when": [], "default": True}])
+        state, envelope, row, vm = self._read_and_adopt()
+        self.assertFalse(self.posts)
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertFalse(effects)
+        state, effects = self._ui_action(state, ("question.choice", "confirm", "false"), row, vm)
+        self.assertEqual(effects[0][0], "questions.draft")
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertEqual(effects[0][0], "questions.submit")
+        self.assertEqual(self.posts, [(
+            f"/api/session/{self.sid}/form/{self.form_id}/reply",
+            {"answer": {"confirm": False}},
+        )])
+        self.assertNotIn("default", envelope["detail"]["questions"][0])
+
+        self.form_id = "frm_optional_ui8223"
+        self.item_id = "S1:opencode-form-ui8223-optional"
+        self._set_form([
+            {"key": "required", "type": "string", "required": True,
+             "hidden": False, "when": []},
+            {"key": "optional", "type": "string", "required": False,
+             "hidden": False, "when": [], "default": "never-copy"},
+        ])
+        self._publish_wait()
+        state, _envelope, row, vm = self._read_and_adopt()
+        state = self._ui_text(state, "required", "explicit", row, vm)
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertEqual(effects[0][0], "questions.submit")
+        self.assertEqual(self.posts[-1], (
+            f"/api/session/{self.sid}/form/{self.form_id}/reply",
+            {"answer": {"required": "explicit"}},
+        ))
+        self.assertNotIn("never-copy", human_wait_state._fleet_cache_path().read_text())
+
+    def test_optional_only_input_and_hidden_defaults_remain_private(self):
+        from fleet.explorer.state import question_items
+
+        self._set_form([
+            {"key": "notes", "type": "string", "required": False,
+             "hidden": False, "when": [], "default": "never-copy"},
+            {"key": "private", "type": "string", "required": False,
+             "hidden": True, "when": [], "default": "also-never-copy"},
+        ])
+        state, _envelope, row, vm = self._read_and_adopt()
+        self.assertEqual([item["id"] for item in question_items(
+            state.question_overlay["detail"])], ["notes"])
+        self.assertFalse(self.posts)
+        state = self._ui_text(state, "notes", "explicit optional answer", row, vm)
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertEqual(effects[0][0], "questions.submit")
+        self.assertEqual(self.posts, [(
+            f"/api/session/{self.sid}/form/{self.form_id}/reply",
+            {"answer": {"notes": "explicit optional answer"}},
+        )])
+        self.assertNotIn("never-copy", human_wait_state._fleet_cache_path().read_text())
+        self.assertNotIn("also-never-copy", human_wait_state._fleet_cache_path().read_text())
+
+    def test_optional_only_empty_submit_is_explicit_and_once(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+
+        self._set_form([
+            {"key": "notes", "type": "string", "required": False, "default": "never-copy"},
+            {"key": "private", "type": "string", "required": False, "hidden": True},
+        ])
+        state, _envelope, row, vm = self._read_and_adopt()
+        self.assertFalse(self.posts)
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertEqual(len(effects), 1)
+        self.assertEqual(self.posts, [(
+            f"/api/session/{self.sid}/form/{self.form_id}/reply", {"answer": {}})])
+        self.assertEqual(state.question_overlay["state"], "applied")
+        receipt = ExplorerRuntime.execute_question_action(effects[0])
+        self.assertEqual(receipt["state"], "applied")
+        self.assertEqual(len(self.posts), 1)
+
+    def test_all_hidden_optional_form_needs_rendered_explicit_submit_and_sends_empty_once(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+        from fleet.explorer.state import question_answer_supported, question_items, reduce
+
+        self._set_form([
+            {"key": "private-note", "type": "string", "title": "HIDDEN-PRIVATE-TITLE",
+             "required": False, "hidden": True, "default": "HIDDEN-PRIVATE-DEFAULT"},
+            {"key": "private-choice", "type": "multiselect", "required": False,
+             "hidden": True, "options": [{"value": "secret", "label": "HIDDEN-PRIVATE-CHOICE"}],
+             "default": ["secret"]},
+        ])
+        state, envelope, row, vm = self._read_and_adopt()
+        self.assertEqual(question_items(state.question_overlay["detail"]), ())
+        self.assertEqual(envelope["native_ref"]["field_keys"],
+                         ["private-note", "private-choice"])
+        detail = state.question_overlay["detail"]
+        self.assertTrue(question_answer_supported(detail))
+        unknown = dict(detail, state="unknown")
+        self.assertFalse(question_answer_supported(unknown))
+        malformed = dict(detail)
+        malformed_native = dict(detail["native_ref"], field_keys=["other"])
+        malformed["native_ref"] = malformed_native
+        self.assertFalse(question_answer_supported(malformed))
+        unsupported_schema = dict(detail)
+        unsupported_body = dict(detail["detail"])
+        unsupported_body["questions"] = [dict(item, field_type="object")
+                                          for item in detail["detail"]["questions"]]
+        unsupported_schema["detail"] = unsupported_body
+        self.assertFalse(question_answer_supported(unsupported_schema))
+        self.assertFalse(self.posts)
+
+        refresh = ExplorerRuntime.execute_question_action(
+            ("questions.read", state.question_overlay["ref"]))
+        self.assertEqual(refresh["state"], "open")
+        human_wait_state.cached_fleet_view(now=self.now + 300, request=False)
+        row, vm = self._row()
+        self.assertFalse(self.posts)
+        self.assertFalse(any(method == "POST" for method, _path in self.http_paths))
+
+        public = json.dumps(human_wait_state.cached_fleet_view(now=self.now, request=False))
+        cache = human_wait_state._fleet_cache_path().read_text(encoding="utf-8")
+        self.assertNotIn("HIDDEN-PRIVATE-TITLE", public + cache)
+        self.assertNotIn("HIDDEN-PRIVATE-DEFAULT", public + cache)
+        self.assertNotIn("HIDDEN-PRIVATE-CHOICE", public + cache)
+
+        hit, grid = self._rendered_submit_hit(state, vm)
+        self.assertIsNotNone(hit, "the rendered QUESTIONS grid must expose explicit Submit")
+        rendered = "\n".join(grid.rows_text())
+        self.assertIn("submit answer", rendered)
+        self.assertNotIn("HIDDEN-PRIVATE-TITLE", rendered)
+        self.assertNotIn("HIDDEN-PRIVATE-CHOICE", rendered)
+        submitted, effects = reduce(state, {"type": "click", "action": hit.action})
+        self.assertEqual(len(effects), 1)
+        self.assertEqual(effects[0][0], "questions.submit")
+        self.assertEqual(effects[0][2], {"answers": {}})
+        receipt = ExplorerRuntime.execute_question_action(effects[0])
+        state = self._adopt(submitted, effects[0], receipt, row, vm)
+        self.assertEqual(receipt["state"], "applied")
+        self.assertEqual(self.posts, [(
+            f"/api/session/{self.sid}/form/{self.form_id}/reply", {"answer": {}})])
+
+        duplicate = ExplorerRuntime.execute_question_action(effects[0])
+        self.assertEqual(duplicate["state"], "applied")
+        self.assertEqual(len(self.posts), 1)
+
+    def test_hidden_required_stale_and_unsupported_forms_never_post(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+        from fleet.explorer.state import question_answer_supported, question_items, reduce
+
+        self._set_form([
+            {"key": "private-note", "type": "string", "required": False,
+             "hidden": True},
+        ])
+        state, _envelope, row, vm = self._read_and_adopt()
+        hit, _grid = self._rendered_submit_hit(state, vm)
+        self.assertIsNotNone(hit)
+        submitted, effects = reduce(state, {"type": "click", "action": hit.action})
+        self.assertEqual(len(effects), 1)
+        self.form["fields"].append({"key": "new-field", "type": "string",
+                                    "required": False, "hidden": True})
+        stale = ExplorerRuntime.execute_question_action(effects[0])
+        self.assertNotEqual(stale["state"], "applied")
+        self.assertFalse(self.posts)
+
+        self.form_id = "frm_hidden_required_ui8223"
+        self.item_id = "S1:opencode-form-ui8223-hidden-required"
+        self._set_form([
+            {"key": "private-required", "type": "string", "required": True,
+             "hidden": True},
+        ])
+        self._publish_wait()
+        state, _envelope, row, vm = self._read_and_adopt(expected_state="unknown")
+        self.assertEqual(question_items(state.question_overlay["detail"]), ())
+        self.assertFalse(question_answer_supported(state.question_overlay["detail"]))
+        would_be_supported = dict(state.question_overlay["detail"])
+        would_be_supported["state"] = "open"
+        would_be_supported["support"] = {"supported": True}
+        self.assertFalse(question_answer_supported(would_be_supported))
+        hit, _grid = self._rendered_submit_hit(state, vm)
+        self.assertIsNone(hit)
+        _state, effects = reduce(state, {"type": "click", "action": ("question.submit",)})
+        self.assertFalse(effects)
+        self.assertFalse(self.posts)
+
+        self.form_id = "frm_mixed_hidden_required_ui8223"
+        self.item_id = "S1:opencode-form-ui8223-mixed-hidden-required"
+        self._set_form([
+            {"key": "visible-note", "type": "string", "required": False,
+             "hidden": False},
+            {"key": "private-required", "type": "string", "required": True,
+             "hidden": True},
+        ])
+        self._publish_wait()
+        state, _envelope, row, vm = self._read_and_adopt(expected_state="unknown")
+        self.assertTrue(question_items(state.question_overlay["detail"]))
+        self.assertFalse(question_answer_supported(state.question_overlay["detail"]))
+        would_be_supported = dict(state.question_overlay["detail"])
+        would_be_supported["state"] = "open"
+        would_be_supported["support"] = {"supported": True}
+        forced_overlay = dict(state.question_overlay, state="open", detail=would_be_supported)
+        forced_state = replace(state, question_overlay=forced_overlay)
+        self.assertFalse(question_answer_supported(would_be_supported))
+        hit, _grid = self._rendered_submit_hit(forced_state, vm)
+        self.assertIsNone(hit)
+        _state, effects = reduce(forced_state, {
+            "type": "click", "action": ("question.submit",)})
+        self.assertFalse(effects)
+        self.assertFalse(self.posts)
+
+        unsupported_detail = dict(state.question_overlay["detail"])
+        unsupported_detail["support"] = {"supported": False}
+        unsupported_overlay = dict(state.question_overlay, detail=unsupported_detail)
+        unsupported_state = replace(state, question_overlay=unsupported_overlay)
+        hit, _grid = self._rendered_submit_hit(unsupported_state, vm)
+        self.assertIsNone(hit)
+        _state, effects = reduce(unsupported_state, {
+            "type": "click", "action": ("question.submit",)})
+        self.assertFalse(effects)
+        self.assertFalse(self.posts)
+
+    def test_multifield_custom_edit_preserves_native_choices_and_field_limit(self):
+        from fleet.explorer.state import question_items, question_answer_supported
+
+        self.assertEqual(question_items(None), ())
+        self.assertFalse(question_answer_supported(None))
+        self._set_form([
+            {**self._single_multiselect()[0], "maxItems": 2},
+            {"key": "notes", "type": "string", "required": True},
+        ])
+        state, _envelope, row, vm = self._read_and_adopt()
+        state, _ = self._ui_action(state, ("question.choice", "colors", "red-native"), row, vm)
+        state = self._ui_text(state, "colors", "custom original", row, vm)
+        state, effects = self._ui_action(state, ("question.choice", "colors", "blue-native"), row, vm)
+        self.assertFalse(effects)
+        state = self._ui_text(state, "colors", "custom revised", row, vm)
+        self.assertEqual(state.question_overlay["draft"]["answers"]["colors"],
+                         ["red-native", "custom revised"])
+        state = self._ui_text(state, "notes", "explicit note", row, vm)
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertEqual(effects[0][0], "questions.submit")
+        self.assertEqual(self.posts, [(
+            f"/api/session/{self.sid}/form/{self.form_id}/reply",
+            {"answer": {"colors": ["red-native", "custom revised"], "notes": "explicit note"}},
+        )])
+
+    def test_extreme_integer_exponent_stays_editable_without_post(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+
+        self._set_form([{"key": "count", "type": "integer", "required": True}])
+        state, envelope, row, vm = self._read_and_adopt()
+        state = self._ui_text(state, "count", "1e999999999", row, vm)
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertFalse(effects)
+        self.assertEqual(state.question_overlay["draft"]["answers"]["count"], ["1e999999999"])
+        ref = {**envelope, "id": self.item_id, "_fleet_row_ref": row["ref"]}
+        result = ExplorerRuntime.execute_question_action((
+            "questions.submit", ref, {"answers": {"count": ["1e999999999"]}}))
+        self.assertEqual(result["state"], "open")
+        self.assertEqual(result["reason"], "opencode-form-integer-answer-unsafe")
+        self.assertNotIn("action_id", result)
+        self.assertFalse(self.posts)
+
+    def test_condition_visibility_tracks_choices_and_inactive_values_are_omitted(self):
+        from fleet.explorer.state import question_items
+
+        self._set_form([
+            {"key": "mode", "type": "string", "required": True,
+             "hidden": False, "when": [],
+             "options": [{"value": "basic-native", "label": "Basic"},
+                         {"value": "advanced-native", "label": "Advanced"}]},
+            {"key": "details", "type": "string", "required": True,
+             "hidden": False,
+             "when": [{"key": "mode", "op": "eq", "value": "advanced-native"},
+                      {"key": "mode", "op": "neq", "value": "basic-native"}]},
+            {"key": "private", "type": "string", "required": False,
+             "hidden": True, "when": []},
+        ])
+        state, _envelope, row, vm = self._read_and_adopt()
+        visible = lambda current: [item["id"] for item in question_items(
+            current.question_overlay["detail"])]
+        self.assertEqual(visible(state), ["mode"])
+        state, effects = self._ui_action(
+            state, ("question.choice", "mode", "advanced-native"), row, vm)
+        self.assertEqual(effects[0][0], "questions.draft")
+        self.assertEqual(visible(state), ["mode", "details"])
+        state = self._ui_text(state, "details", "keep this private draft", row, vm)
+        state, _ = self._ui_action(state, ("question.choice", "mode", "basic-native"), row, vm)
+        self.assertEqual(visible(state), ["mode"])
+        self.assertEqual(state.question_overlay["draft"]["answers"]["details"],
+                         ["keep this private draft"])
+        state, _ = self._ui_action(
+            state, ("question.choice", "mode", "advanced-native"), row, vm)
+        self.assertEqual(visible(state), ["mode", "details"])
+        self.assertEqual(state.question_overlay["draft"]["answers"]["details"],
+                         ["keep this private draft"])
+        state, _ = self._ui_action(state, ("question.choice", "mode", "basic-native"), row, vm)
+        state, effects = self._ui_action(state, ("question.submit",), row, vm)
+        self.assertEqual(effects[0][0], "questions.submit")
+        self.assertEqual(self.posts, [(
+            f"/api/session/{self.sid}/form/{self.form_id}/reply",
+            {"answer": {"mode": "basic-native"}},
+        )])
+
+
 class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
     """Exercise private workflow questions through real registry-backed UI actions."""
 
@@ -1364,10 +2048,34 @@ class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
 
         self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
         self.root = Path(self.tmp.name)
+        self.agent_home = self.root / "agent-home"
+        (self.agent_home / "core").mkdir(parents=True)
+        (self.agent_home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
         self.env = mock.patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "xdg"),
             "HOME": str(self.root),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "AGENT_HOME": str(self.agent_home),
+            "AGENT_WORKFLOW_ROOT": str(self.root / "workflow"),
+            "AGENT_ARTIFACT_CHECKPOINT": "off",
+            "AGENT_ARTIFACT_CAMPAIGN_ID": "",
+            "AGENT_ARTIFACT_CYCLE_ID": "",
+            "AGENT_ARTIFACT_PRODUCER_ID": "",
+            "AGENT_ARTIFACT_CYCLE_DIR": "",
+            "AGENT_ARTIFACT_OUTPUT_DIR": "",
+            "AGENT_DISPATCH_CALLER_HARNESS": "codex",
+            "AGENT_DISPATCH_REGISTERED_WORKER": "",
+            "AGENT_DISPATCH_CHILD": "",
+            "AGENT_DISPATCH_DEPTH": "0",
+            "AGENT_DISPATCH_ATTEMPT_ID": "",
+            "AGENT_OWNER_ROUTE_FILE": "",
+            "AGENT_OWNER_ROUTE_ID": "",
+            "AGENT_OWNER_ROUTE_HASH": "",
+            "CODEX_THREAD_ID": "parent-session",
+            "CODEX_SESSION_ID": "",
+            "CLAUDE_CODE_SESSION_ID": "",
+            "CLAUDE_SESSION_ID": "",
+            "OPENCODE_SESSION_ID": "",
         })
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -1384,6 +2092,7 @@ class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
         self.dispatch = dispatch
         self.jobs = self.root / "jobs.log"
         self.jobs.write_text("", encoding="utf-8")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         registries = mock.patch.object(dispatch, "human_gate_registry_paths",
                                        return_value=(self.jobs,))
         registries.start()
@@ -1674,22 +2383,28 @@ class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
         from fleet.explorer.state import reduce
 
         metadata = self._metadata
-        with mock.patch.object(self, "_metadata", side_effect=lambda *args, **kwargs:
-                               metadata(*args, **kwargs).replace(
-                                   "parent_harness=codex", "parent_harness=" + harness)):
-            source = self._blocked_owner_wait()
-        row = self._row(self._view_model(self.latest_result), "S3")
-        state, envelope, _ = self._read_in_ui(row)
-        self.assertEqual(envelope["harness"], harness)
-        self.assertEqual(envelope["native_ref"]["transport"], "hearting-owner-input")
-        state, saved = self._save_typed_draft(state, "Continue this exact owner")
-        state = self._adopt_result(state, saved)
-        state, effects = reduce(state, {"type": "click", "action": ("question.submit",)})
-        self.assertEqual(len(effects), 1)
-        receipt = ExplorerRuntime.execute_question_action(effects[0])
-        self.assertEqual(receipt["state"], "received")
-        self.assertEqual(len(dispatch_owner_input.inspect(
-            self.jobs, source["attempt_id"])["requests"]), 1)
+        identity = {"AGENT_DISPATCH_CALLER_HARNESS": harness,
+                    "CODEX_THREAD_ID": "" if harness != "codex" else "parent-session",
+                    "CLAUDE_CODE_SESSION_ID": "parent-session" if harness == "claude" else "",
+                    "CLAUDE_SESSION_ID": "",
+                    "OPENCODE_SESSION_ID": "parent-session" if harness == "opencode" else ""}
+        with mock.patch.dict(os.environ, identity):
+            with mock.patch.object(self, "_metadata", side_effect=lambda *args, **kwargs:
+                    metadata(*args, **kwargs).replace(
+                        "parent_harness=codex", "parent_harness=" + harness)):
+                source = self._blocked_owner_wait()
+            row = self._row(self._view_model(self.latest_result), "S3")
+            state, envelope, _ = self._read_in_ui(row)
+            self.assertEqual(envelope["harness"], harness)
+            self.assertEqual(envelope["native_ref"]["transport"], "hearting-owner-input")
+            state, saved = self._save_typed_draft(state, "Continue this exact owner")
+            state = self._adopt_result(state, saved)
+            state, effects = reduce(state, {"type": "click", "action": ("question.submit",)})
+            self.assertEqual(len(effects), 1)
+            receipt = ExplorerRuntime.execute_question_action(effects[0])
+            self.assertEqual(receipt["state"], "received")
+            self.assertEqual(len(dispatch_owner_input.inspect(
+                self.jobs, source["attempt_id"])["requests"]), 1)
 
     def test_workflow_free_text_does_not_widen_native_explicit_choices(self):
         from fleet.explorer.state import question_free_text_supported, question_values_valid
@@ -1849,6 +2564,181 @@ class FleetWorkflowQuestionIntegrationTests(unittest.TestCase):
         return dispatch_owner_input.inspect(self.jobs, attempt)["requests"]
 
 
+class FleetS3OwnerContinuationTests(unittest.TestCase):
+    """Exercise selected S3 answers through the public correction continuation."""
+
+    _seal_route = FleetWorkflowQuestionIntegrationTests._seal_route
+    _metadata = FleetWorkflowQuestionIntegrationTests._metadata
+    _write_owner = FleetWorkflowQuestionIntegrationTests._write_owner
+    _observe = FleetWorkflowQuestionIntegrationTests._observe
+    _blocked_owner_wait = FleetWorkflowQuestionIntegrationTests._blocked_owner_wait
+
+    def setUp(self):
+        FleetWorkflowQuestionIntegrationTests.setUp(self)
+        import work_start
+
+        project_root = Path(__file__).resolve().parents[3]
+        router = work_start._route_module()
+        gate = {"spec_read": {"satisfied": True, "source": "canonical-prd-sha256"},
+                "drift_verdict": "within-spec", "workflow_mode": "tracked",
+                "artifact_guard": {"satisfied": True, "source": "conductor-prechecked"}}
+        route = router.compile_route(
+            "autopilot-code", "dev", "direct", str(project_root), str(self.artifacts),
+            predicates=["atomic-outcome", "known-scope", "no-shared-contract",
+                        "no-resource-run", "no-artifact-handoff", "no-independent-verifier",
+                        "focused-verification"],
+            signals=[], transport=None, inline_reason="atomic-direct", tracking="tracked",
+            tracked_gate_evidence=gate)
+        route["work_request"] = {"text": "Continue the selected owner's approved route.",
+                                 "owner_harness": "codex"}
+        self.route = route
+        self._seal_route()
+        router.verify_route(self.route, str(project_root))
+        self.public_correct_commands = []
+
+    def _public_correct_runner(self, *, lose_reply=False):
+        import subprocess
+
+        real_run = subprocess.run
+        calls = []
+        files = []
+
+        def run(command, *args, **kwargs):
+            if (not isinstance(command, (list, tuple)) or len(command) < 3
+                    or Path(str(command[1])).name != "capability-route.py"
+                    or command[2] != "correct"):
+                return real_run(command, *args, **kwargs)
+            command = list(command)
+            calls.append(command)
+            message_path = Path(command[command.index("--message-file") + 1])
+            self.assertTrue(message_path.is_file())
+            self.assertEqual(stat.S_IMODE(message_path.stat().st_mode), 0o600)
+            files.append(message_path)
+            completed = real_run(command, *args, **kwargs)
+            if lose_reply:
+                raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 30))
+            return completed
+
+        return run, calls, files
+
+    def _selected_owner(self):
+        item = self._blocked_owner_wait()
+        selected = human_wait_state.read_selected_request({"id": item["id"]})
+        self.assertEqual(selected["state"], "open")
+        self.assertTrue(selected["support"]["supported"], selected)
+        self.assertEqual(selected["native_ref"]["attempt_id"], item["attempt_id"])
+        return item, selected
+
+    def test_public_correct_continues_once_and_refreshes_the_private_receipt(self):
+        import dispatch_owner_input
+
+        item, selected = self._selected_owner()
+        answer = "private continuation answer"
+        drafted = human_wait_state.write_selected_draft(selected, answer)
+        runner, calls, files = self._public_correct_runner()
+        with mock.patch.object(human_wait_state.subprocess, "run", side_effect=runner):
+            result = human_wait_state.submit_selected_response(
+                drafted, {"answers": {"owner-correction": [answer]}},
+                action_id="s3-public-correct-once")
+
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[argv.index("--attempt-id") + 1], item["attempt_id"])
+        self.assertEqual(argv[argv.index("--request-id") + 1], "s3-public-correct-once")
+        self.assertNotIn(answer, " ".join(argv))
+        self.assertEqual(len(files), 1)
+        self.assertFalse(files[0].exists())
+        self.assertEqual(result["state"], "received", result)
+        self.assertEqual(result["result"]["status"], "retained", result)
+        self.assertEqual(result["result"]["target_attempt_id"], item["attempt_id"])
+        self.assertEqual(result["result"]["continuation"]["state"], "inline")
+        receipt = dispatch_owner_input.inspect(self.jobs, item["attempt_id"])
+        self.assertEqual([row["id"] for row in receipt["requests"]], ["s3-public-correct-once"])
+        self.assertEqual(receipt["requests"][0]["state"], "retained")
+        self.assertNotIn(answer, self.jobs.read_text(encoding="utf-8"))
+        self.assertNotIn(answer, human_wait_state._fleet_cache_path().read_text(encoding="utf-8"))
+
+        empty = dict(self.latest_result, items=[], total=0, older=0, unattributed=[])
+        self.assertTrue(human_wait_state.publish_cache(empty))
+        refreshed = human_wait_state.read_selected_request(selected)
+        self.assertEqual(refreshed["state"], "received", refreshed)
+        self.assertEqual(refreshed["result"]["status"], "retained", refreshed)
+        self.assertEqual(refreshed["result"]["target_attempt_id"], item["attempt_id"])
+        self.assertEqual(refreshed["result"]["continuation"]["state"], "inline")
+        self.assertNotIn(answer, human_wait_state._fleet_cache_path().read_text(encoding="utf-8"))
+
+    def test_lost_correct_reply_is_not_replayed_and_exact_receipt_recovers(self):
+        import dispatch_owner_input
+
+        item, selected = self._selected_owner()
+        answer = "private answer with a lost command reply"
+        drafted = human_wait_state.write_selected_draft(selected, answer)
+        runner, calls, files = self._public_correct_runner(lose_reply=True)
+        with mock.patch.object(human_wait_state.subprocess, "run", side_effect=runner):
+            ambiguous = human_wait_state.submit_selected_response(
+                drafted, {"answers": {"owner-correction": [answer]}},
+                action_id="s3-lost-correct-reply")
+            recovered = human_wait_state.submit_selected_response(
+                drafted, {"answers": {"owner-correction": [answer]}},
+                action_id="s3-lost-correct-reply")
+
+        self.assertEqual(ambiguous["state"], "unknown", ambiguous)
+        self.assertEqual(recovered["state"], "received", recovered)
+        self.assertEqual(recovered["result"]["status"], "retained")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(files), 1)
+        self.assertFalse(files[0].exists())
+        receipt = dispatch_owner_input.inspect(self.jobs, item["attempt_id"])
+        self.assertEqual([row["id"] for row in receipt["requests"]], ["s3-lost-correct-reply"])
+
+    def test_registered_worker_and_foreign_parent_cannot_submit(self):
+        _item, selected = self._selected_owner()
+        for context in ({"AGENT_DISPATCH_REGISTERED_WORKER": "1"},
+                        {"CODEX_THREAD_ID": "foreign-parent"}):
+            with self.subTest(context=context), \
+                 mock.patch.dict(os.environ, context), \
+                 mock.patch.object(human_wait_state.subprocess, "run",
+                                   side_effect=AssertionError("public correct must not run")) as run:
+                refused = human_wait_state.submit_selected_response(
+                    selected, {"answers": {"owner-correction": ["must stay local"]}},
+                    action_id="s3-refused-context")
+                self.assertFalse(refused["support"]["supported"])
+                self.assertEqual(refused["reason"],
+                                 "owner-correction-native-parent-context-required")
+                run.assert_not_called()
+
+    def test_changed_parent_route_target_or_lineage_refuses_before_public_correct(self):
+        cases = ("parent", "route", "target", "lineage")
+        for change in cases:
+            with self.subTest(change=change):
+                item, selected = self._selected_owner()
+                drafted = human_wait_state.write_selected_draft(selected, "keep this selected answer")
+                if change == "parent":
+                    self.jobs.write_text(self.jobs.read_text(encoding="utf-8").replace(
+                        "parent_sid=parent-session", "parent_sid=replacement-session"),
+                        encoding="utf-8")
+                elif change == "route":
+                    self.route["changed_after_selection"] = True
+                    self._seal_route()
+                elif change == "target":
+                    drafted = dict(drafted)
+                    drafted["native_ref"] = {**drafted["native_ref"],
+                                             "attempt_id": "att-different-selected-target"}
+                else:
+                    fields = self.jobs.read_text(encoding="utf-8").rstrip("\n").split("\t")
+                    fields[5] += (",replacement_family_id=unrecorded-family"
+                                  ",replacement_attempt_id=att-unrecorded"
+                                  ",replacement_claim_digest=" + "a" * 64)
+                    self.jobs.write_text("\t".join(fields) + "\n", encoding="utf-8")
+                with mock.patch.object(human_wait_state.subprocess, "run",
+                                       side_effect=AssertionError("changed selection must not submit")) as run:
+                    refused = human_wait_state.submit_selected_response(
+                        drafted, {"answers": {"owner-correction": ["keep this selected answer"]}},
+                        action_id="s3-changed-selection")
+                self.assertIn(refused["state"], {"unknown", "open"}, refused)
+                run.assert_not_called()
+
+
 class FleetS2WorkflowResponseTests(unittest.TestCase):
     """Exercise S2 selection through the current ledger and public release command."""
 
@@ -1868,9 +2758,7 @@ class FleetS2WorkflowResponseTests(unittest.TestCase):
 
     def setUp(self):
         FleetWorkflowQuestionIntegrationTests.setUp(self)
-        agent_home = self.root / "agent-home"
-        (agent_home / "core").mkdir(parents=True)
-        (agent_home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
+        agent_home = self.agent_home
         local_env = mock.patch.dict(os.environ, {
             "AGENT_HOME": str(agent_home),
             "AGENT_WORKFLOW_ROOT": str(self.root / "workflow"),

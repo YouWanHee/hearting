@@ -2707,6 +2707,11 @@ check_opencode_native_plugin_projection() {
           fail_msg "adapters/opencode/plugins/hearting-guards/index.ts is missing"
         fi
         ;;
+      hearting-tui-identity)
+        if [ ! -f adapters/opencode/plugins/hearting-tui-identity/tui.ts ]; then
+          fail_msg "adapters/opencode/plugins/hearting-tui-identity/tui.ts is missing"
+        fi
+        ;;
       *) fail_msg "adapters/opencode/plugins/$entry is not an approved OpenCode plugin projection" ;;
     esac
   done

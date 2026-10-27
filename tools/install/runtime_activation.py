@@ -600,23 +600,27 @@ def _mode_entries(source: Path, dest: Path) -> List[dict]:
 
 
 _OPENCODE_V2_SERVER_IMPORT = 'from "../hearting-guards.js"'
+_OPENCODE_V2_TUI_IMPORT = 'from "../../tui/hearting-tui-identity.ts"'
 
 
-def _opencode_v2_plugin_entry(entrypoint: Path, server: Path, dest: Path) -> dict:
+def _opencode_v2_plugin_entry(entrypoint: Path, server: Path, dest: Path,
+                              marker: str = _OPENCODE_V2_SERVER_IMPORT) -> dict:
     """The OpenCode 2 package entry as an activation-owned file, never a link.
 
     OpenCode 2 drops a plugin package whose entry resolves outside the package
     directory (v2.0.32 `config/plugin/source.ts`), so a link into the bundle is
     silently never loaded. The rendered entry stays inside the package and
-    imports the activated server export by absolute path; each release renders
-    a new import, so the server's config watcher sees the change.
+    imports the activated module by absolute path; each release renders a new
+    import, so the config watcher sees the change. The same rendering serves the
+    terminal-client package, whose `tui` entry V2 discovers under `plugins/`
+    while it skips a tui.json/cli.json entry that names a plain file.
     """
     if not entrypoint.is_file():
         return _entry(entrypoint, dest, "hook_config")
     text = entrypoint.read_text(encoding="utf-8")
-    if _OPENCODE_V2_SERVER_IMPORT not in text:
-        raise ActivationError(f"{entrypoint} lacks {_OPENCODE_V2_SERVER_IMPORT}")
-    content = text.replace(_OPENCODE_V2_SERVER_IMPORT, f"from {json.dumps(str(server))}", 1)
+    if marker not in text:
+        raise ActivationError(f"{entrypoint} lacks {marker}")
+    content = text.replace(marker, f"from {json.dumps(str(server))}", 1)
     entry = _entry(entrypoint, dest, "hook_config", kind="render")
     entry["content"] = content
     entry["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -905,6 +909,10 @@ def _linked_entries(
         entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config", kind="copy"))
         tui_entry = source_root / "adapters/opencode/tui/hearting-tui-identity.ts"
         entries.append(_entry(tui_entry, home / "tui/hearting-tui-identity.ts", "hook_config"))
+        tui_v2 = source_root / "adapters/opencode/plugins/hearting-tui-identity/tui.ts"
+        entries.append(_opencode_v2_plugin_entry(
+            tui_v2, tui_entry, home / "plugins/hearting-tui-identity/tui.ts",
+            marker=_OPENCODE_V2_TUI_IMPORT))
         herdr_tui = source_root / "adapters/opencode/tui/herdr-tui-session.js"
         entries.append(_entry(herdr_tui, home / "herdr-tui-session.js", "hook_config", kind="copy"))
         herdr_tui_v2 = source_root / "adapters/opencode/tui/herdr-opencode/tui.js"
