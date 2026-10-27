@@ -30,6 +30,7 @@ try:
 except ImportError:  # native Windows without windows-curses: plain --once / --json still work
     curses = None
 import glob
+import json
 import math
 import os
 import re
@@ -214,9 +215,11 @@ _HUE_OF = {
     "h_claude": ("c", _A_D), "h_codex": ("m", _A_D), "h_opencode": ("l", _A_D),
     "hb_claude": ("c", 0), "hb_codex": ("m", 0), "hb_opencode": ("l", 0), "hb_other": ("d", 0),
     "fam_opus": ("c", 0), "fam_sonnet": ("l", 0), "fam_haiku": ("g", 0),
-    "fam_fable": ("m", 0), "fam_gpt": ("y", 0), "fam_other": ("d", 0),
+    "fam_fable": ("m", 0), "fam_sol": ("y", 0), "fam_astra": ("o", 0),
+    "fam_luna": ("w", 0), "fam_gpt": ("y", 0), "fam_other": ("d", 0),
     "famd_opus": ("c", _A_D), "famd_sonnet": ("l", _A_D), "famd_haiku": ("g", _A_D),
-    "famd_fable": ("m", _A_D), "famd_gpt": ("y", _A_D), "famd_other": ("d", _A_D),
+    "famd_fable": ("m", _A_D), "famd_sol": ("y", _A_D), "famd_astra": ("o", _A_D),
+    "famd_luna": ("w", _A_D), "famd_gpt": ("y", _A_D), "famd_other": ("d", _A_D),
     "gpu_rtx6000": ("l", _A_D), "gpu_rtx4090": ("c", _A_D),
     "gpu_rtx5090": ("g", _A_D),
     "gpu_blackwell": ("g", _A_D), "gpu_hopper": ("m", _A_D),
@@ -375,10 +378,18 @@ def _init_colors():
     # per-MODEL family colors, in TWO intensities (2026-07-02: main↔dispatch contrast = whole-row
     # brightness): fam_* = BRIGHT (main session rows) / famd_* = DIM (dispatch rows recede).
     _hue = {h: _COLOR.get("h_" + h, 0) for h in ("claude", "codex", "opencode")}
+    # The three named Codex models are separate families, not one `gpt` bucket (user
+    # 2026-10-27: "codex 모델들 전부 같은 컬러"). Sol keeps the old gpt yellow, Astra
+    # takes the unused orange, and Luna takes soft white; a bare gpt-* id still lands
+    # on the shared `gpt` key. Names stay the primary identifier — the 8-color
+    # fallback folds orange into yellow — but the 256-color board separates them.
     _fam = {"opus": _palette_fg("cyan", curses.COLOR_CYAN),
             "sonnet": _palette_fg("blue", curses.COLOR_BLUE),
             "haiku": _palette_fg("green", curses.COLOR_GREEN),
             "fable": _palette_fg("magenta", curses.COLOR_MAGENTA),
+            "sol": _palette_fg("yellow", curses.COLOR_YELLOW),
+            "astra": _palette_fg("orange", curses.COLOR_YELLOW),
+            "luna": _palette_fg("soft", curses.COLOR_WHITE),
             "gpt": _palette_fg("yellow", curses.COLOR_YELLOW)}
     n_pair = 10                                     # pairs 1-9 reserved above; families from 10
     for fam, fg in _fam.items():
@@ -643,17 +654,24 @@ def _flat_level(key):
     return "lvl_r_flat" if key == "lvl_r" else key
 
 
-_FAMILIES = ("opus", "sonnet", "haiku", "fable", "gpt")
+_FAMILIES = ("sol", "astra", "luna", "opus", "sonnet", "haiku", "fable", "gpt")
 
 
 def _model_family(model):
     """Model-family token from a model/bucket name: 'Opus 4.8'→opus, 'gpt-5.5'→gpt, 'fable'→fable.
-    Unknown (glm/deepseek/…) → 'other' (default fg — distinct from the colored families)."""
+    The named Codex models keep their own tokens ('gpt-6.1-sol'→sol, 'Astra'→astra,
+    'gpt-6-luna'→luna) so each gets one stable identity colour in every view; any
+    other gpt id stays on the shared 'gpt' token. Unknown (glm/deepseek/…) → 'other'
+    (default fg — distinct from the colored families)."""
     m = (model or "").lower()
-    if re.fullmatch(r"\s*(?:sol|astra)\s*", m) or re.search(r"\bgpt(?:[-_ ]\d+(?:\.\d+)?)?[-_ /]*(?:sol|astra)\b", m):
-        return "gpt"
     for fam in _FAMILIES:
-        if fam in m:
+        if fam in ("sol", "astra", "luna"):
+            matched = re.search(r"\b%s\b" % fam, m)
+        elif fam == "gpt":
+            matched = "gpt" in m
+        else:
+            matched = fam in m
+        if matched:
             return fam
     return "other"
 
@@ -680,7 +698,13 @@ def _clean_model(name):
     name = name.split(" (", 1)[0]
     if "/" in name:
         name = name.split("/", 1)[1]
-    return _shorten_model_suffix(_ROLE_MODEL_NAME.get(name.lower(), name))
+    role = _ROLE_MODEL_NAME.get(name.lower())
+    if role:
+        # Only the bare lowercase alias the configs/dispatch env actually export is
+        # resolved against the catalog; a proper-noun value already came from an
+        # observed display name and is not rewritten by today's catalog.
+        name = (_resolved_alias_model(name) if name == name.lower() else None) or role
+    return _shorten_model_suffix(name)
 
 
 # Variant/effort tokens that carry no information: the runtime picked its own default and
@@ -734,10 +758,105 @@ def _short_model_id(name):
     return "%s %s" % (fam, major + ("." + minor if minor else ""))
 
 
+# A bare role alias names a family, not one model. The Claude runtime's own catalog is
+# the checked source for which concrete id this account currently resolves that family
+# to; a version is never written into this file. A missing, malformed, or ambiguous
+# catalog keeps the family word (the honest fallback this table always had).
+_ALIAS_FAMILIES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku", "fable": "fable"}
+_MODEL_CATALOG_MAX_BYTES = 16 * 1024 * 1024
+_ALIAS_MODEL_CACHE = {"stamp": None, "models": {}}
+
+
+def _claude_catalog_paths():
+    """The runtime's already-written catalog caches, in the same root order the explorer uses."""
+    config = (os.environ.get("HEARTING_MODEL_CONFIG_HOME")
+              or os.environ.get("CLAUDE_CONFIG_DIR")
+              or os.path.join(os.path.expanduser("~"), ".claude"))
+    return tuple(sorted(glob.glob(os.path.join(config, "cache", "model-catalog", "*.json"))))
+
+
+def _catalog_model_records(document):
+    """The model records in the runtime catalogs' bounded public shapes."""
+    if not isinstance(document, dict):
+        return ()
+    catalog = document.get("catalog")
+    config = catalog.get("config") if isinstance(catalog, dict) else None
+    records = config.get("models") if isinstance(config, dict) else None
+    if not isinstance(records, list):
+        records = document.get("models")
+    if not isinstance(records, list):
+        return ()
+    return tuple(item for item in records if isinstance(item, dict))
+
+
+def _resolved_alias_models():
+    """Role family → the one concrete id the account's runtime catalog marks ``main``.
+
+    Reads only the cache files the runtime already wrote. A family with no record,
+    zero ``main`` entries, or two different ``main`` ids across accounts stays
+    unresolved, so display never guesses. Cached by each file's (mtime, size) so a
+    frame never re-reads an unchanged catalog.
+    """
+    paths = _claude_catalog_paths()
+    stamps = []
+    for path in paths:
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        stamps.append((path, info.st_mtime_ns, info.st_size))
+    stamp = tuple(stamps)
+    cached = _ALIAS_MODEL_CACHE
+    if cached["stamp"] == stamp:
+        return cached["models"]
+    found = {}
+    for path, _mtime, size in stamps:
+        if size > _MODEL_CATALOG_MAX_BYTES:
+            continue
+        try:
+            with open(path, encoding="utf-8") as stream:
+                document = json.load(stream)
+        except (OSError, ValueError, UnicodeError, TypeError):
+            continue
+        for item in _catalog_model_records(document):
+            if item.get("section") != "main":
+                continue
+            runtime = item.get("runtime")
+            family = runtime.get("family") if isinstance(runtime, Mapping) else None
+            model_id = item.get("id")
+            if not isinstance(family, str) or not isinstance(model_id, str) or not model_id:
+                continue
+            found.setdefault(family.lower(), []).append(model_id)
+    resolved = {}
+    for family, ids in found.items():
+        distinct = tuple(dict.fromkeys(ids))
+        if family in _ALIAS_FAMILIES.values() and len(distinct) == 1:
+            resolved[family] = distinct[0]
+    cached["stamp"] = stamp
+    cached["models"] = resolved
+    return resolved
+
+
+def _resolved_alias_model(name):
+    """Versioned display for a bare role alias, or None when the catalog cannot confirm it."""
+    family = _ALIAS_FAMILIES.get(str(name).strip().lower())
+    if family is None:
+        return None
+    model_id = _resolved_alias_models().get(family)
+    if not model_id:
+        return None
+    return _short_model_id(model_id)
+
+
 def _dispatch_display_model(name):
     if not name:
         return name
-    return _short_model_id(_ROLE_MODEL_NAME.get(str(name).strip().lower(), name))
+    raw = str(name).strip()
+    token = raw.lower()
+    role = _ROLE_MODEL_NAME.get(token)
+    if role:
+        return (_resolved_alias_model(raw) if raw == token else None) or role
+    return _short_model_id(name)
 
 
 def _job_display_model(job, parent_model=None):
@@ -7192,10 +7311,10 @@ def _explorer_apply_effects(effects, vm):
     for effect in question_effects:
         _explorer_queue_question_effect(effect)
     model_actions = tuple(effect for effect in effects
-                          if effect and effect[0] == "models.apply")
+                          if effect and effect[0] in ("models.apply", "alloc.apply"))
     if _EXPLORER_REPLAY_ACTIVE:
         effects = tuple(effect for effect in effects
-                        if not effect or effect[0] != "models.apply")
+                        if not effect or effect[0] not in ("models.apply", "alloc.apply"))
         result = None
         if effects:
             result = _explorer_runtime().apply_effects(effects, vm)
@@ -11764,6 +11883,12 @@ def _explorer_question_editing():
                 and isinstance(overlay, Mapping) and overlay.get("editing"))
 
 
+def _explorer_text_input():
+    """Typed characters are text, not commands: a question is being edited or the MODELS list filtered."""
+    from .explorer.state import models_finding
+    return _explorer_question_editing() or models_finding(_EXPLORER_STATE)
+
+
 def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     """Apply one decoded event to the explorer's view-local reducer."""
     global _EXPLORER_STATE, _EXPLORER_TEXT
@@ -11807,7 +11932,8 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
             _EXPLORER_STATE = state
             _explorer_apply_effects(_effects, _EXPLORER_MODEL)
         return
-    editing = (state.view == "QUESTIONS" and _explorer_question_editing())
+    from .explorer.state import models_finding
+    editing = (state.view == "QUESTIONS" and _explorer_question_editing()) or models_finding(state)
     if editing and isinstance(ch, int) and (32 <= ch < 127 or 128 <= ch < 256):
         key = _explorer_text_key(ch)
     else:
@@ -12216,7 +12342,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _EXPLORER_RESULT = focus_result
                     _HIT_VALID = False
 
-            question_editing = _explorer_question_editing()
+            question_editing = _explorer_text_input()
             if (ch in (ord("q"), ord("Q")) and not _explorer_searching()
                     and not question_editing):
                 return 0

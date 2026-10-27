@@ -141,14 +141,20 @@ def _link_when(links, upper, lower):
 
 
 def _draw_side_lanes(grid, edges, boxes, right):
-    """Stacked pairs join round their right side, one lane each way, labelled under the upper card."""
+    """Stacked pairs join round their right side, one lane each way, labelled under the upper card.
+
+    Every card meets its lanes on its two first inner rows: the arriving head sits beside the
+    title row and the leaving tail leaves from the gauge row, so a lane never lands on a
+    corner, a divider or another card whatever height the cards have.
+    """
     links = tuple(edges.get("links", ()))
     for lane in edges.get("side_lanes", ()):
         if len(lane) < 2:
             continue
         upper, lower = str(lane[0]), str(lane[1])
         top, tail = boxes.get(upper), boxes.get(lower)
-        if not top or not tail or top[4] != tail[4] or top[1] >= tail[1]:
+        if (not top or not tail or top[4] != tail[4] or top[2] != tail[2]
+                or top[3] >= tail[1]):
             continue
         ux, uy, edge, ub = top[0], top[1], top[2], top[3]
         fy = tail[1]
@@ -157,18 +163,18 @@ def _draw_side_lanes(grid, edges, boxes, right):
         def put(px, py, text, key="branch_s"):
             grid.put(px, py, text, key, limit=right)
 
-        put(edge, uy + 2, "├", top[5])
+        put(edge, uy + 2, "├", top[5])                 # upper → lower
         put(edge + 1, uy + 2, "──")
         put(first, uy + 2, "┐")
-        for yy in range(uy + 3, fy + 2):
+        for yy in range(uy + 3, fy + 1):
             put(first, yy, "│")
-        put(first, fy + 2, "┘")
-        put(edge + 2, fy + 2, "─")
-        put(edge + 1, fy + 2, LANE_HEAD_LEFT, "soft")
-        put(edge, fy + 3, "├", tail[6])
-        put(edge + 1, fy + 3, "────")
-        put(second, fy + 3, "┘")
-        for yy in range(uy + 2, fy + 3):
+        put(first, fy + 1, "┘")
+        put(edge + 2, fy + 1, "─")
+        put(edge + 1, fy + 1, LANE_HEAD_LEFT, "soft")
+        put(edge, fy + 2, "├", tail[5])                # lower → upper
+        put(edge + 1, fy + 2, "────")
+        put(second, fy + 2, "┘")
+        for yy in range(uy + 2, fy + 2):
             put(second, yy, "│")
         put(second, uy + 1, "┐")
         put(edge + 2, uy + 1, "───")
@@ -258,6 +264,23 @@ def _draw_links_compact(grid, vm, state, links, opened, x, y, use, right, bottom
 
 
 
+def _row_width(col_gaps, members, box_width):
+    """Frame width for one row of columns: a trailing side lane keeps its gutter inside."""
+    inner = 2 + sum(box_width + col_gaps[ci] for ci in members)
+    return inner + 1 if col_gaps[members[-1]] > 2 else inner - col_gaps[members[-1]] + 2
+
+
+def _wrap_columns(col_gaps, box_width, use):
+    """Split column indexes into the fewest rows that fit ``use``, balanced across rows."""
+    count = len(col_gaps)
+    for rows in range(1, count + 1):
+        per_row = -(-count // rows)
+        chunks = [list(range(start, min(count, start + per_row))) for start in range(0, count, per_row)]
+        if all(_row_width(col_gaps, chunk, box_width) <= use for chunk in chunks):
+            return chunks
+    return [[index] for index in range(count)]
+
+
 def draw_peers(grid, vm, state, x=34, y=3):
     """Draw data-sized repository frames, session cards and the complete link list.
 
@@ -295,31 +318,24 @@ def draw_peers(grid, vm, state, x=34, y=3):
                                     for pair in edges.get("side_lanes", ())
                                     for i in range(max(0, len(col) - 1))) else column_gap
                     for col in cols]
-        has_lane = col_gaps[-1] == lane_gap
-        dx = 2
-        col_x = []
-        for gap in col_gaps:
-            col_x.append(dx)
-            dx += box_width + gap
-        frame_width = dx + 1 if has_lane else dx - column_gap + 2
-        if frame_width > use and len(cols) > 1:
-            cols = [tuple(tag for col in cols for tag in col)]
-            has_lane = any(tuple(pair) == tuple(cols[0][i:i + 2])
-                           for pair in edges.get("side_lanes", ())
-                           for i in range(max(0, len(cols[0]) - 1)))
-            col_gaps = [lane_gap if has_lane else column_gap]
-            frame_width = 2 + box_width + col_gaps[0] + (1 if has_lane else -column_gap + 2)
-            col_x = [2]
-        row_count = max(map(len, cols))
-        row_height = [max(height_of(col[row]) + 1
-                          for col in cols if row < len(col)) for row in range(row_count)]
-        positions = {}
-        for ci, col in enumerate(cols):
-            yy = 1
-            for ri, tag in enumerate(col):
-                positions[tag] = (col_x[ci], yy, height_of(tag))
-                yy += row_height[ri] + stack_gap
-        frame_height = 1 + sum(row_height) + stack_gap * (row_count - 1) + 1
+        # Wrap the columns into as many rows as the pane width needs; each row keeps the
+        # columns' own order and a stacked pair stays one column with its side lanes.
+        grid_rows = _wrap_columns(col_gaps, box_width, use)
+        positions, frame_width, yy = {}, 0, 1
+        for members in grid_rows:
+            frame_width = max(frame_width, _row_width(col_gaps, members, box_width))
+            depth = max(len(cols[ci]) for ci in members)
+            row_height = [max(height_of(cols[ci][row]) + 1 for ci in members if row < len(cols[ci]))
+                          for row in range(depth)]
+            dx = 2
+            for ci in members:
+                cy = yy
+                for ri, tag in enumerate(cols[ci]):
+                    positions[tag] = (dx, cy, height_of(tag))
+                    cy += row_height[ri] + stack_gap
+                dx += box_width + col_gaps[ci]
+            yy += sum(row_height) + stack_gap * depth
+        frame_height = yy - stack_gap + 1
         layouts[str(repo)] = {"repo": str(repo), "columns": cols, "positions": positions,
                               "width": frame_width, "height": frame_height, "col_gaps": col_gaps}
 

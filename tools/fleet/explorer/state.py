@@ -46,6 +46,55 @@ class NavState:
 VIEWS = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE", "MEMORY", "MODELS", "SYSTEM")
 
 
+_MODEL_FIND_FOLDS = ("ui:mfind", "ui:mfocus", "ui:mcursor")
+
+
+def models_finding(state):
+    """The MODELS model list holds the keyboard: typed characters filter it instead of acting."""
+    return (getattr(state, "view", None) == "MODELS" and getattr(state, "scope", "-") == "-"
+            and state.fold_map().get("ui:mfocus") == "1")
+
+
+def _models_find_hit(frame):
+    return next((hit for hit in getattr(frame, "hits", ())
+                 if hit.action[:1] == ("models.find",) and len(hit.action) >= 6), None)
+
+
+def _models_find_key(state, key, hit):
+    """One key while the model list is focused; ``None`` leaves the key to the shared handling."""
+    _name, count, item, cursor, top, rows = hit.action[:6]
+    count, cursor, top, rows = int(count), int(cursor), int(top), max(1, int(rows))
+    folds = state.fold_map()
+    offsets = dict(state.scroll)
+    if key in ("escape", "esc"):
+        folds.pop("ui:mfocus", None)
+    elif key in ("enter", "\n"):
+        if not item:
+            return state
+        folds["ui:model"] = str(item)
+    elif key == "backspace" or (isinstance(key, str) and key.startswith("text:")):
+        text = folds.get("ui:mfind", "")
+        text = text[:-1] if key == "backspace" else (text + key[5:])[:80]
+        folds["ui:mfind"] = text
+        folds["ui:mcursor"] = "0"
+        offsets["mpick"] = 0
+    elif key in ("up", "down", "pageup", "pagedown", "home", "end"):
+        if not count:
+            return state
+        cursor = {"up": cursor - 1, "down": cursor + 1, "pageup": cursor - rows,
+                  "pagedown": cursor + rows, "home": 0, "end": count - 1}[key]
+        cursor = max(0, min(count - 1, cursor))
+        if cursor < top:
+            top = cursor
+        elif cursor >= top + rows:
+            top = cursor - rows + 1
+        folds["ui:mcursor"] = str(cursor)
+        offsets["mpick"] = max(0, min(max(0, count - rows), top))
+    else:
+        return None
+    return replace(state, folds=tuple(sorted(folds.items())), scroll=tuple(sorted(offsets.items())))
+
+
 def _scroll_region(frame, name):
     region = getattr(frame, name, ()) if frame is not None else ()
     return tuple(region) if isinstance(region, (list, tuple)) else ()
@@ -163,10 +212,47 @@ def question_items(detail):
                  if question.get("id") in active and question.get("hidden") is not True)
 
 
+def _question_empty_hidden_optional_v2_form(detail):
+    """Allow explicit empty submission only for a complete optional hidden V2 schema."""
+    if (not isinstance(detail, Mapping) or detail.get("kind") != "question"
+            or detail.get("state") != "open"
+            or detail.get("harness") != "opencode"):
+        return False
+    native = detail.get("native_ref")
+    if (not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"):
+        return False
+    fields = _question_schema_items(detail)
+    field_keys = native.get("field_keys")
+    if (not fields or not isinstance(field_keys, (list, tuple))
+            or len(field_keys) != len(fields)
+            or tuple(field_keys) != tuple(item["id"] for item in fields)
+            or len(set(field_keys)) != len(field_keys)):
+        return False
+    if question_items(detail):
+        return False
+    supported_types = {"string", "number", "integer", "boolean", "multiselect"}
+    return all(item.get("hidden") is True
+               and item.get("required") is False
+               and item.get("field_type") in supported_types
+               for item in fields)
+
+
 def question_answer_supported(detail):
     if not isinstance(detail, Mapping):
         return False
-    return _question_supports_reply(detail) and bool(question_items(detail))
+    if not _question_supports_reply(detail):
+        return False
+    questions = question_items(detail)
+    if questions:
+        if (detail.get("harness") == "opencode"
+                and isinstance(detail.get("native_ref"), Mapping)
+                and detail["native_ref"].get("transport") == "opencode-http-v2"
+                and any(item.get("hidden") is True and item.get("required") is True
+                        for item in _question_schema_items(detail))):
+            return False
+        return True
+    return _question_empty_hidden_optional_v2_form(detail)
 
 
 def question_draft_supported(detail):
@@ -844,12 +930,21 @@ def _reduce(state, event, frame=None):
             return state, ()
         if action[0] == "ui" and len(action) > 2:
             folds = state.fold_map()
+            offsets = dict(state.scroll)
             if action[1] == "sel":
                 folds = {key: value for key, value in folds.items()
-                         if key not in ("ui:sel", "ui:model", "ui:effort")}
+                         if key not in ("ui:sel", "ui:model", "ui:effort") + _MODEL_FIND_FOLDS}
+                offsets.pop("mpick", None)
             folds["ui:" + str(action[1])] = str(action[2])
+            return replace(state, folds=tuple(sorted(folds.items())),
+                           scroll=tuple(sorted(offsets.items()))), ()
+        if action[0] == "models.find":
+            folds = state.fold_map()
+            folds["ui:mfocus"] = "1"
             return replace(state, folds=tuple(sorted(folds.items()))), ()
         if action[0] == "models.apply" and len(action) in (5, 7):
+            return state, (action,)
+        if action[0] == "alloc.apply" and len(action) == 3:
             return state, (action,)
         if action[0] == "usage":
             return replace(state, usage_open=not state.usage_open), ()
@@ -1049,6 +1144,14 @@ def _reduce(state, event, frame=None):
                     return _question_selection(state, ref)
             if refs:
                 return _question_selection(state, refs[0])
+    if state.view == "MODELS" and state.scope == "-":
+        found = _models_find_hit(frame)
+        if found is not None and models_finding(state):
+            handled = _models_find_key(state, key, found)
+            if handled is not None:
+                return handled, ()
+        elif found is not None and key in ("e", "E"):
+            return _reduce(state, {"type": "click", "action": found.action}, frame)
     if key in ("tab", "shift-tab", "left", "right"):
         if state.scope != "-":
             return replace(state, scope="-", opened=""), ()

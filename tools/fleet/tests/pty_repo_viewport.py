@@ -191,6 +191,8 @@ def _child_main(evidence_dir, explorer=False):
         if explorer:
             frame = render._EXPLORER_FRAME
             explorer_state = render._EXPLORER_STATE
+            compute_top = min((hit.y for hit in getattr(frame, "hits", ()) or ()
+                               if tuple(hit.action) == ("root", "COMPUTE")), default=None)
             state["explorer"] = {
                 "title": getattr(frame, "title", ""),
                 "frame_size": ([int(frame.rows), int(frame.cols)] if frame is not None else []),
@@ -203,9 +205,9 @@ def _child_main(evidence_dir, explorer=False):
                 "compute_host_rows": min(5, len(getattr(render._EXPLORER_MODEL, "compute", ()) or ())),
                 "compute_lines": (["".join(cell[0] for cell in row[1:32])
                                    for row in frame.cells[
-                                       frame.tree_scroll[3]:frame.tree_scroll[3] + 2 +
+                                       compute_top:compute_top + 2 +
                                        min(5, len(getattr(render._EXPLORER_MODEL, "compute", ()) or ()))]]
-                                  if frame is not None and len(frame.tree_scroll) >= 4 else []),
+                                  if frame is not None and compute_top is not None else []),
                 "state": ({"view": explorer_state.view,
                            "scope": explorer_state.scope,
                            "opened": explorer_state.opened,
