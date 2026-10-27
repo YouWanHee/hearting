@@ -8,7 +8,6 @@ background focus reader and arrive through ``accepted_detail``.
 """
 from collections.abc import Mapping
 import datetime
-import hashlib
 import math
 import os
 import re
@@ -136,36 +135,32 @@ def _is_main(session):
     return _get(session, "process_role") != "registered-worker"
 
 
+PENDING_TAG = "?"                # an unconfirmed row's key prefix: never a number another session wears
+
+
+def _shared_tag(harness, sid):
+    """The one badge rule every surface draws (Herdr title, peer trailer, Fleet collector)."""
+    try:
+        from ..session_handle import resolve_tag
+        return _text(resolve_tag(harness, sid))
+    except Exception:
+        return None
+
+
 def _tag_for(session, used):
+    """The collector's tag, else the shared rule for the native session id, else ``None``.
+
+    Explorer mints no number of its own: a row whose native session id is not confirmed, or whose
+    shared tag already belongs to another row, gets no number here (the caller shows it as pending)
+    so it can never take or shadow the number of a different live session."""
     tag = _text(_get(session, "session_tag", "tag"))
-    if tag is None:
-        sid = _text(_get(session, "session_id", "sid", "id"))
-        if sid is None:
-            # Keep a first-observed process row visible until the harness publishes its sid.
-            # The collector's explicit session_tag remains authoritative once identity resolves.
-            pid = _get(session, "pid")
-            start = _get(session, "proc_start", "started_at")
-            managed = _text(_get(session, "managed_dir"))
-            if pid is None or start is None:
-                return None
-            sid = f"process:{pid}:{start}:{managed or ''}"
-            seed = f"{_get(session, 'harness', default='')}:{sid}"
-            tag = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:2]
-            for offset in range(1, 40):
-                if tag not in used:
-                    break
-                tag = hashlib.sha1(seed.encode("utf-8")).hexdigest()[offset:offset + 2]
-            return tag
-        if sid is None:
-            return None
-        seed = f"{_get(session, 'harness', default='')}:{sid}"
-        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
-        tag = digest[:2]
-        for offset in range(1, 40):
-            if tag not in used:
-                break
-            tag = digest[offset:offset + 2]
-    return tag
+    if tag is not None:
+        return tag
+    sid = _text(_get(session, "session_id", "sid", "id"))
+    if sid is None:
+        return None
+    tag = _shared_tag(_text(_get(session, "harness", "adapter", "h")), sid)
+    return tag if tag is not None and tag not in used else None
 
 
 def _resolver(snapshot):
@@ -328,9 +323,18 @@ def _session_records(snapshot, now, resolver):
     # A collector tag is authoritative wherever its row sits: a tag minted for an earlier row must
     # never take it, or the row that owns it is dropped as a duplicate below.
     reserved = {tag for tag in (_text(_get(session, "session_tag", "tag")) for session in sessions) if tag}
+    pending = 0
     for session in sessions:
         tag = _tag_for(session, used | reserved)
-        if tag is None or tag in used:
+        if tag is None:
+            # A process row whose native session is not confirmed stays visible as pending under a
+            # key no session tag can equal, so it neither borrows nor hides a real session's number.
+            if _text(_get(session, "session_id", "sid", "id")) is None and (
+                    _get(session, "pid") is None or _get(session, "proc_start", "started_at") is None):
+                continue
+            pending += 1
+            tag = f"{PENDING_TAG}{pending}"
+        elif tag in used:
             continue
         used.add(tag)
         harness = _text(_get(session, "harness", "adapter", "h"))

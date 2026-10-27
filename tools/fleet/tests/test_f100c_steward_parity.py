@@ -533,6 +533,20 @@ class StewardCollectorTest(unittest.TestCase):
         self.assertEqual([t["session_id"] for t in sessions[0].steward_targets], ["y", "x"])
         self.assertIsNone(sessions[1].steward_targets)
 
+    def test_opencode_watch_target_flags_once_its_native_session_is_confirmed(self):
+        # Measured 2026-10-27: supervisor 1b watched Herdr OpenCode panes, but Fleet read those
+        # processes without a native session id, so the steward rule found no target and Herdr's
+        # flag and Fleet disagreed. The rule itself is unchanged: an exact sid and cwd are enough.
+        sid = "ses_e8516db7dffedMkTbhlkto5vgo"
+        markers = {("claude", "steward"): {"session_id": "steward", "targets": {
+            sid: {"harness": "opencode", "session_id": sid, "name": "w", "kind": "watch",
+                  "ts": "1", "source": "watch"}}}}
+        for target_sid, expected in ((None, False), (sid, True)):
+            sessions = [Session(harness="claude", pid=1, session_id="steward", cwd="/x"),
+                        Session(harness="opencode", pid=2, session_id=target_sid, cwd="/x")]
+            steward.enrich(sessions, markers=markers)
+            self.assertEqual(sessions[0].steward, expected)
+
     def test_handoff_only_and_legacy_markers_do_not_make_a_steward(self):
         """Role ≠ communication (user 2026-09-06: "통신만 하면 죄다 d=-1"). A marker whose
         entries are steer/handoff/gate-relay sends — new (source absent, kind=handoff) or
