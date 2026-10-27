@@ -28,6 +28,7 @@ import shlex
 import sqlite3
 import stat
 import sys
+import threading
 import time
 from types import MappingProxyType
 from datetime import datetime, timezone
@@ -243,27 +244,126 @@ _PARSED_REGISTRY_INDEXES = OrderedDict()
 _PARSED_REGISTRY_LINE_COUNTS = {}
 _PARSED_REGISTRY_SEGMENTS = {}
 _PARSED_REGISTRY_DIAGNOSTICS = OrderedDict()
+_PARSED_REGISTRY_PATH_ORDER = OrderedDict()
 _PARSED_REGISTRY_ROWS_LIMIT = 32
+_PARSED_REGISTRY_CACHE_LOCK = threading.RLock()
 
 
 def _registry_diagnostic_key(path, generation):
     return os.path.abspath(os.fspath(path)), generation
 
 
+def _registry_generation_is_current(path, generation):
+    """Reject cache ownership from an observation superseded on disk."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return generation is None
+    if not isinstance(generation, tuple) or len(generation) < 5:
+        return False
+    return generation[:5] == (info.st_dev, info.st_ino, info.st_size,
+                              info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _drop_registry_path_locked(absolute):
+    """Release every parsed-cache reference owned by one registry path."""
+    for cache in (_PARSED_REGISTRY_ROWS, _PARSED_REGISTRY_INDEXES,
+                  _PARSED_REGISTRY_LINE_COUNTS, _PARSED_REGISTRY_SEGMENTS,
+                  _PARSED_REGISTRY_DIAGNOSTICS):
+        for key in tuple(cache):
+            if key[0] == absolute:
+                cache.pop(key, None)
+    _PARSED_REGISTRY_PATH_ORDER.pop(absolute, None)
+
+
+def _touch_registry_path_locked(absolute, key):
+    _PARSED_REGISTRY_PATH_ORDER[absolute] = key
+    _PARSED_REGISTRY_PATH_ORDER.move_to_end(absolute)
+
+
+def _trim_registry_path_order_locked():
+    while len(_PARSED_REGISTRY_PATH_ORDER) > _PARSED_REGISTRY_ROWS_LIMIT:
+        absolute, _key = _PARSED_REGISTRY_PATH_ORDER.popitem(last=False)
+        _drop_registry_path_locked(absolute)
+
+
 def _remember_registry_diagnostics(path, generation, error, malformed):
     key = _registry_diagnostic_key(path, generation)
-    _PARSED_REGISTRY_DIAGNOSTICS[key] = (error, malformed)
-    _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
-    while len(_PARSED_REGISTRY_DIAGNOSTICS) > _PARSED_REGISTRY_ROWS_LIMIT:
-        _PARSED_REGISTRY_DIAGNOSTICS.popitem(last=False)
+    absolute = key[0]
+    if not _registry_generation_is_current(absolute, generation):
+        return
+    with _PARSED_REGISTRY_CACHE_LOCK:
+        if not _registry_generation_is_current(absolute, generation):
+            return
+        # A diagnostic-only observation replaces the prior generation. A
+        # diagnostic added to an existing parsed generation keeps its rows.
+        if key not in _PARSED_REGISTRY_ROWS:
+            _drop_registry_path_locked(absolute)
+        _PARSED_REGISTRY_DIAGNOSTICS[key] = (error, malformed)
+        _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
+        _touch_registry_path_locked(absolute, key)
+        _trim_registry_path_order_locked()
 
 
 def _registry_diagnostics(path):
     absolute = os.path.abspath(os.fspath(path))
-    for (candidate, _generation), value in reversed(_PARSED_REGISTRY_DIAGNOSTICS.items()):
-        if candidate == absolute:
-            return value
-    return None, 0
+    with _PARSED_REGISTRY_CACHE_LOCK:
+        key = _PARSED_REGISTRY_PATH_ORDER.get(absolute)
+        if key is None or key not in _PARSED_REGISTRY_DIAGNOSTICS:
+            return None, 0
+        _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
+        _touch_registry_path_locked(absolute, key)
+        return _PARSED_REGISTRY_DIAGNOSTICS[key]
+
+
+def _cached_registry_rows(path, generation):
+    """Return the exact current immutable snapshot, if it is still retained."""
+    key = _registry_diagnostic_key(path, generation)
+    absolute = key[0]
+    if not _registry_generation_is_current(absolute, generation):
+        return False, None
+    with _PARSED_REGISTRY_CACHE_LOCK:
+        if not _registry_generation_is_current(absolute, generation):
+            return False, None
+        if key not in _PARSED_REGISTRY_ROWS:
+            return False, None
+        _PARSED_REGISTRY_ROWS.move_to_end(key)
+        if key in _PARSED_REGISTRY_DIAGNOSTICS:
+            _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
+        _touch_registry_path_locked(absolute, key)
+        return True, _PARSED_REGISTRY_ROWS[key]
+
+
+def _registry_prefix_snapshot(path, generation, segments):
+    """Get append-prefix data from the one retained generation for this path."""
+    absolute = os.path.abspath(os.fspath(path))
+    if generation is None or not _registry_generation_is_current(absolute, generation):
+        return None
+    identity = (generation[0], generation[1])
+    new_segments = tuple(segments)
+    with _PARSED_REGISTRY_CACHE_LOCK:
+        if not _registry_generation_is_current(absolute, generation):
+            return None
+        for candidate in reversed(_PARSED_REGISTRY_ROWS):
+            candidate_path, candidate_generation = candidate
+            if (candidate_path != absolute or not isinstance(candidate_generation, tuple)
+                    or len(candidate_generation) < 3):
+                continue
+            if ((candidate_generation[0], candidate_generation[1]) != identity
+                    or candidate_generation[2] >= generation[2]):
+                continue
+            old_segments = _PARSED_REGISTRY_SEGMENTS.get(candidate)
+            if (old_segments is None or len(old_segments) > len(new_segments)
+                    or not all(old is new for old, new in zip(old_segments, new_segments))):
+                continue
+            _PARSED_REGISTRY_ROWS.move_to_end(candidate)
+            _touch_registry_path_locked(absolute, candidate)
+            prefix_lines = _PARSED_REGISTRY_LINE_COUNTS.get(candidate, 0)
+            prefix_rows = tuple(row for row in _PARSED_REGISTRY_ROWS[candidate]
+                                if row[0] < prefix_lines)
+            diagnostics = _PARSED_REGISTRY_DIAGNOSTICS.get(candidate)
+            return candidate, prefix_rows, prefix_lines, diagnostics
+    return None
 
 
 def _raise_registry_read_error(path, *, ignore_missing=False):
@@ -337,7 +437,7 @@ def _orphan_registry_rows_for_pass(path, registry, cache):
 
 
 def _parse_registry_lines(path, lines, generation, *, first_line=0,
-                          complete_line_count=None, segments=None):
+                          complete_line_count=None, segments=None, remember=True):
     """Parse registry rows once, retaining physical line positions."""
     rows = []
     malformed = 0
@@ -355,25 +455,36 @@ def _parse_registry_lines(path, lines, generation, *, first_line=0,
     result = tuple(rows)
     complete_count = (first_line + len(lines) if complete_line_count is None
                       else complete_line_count)
-    return _remember_parsed_registry_rows(
-        path, generation, result, complete_count, segments, malformed)
+    if remember:
+        return _remember_parsed_registry_rows(
+            path, generation, result, complete_count, segments, malformed)
+    return result
 
 
 def _remember_parsed_registry_rows(path, generation, rows, complete_count,
                                    segments, malformed):
     result = tuple(rows)
-    key = (os.path.abspath(os.fspath(path)), generation)
-    _PARSED_REGISTRY_ROWS[key] = result
-    _PARSED_REGISTRY_LINE_COUNTS[key] = complete_count
-    _PARSED_REGISTRY_SEGMENTS[key] = tuple(segments) if segments is not None else None
-    _PARSED_REGISTRY_ROWS.move_to_end(key)
-    while len(_PARSED_REGISTRY_ROWS) > _PARSED_REGISTRY_ROWS_LIMIT:
-        evicted, _value = _PARSED_REGISTRY_ROWS.popitem(last=False)
-        _PARSED_REGISTRY_INDEXES.pop(evicted, None)
-        _PARSED_REGISTRY_LINE_COUNTS.pop(evicted, None)
-        _PARSED_REGISTRY_SEGMENTS.pop(evicted, None)
-    _remember_registry_diagnostics(path, generation, None, malformed)
-    return result
+    if generation is None:
+        return result
+    key = _registry_diagnostic_key(path, generation)
+    absolute = key[0]
+    if not _registry_generation_is_current(absolute, generation):
+        return result
+    with _PARSED_REGISTRY_CACHE_LOCK:
+        if not _registry_generation_is_current(absolute, generation):
+            return result
+        if key in _PARSED_REGISTRY_ROWS:
+            _PARSED_REGISTRY_ROWS.move_to_end(key)
+            _touch_registry_path_locked(absolute, key)
+            return _PARSED_REGISTRY_ROWS[key]
+        _drop_registry_path_locked(absolute)
+        _PARSED_REGISTRY_ROWS[key] = result
+        _PARSED_REGISTRY_LINE_COUNTS[key] = complete_count
+        _PARSED_REGISTRY_SEGMENTS[key] = tuple(segments) if segments is not None else None
+        _PARSED_REGISTRY_DIAGNOSTICS[key] = (None, malformed)
+        _touch_registry_path_locked(absolute, key)
+        _trim_registry_path_order_locked()
+        return result
 
 
 def _registry_metadata_analysis(raw):
@@ -441,19 +552,32 @@ def _index_registry_rows_by_attempt(rows):
 def _registry_derived_index(path, rows):
     """Reuse immutable row indexes only while their parsed generation is retained."""
     absolute = os.path.abspath(os.fspath(path))
-    key = next((candidate for candidate in reversed(_PARSED_REGISTRY_ROWS)
-                if candidate[0] == absolute and _PARSED_REGISTRY_ROWS[candidate] is rows), None)
+    with _PARSED_REGISTRY_CACHE_LOCK:
+        key = next((candidate for candidate in reversed(_PARSED_REGISTRY_ROWS)
+                    if candidate[0] == absolute
+                    and _PARSED_REGISTRY_ROWS[candidate] is rows), None)
+        if key is not None and _registry_generation_is_current(absolute, key[1]):
+            cached = _PARSED_REGISTRY_INDEXES.get(key)
+            if cached is not None:
+                _PARSED_REGISTRY_INDEXES.move_to_end(key)
+                _PARSED_REGISTRY_ROWS.move_to_end(key)
+                _touch_registry_path_locked(absolute, key)
+                return cached
     if key is None:
         return _build_registry_derived_index(rows)
-    cached = _PARSED_REGISTRY_INDEXES.get(key)
-    if cached is not None:
-        _PARSED_REGISTRY_INDEXES.move_to_end(key)
-        return cached
     index = _build_registry_derived_index(rows)
-    _PARSED_REGISTRY_INDEXES[key] = index
-    _PARSED_REGISTRY_INDEXES.move_to_end(key)
-    while len(_PARSED_REGISTRY_INDEXES) > _PARSED_REGISTRY_ROWS_LIMIT:
-        _PARSED_REGISTRY_INDEXES.popitem(last=False)
+    with _PARSED_REGISTRY_CACHE_LOCK:
+        if (key in _PARSED_REGISTRY_ROWS
+                and _PARSED_REGISTRY_ROWS[key] is rows
+                and _registry_generation_is_current(absolute, key[1])):
+            cached = _PARSED_REGISTRY_INDEXES.get(key)
+            if cached is None:
+                _PARSED_REGISTRY_INDEXES[key] = index
+                cached = index
+            _PARSED_REGISTRY_INDEXES.move_to_end(key)
+            _PARSED_REGISTRY_ROWS.move_to_end(key)
+            _touch_registry_path_locked(absolute, key)
+            return cached
     return index
 
 
@@ -512,12 +636,8 @@ def parsed_registry_rows(path):
             before = source.stat()
             generation = (before.st_dev, before.st_ino, before.st_size,
                           before.st_mtime_ns, before.st_ctime_ns)
-            key = _registry_diagnostic_key(path, generation)
-            cached = _PARSED_REGISTRY_ROWS.get(key)
-            if cached is not None:
-                _PARSED_REGISTRY_ROWS.move_to_end(key)
-                if key in _PARSED_REGISTRY_DIAGNOSTICS:
-                    _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
+            found, cached = _cached_registry_rows(path, generation)
+            if found:
                 return cached
             lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
             after = source.stat()
@@ -529,7 +649,16 @@ def parsed_registry_rows(path):
             else:
                 generation = None
         except OSError as exc:
-            _remember_registry_diagnostics(path, None, exc, 0)
+            try:
+                current = os.stat(path)
+            except OSError:
+                _remember_registry_diagnostics(path, None, exc, 0)
+            else:
+                current_generation = (current.st_dev, current.st_ino, current.st_size,
+                                      current.st_mtime_ns, current.st_ctime_ns)
+                if (isinstance(generation, tuple) and len(generation) >= 5
+                        and generation[:5] == current_generation):
+                    _remember_registry_diagnostics(path, generation, exc, 0)
             return ()
     else:
         try:
@@ -537,12 +666,16 @@ def parsed_registry_rows(path):
             generation = tuple(view.signature)
         except (OSError, ValueError):
             pass
-    key = (os.path.abspath(os.fspath(path)), generation)
-    cached = _PARSED_REGISTRY_ROWS.get(key) if generation is not None else None
-    if cached is not None:
-        _PARSED_REGISTRY_ROWS.move_to_end(key)
+    if generation is not None:
+        found, cached = _cached_registry_rows(path, generation)
+    else:
+        found, cached = False, None
+    if found:
+        key = _registry_diagnostic_key(path, generation)
         if key in _PARSED_REGISTRY_DIAGNOSTICS:
-            _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
+            with _PARSED_REGISTRY_CACHE_LOCK:
+                if key in _PARSED_REGISTRY_DIAGNOSTICS:
+                    _PARSED_REGISTRY_DIAGNOSTICS.move_to_end(key)
         else:
             complete_count = view.line_count - int(view.has_partial_tail) if view is not None else len(lines)
             malformed = sum(1 for line in lines[:complete_count]
@@ -551,51 +684,29 @@ def parsed_registry_rows(path):
         return cached
     # The shared registry cache already retains append-only byte segments. Reuse
     # the parsed prefix too, so a generation append parses only newly added rows.
-    prefix_key = None
-    prefix_rows = ()
-    prefix_lines = 0
-    if view is not None and generation is not None and len(generation) >= 3:
-        identity = (generation[0], generation[1])
-        for candidate in reversed(_PARSED_REGISTRY_ROWS):
-            candidate_path, candidate_generation = candidate
-            if (candidate_path != key[0] or not isinstance(candidate_generation, tuple)
-                    or len(candidate_generation) < 3):
-                continue
-            if ((candidate_generation[0], candidate_generation[1]) == identity
-                    and candidate_generation[2] < generation[2]):
-                old_segments = _PARSED_REGISTRY_SEGMENTS.get(candidate)
-                new_segments = tuple(view._segments)
-                if (old_segments is not None and len(old_segments) <= len(new_segments)
-                        and all(old is new for old, new in zip(old_segments, new_segments))):
-                    prefix_key = candidate
-                    prefix_lines = _PARSED_REGISTRY_LINE_COUNTS.get(candidate, 0)
-                    prefix_rows = tuple(row for row in _PARSED_REGISTRY_ROWS[candidate]
-                                        if row[0] < prefix_lines)
-                    break
-    if prefix_key is not None and prefix_lines <= len(lines):
-        prefix_diagnostics = _PARSED_REGISTRY_DIAGNOSTICS.get(prefix_key)
+    prefix = (_registry_prefix_snapshot(path, generation, view._segments)
+              if view is not None and generation is not None and len(generation) >= 3
+              else None)
+    if prefix is not None:
+        _prefix_key, prefix_rows, prefix_lines, prefix_diagnostics = prefix
+    else:
+        prefix_rows, prefix_lines, prefix_diagnostics = (), 0, None
+    if prefix is not None and prefix_lines <= len(lines):
         prefix_malformed = (prefix_diagnostics[1] if prefix_diagnostics is not None else
                             sum(1 for line in lines[:prefix_lines]
                                 if line.strip() and len(line.split("\t")) != 6))
+        complete_count = view.line_count - int(view.has_partial_tail)
         suffix = _parse_registry_lines(
             path, lines[prefix_lines:], generation, first_line=prefix_lines,
-            complete_line_count=view.line_count - int(view.has_partial_tail),
-            segments=view._segments)
-        suffix_diagnostics = _PARSED_REGISTRY_DIAGNOSTICS.get(key)
-        suffix_malformed = suffix_diagnostics[1] if suffix_diagnostics is not None else 0
+            complete_line_count=complete_count, segments=view._segments,
+            remember=False)
+        suffix_malformed = sum(
+            1 for line in lines[prefix_lines:complete_count]
+            if line.strip() and len(line.split("\t")) != 6)
         result = tuple(prefix_rows) + tuple(suffix)
-        _PARSED_REGISTRY_ROWS[key] = result
-        _PARSED_REGISTRY_LINE_COUNTS[key] = view.line_count - int(view.has_partial_tail)
-        _PARSED_REGISTRY_SEGMENTS[key] = tuple(view._segments)
-        _remember_registry_diagnostics(
-            path, generation, None, prefix_malformed + suffix_malformed)
-        while len(_PARSED_REGISTRY_ROWS) > _PARSED_REGISTRY_ROWS_LIMIT:
-            evicted, _value = _PARSED_REGISTRY_ROWS.popitem(last=False)
-            _PARSED_REGISTRY_INDEXES.pop(evicted, None)
-            _PARSED_REGISTRY_LINE_COUNTS.pop(evicted, None)
-            _PARSED_REGISTRY_SEGMENTS.pop(evicted, None)
-            _PARSED_REGISTRY_DIAGNOSTICS.pop(evicted, None)
-        return result
+        return _remember_parsed_registry_rows(
+            path, generation, result, complete_count, view._segments,
+            prefix_malformed + suffix_malformed)
     if (view is not None and view._prefix_reuse_eligible):
         return _parse_registry_view(path, view, generation)
     if view is not None:

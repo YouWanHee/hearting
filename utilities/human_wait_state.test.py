@@ -396,6 +396,12 @@ class _StrictOpenCodeTransport:
         self.calls = []
         self.unexpected = []
         self.post_status = 204
+        self.server_info = {"version": "fixture-v2", "pid": 1234,
+                            "urls": ["http://127.0.0.1:4096"],
+                            "paths": {"tmp": "/tmp/opencode-fixture"}}
+        self.info_status = 200
+        self.after_info = None
+        self.after_post = None
 
     def question(self, request_id="frm_1", *, state="pending", message_id="msg_1",
                  field_type="multiselect", min_items=1, max_items=1, custom=False):
@@ -432,8 +438,12 @@ class _StrictOpenCodeTransport:
         if endpoint.get("url") != "http://127.0.0.1:4096":
             self.unexpected.append((method, path, "endpoint"))
             return {"status": 0, "reason": "fixture-endpoint-mismatch"}
-        if method == "GET" and path == "/global/health":
-            return {"status": 200, "body": {"healthy": True, "version": "2.0.32"}}
+        if method == "GET" and path == "/api/info":
+            if self.after_info:
+                callback = self.after_info
+                self.after_info = None
+                callback()
+            return {"status": self.info_status, "body": self.server_info}
         prefix = "/api/session/" + self.session_id + "/"
         if method == "GET" and path == prefix + "form":
             data = [{key: value for key, value in self.forms[request_id].items()
@@ -452,6 +462,8 @@ class _StrictOpenCodeTransport:
             if self.post_status == 204:
                 self.forms[request_id]["state"] = {"status": "answered",
                                                     "answer": payload.get("answer", {})}
+                if self.after_post:
+                    self.after_post()
             return {"status": self.post_status, "body": None}
         if method == "GET" and path == prefix + "permission":
             data = [self.permissions[request_id] for request_id in self.permission_ids]
@@ -479,7 +491,10 @@ class SelectedQuestionActionsTest(unittest.TestCase):
         self.sid = "ses_fixture"
         self.now = time.time()
         self.endpoint = {"url": "http://127.0.0.1:4096", "generation": "fixture-gen-1",
-                         "pid": 1234, "proc_start": "123", "socket_inodes": []}
+                         "pid": 1234, "proc_start": "123", "socket_inodes": ["700"],
+                         "server_pid": 1234, "server_proc_start": "123",
+                         "server_urls": ["http://127.0.0.1:4096"],
+                         "frontend_pid": 1234, "frontend_proc_start": "123"}
         self.api = _StrictOpenCodeTransport(self.sid)
         env = mock.patch.dict(os.environ, {
             "XDG_STATE_HOME": self.tmp.name,
@@ -764,19 +779,23 @@ class SelectedQuestionActionsTest(unittest.TestCase):
         self.assertFalse(claude["support"]["supported"])
         self.assertEqual(claude["state"], "unknown")
 
-    def test_opencode_form_without_native_turn_keeps_draft_but_cannot_submit(self):
+    def test_opencode_form_without_native_turn_uses_exact_schema_binding(self):
+        self.endpoint["generation"] = "a" * 64
         self.api.question(message_id=None)
         selected = state.read_selected_request({"id": self.item_id, "harness": "opencode",
                                                 "session_id": self.sid})
         self.assertEqual(selected["request_id"], "frm_1")
         self.assertIsNone(selected["turn_id"])
-        self.assertFalse(selected["support"]["supported"])
+        self.assertTrue(selected["support"]["supported"])
+        self.assertTrue(state._opencode_turnless_form_binding(selected))
         drafted = state.write_selected_draft(selected, "keep this native fallback draft")
         self.assertEqual(drafted["draft"], "keep this native fallback draft")
         result = state.submit_selected_response(
             drafted, {"answers": {"choice": ["red"]}}, action_id="no-turn")
-        self.assertFalse(result["support"]["supported"])
-        self.assertFalse([call for call in self.api.calls if call[0] == "POST"])
+        self.assertEqual(result["state"], "applied")
+        self.assertEqual([call for call in self.api.calls if call[0] == "POST"], [
+            ("POST", f"/api/session/{self.sid}/form/frm_1/reply",
+             {"answer": {"choice": ["red"]}})])
 
     def test_codex_control_shape_uses_native_gateway_questions(self):
         sid = "thread_fixture"
@@ -1374,10 +1393,31 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        agent_home = self.root / "agent-home"
+        (agent_home / "core").mkdir(parents=True)
+        (agent_home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
         self.env = mock.patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "xdg"),
             "HOME": str(self.root),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "AGENT_HOME": str(agent_home),
+            "AGENT_WORKFLOW_ROOT": str(self.root / "workflow"),
+            "AGENT_ARTIFACT_CHECKPOINT": "off",
+            "AGENT_ARTIFACT_CAMPAIGN_ID": "",
+            "AGENT_ARTIFACT_CYCLE_ID": "",
+            "AGENT_ARTIFACT_PRODUCER_ID": "",
+            "AGENT_ARTIFACT_CYCLE_DIR": "",
+            "AGENT_ARTIFACT_OUTPUT_DIR": "",
+            "AGENT_DISPATCH_CALLER_HARNESS": "codex",
+            "AGENT_DISPATCH_REGISTERED_WORKER": "",
+            "AGENT_DISPATCH_CHILD": "",
+            "AGENT_DISPATCH_DEPTH": "0",
+            "AGENT_DISPATCH_ATTEMPT_ID": "",
+            "CODEX_THREAD_ID": "parent-session",
+            "CODEX_SESSION_ID": "",
+            "CLAUDE_CODE_SESSION_ID": "",
+            "CLAUDE_SESSION_ID": "",
+            "OPENCODE_SESSION_ID": "",
         }, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -1392,6 +1432,7 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
         self.dispatch = dispatch
         self.jobs = self.root / "jobs.log"
         self.jobs.write_text("", encoding="utf-8")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         registries = mock.patch.object(dispatch, "human_gate_registry_paths",
                                        return_value=(self.jobs,))
         registries.start()
@@ -1498,8 +1539,8 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
             return original(*args)
 
         with mock.patch.object(state, "_claim_selected_action", side_effect=simultaneous_claim), \
-             mock.patch.object(dispatch_owner_input, "submit",
-                               wraps=dispatch_owner_input.submit) as submit:
+             mock.patch.object(state.subprocess, "run",
+                               wraps=state.subprocess.run) as public_correct:
             results = []
             failures = []
 
@@ -1519,7 +1560,7 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
                 caller.join(timeout=20)
             self.assertTrue(all(not caller.is_alive() for caller in callers))
             self.assertEqual(failures, [])
-            self.assertEqual(submit.call_count, 1)
+            self.assertEqual(public_correct.call_count, 1)
 
         receipt = dispatch_owner_input.inspect(self.jobs, "att-workflow-owner")
         self.assertEqual(len(receipt["requests"]), 1)
@@ -1552,7 +1593,9 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
         self.assertEqual(applied["state"], "applied")
         self.assertEqual(applied["result"], {
             "source": "hearting-owner-input", "status": "turn-completed",
-            "request_id": "owner-consumed", "delivery_observation": "turn-completed"})
+            "request_id": "owner-consumed", "delivery_observation": "turn-completed",
+            "target_attempt_id": item["attempt_id"],
+            "continuation": received["result"]["continuation"]})
         self.assertEqual(applied["draft"], "")
 
     def test_s3_replaced_owner_route_or_parent_cannot_receive_old_answer(self):
@@ -1614,6 +1657,672 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
                          state._cache_path().read_text(encoding="utf-8"))
         self.assertNotIn("select the next step",
                          state._fleet_cache_path().read_text(encoding="utf-8"))
+
+
+class S3EffectiveParentTest(unittest.TestCase):
+    """Keep S3's original request binding while following confirmed native handover."""
+
+    setUp = WorkflowSelectedResponseTest.setUp
+    _seal_route = WorkflowSelectedResponseTest._seal_route
+    _metadata = WorkflowSelectedResponseTest._metadata
+    _write_owner = WorkflowSelectedResponseTest._write_owner
+    _observe = WorkflowSelectedResponseTest._observe
+    _blocked_owner_wait = WorkflowSelectedResponseTest._blocked_owner_wait
+
+    def _native_caller(self, harness, session_id, extra=None):
+        session_vars = {
+            "claude": "CLAUDE_CODE_SESSION_ID",
+            "codex": "CODEX_THREAD_ID",
+            "opencode": "OPENCODE_SESSION_ID",
+        }
+        values = {
+            "AGENT_DISPATCH_CALLER_HARNESS": harness,
+            "AGENT_DISPATCH_CURRENT_HARNESS": "",
+            "CLAUDE_CODE_SESSION_ID": "", "CLAUDE_SESSION_ID": "",
+            "CODEX_THREAD_ID": "", "CODEX_SESSION_ID": "",
+            "OPENCODE_SESSION_ID": "",
+            "AGENT_DISPATCH_REGISTERED_WORKER": "",
+            "AGENT_DISPATCH_CHILD": "",
+            "AGENT_DISPATCH_ATTEMPT_ID": "",
+            "AGENT_DISPATCH_DEPTH": "0",
+            "AGENT_DISPATCH_PARENT_SESSION_ID": "",
+            "HERDR_PANE_ID": "",
+        }
+        values[session_vars[harness]] = session_id
+        values.update(extra or {})
+        return mock.patch.dict(os.environ, values, clear=False)
+
+    def _record_handover(self, successor, successor_harness, seat_key):
+        import dispatch_seat_handover
+        import session_tidy
+
+        return dispatch_seat_handover.record_retire_handover(
+            "parent-session", "codex", successor, successor_harness,
+            jobs=self.jobs, now=time.time(),
+            successor_seat=session_tidy.Seat("pane", seat_key, "fixture:pane"))
+
+    def _open_pending_delivery(self, item):
+        import dispatch_pending_delivery
+
+        attempt = item["attempt_id"]
+        receipt = {
+            "schema_version": 2, "state": "delivered",
+            "parent_attempt_id": attempt, "job_registry": str(self.jobs),
+            "delivery_classification": "attention",
+            "children": [{"attempt_id": attempt, "status": "done", "readiness": "ready",
+                          "reason": "terminal-failure-or-unclosed",
+                          "required_action": "inspect-done-failure", "harness": "codex",
+                          "delivery_classification": "attention"}],
+        }
+        dispatch_pending_delivery.create(
+            self.jobs.parent, recipient_kind="codex-native-queue",
+            recipient_key="parent-session", delivery_id="delivery-effective-parent-fixture",
+            session_generation="", session_generation_supported="0", attempt_ids=[attempt],
+            parent_attempt_id=attempt, route_id=item["route_id"], route_node="owner",
+            receipt=receipt,
+            receipt_digest=dispatch_pending_delivery._canonical_receipt_digest(receipt),
+            row_revisions={attempt: item["route_hash"]})
+
+    def test_confirmed_cross_harness_successor_keeps_binding_and_corrects_once(self):
+        import dispatch_completion_join
+        import dispatch_owner_input
+        import dispatch_seat_handover
+
+        item = self._blocked_owner_wait()
+        jobs_before = self.jobs.read_bytes()
+        original = state.read_selected_request({"id": item["id"]})
+        self.assertTrue(original["support"]["supported"])
+        original_draft = state.write_selected_draft(original, "parent's private draft")
+        original_ref = original["native_ref"]
+        metadata = dispatch_completion_join.exact_attempt_row(
+            self.jobs, item["attempt_id"]).metadata
+        self.assertEqual(original_ref["owner_binding"], state._owner_binding(metadata))
+
+        self._open_pending_delivery(item)
+        with mock.patch.object(dispatch_seat_handover, "pane_seat", return_value=None):
+            handover = self._record_handover("successor-session", "claude", "effective-seat")
+            self.assertIsNotNone(handover)
+            self.assertEqual(dispatch_seat_handover.effective_parent(metadata, self.jobs),
+                             "successor-session")
+            self.assertEqual(dispatch_seat_handover.effective_parent_harness(metadata, self.jobs),
+                             "claude")
+
+            observed = self._observe()
+            current_item = next(row for row in observed["items"] if row["id"] == item["id"])
+            self.assertEqual(current_item["owner"], {
+                "harness": "claude", "session_id": "successor-session", "seat_key": None})
+            self.assertEqual(self.jobs.read_bytes(), jobs_before)
+
+            with mock.patch.object(state.subprocess, "run", wraps=state.subprocess.run) as correct:
+                late_parent = state.submit_selected_response(
+                    original_draft,
+                    {"answers": {"owner-correction": [original_draft["draft"]]}},
+                    action_id="late-parent-answer")
+                self.assertFalse(late_parent["support"]["supported"])
+                self.assertEqual(correct.call_count, 0)
+                self.assertEqual(dispatch_owner_input.inspect(
+                    self.jobs, item["attempt_id"])["requests"], [])
+
+                with self._native_caller("claude", "successor-session"):
+                    selected = state.read_selected_request({"id": item["id"]})
+                    self.assertTrue(selected["support"]["supported"], selected["support"])
+                    self.assertEqual(selected["native_ref"], original_ref)
+                    self.assertEqual(selected["native_ref"]["source_id"], item["id"])
+                    self.assertEqual(selected["native_ref"]["attempt_id"], item["attempt_id"])
+                    self.assertEqual(selected["native_ref"]["route_hash"], item["route_hash"])
+                    self.assertEqual(selected["item_id"], item["attempt_id"])
+                    self.assertEqual(selected["route_id"], item["route_id"])
+                    self.assertEqual(selected["request_id"], item["id"])
+                    drafted = state.write_selected_draft(
+                        selected, "successor correction for the original request")
+                    received = state.submit_selected_response(
+                        drafted, {"answers": {"owner-correction": [drafted["draft"]]}},
+                        action_id="successor-owner-answer")
+                    self.assertEqual(received["state"], "received")
+                    duplicate = state.submit_selected_response(
+                        drafted, {"answers": {"owner-correction": [drafted["draft"]]}},
+                        action_id="successor-owner-answer")
+                    self.assertEqual(duplicate["state"], "received")
+
+                correct_calls = [call for call in correct.call_args_list
+                                 if "correct" in call.args[0]]
+                self.assertEqual(len(correct_calls), 1)
+
+        receipt = dispatch_owner_input.inspect(self.jobs, item["attempt_id"])
+        self.assertEqual(len(receipt["requests"]), 1)
+        self.assertEqual(receipt["requests"][0]["id"], "successor-owner-answer")
+        self.assertNotIn("successor correction for the original request", json.dumps(receipt))
+        self.assertEqual(dispatch_completion_join.exact_attempt_row(
+            self.jobs, item["attempt_id"]).metadata["parent_sid"], "parent-session")
+        self.assertEqual(original_ref["owner_binding"], state._owner_binding(
+            dispatch_completion_join.exact_attempt_row(
+                self.jobs, item["attempt_id"]).metadata))
+
+    def test_unconfirmed_forked_different_route_and_worker_contexts_are_refused(self):
+        import dispatch_completion_join
+        import dispatch_seat_handover
+
+        item = self._blocked_owner_wait()
+        metadata = dispatch_completion_join.exact_attempt_row(
+            self.jobs, item["attempt_id"]).metadata
+
+        with mock.patch.object(dispatch_seat_handover, "pane_seat", return_value=None):
+            # Native identity plus a parent alias and pane hint do not create lineage.
+            with self._native_caller("claude", "successor-session", {
+                    "AGENT_DISPATCH_PARENT_SESSION_ID": "successor-session",
+                    "HERDR_PANE_ID": "unconfirmed-seat"}):
+                unconfirmed = state.read_selected_request({"id": item["id"]})
+                self.assertFalse(unconfirmed["support"]["supported"])
+                self.assertEqual(dispatch_seat_handover.effective_parent(metadata, self.jobs),
+                                 "parent-session")
+
+            self._open_pending_delivery(item)
+            handover = self._record_handover("successor-session", "claude", "effective-seat")
+            self.assertIsNotNone(handover)
+            # The old parent cannot fork the same exact route to another seat.
+            fork = self._record_handover("fork-session", "opencode", "fork-seat")
+            self.assertIsNone(fork)
+            self.assertEqual(dispatch_seat_handover.effective_parent(metadata, self.jobs),
+                             "successor-session")
+
+            with self._native_caller("opencode", "fork-session"):
+                forked = state.read_selected_request({"id": item["id"]})
+                self.assertFalse(forked["support"]["supported"])
+            with self._native_caller("opencode", "unrelated-session"):
+                unrelated = state.read_selected_request({"id": item["id"]})
+                self.assertFalse(unrelated["support"]["supported"])
+            with self._native_caller("claude", "successor-session", {
+                    "AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+                worker = state.read_selected_request({"id": item["id"]})
+                self.assertFalse(worker["support"]["supported"])
+            with self._native_caller("claude", "successor-session"):
+                wrong_route = state.read_selected_request({
+                    "id": item["id"], "route_id": "different-route"})
+                self.assertFalse(wrong_route["support"]["supported"])
+
+            changed_route = dict(metadata)
+            changed_route.update({"route_id": "different-route",
+                                  "owner_route_id": "different-route",
+                                  "route_hash": "f" * 64,
+                                  "owner_route_hash": "f" * 64})
+            self.assertEqual(dispatch_seat_handover.effective_parent(
+                changed_route, self.jobs), "parent-session")
+
+
+class OpenCodeCurrentFormSchemaTest(unittest.TestCase):
+    """Focused fixtures for current OpenCode V2 form identity and typed answers."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sid = "ses_fixture"
+        self.now = time.time()
+        self.real_opencode_endpoint = state._opencode_endpoint
+        self.endpoint = {"url": "http://127.0.0.1:4096", "generation": "a" * 64,
+                         "pid": 1234, "proc_start": "123", "socket_inodes": ["700"],
+                         "server_pid": 1234, "server_proc_start": "123",
+                         "server_urls": ["http://127.0.0.1:4096"],
+                         "frontend_pid": 1234, "frontend_proc_start": "123"}
+        self.api = _StrictOpenCodeTransport(self.sid)
+        env = mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": self.tmp.name,
+            "HOME": self.tmp.name,
+            "FLEET_INTERACTION_STATE_DIR": str(Path(self.tmp.name) / "interactions"),
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        demand = mock.patch.object(state, "_request_producer")
+        demand.start()
+        self.addCleanup(demand.stop)
+        endpoint = mock.patch.object(
+            state, "_opencode_endpoint",
+            side_effect=lambda sid: dict(self.endpoint) if sid == self.sid else None)
+        endpoint.start()
+        self.addCleanup(endpoint.stop)
+        transport = mock.patch.object(state, "_opencode_http", side_effect=self.api)
+        transport.start()
+        self.addCleanup(transport.stop)
+        project_root = str(Path(__file__).resolve().parents[1])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        self._publish_wait()
+
+    def _publish_wait(self, *, stamp=None, sid=None):
+        sid = sid or self.sid
+        stamp = self.now if stamp is None else stamp
+        self.item_id = f"S1:opencode:{sid}:{int(stamp * 1000)}"
+        item = {"id": self.item_id, "source": "S1", "kind": "decision",
+                "question": None, "choices": [], "route_id": None,
+                "attempt_id": None, "gate_id": None, "since": stamp,
+                "stale": False, "owner": {"harness": "opencode", "session_id": sid},
+                "attribution": "exact"}
+        self.assertTrue(state.publish_cache({"items": [item], "complete": True,
+                                             "observed_at": time.time(), "health": []}))
+
+    def _form(self, fields, *, request_id="frm_1", message_id=None, title="Question title"):
+        metadata = {} if message_id is None else {"messageID": message_id}
+        value = {"id": request_id, "sessionID": self.sid, "title": title,
+                 "metadata": metadata, "fields": fields, "state": {"status": "pending"}}
+        self.api.forms[request_id] = value
+        if request_id not in self.api.form_ids:
+            self.api.form_ids.append(request_id)
+        return value
+
+    def _selected(self):
+        return state.read_selected_request({"id": self.item_id, "harness": "opencode",
+                                             "session_id": self.sid})
+
+    def test_endpoint_requires_exact_current_tui_selection(self):
+        project_root = str(Path(__file__).resolve().parents[1])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from tools.fleet.collectors import opencode as collector
+
+        proc_path = Path("/proc")
+        real_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == proc_path:
+                return iter([Path("/proc/4242")])
+            return real_iterdir(path)
+
+        def resolve(observed, source):
+            with mock.patch.object(Path, "iterdir", fake_iterdir), \
+                 mock.patch.object(state, "_proc_uid", return_value=os.getuid()), \
+                 mock.patch.object(state, "_proc_start_ticks", return_value=424242), \
+                 mock.patch.object(state, "_proc_argv", return_value=["opencode"]), \
+                 mock.patch.object(state, "_explicit_opencode_server",
+                                   return_value=self.endpoint["url"]), \
+                 mock.patch.object(state, "_proc_listening_sockets",
+                                   return_value=(4096, "127.0.0.1", ("700",))), \
+                 mock.patch.object(collector, "session_of_process",
+                                   return_value=(observed, source)):
+                return self.real_opencode_endpoint(self.sid)
+
+        self.assertIsNone(resolve(self.sid, "opencode-argv"))
+        self.assertIsNone(resolve("ses_switched", "opencode-tui-selection"))
+        current = resolve(self.sid, "opencode-tui-selection")
+        self.assertEqual(current["frontend_pid"], 4242)
+        self.assertEqual(current["server_pid"], 1234)
+        self.assertEqual(current["url"], self.endpoint["url"])
+
+    def test_multiple_keyed_fields_emit_native_typed_answer_and_allow_missing_turn(self):
+        self._form([
+            {"type": "string", "key": "name", "title": "Name", "required": True,
+             "minLength": 2},
+            {"type": "number", "key": "amount", "title": "Amount", "required": True,
+             "minimum": 0, "maximum": 5},
+            {"type": "integer", "key": "count", "title": "Count", "required": True,
+             "minimum": 1, "maximum": 4},
+            {"type": "boolean", "key": "confirm", "title": "Confirm", "required": True},
+            {"type": "multiselect", "key": "colors", "title": "Colors", "required": True,
+             "options": [{"value": "r", "label": "Red"},
+                         {"value": "b", "label": "Blue"}],
+             "minItems": 1, "maxItems": 2},
+            {"type": "string", "key": "optional", "title": "Optional", "hidden": True,
+             "default": "must-not-be-copied"},
+        ])
+        selected = self._selected()
+        self.assertTrue(selected["support"]["supported"])
+        self.assertIsNone(selected["turn_id"])
+        self.assertIsNone(selected.get("question_id"))
+        self.assertEqual([row["id"] for row in selected["detail"]["questions"]],
+                         ["name", "amount", "count", "confirm", "colors", "optional"])
+        self.assertEqual(selected["detail"]["questions"][4]["choices"], [
+            {"value": "r", "label": "Red", "description": ""},
+            {"value": "b", "label": "Blue", "description": ""}])
+        result = state.submit_selected_response(selected, {"answers": {
+            "name": ["Ada"], "amount": ["2.5"], "count": ["3"],
+            "confirm": [False], "colors": ["b", "r"]}}, action_id="typed-form")
+        self.assertEqual(result["state"], "applied")
+        posts = [call for call in self.api.calls if call[0] == "POST"]
+        self.assertEqual(posts, [("POST", f"/api/session/{self.sid}/form/frm_1/reply", {
+            "answer": {"name": "Ada", "amount": 2.5, "count": 3,
+                       "confirm": False, "colors": ["b", "r"]}})])
+        self.assertEqual(self.api.unexpected, [])
+
+    def test_no_turn_requires_exact_current_form_schema_reference(self):
+        self._form([{"type": "string", "key": "answer", "title": "Answer",
+                     "required": True}])
+        selected = self._selected()
+        self.assertTrue(state._opencode_turnless_form_binding(selected))
+        weak = dict(selected)
+        weak.pop("native_ref")
+        refused = state.submit_selected_response(
+            weak, {"answers": {"answer": ["yes"]}}, action_id="weak-form-ref")
+        self.assertNotEqual(refused.get("state"), "applied")
+        self.assertFalse([call for call in self.api.calls if call[0] == "POST"])
+        self.assertIsNone(state._selected_entry(weak))
+
+    def test_required_optional_hidden_and_conditional_fields_validate_before_claim(self):
+        self._form([
+            {"type": "boolean", "key": "enabled", "title": "Enable", "required": True},
+            {"type": "string", "key": "extra", "title": "Extra", "required": True,
+             "when": [{"key": "enabled", "op": "eq", "value": True}]},
+            {"type": "string", "key": "hidden", "title": "Hidden", "hidden": True,
+             "default": "native-only"},
+            {"type": "string", "key": "optional", "title": "Optional",
+             "default": "never-use-default"},
+        ])
+        selected = self._selected()
+        drafted = state.write_selected_draft(selected, "retain this draft")
+        incomplete = state.submit_selected_response(
+            drafted, {"answers": {"enabled": [True]}}, action_id="missing-active-field")
+        self.assertEqual(incomplete["state"], "open")
+        self.assertEqual(incomplete["reason"], "opencode-form-required-answer-missing")
+        self.assertEqual(incomplete["draft"], "retain this draft")
+        self.assertNotIn("action_id", incomplete)
+        self.assertIsNone(state._selected_entry(incomplete).get("action_id"))
+        self.assertFalse([call for call in self.api.calls if call[0] == "POST"])
+
+        corrected = state.submit_selected_response(
+            incomplete, {"answers": {"enabled": [True], "extra": ["provided"]}},
+            action_id="complete-active-field")
+        self.assertEqual(corrected["state"], "applied")
+        self.assertEqual([call for call in self.api.calls if call[0] == "POST"], [
+            ("POST", f"/api/session/{self.sid}/form/frm_1/reply",
+             {"answer": {"enabled": True, "extra": "provided"}})])
+
+    def test_numeric_boolean_required_and_defaults_are_not_coerced_or_invented(self):
+        self._form([
+            {"type": "number", "key": "amount", "title": "Amount", "required": True,
+             "minimum": 1, "maximum": 5, "default": 2},
+            {"type": "integer", "key": "count", "title": "Count", "required": True,
+             "minimum": 1, "maximum": 5, "default": 3},
+            {"type": "boolean", "key": "confirm", "title": "Confirm", "required": True,
+             "default": True},
+            {"type": "string", "key": "optional", "title": "Optional",
+             "default": "not-submitted"},
+        ])
+        selected = self._selected()
+        cases = [
+            ({"amount": ["NaN"], "count": ["2"], "confirm": [True]},
+             "opencode-form-numeric-answer-invalid"),
+            ({"amount": ["2"], "count": ["2.5"], "confirm": [True]},
+             "opencode-form-integer-answer-invalid"),
+            ({"amount": ["2"], "count": ["2"], "confirm": ["false"]},
+             "opencode-form-boolean-answer-explicit-required"),
+            ({"amount": ["2"], "confirm": [True]},
+             "opencode-form-required-answer-missing"),
+        ]
+        for index, (answers, reason) in enumerate(cases):
+            invalid = state.submit_selected_response(
+                selected, {"answers": answers}, action_id=f"invalid-typed-{index}")
+            self.assertEqual(invalid["state"], "open")
+            self.assertEqual(invalid["reason"], reason)
+            self.assertNotIn("action_id", invalid)
+            self.assertIsNone(state._selected_entry(invalid))
+            self.assertFalse([call for call in self.api.calls if call[0] == "POST"])
+
+        valid = state.submit_selected_response(selected, {"answers": {
+            "amount": ["2"], "count": ["2"], "confirm": [True]}},
+            action_id="valid-typed-values")
+        self.assertEqual(valid["state"], "applied")
+        post = [call for call in self.api.calls if call[0] == "POST"]
+        self.assertEqual(post[0][2], {"answer": {"amount": 2.0, "count": 2, "confirm": True}})
+        self.assertNotIn("optional", post[0][2]["answer"])
+
+    def test_changed_schema_endpoint_and_ambiguous_current_form_refuse_old_action(self):
+        self._form([{"type": "string", "key": "answer", "title": "Answer",
+                     "required": True}])
+        selected = self._selected()
+        self.api.forms["frm_1"]["fields"][0]["title"] = "Replaced schema"
+        stale = state.submit_selected_response(
+            selected, {"answers": {"answer": ["old"]}}, action_id="stale-schema")
+        self.assertNotEqual(stale["state"], "applied")
+        self.assertFalse([call for call in self.api.calls if call[0] == "POST"])
+
+        self.api.forms["frm_1"]["fields"][0]["title"] = "Answer"
+        current = self._selected()
+        self.endpoint["generation"] = "b" * 64
+        changed_owner = state.submit_selected_response(
+            current, {"answers": {"answer": ["old owner"]}}, action_id="stale-owner")
+        self.assertNotEqual(changed_owner["state"], "applied")
+        self.assertFalse([call for call in self.api.calls if call[0] == "POST"])
+
+        self.endpoint["generation"] = "a" * 64
+        self.api.question("frm_2", message_id=None)
+        ambiguous = self._selected()
+        self.assertFalse(ambiguous["support"]["supported"])
+        self.assertFalse([call for call in self.api.calls if call[0] == "POST"])
+
+    def test_lost_reply_keeps_one_shot_action_and_never_replays(self):
+        self._form([{"type": "string", "key": "answer", "title": "Answer",
+                     "required": True}])
+        selected = self._selected()
+        self.api.post_status = 0
+        first = state.submit_selected_response(
+            selected, {"answers": {"answer": ["yes"]}}, action_id="lost-once")
+        self.assertEqual(first["state"], "unknown")
+        second = state.submit_selected_response(
+            selected, {"answers": {"answer": ["yes"]}}, action_id="must-not-replay")
+        self.assertEqual(second["action_id"], "lost-once")
+        self.assertEqual(len([call for call in self.api.calls if call[0] == "POST"]), 1)
+
+    def test_form_detail_draft_stays_private_and_external_type_keeps_native_fallback(self):
+        self._form([{"type": "string", "key": "answer", "title": "Private form",
+                     "required": True}])
+        selected = self._selected()
+        drafted = state.write_selected_draft(selected, "private draft")
+        fleet = state._fleet_cache_path().read_text(encoding="utf-8")
+        projection = state._cache_path().read_text(encoding="utf-8")
+        self.assertNotIn("Private form", fleet)
+        self.assertNotIn("Private form", projection)
+        self.assertNotIn("private draft", fleet)
+        self.assertIn("private draft", projection)
+        self.assertEqual(drafted["draft"], "private draft")
+
+        self.api.forms.clear()
+        self.api.form_ids.clear()
+        self._form([{"type": "external", "key": "external", "url": "https://example.invalid"}],
+                   request_id="frm_external")
+        unsupported = state.read_selected_request({"id": self.item_id,
+                                                    "harness": "opencode",
+                                                    "session_id": self.sid})
+        self.assertFalse(unsupported["support"]["supported"])
+        preserved = state.write_selected_draft(unsupported, "keep external native fallback")
+        refused = state.submit_selected_response(
+            preserved, {"answers": {"external": [True]}}, action_id="external-no-reply")
+        self.assertNotEqual(refused.get("state"), "applied")
+        self.assertFalse([call for call in self.api.calls if call[0] == "POST"])
+
+
+class OpenCodeV2EndpointIdentityTest(unittest.TestCase):
+    """Synthetic /proc and documented /api/info fixtures prove endpoint ownership."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.sid = "ses_identity_fixture"
+        self.frontend_pid = 4242
+        self.server_pid = 5252
+        self.url = "http://127.0.0.1:4096"
+        self.proc_starts = {self.frontend_pid: "420", self.server_pid: "520"}
+        self.listeners = {self.server_pid: (4096, "127.0.0.1", ("7001",))}
+        self.listener_calls = []
+        self.selection = (self.sid, "opencode-tui-selection")
+        self.argv = ["opencode", "--server", self.url]
+        self.api = _StrictOpenCodeTransport(self.sid)
+        self.api.server_info = {
+            "version": "1.2.3", "pid": self.server_pid, "urls": [self.url],
+            "paths": {"tmp": "/tmp/opencode-fixture"}}
+        self.api.after_info = None
+        self.now = time.time()
+
+        env = mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": self.tmp.name,
+            "HOME": self.tmp.name,
+            "FLEET_INTERACTION_STATE_DIR": str(Path(self.tmp.name) / "interactions"),
+        }, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        producer = mock.patch.object(state, "_request_producer")
+        producer.start()
+        self.addCleanup(producer.stop)
+
+        project_root = str(Path(__file__).resolve().parents[1])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from tools.fleet.collectors import opencode as collector
+        proc_path = Path("/proc")
+        real_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path == proc_path:
+                return iter([Path(f"/proc/{self.frontend_pid}")])
+            return real_iterdir(path)
+
+        patches = [
+            mock.patch.object(Path, "iterdir", fake_iterdir),
+            mock.patch.object(state, "_proc_uid", side_effect=self._proc_uid),
+            mock.patch.object(state, "_proc_start_ticks", side_effect=self._proc_start),
+            mock.patch.object(state, "_proc_argv", side_effect=self._proc_argv),
+            mock.patch.object(state, "_proc_listening_sockets", side_effect=self._listener),
+            mock.patch.object(collector, "session_of_process", side_effect=self._selection),
+            mock.patch.object(state, "_opencode_http", side_effect=self.api),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _proc_uid(self, pid):
+        return os.getuid() if int(pid) in self.proc_starts else None
+
+    def _proc_start(self, pid):
+        return self.proc_starts.get(int(pid))
+
+    def _proc_argv(self, pid):
+        return list(self.argv) if int(pid) == self.frontend_pid else []
+
+    def _listener(self, pid):
+        self.listener_calls.append(int(pid))
+        return self.listeners.get(int(pid))
+
+    def _selection(self, pid):
+        if int(pid) != self.frontend_pid:
+            return None, ""
+        return self.selection
+
+    def _attach(self):
+        self.argv = ["opencode", "--server", self.url]
+
+    def _standalone(self):
+        self.server_pid = self.frontend_pid
+        self.proc_starts[self.server_pid] = "420"
+        self.listeners[self.frontend_pid] = (4096, "127.0.0.1", ("7001",))
+        self.argv = ["opencode"]
+        self.api.server_info = {
+            "version": "1.2.3", "pid": self.frontend_pid, "urls": [self.url],
+            "paths": {"tmp": "/tmp/opencode-fixture"}}
+
+    def _publish_wait(self):
+        self.item_id = f"S1:opencode:{self.sid}:{int(self.now * 1000)}"
+        item = {"id": self.item_id, "source": "S1", "kind": "decision",
+                "question": None, "choices": [], "route_id": None,
+                "attempt_id": None, "gate_id": None, "since": self.now,
+                "stale": False,
+                "owner": {"harness": "opencode", "session_id": self.sid},
+                "attribution": "exact"}
+        self.assertTrue(state.publish_cache({"items": [item], "complete": True,
+                                             "observed_at": time.time(), "health": []}))
+
+    def _form_selection(self):
+        self.api.question(message_id=None)
+        self._publish_wait()
+        return state.read_selected_request({"id": self.item_id, "harness": "opencode",
+                                             "session_id": self.sid})
+
+    def test_standalone_requires_current_selection_and_documented_v2_info(self):
+        self._standalone()
+        endpoint = state._opencode_endpoint(self.sid)
+        self.assertIsNotNone(endpoint)
+        self.assertEqual(endpoint["frontend_pid"], self.frontend_pid)
+        self.assertEqual(endpoint["server_pid"], self.frontend_pid)
+        self.assertEqual(endpoint["socket_inodes"], ["7001"])
+        self.assertEqual([call[1] for call in self.api.calls], ["/api/info"])
+        self.assertNotIn("/global/health", [call[1] for call in self.api.calls])
+
+    def test_attached_server_uses_server_pid_and_its_owned_listener(self):
+        self._attach()
+        endpoint = state._opencode_endpoint(self.sid)
+        self.assertIsNotNone(endpoint)
+        self.assertEqual(endpoint["frontend_pid"], self.frontend_pid)
+        self.assertEqual(endpoint["server_pid"], self.server_pid)
+        self.assertEqual(endpoint["pid"], self.server_pid)
+        self.assertEqual(endpoint["server_proc_start"], "520")
+        self.assertEqual(endpoint["socket_inodes"], ["7001"])
+        self.assertEqual(self.listener_calls, [self.server_pid])
+
+    def test_frontend_selection_is_rechecked_after_server_info(self):
+        def switch_selection():
+            self.api.after_info = None
+            self.selection = ("ses_other", "opencode-tui-selection")
+
+        self.api.after_info = switch_selection
+        self.assertIsNone(state._opencode_endpoint(self.sid))
+
+    def test_bad_info_auth_url_or_listener_stays_unsupported(self):
+        valid = dict(self.api.server_info)
+        invalid_bodies = [
+            None,
+            {"version": "1.2.3", "pid": True, "urls": [self.url],
+             "paths": {"tmp": "/tmp"}},
+            {"version": "1.2.3", "pid": self.server_pid,
+             "urls": ["http://127.0.0.1:4097"], "paths": {"tmp": "/tmp"}},
+            {"version": "1.2.3", "pid": self.server_pid,
+             "urls": [self.url], "paths": {}},
+        ]
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                self.api.server_info = body
+                self.assertIsNone(state._opencode_endpoint(self.sid))
+        self.api.server_info = valid
+        self.api.info_status = 401
+        self.assertIsNone(state._opencode_endpoint(self.sid))
+        self.api.info_status = 200
+        self.listeners[self.server_pid] = (4097, "127.0.0.1", ("7002",))
+        self.assertIsNone(state._opencode_endpoint(self.sid))
+
+    def test_pid_birth_and_socket_replacement_change_generation_at_same_url(self):
+        original = state._opencode_endpoint(self.sid)
+        self.assertIsNotNone(original)
+        self.proc_starts[self.server_pid] = "521"
+        self.listeners[self.server_pid] = (4096, "127.0.0.1", ("7002",))
+        new_birth = state._opencode_endpoint(self.sid)
+        self.assertIsNotNone(new_birth)
+        self.assertEqual(new_birth["url"], original["url"])
+        self.assertNotEqual(new_birth["generation"], original["generation"])
+        self.listeners[self.server_pid] = (4096, "127.0.0.1", ("7003",))
+        new_socket = state._opencode_endpoint(self.sid)
+        self.assertNotEqual(new_socket["generation"], new_birth["generation"])
+
+    def test_same_url_restart_before_submission_cannot_post_old_form(self):
+        selected = self._form_selection()
+        self.assertTrue(selected["support"]["supported"])
+        self.proc_starts[self.server_pid] = "521"
+        self.listeners[self.server_pid] = (4096, "127.0.0.1", ("7002",))
+        result = state.submit_selected_response(
+            selected, {"answers": {"choice": ["red"]}}, action_id="old-server")
+        self.assertNotEqual(result.get("state"), "applied")
+        self.assertFalse([call for call in self.api.calls if call[0] == "POST"])
+
+    def test_server_replacement_after_post_is_unknown_and_never_replayed(self):
+        selected = self._form_selection()
+        self.assertTrue(selected["support"]["supported"])
+
+        def replace_server():
+            self.proc_starts[self.server_pid] = "521"
+            self.listeners[self.server_pid] = (4096, "127.0.0.1", ("7002",))
+
+        self.api.after_post = replace_server
+        first = state.submit_selected_response(
+            selected, {"answers": {"choice": ["red"]}}, action_id="server-replaced")
+        self.assertEqual(first["state"], "unknown")
+        second = state.submit_selected_response(
+            selected, {"answers": {"choice": ["red"]}}, action_id="must-not-replay")
+        self.assertNotEqual(second.get("state"), "applied")
+        self.assertEqual(len([call for call in self.api.calls if call[0] == "POST"]), 1,
+                         (first, second, self.api.calls))
 
 
 if __name__ == "__main__":

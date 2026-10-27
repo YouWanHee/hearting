@@ -118,11 +118,15 @@ def forget_shown_candidates(payload: dict[str, Any]) -> None:
         pass
 
 
-def card_context(payload: dict[str, Any], current_cwd: str) -> tuple[str, str]:
-    """Session card / tidy notice due at this start; independent of the memory opt-in."""
+def card_context(payload: dict[str, Any], current_cwd: str) -> tuple[str, str, Any]:
+    """Session card / tidy notice due at this start; independent of the memory opt-in.
+
+    JSON mode hands back the consumption receipts instead of writing them, so
+    they are committed only after this bridge's final output exists.
+    """
     sid = session_id(payload)
     if not sid or not SESSION_TIDY.is_file():
-        return "", ""
+        return "", "", None
     command = [sys.executable, str(SESSION_TIDY), "hook", "--harness", "codex",
                "--event", "start", "--session-id", sid, "--cwd", current_cwd, "--format", "json"]
     source = nested_string(payload, "source")
@@ -137,16 +141,18 @@ def card_context(payload: dict[str, Any], current_cwd: str) -> tuple[str, str]:
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return "", ""
+        return "", "", None
     if result.returncode:
-        return "", ""
+        return "", "", None
     try:
         payload = json.loads(result.stdout or "{}")
     except ValueError:
-        return "", ""
+        return "", "", None
     if not isinstance(payload, dict):
-        return "", ""
-    return (str(payload.get("additionalContext") or ""), str(payload.get("humanNotice") or ""))
+        return "", "", None
+    return (str(payload.get("additionalContext") or ""),
+            str(payload.get("humanNotice") or ""),
+            payload.get("deferredConsumed"))
 
 
 def env_truthy(name: str) -> bool:
@@ -203,10 +209,11 @@ def main() -> int:
 
     parts = []
     human_notice = ""
+    card_deferred = None
     try:
         if not worker:
             forget_shown_candidates(payload)
-            card, human_notice = card_context(payload, current_cwd)
+            card, human_notice, card_deferred = card_context(payload, current_cwd)
             parts.append(card)
             try:
                 utilities = ROOT / "utilities"
@@ -228,6 +235,12 @@ def main() -> int:
     finally:
         try:
             emit_context("SessionStart", parts, human_notice)
+            if card_deferred:
+                try:
+                    import session_tidy
+                    session_tidy.apply_deferred(card_deferred)
+                except Exception:
+                    pass
         finally:
             if not worker:
                 request_lifecycle_recovery()

@@ -37,18 +37,27 @@ class R14Renderer(unittest.TestCase):
         self.assertTrue(any(hit.action == ("tab", "COMPUTE") for hit in frame.hits))
         self.assertTrue(any(hit.action == ("root", "COMPUTE") for hit in frame.hits))
 
-    def test_sol_and_astra_share_model_family_color_across_viewers(self):
+    def test_sol_astra_and_luna_get_distinct_family_colors_in_every_viewer(self):
         from tools.fleet import render
         from tools.fleet.explorer import live, models
         from tools.fleet.explorer.grid import CellGrid
 
-        for model in ("gpt-6.1-sol", "gpt-6.1-astra", "Sol", "Astra"):
-            self.assertEqual(render._model_key(model), "fam_gpt")
-            self.assertEqual(live._model_pair(model)[1], "fam_gpt")
-            self.assertEqual(live._stage_model(model)[1], "fam_gpt")
-            grid = CellGrid(48, 3)
-            models._model_cell(grid, 1, 1, "codex", (model, "high"), {}, {}, 40)
-            self.assertEqual(grid.cells[1][1][1], "g_idle")
+        cases = (("sol", ("gpt-6.1-sol", "Sol", "gpt-6-sol")),
+                 ("astra", ("gpt-6.1-astra", "Astra")),
+                 ("luna", ("gpt-6-luna", "Luna")))
+        for family, names in cases:
+            for model in names:
+                with self.subTest(model=model):
+                    key = "fam_" + family
+                    self.assertEqual(render._model_key(model), key)
+                    self.assertEqual(live._model_pair(model)[1], key)
+                    self.assertEqual(live._stage_model(model)[1], key)
+                    grid = CellGrid(48, 3)
+                    models._model_cell(grid, 1, 1, "codex", (model, "high"), {}, {}, 40)
+                    self.assertEqual(grid.cells[1][1][1], key)
+        hues = {render._HUE_OF["fam_" + family][0] for family, _names in cases}
+        self.assertEqual(len(hues), 3)
+        self.assertEqual(render._model_key("gpt-5.5"), "fam_gpt")
 
     def test_route_columns_leave_progress_room_at_100_140_and_168(self):
         from tools.fleet.explorer.tables import _route_columns
@@ -141,7 +150,8 @@ class R14Renderer(unittest.TestCase):
                         self.assertTrue(all(hit.y < footer for hit in compute_hits))
                         self.assertTrue(any(hit.action == ("tab", "COMPUTE") for hit in frame.hits))
                         tree = frame.tree_scroll
-                        self.assertEqual(tree[3], compute_hit.y)
+                        rule = tree[1] < compute_hit.y - 1       # the faint rule row above RESOURCES
+                        self.assertEqual(tree[3], compute_hit.y - 1 if rule else compute_hit.y)
                         tree_hits = [hit for hit in frame.hits
                                      if hit.action[:1] in (("scope",), ("route",))]
                         self.assertTrue(all(tree[1] <= hit.y < tree[3] for hit in tree_hits))

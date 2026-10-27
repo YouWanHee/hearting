@@ -907,8 +907,9 @@ def read_model_config():
         for models in choices.values():
             for model in models:
                 shown[model] = render._clean_model(render._dispatch_display_model(model)) or model
-        for model in main_only.values():
-            shown[model] = render._clean_model(render._dispatch_display_model(model)) or model
+        for models in main_only.values():
+            for model in models:
+                shown[model] = render._clean_model(render._dispatch_display_model(model)) or model
     except Exception:
         shown = {}
     return {"profiles": [p for p in _PROFILES if any(m.get(p) for m in profile_map.values())],

@@ -133,6 +133,16 @@ class ViewerByteTrace(unittest.TestCase):
                             # still checks exact navigation and hit-map transitions.
                             for row_index in range(3, len(expected_cells) - 4):
                                 expected_cells[row_index][34:] = actual_cells[row_index][34:]
+                        pinned_top = int(actual.pane_scroll[3])
+                        if state.view == "OVERVIEW" and state.scope == "-" and pinned_top < 45 - 4:
+                            # ROUTES and RECENT now stay pinned above the footer under a long
+                            # session list; their own layout checks cover the pinned rows,
+                            # while every row and hit above them still matches the trace.
+                            for row_index in range(pinned_top, 45 - 4):
+                                expected_cells[row_index][34:] = actual_cells[row_index][34:]
+                            in_pin = lambda hit: pinned_top <= hit[0] < 45 - 4 and hit[2] > 34
+                            expected_hits = [hit for hit in expected_hits if not in_pin(hit)]
+                            actual_hits = [hit for hit in actual_hits if not in_pin(hit)]
                         difference = _first_cell_difference(expected_cells, actual_cells)
                         self.assertIsNone(difference, f"{context}: {difference or 'cell grids differ'}")
                         if actual_hits != expected_hits:

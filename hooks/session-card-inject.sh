@@ -44,6 +44,7 @@ def text(key):
     return value if isinstance(value, str) else ""
 contexts = []
 human = []
+deferred = []
 def emit(context):
     contexts.append(context)
 try:
@@ -51,7 +52,7 @@ try:
     session_tidy.run_hook(
         "claude", event, sid, source=text("source"),
         transcript=text("transcript_path"), cwd=text("cwd") or os.getcwd(), emit=emit,
-        emit_human=human.append,
+        emit_human=human.append, deferred=deferred,
         prompt_text=text("prompt"))
 except Exception:
     pass
@@ -70,5 +71,13 @@ if contexts or system:
     if system:
         output["systemMessage"] = system
     print(json.dumps(output, ensure_ascii=False), flush=True)
+if deferred:
+    # Only here is the Claude hook stdout the delivery boundary: a failed
+    # print above leaves the card/notices due for the next prompt.
+    try:
+        import session_tidy
+        session_tidy.apply_deferred(deferred)
+    except Exception:
+        pass
 ' 2>/dev/null
 exit 0
