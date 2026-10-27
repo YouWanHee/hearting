@@ -1505,7 +1505,7 @@ class FleetOpenCodeFormsIntegrationTests(unittest.TestCase):
         }, now=self.now)
         return next(row for row in vm.questions if row["id"] == self.item_id), vm
 
-    def _read_and_adopt(self):
+    def _read_and_adopt(self, *, expected_state="open"):
         from fleet import render
         from fleet.explorer.runtime import ExplorerRuntime
         from fleet.explorer.state import NavState, reduce
@@ -1522,7 +1522,7 @@ class FleetOpenCodeFormsIntegrationTests(unittest.TestCase):
             render._explorer_accept_question_result({"effect": effects[0],
                                                      "result": envelope})
             state = render._EXPLORER_STATE
-        self.assertEqual(state.question_overlay["state"], "open", envelope)
+        self.assertEqual(state.question_overlay["state"], expected_state, envelope)
         return state, envelope, row, vm
 
     def _adopt(self, state, effect, result, row, vm):
@@ -1565,6 +1565,16 @@ class FleetOpenCodeFormsIntegrationTests(unittest.TestCase):
         if latest is not None:
             state = self._run_effect(state, latest, row, vm)
         return state
+
+    def _rendered_submit_hit(self, state, vm):
+        from fleet.explorer.grid import CellGrid
+        from fleet.explorer.tables import draw_questions
+
+        grid = CellGrid(140, 45)
+        draw_questions(grid, vm, state)
+        hit = next((item for item in grid.hits
+                    if item.action == ("question.submit",)), None)
+        return hit, grid
 
     def test_turnless_multifield_schema_is_exact_and_private_in_live_render(self):
         from fleet import render
@@ -1805,6 +1815,146 @@ class FleetOpenCodeFormsIntegrationTests(unittest.TestCase):
         receipt = ExplorerRuntime.execute_question_action(effects[0])
         self.assertEqual(receipt["state"], "applied")
         self.assertEqual(len(self.posts), 1)
+
+    def test_all_hidden_optional_form_needs_rendered_explicit_submit_and_sends_empty_once(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+        from fleet.explorer.state import question_answer_supported, question_items, reduce
+
+        self._set_form([
+            {"key": "private-note", "type": "string", "title": "HIDDEN-PRIVATE-TITLE",
+             "required": False, "hidden": True, "default": "HIDDEN-PRIVATE-DEFAULT"},
+            {"key": "private-choice", "type": "multiselect", "required": False,
+             "hidden": True, "options": [{"value": "secret", "label": "HIDDEN-PRIVATE-CHOICE"}],
+             "default": ["secret"]},
+        ])
+        state, envelope, row, vm = self._read_and_adopt()
+        self.assertEqual(question_items(state.question_overlay["detail"]), ())
+        self.assertEqual(envelope["native_ref"]["field_keys"],
+                         ["private-note", "private-choice"])
+        detail = state.question_overlay["detail"]
+        self.assertTrue(question_answer_supported(detail))
+        unknown = dict(detail, state="unknown")
+        self.assertFalse(question_answer_supported(unknown))
+        malformed = dict(detail)
+        malformed_native = dict(detail["native_ref"], field_keys=["other"])
+        malformed["native_ref"] = malformed_native
+        self.assertFalse(question_answer_supported(malformed))
+        unsupported_schema = dict(detail)
+        unsupported_body = dict(detail["detail"])
+        unsupported_body["questions"] = [dict(item, field_type="object")
+                                          for item in detail["detail"]["questions"]]
+        unsupported_schema["detail"] = unsupported_body
+        self.assertFalse(question_answer_supported(unsupported_schema))
+        self.assertFalse(self.posts)
+
+        refresh = ExplorerRuntime.execute_question_action(
+            ("questions.read", state.question_overlay["ref"]))
+        self.assertEqual(refresh["state"], "open")
+        human_wait_state.cached_fleet_view(now=self.now + 300, request=False)
+        row, vm = self._row()
+        self.assertFalse(self.posts)
+        self.assertFalse(any(method == "POST" for method, _path in self.http_paths))
+
+        public = json.dumps(human_wait_state.cached_fleet_view(now=self.now, request=False))
+        cache = human_wait_state._fleet_cache_path().read_text(encoding="utf-8")
+        self.assertNotIn("HIDDEN-PRIVATE-TITLE", public + cache)
+        self.assertNotIn("HIDDEN-PRIVATE-DEFAULT", public + cache)
+        self.assertNotIn("HIDDEN-PRIVATE-CHOICE", public + cache)
+
+        hit, grid = self._rendered_submit_hit(state, vm)
+        self.assertIsNotNone(hit, "the rendered QUESTIONS grid must expose explicit Submit")
+        rendered = "\n".join(grid.rows_text())
+        self.assertIn("submit answer", rendered)
+        self.assertNotIn("HIDDEN-PRIVATE-TITLE", rendered)
+        self.assertNotIn("HIDDEN-PRIVATE-CHOICE", rendered)
+        submitted, effects = reduce(state, {"type": "click", "action": hit.action})
+        self.assertEqual(len(effects), 1)
+        self.assertEqual(effects[0][0], "questions.submit")
+        self.assertEqual(effects[0][2], {"answers": {}})
+        receipt = ExplorerRuntime.execute_question_action(effects[0])
+        state = self._adopt(submitted, effects[0], receipt, row, vm)
+        self.assertEqual(receipt["state"], "applied")
+        self.assertEqual(self.posts, [(
+            f"/api/session/{self.sid}/form/{self.form_id}/reply", {"answer": {}})])
+
+        duplicate = ExplorerRuntime.execute_question_action(effects[0])
+        self.assertEqual(duplicate["state"], "applied")
+        self.assertEqual(len(self.posts), 1)
+
+    def test_hidden_required_stale_and_unsupported_forms_never_post(self):
+        from fleet.explorer.runtime import ExplorerRuntime
+        from fleet.explorer.state import question_answer_supported, question_items, reduce
+
+        self._set_form([
+            {"key": "private-note", "type": "string", "required": False,
+             "hidden": True},
+        ])
+        state, _envelope, row, vm = self._read_and_adopt()
+        hit, _grid = self._rendered_submit_hit(state, vm)
+        self.assertIsNotNone(hit)
+        submitted, effects = reduce(state, {"type": "click", "action": hit.action})
+        self.assertEqual(len(effects), 1)
+        self.form["fields"].append({"key": "new-field", "type": "string",
+                                    "required": False, "hidden": True})
+        stale = ExplorerRuntime.execute_question_action(effects[0])
+        self.assertNotEqual(stale["state"], "applied")
+        self.assertFalse(self.posts)
+
+        self.form_id = "frm_hidden_required_ui8223"
+        self.item_id = "S1:opencode-form-ui8223-hidden-required"
+        self._set_form([
+            {"key": "private-required", "type": "string", "required": True,
+             "hidden": True},
+        ])
+        self._publish_wait()
+        state, _envelope, row, vm = self._read_and_adopt(expected_state="unknown")
+        self.assertEqual(question_items(state.question_overlay["detail"]), ())
+        self.assertFalse(question_answer_supported(state.question_overlay["detail"]))
+        would_be_supported = dict(state.question_overlay["detail"])
+        would_be_supported["state"] = "open"
+        would_be_supported["support"] = {"supported": True}
+        self.assertFalse(question_answer_supported(would_be_supported))
+        hit, _grid = self._rendered_submit_hit(state, vm)
+        self.assertIsNone(hit)
+        _state, effects = reduce(state, {"type": "click", "action": ("question.submit",)})
+        self.assertFalse(effects)
+        self.assertFalse(self.posts)
+
+        self.form_id = "frm_mixed_hidden_required_ui8223"
+        self.item_id = "S1:opencode-form-ui8223-mixed-hidden-required"
+        self._set_form([
+            {"key": "visible-note", "type": "string", "required": False,
+             "hidden": False},
+            {"key": "private-required", "type": "string", "required": True,
+             "hidden": True},
+        ])
+        self._publish_wait()
+        state, _envelope, row, vm = self._read_and_adopt(expected_state="unknown")
+        self.assertTrue(question_items(state.question_overlay["detail"]))
+        self.assertFalse(question_answer_supported(state.question_overlay["detail"]))
+        would_be_supported = dict(state.question_overlay["detail"])
+        would_be_supported["state"] = "open"
+        would_be_supported["support"] = {"supported": True}
+        forced_overlay = dict(state.question_overlay, state="open", detail=would_be_supported)
+        forced_state = replace(state, question_overlay=forced_overlay)
+        self.assertFalse(question_answer_supported(would_be_supported))
+        hit, _grid = self._rendered_submit_hit(forced_state, vm)
+        self.assertIsNone(hit)
+        _state, effects = reduce(forced_state, {
+            "type": "click", "action": ("question.submit",)})
+        self.assertFalse(effects)
+        self.assertFalse(self.posts)
+
+        unsupported_detail = dict(state.question_overlay["detail"])
+        unsupported_detail["support"] = {"supported": False}
+        unsupported_overlay = dict(state.question_overlay, detail=unsupported_detail)
+        unsupported_state = replace(state, question_overlay=unsupported_overlay)
+        hit, _grid = self._rendered_submit_hit(unsupported_state, vm)
+        self.assertIsNone(hit)
+        _state, effects = reduce(unsupported_state, {
+            "type": "click", "action": ("question.submit",)})
+        self.assertFalse(effects)
+        self.assertFalse(self.posts)
 
     def test_multifield_custom_edit_preserves_native_choices_and_field_limit(self):
         from fleet.explorer.state import question_items, question_answer_supported
