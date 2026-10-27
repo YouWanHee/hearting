@@ -1553,19 +1553,25 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
         events = [item["event"] for item in trace]
-        self.assertEqual(events, ["turn-start", "join-start", "join-end", "turn-start"])
-        self.assertEqual(trace[0]["delivered"], [])
-        self.assertEqual(trace[0]["phase"], "running-turn")
-        self.assertEqual(trace[3]["phase"], "running-turn")
-        self.assertEqual(set(trace[3]["outbox"]["attempt_ids"]), {"att-child-a", "att-child-b"})
-        self.assertEqual(trace[3]["outbox"]["consumed_attempt_ids"], [])
+        self.assertEqual(events, [
+            "thread-start", "turn-start", "join-start", "join-end", "turn-start",
+        ])
+        self.assertEqual(events.count("thread-start"), 1)
+        self.assertEqual(events.count("thread-resume"), 0)
+        turns = [item for item in trace if item["event"] == "turn-start"]
+        self.assertEqual(turns[0]["delivered"], [])
+        self.assertEqual(turns[0]["phase"], "running-turn")
+        self.assertEqual(turns[1]["phase"], "running-turn")
+        self.assertEqual(set(turns[1]["outbox"]["attempt_ids"]), {"att-child-a", "att-child-b"})
+        self.assertEqual(turns[1]["outbox"]["consumed_attempt_ids"], [])
         self.assertTrue(all(item.get("lease_held") for item in trace if item["event"] == "turn-start"))
         self.assertEqual(
-            set(trace[3]["delivered"]), {"att-child-a", "att-child-b"}
+            set(turns[1]["delivered"]), {"att-child-a", "att-child-b"}
         )
-        self.assertLess(trace[1]["time"], trace[2]["time"])
-        self.assertLessEqual(trace[2]["time"], trace[3]["time"])
-        self.assertEqual(trace[1]["phase"], "parked")
+        joins = [item for item in trace if item["event"].startswith("join-")]
+        self.assertLess(joins[0]["time"], joins[1]["time"])
+        self.assertLessEqual(joins[1]["time"], turns[1]["time"])
+        self.assertEqual(joins[0]["phase"], "parked")
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(sum(row.get("type") == "turn.completed" for row in rows), 1)
         self.assertEqual(
@@ -1602,7 +1608,7 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertIsInstance(observed[0]["join_completed_ns"], int)
         # This transport fixture supplies no marker/committed child receipt.
         # A bare done/pass word must arrive as attention, not proved success.
-        self.assertIn('"delivery_classification":"attention"', trace[3]["prompt"])
+        self.assertIn('"delivery_classification":"attention"', turns[1]["prompt"])
         timing_events = [
             row for row in rows
             if row.get("type") == "dispatch.supervisor.delivery-timing"
@@ -1703,7 +1709,9 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         result = self.run_supervisor(FAKE_NO_CHILD="1")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
-        self.assertEqual([item["event"] for item in trace], ["turn-start"])
+        self.assertEqual([item["event"] for item in trace], ["thread-start", "turn-start"])
+        self.assertEqual(sum(item["event"] == "thread-start" for item in trace), 1)
+        self.assertEqual(sum(item["event"] == "thread-resume" for item in trace), 0)
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual(sum(row.get("type") == "turn.completed" for row in rows), 1)
         self.assertEqual(
@@ -1763,6 +1771,8 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
             FAKE_NO_CHILD="1", FAKE_GIT_ITEM_FILE=str(item_file), FAKE_EXPECT_STEER="1")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(sum(row.get("event") == "thread-start" for row in trace), 1, trace)
+        self.assertEqual(sum(row.get("event") == "thread-resume" for row in trace), 0, trace)
         steer_rows = [row for row in trace if row.get("event") == "turn-steer"]
         self.assertEqual(len(steer_rows), 1, trace)
         request = steer_rows[0]["request"]
@@ -1809,6 +1819,11 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertTrue(any(row.get("status") == "observation-limit"
                             and row.get("reason") == "feedback-rejected"
                             for row in rejected_feedback), rejected_feedback)
+        rejected_trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
+        self.assertEqual(sum(row.get("event") == "thread-start" for row in rejected_trace), 1,
+                         rejected_trace)
+        self.assertEqual(sum(row.get("event") == "thread-resume" for row in rejected_trace), 0,
+                         rejected_trace)
         self.assertEqual(sum(row.get("type") == "dispatch.supervisor.turn.started"
                              for row in rejected_events), 1)
         self.assertIn("verdict: PASS", rejected.stdout)
@@ -1930,8 +1945,11 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         result = self.run_supervisor(FAKE_NO_CHILD="1")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
-        self.assertEqual(len(trace), 1)
-        self.assertIn("early word", trace[0]["prompt"])
+        self.assertEqual([item["event"] for item in trace], ["thread-start", "turn-start"])
+        self.assertEqual(sum(item["event"] == "thread-start" for item in trace), 1)
+        self.assertEqual(sum(item["event"] == "thread-resume" for item in trace), 0)
+        turn = next(item for item in trace if item["event"] == "turn-start")
+        self.assertIn("early word", turn["prompt"])
         receipt = owner_input.inspect(self.jobs, PARENT)
         self.assertEqual(receipt["requests"][0]["state"], "turn-completed")
         self.assertEqual(receipt["requests"][0]["thread_id"], "thread-1")
@@ -2051,12 +2069,46 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         trace = [json.loads(line) for line in self.trace.read_text().splitlines()]
         self.assertEqual([event["event"] for event in trace], [
-            "turn-start", "join-start", "join-end", "turn-start",
+            "thread-start", "turn-start", "join-start", "join-end", "turn-start",
             "join-start", "join-end", "turn-start",
         ])
-        self.assertEqual(trace[3]["delivered"], ["att-child"])
-        self.assertEqual(set(trace[-1]["delivered"]), {"att-child", "att-pending"})
+        self.assertEqual(sum(event["event"] == "thread-start" for event in trace), 1)
+        self.assertEqual(sum(event["event"] == "thread-resume" for event in trace), 0)
+        turns = [event for event in trace if event["event"] == "turn-start"]
+        self.assertEqual(turns[1]["delivered"], ["att-child"])
+        self.assertEqual(set(turns[-1]["delivered"]), {"att-child", "att-pending"})
         self.assertNotIn('"state": "registration-required"', result.stdout)
+
+    def test_unavailable_state_for_pending_bound_input_never_starts_replacement_thread(self):
+        import dispatch_owner_input as owner_input
+        from dispatch_contract import hold_supervisor_lease
+
+        self.jobs.write_text(owner_row(self.lease), encoding="utf-8")
+        owner_input.initialize_owner_input(self.jobs, PARENT, "codex-active-turn")
+        with hold_supervisor_lease(self.jobs, PARENT, self.lease):
+            owner_input.OwnerInput(self.jobs, PARENT, "thread-1", "codex-active-turn", lambda _e: None)
+            owner_input.submit(self.jobs, PARENT, "keep this correction", "pending-correction")
+        jobs_before = self.jobs.read_bytes()
+
+        for saved_state in (None, "{unreadable"):
+            with self.subTest(saved_state="missing" if saved_state is None else "unreadable"):
+                if saved_state is None:
+                    self.state.unlink(missing_ok=True)
+                else:
+                    self.state.write_text(saved_state, encoding="utf-8")
+                state_before = self.state.read_bytes() if self.state.exists() else None
+                self.trace.unlink(missing_ok=True)
+
+                result = self.run_supervisor(FAKE_NO_CHILD="1")
+
+                self.assertEqual(result.returncode, 75, result.stderr + result.stdout)
+                self.assertIn("dispatch.supervisor.consumer-recovery-failed", result.stdout)
+                self.assertEqual(self.jobs.read_bytes(), jobs_before)
+                self.assertEqual(self.state.read_bytes() if self.state.exists() else None,
+                                 state_before)
+                self.assertFalse(self.trace.exists())
+                receipt = owner_input.inspect(self.jobs, PARENT)
+                self.assertEqual(receipt["requests"][0]["state"], "queued")
 
     def test_bound_long_route_survives_thirteen_continuations_and_completes(self):
         route = self.base / "long-route.json"

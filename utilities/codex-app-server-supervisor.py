@@ -1304,9 +1304,25 @@ def main(argv: list[str] | None = None) -> int:
         argument_parser.error("--jobs or AGENT_DISPATCH_JOBS is required outside --one-turn")
     if not args.parent_attempt_id or not args.lease_file:
         argument_parser.error("--parent-attempt-id and --lease-file are required outside --one-turn")
-    from dispatch_owner_input import bound_input_thread
+    from dispatch_owner_input import bound_input_thread, inspect as inspect_owner_input
     restart_thread = bound_input_thread(args.jobs, args.parent_attempt_id)
-    restart = restart_thread is not None
+    bound_input = restart_thread is not None
+    restart = False
+    if bound_input:
+        # Completed channels stay bound after a normal turn; only unresolved
+        # receipts can make the channel itself evidence of a consumer restart.
+        try:
+            owner_input_state = inspect_owner_input(args.jobs, args.parent_attempt_id)
+        except (JoinContractError, OSError, ValueError, KeyError, TypeError):
+            # A bound channel whose receipt cannot be read must not authorize a
+            # replacement thread or an uncertain resend.
+            restart = True
+        else:
+            requests = owner_input_state.get("requests")
+            restart = (not isinstance(requests, list) or any(
+                not isinstance(request, dict) or request.get("state") != "turn-completed"
+                for request in requests
+            ))
     continuation_budget = resolve_continuation_budget(
         explicit=args.max_continuations,
         route_file=args.route_file,
@@ -1332,7 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     prompt = sys.stdin.read()
     if not prompt.strip():
-        if restart:
+        if bound_input:
             emit({"type": "dispatch.supervisor.consumer-recovery-failed",
                   "parent_attempt_id": args.parent_attempt_id,
                   "reason": "consumer-recovery-prompt-empty"})
@@ -1359,6 +1375,12 @@ def main(argv: list[str] | None = None) -> int:
     if state_path is not None:
         runtime_env["AGENT_DISPATCH_COMPLETION_STATE_FILE"] = str(state_path)
     runtime_env["AGENT_DISPATCH_SUPERVISOR_LEASE_FILE"] = str(lease_path)
+    # Use a read-only hint to classify lease-acquisition failures. The snapshot
+    # is always read again under the exclusive lease before any recovery action.
+    phase_state_hint = read_supervisor_phase_state(state_path, args.parent_attempt_id)
+    if ((state_path is not None and os.path.lexists(state_path) and phase_state_hint is None)
+            or (phase_state_hint is not None and phase_state_hint.resource is not None)):
+        restart = True
     server: AppServer | None = None
     control = None
     lease = hold_supervisor_lease(
@@ -1383,8 +1405,14 @@ def main(argv: list[str] | None = None) -> int:
         recovered = read_supervisor_phase_state(
             state_path, args.parent_attempt_id
         )
+        if state_path is not None and os.path.lexists(state_path) and recovered is None:
+            restart = True
+            raise SupervisorError("supervisor-state-unavailable")
+        if recovered is not None and recovered.resource is not None:
+            restart = True
         if restart and (recovered is None or recovered.resource is None
-                        or recovered.resource.get("session_id") != restart_thread):
+                        or (restart_thread is not None
+                            and recovered.resource.get("session_id") != restart_thread)):
             raise SupervisorError("owner-input-restart-state-unavailable")
         if recovered is not None:
             delivered = set(recovered.delivered_attempt_ids)
