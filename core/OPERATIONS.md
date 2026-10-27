@@ -1567,6 +1567,31 @@ an unacknowledged success or failure remains recoverable from its original bindi
 next registration, with no lifetime receipt-count ceiling.
 The resource that supplies the declared stage outputs can complete the stage. Continuation retains that admitted resource identity and quiescence; it requires no model attempt sidecar for the resource prefix.
 
+Distinct operations selected by the normal owner within one route/node's
+approved scope may have separate live resource rows. Existing route/resource
+node, registered owner/lifecycle, live parent/controller thread and PID-start,
+input-target, and pending-correction checks remain the execution authority.
+Owner-input id/digest/source/target and accepted/completed turns remain
+provenance; freeform text need not be rewritten as request JSON. The runtime
+binds the exact selected request bytes, local command record and local bridge
+hash, then separately parses the remote `compute-hosts run` argv to validate
+its cwd, explicit environment, payload and input hashes. A route, run name,
+manifest, or completed input-delivery receipt alone does not authorize a
+second operation. A retry of one operation still requires that operation's
+prior execution to be terminal and quiescent; unrelated operations retain
+independent registry rows, watches, results, receipts, and output-settlement
+duties. Aggregate stage admission waits for every current authorized operation
+and claims the existing successor once.
+
+The legacy `<node>.json` watch remains readable. Only the owner's next normal
+model turn may expose a queued operation through its flat launch view; a parked
+wait does not replace that view. Prior watch bytes and all execution records
+remain lossless in the current index/archive. Current readers check both the
+old-readable projection and full current operation binding. Additive execution
+watches remain outside `armed/*.json`. A cached consumer is supported only
+after its actual launch, result-delivery and aggregate admission path has been
+exercised; the file layout alone does not establish that support.
+
 **Registry selection is workflow-ledger authority.** When a supervisor command
 or any adapter launch fence receives an explicit `--jobs`, the ledger is always
 `<jobs-parent>/workflow/<route-id>` even if the raising and releasing actors
@@ -1838,21 +1863,28 @@ pending attempts. Missing, changed, advanced or still-open route bindings and
 launched owners retain the existing reconciliation rules. Fleet may remove
 the cancelled row from its active set without granting successor readiness.
 
-**Verification leaves nothing running.** A verification lease
-(`utilities/verification-background-lease.py`) owns everything its command
-starts: it is the command's child subreaper and tags the command's environment,
-and when the command exits, expires or the lease is stopped it ends whatever is
-still in that scope, detached fixtures included. The scope's memory, measured as
-its proportional set size (shared pages counted once; resident size where that
-is unreadable), has one ceiling: 16 GiB, or a quarter of host memory when
-smaller, unless `--memory-budget SIZE` replaces it with the value an approved
-task or receipt names; the lease record and the 125 message name which one
-applied. Past it the lease ends the scope and returns 125, so a leaking check
-ends instead of other work on a shared host. The lease prints the scope's peak,
-its measure and sampling interval on every exit. The test runner likewise reaps
-each suite's fixtures when that suite ends, and ends its running suites when it
-is stopped. A peer obligation runner whose state root was removed or replaced
-ends on its next pass.
+**Verification owns its processes and private scratch.** A verification lease
+(`utilities/verification-background-lease.py`) creates a private directory
+beneath the final command environment's `TMPDIR` parent and passes that
+directory to the command as `TMPDIR`. It is the command's child subreaper and
+tags the command's environment. After the command finishes, the lease ends any
+remaining owned processes, confirms that known owned identities are no longer
+live, and removes only the directory it created. If an owned child remains live
+or its identity cannot be read, the lease keeps that directory and reports its
+path and cause; unrelated process read failures have no effect on its removal. The
+inherited parent, sibling roots, external symlink targets, and shared runtime
+caches are not lease scratch. The caller retains command output independently
+of scratch removal. The scope's memory, measured as its proportional set size
+(shared pages counted once; resident size where that is unreadable), has one
+ceiling: 16 GiB, or a quarter of host memory when smaller, unless
+`--memory-budget SIZE` replaces it with the value an approved task or receipt
+names; the lease record and the 125 message name which one applied. Past it the
+lease ends the scope and returns 125, so a leaking check ends instead of other
+work on a shared host. The lease prints the scope's peak, its measure and
+sampling interval on every exit. The test runner likewise settles each suite's
+owned fixtures before retiring its attempt scratch, and retains shared layout
+scratch through its last output or diagnostic consumer. A peer obligation
+runner whose state root was removed or replaced ends on its next pass.
 
 **Exact reconcile stays attempt-scoped.** A normal `dispatch-reconcile
 --attempt <id> --apply` covers that attempt, its process drain, and its

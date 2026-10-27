@@ -94,14 +94,19 @@ def turn_id(payload: dict[str, Any]) -> str:
     return nested_string(payload, "turn_id", "turnID", "message_id", "messageID")
 
 
-def candidate_context(payload: dict[str, Any], current_cwd: str, sid: str) -> str:
-    """Run the bounded D-55 capsule probe; every failure is zero context."""
+def candidate_context(payload: dict[str, Any], current_cwd: str, sid: str) -> tuple[str, Any]:
+    """Run the bounded D-55 capsule probe; every failure is zero context.
+
+    The bridge renders more context after this probe, so the helper keeps its
+    seen-ID/recall receipt pending and returns it here. The caller commits only
+    after ``emit_context`` returned (the same boundary the native queue ack uses).
+    """
     prompt = nested_string(payload, "prompt")
     if not prompt:
-        return ""
+        return "", None
     command = [
         str(RECALL_HOOK), "--prompt", prompt, "--cwd", current_cwd,
-        "--session-id", sid, "--runtime", "codex", "--format", "text",
+        "--session-id", sid, "--runtime", "codex", "--format", "hook-json",
     ]
     current_turn = turn_id(payload)
     if current_turn:
@@ -110,6 +115,7 @@ def candidate_context(payload: dict[str, Any], current_cwd: str, sid: str) -> st
     # The installed hook owns this bridge. Do not let a stale/invalid inherited
     # AGENT_HOME redirect the prompt probe to another tree's memory launcher.
     env["AGENT_HOME"] = str(ROOT)
+    env["MEM_CANDIDATE_DEFER_COMMIT"] = "1"
     try:
         result = subprocess.run(
             command, cwd=str(ROOT), env=env, text=True,
@@ -117,17 +123,33 @@ def candidate_context(payload: dict[str, Any], current_cwd: str, sid: str) -> st
             timeout=2, check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout if result.returncode == 0 else ""
+        return "", None
+    if result.returncode != 0:
+        return "", None
+    try:
+        value = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return "", None
+    if not isinstance(value, dict):
+        return "", None
+    output = value.get("hookSpecificOutput")
+    context = output.get("additionalContext") if isinstance(output, dict) else ""
+    return (context if isinstance(context, str) else "",
+            value.get("deferredCandidateReceipt"))
 
 
-def card_context(payload: dict[str, Any], current_cwd: str) -> str:
-    """Session card / tidy notice due at this prompt; needs no prompt text or candidate."""
+def card_context(payload: dict[str, Any], current_cwd: str) -> tuple[str, Any]:
+    """Session card / tidy notice due at this prompt; needs no prompt text or candidate.
+
+    JSON mode hands back the consumption receipts instead of writing them, so
+    they are committed only after the outer hook's final output exists.
+    """
     sid = interaction_session_id(payload)
     if not sid or not SESSION_TIDY.is_file():
-        return ""
+        return "", None
     command = [sys.executable, str(SESSION_TIDY), "hook", "--harness", "codex",
-               "--event", "prompt", "--session-id", sid, "--cwd", current_cwd]
+               "--event", "prompt", "--session-id", sid, "--cwd", current_cwd,
+               "--format", "json"]
     transcript = nested_string(payload, "transcript_path", "transcriptPath")
     if transcript:
         command += ["--transcript", transcript]
@@ -138,8 +160,18 @@ def card_context(payload: dict[str, Any], current_cwd: str) -> str:
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=4, check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""
-    return result.stdout if result.returncode == 0 else ""
+        return "", None
+    if result.returncode != 0:
+        return "", None
+    try:
+        value = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return "", None
+    if not isinstance(value, dict):
+        return "", None
+    context = value.get("additionalContext")
+    return (context if isinstance(context, str) else "",
+            value.get("deferredConsumed"))
 
 
 def run_preflight_result(*args: str, timeout_seconds: float | None = None,
@@ -492,7 +524,7 @@ def main() -> int:
 
     # The card hook runs first: it is where a cleared window's successor is recorded, and the
     # receipts a predecessor left for it are swept only once that is known.
-    card = card_context(payload, current_cwd)
+    card, card_deferred = card_context(payload, current_cwd)
     batches = []
     ackable = set()
     try:
@@ -514,7 +546,8 @@ def main() -> int:
         parts.append(peer.receiver_guidance(current_prompt,
             {"harness": "codex", "session_id": interaction_sid}, cwd=current_cwd))
     parts.append(card)
-    parts.append(candidate_context(payload, current_cwd, sid))
+    candidate, candidate_deferred = candidate_context(payload, current_cwd, sid)
+    parts.append(candidate)
     parts.append(run_preflight("briefing", current_cwd))
     # Phase 1 token self-regulation is transition-only. Normal, unknown,
     # native-owned, and repeated bands return an empty string (zero injection).
@@ -522,6 +555,25 @@ def main() -> int:
     if context_notice:
         parts.append(context_notice)
     emit_context("UserPromptSubmit", parts, system_message=context_notice)
+    # Commit candidate/card consumption only after the context above actually
+    # rendered, and before the existing native-queue ack does the same for its
+    # records. A timeout or render error before this point leaves the same
+    # candidates and card generation due for the next prompt.
+    if card_deferred:
+        try:
+            import session_tidy
+            session_tidy.apply_deferred(card_deferred)
+        except Exception:
+            pass
+    if candidate_deferred:
+        try:
+            memory_dir = ROOT / "tools" / "memory"
+            if str(memory_dir) not in sys.path:
+                sys.path.append(str(memory_dir))
+            import mem
+            mem.apply_candidate_receipt(candidate_deferred)
+        except Exception:
+            pass
     # Commit acknowledgement only after successful synchronous hook rendering.
     from dispatch_session_sweep import ack_delivered
     for root, records in batches:

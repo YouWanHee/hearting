@@ -23,6 +23,36 @@ def _pane(frame):
     return cells, hits
 
 
+def _card_boxes(frame):
+    """``tag -> (x0, top, x1, bottom)`` in screen cells from each card's fold hits."""
+    rows = {}
+    for hit in frame.hits:
+        if hit.action[:2] == ("fold", "pfocus:PEERS") and hit.x1 - hit.x0 >= 28 and hit.x0 >= SEPARATOR:
+            rows.setdefault(hit.action[2], []).append(hit)
+    return {tag: (hits[0].x0, min(h.y for h in hits), hits[0].x1 - 1, max(h.y for h in hits))
+            for tag, hits in rows.items()}
+
+
+def _lane_gutter_delta(frame, vm, expected_cells):
+    """The approved side-lane delta: only the gutter right of each stacked pair may differ.
+
+    The reference put the lower card's leaving tail at a fixed fourth row, on its divider
+    or bottom corner; the lanes now leave and arrive on each card's two first inner rows.
+    """
+    boxes = _card_boxes(frame)
+    normalized = [list(row) for row in expected_cells]
+    for upper, lower in (tuple(lane[:2]) for lane in vm.peer_edges.get("side_lanes", ())):
+        if upper not in boxes or lower not in boxes:
+            continue
+        edge = boxes[upper][2]
+        for yy in range(boxes[upper][1], boxes[lower][3] + 1):
+            for xx in range(edge, edge + 6):
+                py, px = yy - 5, xx - SEPARATOR
+                if 0 <= py < len(normalized) and 0 <= px < len(normalized[py]):
+                    normalized[py][px] = list(frame.cells[yy][xx])
+    return normalized
+
+
 class PeerPaneReference(unittest.TestCase):
     def test_peers_and_selected_links_match_reference_pane(self):
         vm = load_fixture(FIXTURES / "view_model.json")
@@ -43,6 +73,7 @@ class PeerPaneReference(unittest.TestCase):
                         [[hit.y, hit.x0, hit.x1, list(hit.action)] for hit in frame.hits],
                         expected["hits"], frame.tree_scroll)
                     expected_cells = [row[SEPARATOR:] for row in expected_cells[5:]]
+                    expected_cells = _lane_gutter_delta(frame, vm, expected_cells)
                     expected_hits = [[hit[0] - 5, hit[1] - SEPARATOR, hit[2] - SEPARATOR, hit[3]]
                                      for hit in expected_full_hits
                                      if hit[0] >= 5 and hit[1] >= SEPARATOR]
@@ -200,6 +231,91 @@ class PeerDerivedElements(unittest.TestCase):
                                     for b in other_rows:
                                         self.assertFalse(a.y == b.y and a.x0 < b.x1 and b.x0 < a.x1,
                                                          f"{tag} and {other} overlap at row {a.y}")
+
+
+def _one_repo(count, lane=False, owners=False):
+    from tools.fleet.explorer.view_model import ExplorerViewModel
+    values = load_fixture(FIXTURES / "view_model.json").to_mapping()
+    tags = [f"x{index}" for index in range(count)]
+    values["sessions"] = [{"tag": tag, "harness": "codex", "title": f"hearting task {index}",
+                           "state": "idle", "repo": "hearting"} for index, tag in enumerate(tags)]
+    columns = [[tag] for tag in tags]
+    edges = {"links": [], "cross": [], "side_lanes": [], "cards": {}, "watches": []}
+    if lane:
+        columns = [tags[:2]] + columns[2:]
+        edges["side_lanes"] = [tags[:2]]
+        edges["links"] = [[[tags[0], "codex"], [tags[1], "codex"], "steer", "1m ago", "n"],
+                          [[tags[1], "codex"], [tags[0], "codex"], "steer", "2m ago", "n"]]
+    if owners:
+        stage = {"name": "plan", "state": "done"}
+        edges["cards"] = {tags[1]: {"owners": [{"state": "idle", "label": "lab", "stages": [stage]}]}}
+    values["peer_nodes"] = [("hearting", columns)]
+    values["peer_edges"] = edges
+    return ExplorerViewModel.from_mapping(values)
+
+
+class PeerWrappedLayout(unittest.TestCase):
+    def test_one_repo_wraps_into_rows_and_columns_when_the_pane_is_wide(self):
+        frame = draw(_one_repo(8), NavState(view="PEERS", title="PEERS"), 180, 60, beat=1)
+        boxes = _card_boxes(frame)
+        self.assertEqual(len(boxes), 8)
+        xs = sorted({box[0] for box in boxes.values()})
+        tops = sorted({box[1] for box in boxes.values()})
+        self.assertEqual(len(xs), 4, xs)
+        self.assertEqual(len(tops), 2, tops)
+        # Row-major order keeps the session order; nothing leaves the pane.
+        ordered = sorted(boxes, key=lambda tag: (boxes[tag][1], boxes[tag][0]))
+        self.assertEqual(ordered, [f"x{index}" for index in range(8)])
+        self.assertTrue(all(box[2] < 180 - 2 for box in boxes.values()))
+
+    def test_narrow_pane_still_stacks_one_card_per_row(self):
+        frame = draw(_one_repo(4), NavState(view="PEERS", title="PEERS"), 80, 60, beat=1)
+        self.assertEqual(len({box[0] for box in _card_boxes(frame).values()}), 1)
+
+    def test_side_lane_heads_and_tails_meet_both_cards_on_inner_rows(self):
+        for cols in (100, 140, 180):
+            for owners in (False, True):
+                for offset in (0, 3):
+                    with self.subTest(cols=cols, owners=owners, offset=offset):
+                        state = NavState(view="PEERS", title="PEERS", scroll=(("pane", offset),))
+                        frame = draw(_one_repo(6, lane=True, owners=owners), state, cols, 60, beat=1)
+                        boxes = _card_boxes(frame)
+                        ux0, uy, edge, ub = boxes["x0"]
+                        _lx0, fy, lower_edge, fb = boxes["x1"]
+                        self.assertEqual(edge, lower_edge)
+                        glyph = lambda xx, yy: frame.cells[yy][xx][0]
+                        for top, bottom in ((uy, ub), (fy, fb)):
+                            self.assertEqual(glyph(edge + 1, top + 1), "◀")
+                            self.assertEqual(glyph(edge, top + 2), "├")
+                            self.assertEqual(glyph(edge, bottom), "┘", "the corner stays whole")
+                        self.assertEqual([glyph(xx, uy + 2) for xx in range(edge, edge + 4)],
+                                         list("├──┐"))
+                        self.assertTrue(all(glyph(edge + 3, yy) == "│" for yy in range(uy + 3, fy + 1)))
+                        self.assertEqual([glyph(xx, fy + 1) for xx in range(edge + 1, edge + 4)],
+                                         list("◀─┘"))
+                        self.assertEqual([glyph(xx, fy + 2) for xx in range(edge, edge + 6)],
+                                         list("├────┘"))
+                        self.assertTrue(all(glyph(edge + 5, yy) == "│" for yy in range(uy + 2, fy + 2)))
+                        self.assertEqual([glyph(xx, uy + 1) for xx in range(edge + 1, edge + 6)],
+                                         list("◀───┐"))
+                        if owners:
+                            self.assertEqual(glyph(edge, fy + 3), "┤", "the owner divider stays whole")
+                        # The gutter column right of the lanes belongs to the next card's left gap.
+                        others = [box for tag, box in boxes.items() if tag not in ("x0", "x1")]
+                        self.assertTrue(all(not (box[0] <= edge + 5 <= box[2] and
+                                                 box[1] <= fy <= box[3]) for box in others))
+
+    def test_cross_link_tail_line_and_head_share_one_row(self):
+        frame = draw(load_fixture(FIXTURES / "view_model.json"), NavState(view="PEERS", title="PEERS"),
+                     168, 60, beat=1)
+        boxes = _card_boxes(frame)
+        src, dst = boxes["e4"], boxes["f5"]
+        if src[2] >= dst[0]:
+            self.skipTest("the frames are not side by side at this width")
+        row = max(src[1], dst[1]) + 2
+        line = "".join(frame.cells[row][xx][0] for xx in range(src[2], dst[0]))
+        self.assertTrue(line.startswith("├"), line)
+        self.assertTrue(line.endswith("▶"), line)
 
 
 if __name__ == "__main__":

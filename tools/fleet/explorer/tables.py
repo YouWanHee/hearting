@@ -57,6 +57,16 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
     y += 1
     repos = tuple(vm.repos or ())
     sessions = tuple(vm.sessions or ())
+    route_rows = [route for route in vm.routes if route.get("session_tag")]
+    # The ROUTES summary and RECENT stay in view under a long session list: the page
+    # viewport pins them to its bottom edge and only the sessions above them scroll.
+    # A short screen keeps fewer RECENT rows (at least one) before it gives the pin up.
+    room = getattr(grid, "viewport_rows", 0) - OVERVIEW_SCROLL_ROWS
+    recent = sum(1 for repo in repos if repo.get("done") and repo_label(repo.get("name")))
+    recent_rows = min(recent, max(min(1, recent), room - 4 - len(route_rows)))
+    tail_height = 4 + len(route_rows) + recent_rows
+    pin = getattr(grid, "pin_bottom", None)
+    sticky = pin is not None and getattr(state, "scope", "-") == "-" and tail_height <= room
     for repo in repos:
         name = repo_label(repo.get("name", "·"))
         mine = [session for session in sessions
@@ -173,6 +183,11 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
                 _tint_row(grid, row_y, x - 1, right, 236)
                 y = _session_unfold(grid, vm, x, use, y, session, c)
             if y >= grid.rows - 5:
+                if sticky:
+                    pin(None, tail_height, lambda target, top: _draw_overview_tail(
+                        target, vm, state, x, use, right, top, route_rows, repos, recent_rows=recent_rows))
+                    grid.mark_page_incomplete()
+                    return
                 grid.put(right - 18, grid.rows - 5, "↓ more below", "dim", limit=right)
                 return
     sessions_total = len(sessions)
@@ -182,26 +197,14 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
     summary = (f"{count_word(sessions_total, 'session')} · {working_sessions} working · "
                f"{questions} needs answer · {count_word(sum(1 for repo in repos if repo_label(repo.get('name', '·'))), 'project')}")
     grid.put(x + 1, y, summary, "dim")                # the summary runs to the screen edge and is cut there
+    if sticky:
+        pin(y + 1, tail_height, lambda target, top: _draw_overview_tail(
+            target, vm, state, x, use, right, top, route_rows, repos, recent_rows=recent_rows))
+        grid.report_natural_page_end(y + tail_height)
+        return
     y += 2
-    route_rows = [route for route in vm.routes if route.get("session_tag")]
-    open_routes = sum(1 for route in route_rows if route.get("state") != "done")
-    stopped = sum(1 for route in route_rows if route.get("state") == "dead")
-    grid.put(x, y, "── ", "line")
-    label_x = grid.put(x + 3, y, "ROUTES", "head")
+    _draw_overview_routes_rule(grid, vm, state, x, use, right, y, route_rows)
     scoped_page = getattr(state, "scope", "-") != "-"
-    meta = f"  {open_routes} open" + (f" · {stopped} stopped leg{'s' if stopped != 1 else ''}"
-                                      if stopped else "")
-    meta_end = grid.put(label_x, y, meta, "dim", limit=right)
-    grid.put(meta_end, y, " ", "branch_s")
-    for cell_x in range(meta_end + 1, right):
-        grid.put(cell_x, y, "─", "line")
-    mix = _harness_mix(route_rows)
-    mix_width = sum(len(text) for text, _key in mix)
-    mix_x = x + use - 2 - mix_width
-    if mix_x - x >= 40:                      # only where it clears the section's own title
-        cursor = mix_x
-        for text, key in mix:
-            cursor = grid.put(cursor, y, text, key, limit=right)
     y += 1
     if scoped_page:
         from types import SimpleNamespace
@@ -271,6 +274,25 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
                 grid.put(x + c_last, y, "clear " + last_clear, "dim", limit=right)
             y += 1
         return
+    _draw_overview_tail(grid, vm, state, x, use, right, y - 2, route_rows, repos, heading=False,
+                        limit=grid.rows - 5)
+
+
+OVERVIEW_SCROLL_ROWS = 4        # session rows the pinned tail always leaves above itself
+
+
+def _draw_overview_tail(grid, vm, state, x, use, right, y, route_rows, repos, heading=True, limit=None,
+                        recent_rows=None):
+    """The OVERVIEW ROUTES summary and RECENT block, from the blank gap row ``y`` down.
+
+    It is four rows (gap, two rules, the blank between them) plus one per route and
+    per shown RECENT repo; the pinned copy shows ``recent_rows`` of them.
+    """
+    y += 1
+    if heading:
+        _draw_overview_routes_rule(grid, vm, state, x, use, right, y, route_rows)
+    y += 1
+    scoped_page = getattr(state, "scope", "-") != "-"
     repo_order = {repo.get("id", repo.get("name", "")): index for index, repo in enumerate(repos)}
     route_rows.sort(key=lambda route: repo_order.get(route.get("repo"), len(repo_order)))
     for route in route_rows:
@@ -291,11 +313,35 @@ def draw_overview(grid: CellGrid, vm, state, x=34, y=3):
     for cell_x in range(recent_title_end + 1, right):
         grid.put(cell_x, y, "─", "line")
     y += 1
+    shown = 0
     for repo in repos:
-        if not repo.get("done") or not repo_label(repo.get("name")) or y >= grid.rows - 5:
+        if not repo.get("done") or not repo_label(repo.get("name")) or (limit is not None and y >= limit):
             continue
+        if recent_rows is not None and shown >= recent_rows:
+            break
         _recent_row(grid, repo, x, use, y)
+        shown += 1
         y += 1
+
+
+def _draw_overview_routes_rule(grid, vm, state, x, use, right, y, route_rows):
+    open_routes = sum(1 for route in route_rows if route.get("state") != "done")
+    stopped = sum(1 for route in route_rows if route.get("state") == "dead")
+    grid.put(x, y, "── ", "line")
+    label_x = grid.put(x + 3, y, "ROUTES", "head")
+    meta = f"  {open_routes} open" + (f" · {stopped} stopped leg{'s' if stopped != 1 else ''}"
+                                      if stopped else "")
+    meta_end = grid.put(label_x, y, meta, "dim", limit=right)
+    grid.put(meta_end, y, " ", "branch_s")
+    for cell_x in range(meta_end + 1, right):
+        grid.put(cell_x, y, "─", "line")
+    mix = _harness_mix(route_rows)
+    mix_width = sum(len(text) for text, _key in mix)
+    mix_x = x + use - 2 - mix_width
+    if mix_x - x >= 40:                      # only where it clears the section's own title
+        cursor = mix_x
+        for text, key in mix:
+            cursor = grid.put(cursor, y, text, key, limit=right)
 
 
 def _recent_row(grid, repo, x, use, y):
@@ -912,7 +958,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
         y += 1
         grid.put(x + 10, y, "answer:", "label")
         grid.put(x + 20, y, "⏎", "hearting")
-        guide = (" select to answer here · open ▸ native fallback" if can_select
+        guide = (" select to view and answer · native fallback if unsupported" if can_select
                  else " go to its pane and answer there")
         grid.put(x + 21, y, guide, "dim", limit=x + use)
         y += 1
@@ -932,9 +978,13 @@ def draw_questions(grid, vm, state, x=34, y=3):
             kind = str(envelope.get("kind") or "").lower()
             approval = ("approval" in kind or "permission" in kind or
                         any(word in kind for word in ("commandexecution", "filechange")))
+            native_ref = envelope.get("native_ref")
+            opencode_v2_form = (envelope.get("harness") == "opencode"
+                                and isinstance(native_ref, Mapping)
+                                and native_ref.get("transport") == "opencode-http-v2")
             private_detail = envelope.get("detail") if envelope.get("state") != "unknown" else None
             content_x = x + (10 if narrow else 20)
-            if question_specs and not approval:
+            if (question_specs or opencode_v2_form) and not approval:
                 detail_lines = []
             elif isinstance(private_detail, dict) or hasattr(private_detail, "items"):
                 detail_lines = []
@@ -965,7 +1015,26 @@ def draw_questions(grid, vm, state, x=34, y=3):
                         grid.put(x + 10, y, "detail:", "label")
                     grid.put(content_x, y, wrapped, "soft", limit=right)
                     y += 1
+            if envelope.get("source") == "S2" and isinstance(private_detail, Mapping):
+                target = private_detail.get("target")
+                if isinstance(target, Mapping):
+                    parts = ["gate: " + str(target.get("gate") or envelope.get("question_id") or "")]
+                    if target.get("node"):
+                        parts.append("target: " + str(target["node"]))
+                    if private_detail.get("response_mode") == "frame-interview":
+                        parts.append("submit answers to proceed")
+                    else:
+                        parts.append("choose proceed, revise, or stop")
+                    for wrapped in _wrap(" · ".join(parts), max(1, right - content_x)):
+                        if y >= bottom:
+                            break
+                        grid.put(content_x, y, wrapped, "soft", limit=right)
+                        y += 1
             status = str(private.get("status") or private.get("state") or "")
+            support = envelope.get("support")
+            if (support is False or
+                    isinstance(support, Mapping) and support.get("supported") is False):
+                status = "No verified direct response; check the native prompt."
             if status and y < bottom:
                 if narrow:
                     grid.put(x + 10, y, _clip("status: " + status, max(1, right - x - 10)),
@@ -980,10 +1049,12 @@ def draw_questions(grid, vm, state, x=34, y=3):
             request_state = str(private.get("state") or envelope.get("state") or "unknown")
             request_state = (request_state if envelope.get("state") == request_state else "unknown")
             from .state import (question_action_supported, question_answer_supported,
+                                question_draft_supported,
                                 question_choice_click_allowed, question_decisions,
                                 question_free_text_available, question_multiple_select,
                                 question_values_valid)
             supported = question_action_supported(envelope)
+            can_answer = question_answer_supported(envelope)
             if request_state == "open" and supported and approval and y < bottom:
                 for decision in question_decisions(envelope):
                     cursor = x + 10
@@ -995,18 +1066,21 @@ def draw_questions(grid, vm, state, x=34, y=3):
                     y += 1
                     if y >= bottom:
                         break
-            elif not approval and question_specs:
+            elif not approval and (question_specs or can_answer):
                 draft = private.get("draft")
                 answers = draft.get("answers", {}) if hasattr(draft, "get") else {}
-                can_answer = question_answer_supported(envelope)
+                can_draft = question_draft_supported(envelope)
                 complete = True
                 for index, question_spec in enumerate(question_specs, 1):
                     qid = question_spec["id"]
                     prompt = (question_spec.get("question") or question_spec.get("prompt")
                               or question_spec.get("header") or question_spec.get("title")
-                              or question_spec.get("text") or "Question")
+                              or question_spec.get("text") or envelope.get("question_id")
+                              or "Question")
                     if hasattr(prompt, "get"):
-                        prompt = prompt.get("text") or prompt.get("question") or "Question"
+                        prompt = (prompt.get("text") or prompt.get("question")
+                                  or prompt.get("gate") or envelope.get("question_id")
+                                  or "Question")
                     prompt_lines = _wrap(str(prompt), max(1, right - (x + 20)))
                     if y < bottom:
                         grid.put(x + 10, y, f"Q{index}:", "label")
@@ -1042,7 +1116,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
                                  + str(label if isinstance(label, str) else value)
                                  if multi_select else
                                  "[ " + str(label if isinstance(label, str) else value) + " ]")
-                        selectable = (can_answer and request_state == "open"
+                        selectable = (can_draft and request_state == "open"
                                       and question_choice_click_allowed(
                                           envelope, qid, value, values))
                         end = grid.put(cursor, y, shown,
@@ -1064,7 +1138,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
                         label = "answer: " + (answer_text or "press e or click to type")
                         end = grid.put(x + 10, y, _clip(label, max(0, right - x - 10)),
                                        "soft", limit=right)
-                        if can_answer and request_state == "open":
+                        if can_draft and request_state == "open":
                             grid.add_hit(y, x + 10, max(x + 11, end),
                                          ("question.edit", qid))
                         y += 1
@@ -1077,7 +1151,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
                         answers.get(item["id"], ()) if hasattr(answers, "get") else ())
                     and not (item.get("choices", item.get("options")))
                     for item in question_specs)
-                if (not can_answer or no_native_input) and y < bottom:
+                if no_native_input and y < bottom:
                     fallback = ("Multiple question response is unavailable; use the native prompt."
                                 if len(question_specs) > 1 else
                                 "No native answer input is available; use the native prompt.")
@@ -1085,7 +1159,13 @@ def draw_questions(grid, vm, state, x=34, y=3):
                     y += 1
                 elif (complete and can_answer and request_state == "open"
                       and not private.get("pending") and y < bottom):
-                    label = "[ submit answer ]"
+                    response_mode = (envelope.get("detail", {}).get("response_mode")
+                                     if isinstance(envelope.get("detail"), Mapping) else None)
+                    if envelope.get("source") == "S2":
+                        label = ("[ submit answers and proceed ]" if response_mode == "frame-interview"
+                                 else "[ submit gate decision ]")
+                    else:
+                        label = "[ submit answer ]"
                     end = grid.put(x + 10, y, label, "hearting", limit=right)
                     grid.add_hit(y, x + 10, end, ("question.submit",))
                     y += 1

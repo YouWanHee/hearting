@@ -101,8 +101,10 @@ class _PageGrid(CellGrid):
     final painted body row without materializing the intervening canvas.
     """
 
-    def __init__(self, cols, rows, pane_x, keep_rows=(), complete_page=False):
+    def __init__(self, cols, rows, pane_x, keep_rows=(), complete_page=False, viewport_rows=0):
         self.cols, self.rows = max(0, int(cols)), max(0, int(rows))
+        self.viewport_rows = max(0, int(viewport_rows))
+        self.pinned = None
         self.pane_x = int(pane_x)
         self.probe_y = max(0, self.rows - 5)
         self.keep_start, self.keep_end = tuple(keep_rows) if keep_rows else (0, 0)
@@ -121,6 +123,14 @@ class _PageGrid(CellGrid):
     def mark_page_incomplete(self):
         """Record renderer-side clipping that is not visible at the bottom probe."""
         self.page_incomplete = True
+
+    def pin_bottom(self, natural_top, height, paint):
+        """Keep a page's closing block in view: ``paint(grid, top)`` runs on the screen.
+
+        ``natural_top`` is its own page row, or None when the rows above it run past the
+        canvas; the screen draws it there or at the viewport's bottom, whichever is higher.
+        """
+        self.pinned = (natural_top, int(height), paint)
 
     def report_natural_page_end(self, y):
         y = int(y)
@@ -183,8 +193,9 @@ def _draw_page(grid, vm, state):
         resources.draw_system(grid, vm, state)
 
 
-def _page_canvas(vm, state, cols, logical_rows, pane_x, keep_rows=(), complete_page=False):
-    grid = _PageGrid(cols, logical_rows, pane_x, keep_rows, complete_page)
+def _page_canvas(vm, state, cols, logical_rows, pane_x, keep_rows=(), complete_page=False,
+                 viewport_rows=0):
+    grid = _PageGrid(cols, logical_rows, pane_x, keep_rows, complete_page, viewport_rows)
     spill_y = max(0, int(logical_rows) - 5)
     for x in range(pane_x, grid.cols):
         grid.put(x, spill_y, "━", "line")
@@ -231,13 +242,39 @@ def measure_pane_max(view_model, nav_state, cols, rows):
     viewport_rows = max(0, body_end - viewport_top)
     logical_rows = max(view_rows + viewport_rows, view_rows + 1)
     while True:
-        grid, overflow = _page_canvas(vm, state, int(cols), logical_rows, pane_x)
+        grid, overflow = _page_canvas(vm, state, int(cols), logical_rows, pane_x,
+                                      viewport_rows=viewport_rows)
         if grid.natural_page_end is not None:
             return _page_max(grid, pane_x, logical_rows, viewport_rows, 0, overflow)
         if not overflow and not grid.page_incomplete:
             return max(0, _page_end(grid, pane_x, logical_rows) -
                        (3 + viewport_rows - 1))
         logical_rows = max(logical_rows + viewport_rows, logical_rows * 2)
+
+
+def _draw_pinned(grid, page, pane_x, content_top, body_end, shift, effective, pane_max):
+    """Paint a page's pinned closing block over the scrolled rows it now covers.
+
+    Return the first row below the scrolling rows: the block's top while it is held at
+    the bottom edge, else ``body_end`` (it sits in its own place and scrolls with the page).
+    """
+    natural_top, height, paint = page.pinned
+    top = body_end - height
+    held = natural_top is None or natural_top + shift - effective >= top
+    if not held:
+        top = natural_top + shift - effective
+    top = max(content_top, top)
+    for yy in range(top, body_end):
+        grid.fill(pane_x, grid.cols, yy)
+    grid.hits = [hit for hit in grid.hits
+                 if not (top <= hit.y < body_end and hit.x1 > pane_x)]
+    if grid.cols < 120:
+        grid.pane_clip = (pane_x - 1, grid.cols - 1)
+    paint(grid, top)
+    grid.pane_clip = None
+    if effective < pane_max:                # page rows still wait under the pinned block
+        grid.put(grid.cols - 16, top, "↓ more below", "dim", limit=grid.cols - 2)
+    return top if held else body_end
 
 
 def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
@@ -266,7 +303,7 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
         # Each page is a separate logical canvas, not a repaint of the sidebar.
         grid.mark_moved()
         page, overflow = _page_canvas(vm, state, int(cols), logical_rows, pane_x,
-                                      (keep_start, keep_end), complete_page)
+                                      (keep_start, keep_end), complete_page, viewport_rows)
         overflow = overflow or page.page_incomplete
         maximum = _page_max(page, pane_x, logical_rows, viewport_rows, offset, overflow)
         return page, overflow, maximum, logical_rows
@@ -305,6 +342,9 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
     grid.hits = [hit for hit in grid.hits if hit.y < body_end or hit.y == -1]
     # The page cells above were copied into their final viewport coordinates.
     grid.mark_moved()
+    scroll_end = body_end
+    if page.pinned is not None:
+        scroll_end = _draw_pinned(grid, page, pane_x, content_top, body_end, shift, effective, pane_max)
     chrome.draw_chrome(grid, vm, state, beat)
     if page.probe_overflow and body_end < grid.rows:
         grid.put(max(0, grid.cols - 18), body_end, " ↓ more below ", "dim", limit=grid.cols - 1)
@@ -323,8 +363,10 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
                                                   else "-"))
     grid.hits.append(Hit(-1, 0, 0, ("parent", parent)))
     grid.add_hit(1, int(cols) - 9, int(cols), ("usage",))
-    pane_layout = (pane_x, content_top, int(cols), body_end, effective, pane_max,
-                   viewport_rows, bool(overflow))
+    # A pinned block leaves the wheel region and the PageUp/PageDown step to the rows above it.
+    pane_layout = (pane_x, content_top, int(cols), scroll_end, effective, pane_max,
+                   max(1, scroll_end - content_top) if scroll_end < body_end else viewport_rows,
+                   bool(overflow))
     return CellFrame(grid.snapshot(), tuple(grid.hits), int(cols), int(rows),
                      _scope_title(vm, state), state.status, pane_layout, tree_layout)
 

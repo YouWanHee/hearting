@@ -794,6 +794,64 @@ class ExplorerRuntime:
                 "message": message[:240], "error": result.get("error"),
                 "models": refreshed}
 
+    def _apply_allocation_action(self, effect, vm):
+        """Validate one DISPATCH ALLOCATION hit and pass its typed values to the shared setter."""
+        from . import focus
+
+        def failed(message, status="failed"):
+            text = f"allocation: {status}: {message}"[:240]
+            return {"model_action": True, "status": status, "message": text, "error": str(message)[:240],
+                    "models": None}
+
+        if os.environ.get("FLEET_DEMO"):
+            return {"model_action": True, "status": "read-only",
+                    "message": "allocation: read-only in demo", "models": None}
+        kinds = {"strategy": str, "window": int, "usage_gate_used_percent": int,
+                 "usage_headroom_exponent": int, "depth_affinity_weight": float}
+        updates = {}
+        try:
+            _kind, payload, dry_run = effect
+            if not isinstance(dry_run, bool) or not isinstance(payload, (tuple, list)) or not payload:
+                raise ValueError("invalid allocation action")
+            for name, text in payload:
+                parent, _dot, child = str(name).partition(".")
+                if name in kinds:
+                    updates[name] = kinds[name](text)
+                elif parent == "depth_affinity" and child in ("owner", "worker"):
+                    updates[name] = None if text == "none" else str(text)
+                elif parent == "harness_weights" and child in ("claude", "codex", "opencode"):
+                    updates[name] = float(text)
+                else:
+                    raise ValueError(f"allocation.{name} is not editable here")
+        except (TypeError, ValueError) as exc:
+            return failed(exc, "invalid-arguments")
+        install_dir = str(Path(__file__).resolve().parents[3] / "tools" / "install")
+        original_path = list(sys.path)
+        settings = None
+        try:
+            import importlib
+            if install_dir not in sys.path:
+                sys.path.insert(0, install_dir)
+            settings = importlib.import_module("dispatch_settings")
+            result = settings.set_allocation(updates, dry_run=dry_run)
+        except Exception as exc:
+            usage = settings is not None and isinstance(exc, settings.DispatchSettingsUsageError)
+            return failed(exc, "invalid-arguments" if usage else "failed")
+        finally:
+            sys.path[:] = original_path
+        try:
+            refreshed = focus.read_model_config()
+        except Exception as exc:
+            refreshed, note = None, " · refresh failed: " + str(exc)
+        else:
+            note = ""
+        lines = [str(line) for line in result.get("lines", ()) if line]
+        message = (lines[0] if lines else "allocation: " + str(result.get("status", "finished")))
+        if result.get("warnings"):
+            message += " · warning: " + "; ".join(result["warnings"])
+        return {"model_action": True, "status": result.get("status", "failed"),
+                "message": (message + note)[:240], "error": None, "models": refreshed}
+
     def apply_effects(self, effects, vm):
         """Apply accepted ordering and validated MODELS effects."""
         from . import order
@@ -806,6 +864,9 @@ class ExplorerRuntime:
         for effect in effects or ():
             if effect and effect[0] == "models.apply":
                 result = self._apply_model_action(effect, vm)
+                continue
+            if effect and effect[0] == "alloc.apply":
+                result = self._apply_allocation_action(effect, vm)
                 continue
             if not effect or effect[0] != "reorder" or len(effect) < 5:
                 continue

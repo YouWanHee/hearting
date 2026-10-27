@@ -215,6 +215,11 @@ guards. Successful and typed provider HTTP outcomes feed the existing scoped
 eligibility cache without storing response bodies or credentials.
 
 The terminal client plugin API is separate (`cli.json`, `@opencode/plugin/tui`).
+V2 skips a `tui.json`/`cli.json` plugin entry that names a plain file, so the
+Hearting TUI identity plugin loads as the discovered package
+`plugins/hearting-tui-identity/`, whose `tui.ts` entry activation renders as an
+owned regular file importing the activated bundle's
+`tui/hearting-tui-identity.ts`; the V1 file entry stays for V1 clients.
 The current adapter does not port external Herdr TUI code to that API. V2
 session/environment forwarding and native permission enforcement still need
 same-head verification by the supervisor; fixture registration is not native

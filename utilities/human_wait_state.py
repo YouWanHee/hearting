@@ -16,8 +16,10 @@ import fcntl
 import math
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 import ipaddress
 import socket
+from decimal import Decimal, InvalidOperation
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,6 +29,7 @@ _MARKER = re.compile(r"^\s*\[(?:답변 필요|결정 필요)\]\s*(.*)$")
 _MAX_QUESTION = 160
 _SAFE = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._:@/+\-=]{1,256}$")
+_SAFE_ROUTE_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CACHE_MAX_BYTES = 2 * 1024 * 1024
 _DISPLAY_TTL = 180.0
 _REQUEST_TTL = 60.0
@@ -317,8 +320,9 @@ def publish_cache(result: dict) -> bool:
         harness, sid = owner.get("harness"), owner.get("session_id")
         row = {key: item.get(key) for key in ("id", "source", "kind", "since", "route_id",
                "attempt_id", "gate_id", "attribution", "stale")}
-        row["question"] = _clean(item.get("question") or "") or None
-        row["seat_key"] = owner.get("seat_key")
+        route_hash = item.get("route_hash")
+        if isinstance(route_hash, str) and _SAFE_ROUTE_HASH.fullmatch(route_hash):
+            row["route_hash"] = route_hash
         row["owner"] = {"harness": harness, "session_id": sid}
         if item.get("source") == "S1":
             for key in ("request_id", "turn_id", "item_id"):
@@ -413,6 +417,10 @@ def _read_cache(*, now=None, max_age=_DISPLAY_TTL):
                 or isinstance(item.get("since"), bool) or not math.isfinite(float(item["since"]))
                 or not isinstance(item.get("owner"), dict)):
             return None
+        if ("route_hash" in item and
+                (not isinstance(item["route_hash"], str)
+                 or not _SAFE_ROUTE_HASH.fullmatch(item["route_hash"]))):
+            return None
         if (("request_id" in item and _safe_request_id(item["request_id"]) != item["request_id"])
                 or any(_safe_native_ref(item[key]) != item[key]
                        for key in ("turn_id", "item_id") if key in item)):
@@ -495,6 +503,19 @@ def _selected_identity(envelope):
             if safe is None:
                 return None
             identity[key] = safe
+    if (envelope.get("source") == "S2" or "gate_epoch" in envelope
+            or isinstance(native, dict)
+            and native.get("transport") == "hearting-human-gate"):
+        gate_epoch = envelope.get("gate_epoch")
+        if type(gate_epoch) is not int or gate_epoch < 1:
+            return None
+        identity["gate_epoch"] = gate_epoch
+        artifact_sha256 = (native.get("artifact_sha256") if isinstance(native, dict)
+                           else envelope.get("artifact_sha256"))
+        if artifact_sha256 is not None:
+            if not isinstance(artifact_sha256, str) or not _SAFE_ROUTE_HASH.fullmatch(artifact_sha256):
+                return None
+            identity["artifact_sha256"] = artifact_sha256
     return identity
 
 
@@ -763,7 +784,7 @@ def _proc_listening_sockets(pid):
                 port = int(port_hex, 16)
             except (ValueError, OverflowError):
                 continue
-            if not (address.is_loopback or address.is_unspecified) or not port:
+            if not address.is_loopback or not port:
                 continue
             target = listeners.setdefault(port, {"hosts": set(), "inodes": set()})
             target["hosts"].add("127.0.0.1" if address.version == 4 else "::1")
@@ -775,8 +796,115 @@ def _proc_listening_sockets(pid):
     return port, host, tuple(sorted(listener["inodes"]))
 
 
+def _opencode_loopback_url(value):
+    """Parse an HTTP loopback URL without resolving names or following proxies."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme != "http" or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment or parsed.path not in {"", "/"}):
+            return None
+        hostname = parsed.hostname.lower()
+        if hostname == "localhost":
+            hosts = {"127.0.0.1", "::1"}
+        else:
+            if "%" in hostname:
+                return None
+            address = ipaddress.ip_address(hostname)
+            if not address.is_loopback:
+                return None
+            hosts = {str(address)}
+        port = parsed.port or 80
+        if not 1 <= port <= 65535:
+            return None
+        return hosts, port
+    except ValueError:
+        return None
+
+
+def _opencode_info_matches_listener(url, advertised_urls, listener_port, listener_host):
+    requested = _opencode_loopback_url(url)
+    if requested is None:
+        return []
+    requested_hosts, requested_port = requested
+    if requested_port != listener_port or listener_host not in requested_hosts:
+        return []
+    matching = []
+    for advertised in advertised_urls:
+        parsed = _opencode_loopback_url(advertised)
+        if parsed is None:
+            continue
+        hosts, port = parsed
+        if (port == listener_port and listener_host in hosts
+                and requested_hosts.intersection(hosts)):
+            matching.append(advertised)
+    return sorted(set(matching))
+
+
+def _opencode_server_endpoint(base_url, session_id, frontend_pid, frontend_start,
+                              opencode_collector):
+    """Bind a selected TUI to the V2 server PID and its physical loopback socket."""
+    if _opencode_loopback_url(base_url) is None:
+        return None
+    info_result = _opencode_http({"url": base_url}, "GET", "/api/info")
+    info = info_result.get("body") if isinstance(info_result, dict) else None
+    if (not isinstance(info_result, dict) or info_result.get("status") != 200
+            or not isinstance(info, dict)
+            or not isinstance(info.get("version"), str) or not info["version"]
+            or not isinstance(info.get("pid"), int) or isinstance(info.get("pid"), bool)
+            or info["pid"] <= 0
+            or not isinstance(info.get("urls"), list) or not info["urls"]
+            or any(not isinstance(value, str) for value in info["urls"])
+            or not isinstance(info.get("paths"), dict)
+            or not isinstance(info["paths"].get("tmp"), str)):
+        return None
+
+    server_pid = info["pid"]
+    if _proc_uid(server_pid) != os.getuid():
+        return None
+    server_start = _proc_start_ticks(server_pid)
+    if not server_start or not str(server_start).isdigit():
+        return None
+    listener = _proc_listening_sockets(server_pid)
+    if (not isinstance(listener, tuple) or len(listener) != 3
+            or not isinstance(listener[0], int) or isinstance(listener[0], bool)
+            or listener[1] not in {"127.0.0.1", "::1"}
+            or not isinstance(listener[2], (tuple, list)) or not listener[2]
+            or any(not isinstance(inode, str) or not inode.isdigit()
+                   for inode in listener[2])):
+        return None
+    server_urls = _opencode_info_matches_listener(
+        base_url, info["urls"], listener[0], listener[1])
+    if (not server_urls or _proc_start_ticks(server_pid) != server_start
+            or _proc_uid(server_pid) != os.getuid()
+            or _proc_uid(frontend_pid) != os.getuid()
+            or str(_proc_start_ticks(frontend_pid)) != str(frontend_start)):
+        return None
+    try:
+        selected, source = opencode_collector.session_of_process(frontend_pid)
+    except Exception:
+        return None
+    if (selected != session_id or source != "opencode-tui-selection"
+            or str(_proc_start_ticks(frontend_pid)) != str(frontend_start)
+            or _proc_start_ticks(server_pid) != server_start):
+        return None
+
+    socket_ids = sorted(set(listener[2]))
+    identity_parts = [str(frontend_pid), str(frontend_start), str(server_pid),
+                      str(server_start), base_url, *server_urls, *socket_ids]
+    generation = hashlib.sha256("\0".join(identity_parts).encode("utf-8")).hexdigest()
+    return {"url": base_url, "generation": generation,
+            "pid": server_pid, "proc_start": str(server_start),
+            "socket_inodes": socket_ids, "server_pid": server_pid,
+            "server_proc_start": str(server_start), "server_urls": server_urls,
+            "frontend_pid": frontend_pid,
+            "frontend_proc_start": str(frontend_start)}
+
+
 def _opencode_endpoint(session_id):
-    """Resolve one live OpenCode session to its own server process and listener."""
+    """Resolve one current OpenCode TUI selection to its V2 server instance."""
     if not sys.platform.startswith("linux") or not _safe_native_ref(session_id):
         return None
     try:
@@ -800,26 +928,24 @@ def _opencode_endpoint(session_id):
             observed, source = opencode_collector.session_of_process(pid)
         except Exception:
             continue
-        if observed != session_id or source not in {"opencode-tui-selection", "opencode-argv"}:
+        if observed != session_id or source != "opencode-tui-selection":
             continue
         if _proc_start_ticks(pid) != start:
             continue
         explicit = _explicit_opencode_server(argv)
         if explicit:
-            base_url, socket_ids = explicit, ()
+            base_url = explicit
         else:
             listener = _proc_listening_sockets(pid)
             if listener is None:
                 continue
-            port, host, socket_ids = listener
+            port, host, _socket_ids = listener
             formatted_host = "[" + host + "]" if ":" in host else host
             base_url = "http://" + formatted_host + ":" + str(port)
-        generation = hashlib.sha256(
-            (str(pid) + "\0" + str(start) + "\0" + base_url + "\0" +
-             ",".join(socket_ids)).encode("utf-8")).hexdigest()
-        found.append({"url": base_url, "generation": generation,
-                      "pid": pid, "proc_start": str(start),
-                      "socket_inodes": list(socket_ids)})
+        endpoint = _opencode_server_endpoint(
+            base_url, session_id, pid, start, opencode_collector)
+        if endpoint is not None:
+            found.append(endpoint)
     return found[0] if len(found) == 1 else None
 
 
@@ -831,7 +957,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _opencode_http(endpoint, method, path, payload=None):
     """Call a checked OpenCode endpoint directly; never follow proxies or redirects."""
     if (not isinstance(endpoint, dict) or not isinstance(endpoint.get("url"), str)
-            or (not path.startswith("/api/") and path != "/global/health")):
+            or not path.startswith("/api/")):
         return {"status": 0, "reason": "endpoint-invalid"}
     url = endpoint["url"].rstrip("/") + path
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -871,18 +997,179 @@ def _opencode_identity_matches(endpoint, session_id):
             and current.get("generation") == endpoint.get("generation") else None)
 
 
+def _opencode_form_decimal(value, *, allow_infinity=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    if allow_infinity and value in ("Infinity", "-Infinity"):
+        return Decimal(value)
+    try:
+        result = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if result.is_nan() or (result.is_infinite() and not allow_infinity):
+        return None
+    return result
+
+
+def _opencode_form_option_rows(value):
+    if not isinstance(value, list):
+        return None
+    rows, seen = [], set()
+    for option in value:
+        if (not isinstance(option, dict) or not isinstance(option.get("value"), str)
+                or not option["value"] or not isinstance(option.get("label"), str)
+                or not option["label"] or option["value"] in seen):
+            return None
+        seen.add(option["value"])
+        rows.append({"value": option["value"], "label": option["label"],
+                     "description": option.get("description")
+                     if isinstance(option.get("description"), str) else ""})
+    return rows
+
+
+def _opencode_form_question(field, form_title):
+    """Normalize one documented V2 field without losing its native key or value."""
+    if not isinstance(field, dict):
+        return None, "opencode-form-field-invalid"
+    field_type = field.get("type")
+    key = _safe_native_ref(field.get("key"))
+    if (not key or not isinstance(field_type, str)
+            or field_type not in {"string", "number", "integer", "boolean",
+                                  "multiselect", "external"}):
+        return None, "opencode-form-field-unsupported"
+    base_keys = {"key", "type", "title", "description", "required", "hidden", "when"}
+    type_keys = {
+        "string": {"format", "minLength", "maxLength", "pattern", "placeholder",
+                   "default", "options", "custom"},
+        "number": {"minimum", "maximum", "default"},
+        "integer": {"minimum", "maximum", "default"},
+        "boolean": {"default"},
+        "multiselect": {"options", "minItems", "maxItems", "custom", "default"},
+        "external": {"url"},
+    }
+    if set(field).difference(base_keys | type_keys[field_type]):
+        return None, "opencode-form-field-property-unsupported"
+    common = {"id": key,
+              "header": field.get("title") if isinstance(field.get("title"), str) else "",
+              "question": field.get("title") if isinstance(field.get("title"), str)
+              and field["title"] else form_title,
+              "description": field.get("description")
+              if isinstance(field.get("description"), str) else "",
+              "field_type": field_type,
+              "required": field.get("required", False),
+              "hidden": field.get("hidden", False),
+              "when": field.get("when", [])}
+    if type(common["required"]) is not bool or type(common["hidden"]) is not bool:
+        return None, "opencode-form-field-flags-invalid"
+    if not isinstance(common["when"], list):
+        return None, "opencode-form-condition-invalid"
+    if field_type == "external":
+        if not isinstance(field.get("url"), str):
+            return None, "opencode-form-external-field-invalid"
+        common["url"] = field["url"]
+        return common, "opencode-form-external-field-unsupported"
+
+    custom = field.get("custom", False)
+    if type(custom) is not bool:
+        return None, "opencode-form-custom-flag-invalid"
+
+    if field_type in {"number", "integer"}:
+        for name in ("minimum", "maximum"):
+            if name in field and _opencode_form_decimal(field[name], allow_infinity=True) is None:
+                return None, "opencode-form-numeric-bound-invalid"
+            if name in field:
+                common[name] = field[name]
+        minimum = _opencode_form_decimal(field.get("minimum"), allow_infinity=True)
+        maximum = _opencode_form_decimal(field.get("maximum"), allow_infinity=True)
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return None, "opencode-form-numeric-bounds-invalid"
+
+    if field_type == "string":
+        for name in ("minLength", "maxLength"):
+            value = field.get(name)
+            if value is not None and (type(value) is not int or value < 0):
+                return None, "opencode-form-string-bounds-invalid"
+            if value is not None:
+                common["min_length" if name == "minLength" else "max_length"] = value
+        minimum, maximum = common.get("min_length"), common.get("max_length")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return None, "opencode-form-string-bounds-invalid"
+        # Python and JavaScript do not share regex, URL, and date parsing semantics.
+        if any(name in field for name in ("format", "pattern")):
+            return common, "opencode-form-string-constraint-unsupported"
+
+    options = field.get("options")
+    common["options_present"] = options is not None
+    if field_type == "multiselect" or options is not None:
+        option_rows = _opencode_form_option_rows(options)
+        if option_rows is None or (field_type == "multiselect" and not option_rows):
+            return None, "opencode-form-options-invalid"
+        if field_type == "string" and not option_rows and not custom:
+            return common, "opencode-form-options-empty"
+        common["choices"] = option_rows
+        common["option_values"] = [row["value"] for row in option_rows]
+    else:
+        common["choices"] = None
+        common["option_values"] = []
+
+    common["custom"] = custom
+
+    if field_type == "multiselect":
+        for name in ("minItems", "maxItems"):
+            value = field.get(name)
+            if value is not None and (type(value) is not int or value < 0):
+                return None, "opencode-form-multiselect-bounds-invalid"
+            common["min_items" if name == "minItems" else "max_items"] = value
+        minimum, maximum = common.get("min_items"), common.get("max_items")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return None, "opencode-form-multiselect-bounds-invalid"
+
+    # A hidden required value has no user-visible input and no documented server defaulting.
+    if common["hidden"] and common["required"]:
+        return common, "opencode-form-hidden-required-field-unsupported"
+    return common, None
+
+
+def _opencode_form_conditions_supported(questions):
+    earlier = {}
+    for question in questions:
+        for condition in question.get("when", []):
+            if (not isinstance(condition, dict) or condition.get("op") not in {"eq", "neq"}
+                    or not isinstance(condition.get("key"), str)
+                    or condition["key"] not in earlier or "value" not in condition):
+                return False
+            target = earlier[condition["key"]]
+            value = condition["value"]
+            target_type = target["field_type"]
+            if target_type == "boolean":
+                valid = type(value) is bool
+            elif target_type in {"number", "integer"}:
+                valid = _opencode_form_decimal(value) is not None
+            else:
+                valid = isinstance(value, str)
+                values = target.get("option_values", [])
+                if valid and target.get("options_present") and not target.get("custom"):
+                    valid = value in values
+            if not valid:
+                return False
+        earlier[question["id"]] = question
+    return True
+
+
+def _opencode_form_schema_binding(title, fields):
+    try:
+        raw = json.dumps({"title": title, "fields": fields}, sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _opencode_current_selected(base, *, requested_id=None):
     session_id = base["session_id"]
     endpoint = _opencode_endpoint(session_id)
     if endpoint is None:
         return {"state": "unknown", "reason": "opencode-server-identity-unavailable"}
-    health = _opencode_http(endpoint, "GET", "/global/health")
-    health_body = health.get("body") if isinstance(health, dict) else None
-    if (health.get("status") != 200 or not isinstance(health_body, dict)
-            or health_body.get("healthy") is not True
-            or not isinstance(health_body.get("version"), str)
-            or not health_body["version"].startswith("2.")):
-        return {"state": "unknown", "reason": "opencode-v2-server-unavailable"}
     kind = "approval" if base["kind"] in {"approval", "permission"} else "question"
     if kind == "approval":
         collection = "permission"
@@ -915,8 +1202,13 @@ def _opencode_current_selected(base, *, requested_id=None):
     if not _opencode_identity_matches(endpoint, session_id):
         return {"state": "unknown", "reason": "opencode-server-replaced"}
     native_ref = {"transport": "opencode-http-v2", "generation": endpoint["generation"],
-                  "request_id": request_id, "server_pid": endpoint["pid"],
-                  "proc_start": endpoint["proc_start"],
+                  "request_id": request_id, "url": endpoint["url"],
+                  "server_pid": endpoint["server_pid"],
+                  "server_proc_start": endpoint["server_proc_start"],
+                  "proc_start": endpoint["server_proc_start"],
+                  "frontend_pid": endpoint["frontend_pid"],
+                  "frontend_proc_start": endpoint["frontend_proc_start"],
+                  "server_urls": endpoint["server_urls"],
                   "socket_inodes": endpoint["socket_inodes"]}
     if kind == "approval":
         turn_id = _safe_native_ref(detail.get("messageID"))
@@ -945,54 +1237,56 @@ def _opencode_current_selected(base, *, requested_id=None):
                 "reason": "opencode-form-not-pending", "kind": kind,
                 "request_id": request_id, "native_ref": native_ref}
     fields = detail.get("fields")
-    if not isinstance(fields, list) or len(fields) != 1 or not isinstance(fields[0], dict):
+    if not isinstance(fields, list) or not fields:
         return {"state": "unknown", "reason": "opencode-form-needs-native-ui",
                 "kind": kind, "request_id": request_id, "native_ref": native_ref}
-    field = fields[0]
-    question_id = _safe_native_ref(field.get("key"))
+    questions, field_keys, schema_error = [], [], None
+    for field in fields:
+        question, error = _opencode_form_question(
+            field, detail.get("title") if isinstance(detail.get("title"), str) else "")
+        if question is None:
+            return {"state": "unknown", "reason": error,
+                    "kind": kind, "request_id": request_id, "native_ref": native_ref}
+        if question["id"] in field_keys:
+            return {"state": "unknown", "reason": "opencode-form-field-keys-ambiguous",
+                    "kind": kind, "request_id": request_id, "native_ref": native_ref}
+        field_keys.append(question["id"])
+        questions.append(question)
+        schema_error = schema_error or error
+    if not _opencode_form_conditions_supported(questions):
+        schema_error = schema_error or "opencode-form-condition-unsupported"
+    question_id = field_keys[0] if len(field_keys) == 1 else None
     metadata = detail.get("metadata") if isinstance(detail.get("metadata"), dict) else {}
-    # Use an owner message/turn ref only when the native request metadata supplies one.
-    turn_id = (_safe_native_ref(metadata.get("turnID"))
-               or _safe_native_ref(metadata.get("messageID")))
-    field_type = field.get("type")
-    choices = None
-    option_values = []
-    supported = field_type == "string"
-    minimum, maximum = field.get("minItems"), field.get("maxItems")
-    bounds_valid = ((minimum is None or type(minimum) is int and minimum >= 0)
-                    and (maximum is None or type(maximum) is int and maximum >= 0)
-                    and (minimum is None or maximum is None or minimum <= maximum))
-    if field_type == "multiselect" and isinstance(field.get("options"), list):
-        choices = []
-        for option in field["options"]:
-            if not isinstance(option, dict):
-                return {"state": "unknown", "reason": "opencode-form-options-invalid",
-                        "kind": kind, "request_id": request_id, "native_ref": native_ref}
-            value, label = option.get("value"), option.get("label")
-            if not isinstance(value, str) or not value or not isinstance(label, str):
-                return {"state": "unknown", "reason": "opencode-form-options-invalid",
-                        "kind": kind, "request_id": request_id, "native_ref": native_ref}
-            option_values.append(value)
-            choices.append({"value": value, "label": label,
-                            "description": option.get("description")
-                            if isinstance(option.get("description"), str) else ""})
-        supported = bool(choices) or bool(field.get("custom"))
-    if field_type == "multiselect" and not bounds_valid:
-        supported = False
-    if not question_id or not turn_id:
-        supported = False
-    native_ref.update({"field_type": field_type, "option_values": option_values,
-                       "custom": bool(field.get("custom")),
-                       "min_items": minimum, "max_items": maximum})
-    detail_value = {
-        "title": detail.get("title") if isinstance(detail.get("title"), str) else "",
-        "question": field.get("title") if isinstance(field.get("title"), str) else
-                    (detail.get("title") if isinstance(detail.get("title"), str) else ""),
-        "description": field.get("description") if isinstance(field.get("description"), str) else "",
-        "field_type": field_type,
-    }
+    supplied_turns = [metadata[key] for key in ("turnID", "messageID")
+                      if key in metadata and metadata[key] is not None]
+    turn_refs = [_safe_native_ref(value) for value in supplied_turns]
+    if any(value is None for value in turn_refs) or len(set(turn_refs)) > 1:
+        schema_error = schema_error or "opencode-form-native-turn-invalid"
+    turn_id = turn_refs[0] if turn_refs and all(turn_refs) else None
+    title = detail.get("title") if isinstance(detail.get("title"), str) else ""
+    schema_binding = _opencode_form_schema_binding(title, fields)
+    if schema_binding is None:
+        schema_error = schema_error or "opencode-form-schema-unbindable"
+    native_ref.update({"session_id": session_id, "field_keys": field_keys,
+                       "schema_binding": schema_binding})
+    if len(questions) == 1:
+        question = questions[0]
+        native_ref.update({"field_type": question["field_type"],
+                           "option_values": question.get("option_values", []),
+                           "custom": question.get("custom", False),
+                           "min_items": question.get("min_items"),
+                           "max_items": question.get("max_items")})
+    detail_value = {"title": title, "questions": questions}
+    if len(questions) == 1:
+        question = questions[0]
+        detail_value.update({"question": question["question"],
+                             "description": question["description"],
+                             "field_type": question["field_type"]})
+    choices = questions[0].get("choices") if len(questions) == 1 else None
+    supported = schema_error is None and schema_binding is not None
     return {"state": "open" if supported else "unknown",
-            "reason": None if supported else "opencode-form-schema-or-turn-binding-unsupported",
+            "reason": None if supported else
+            (schema_error or "opencode-form-schema-unsupported"),
             "kind": kind, "request_id": request_id, "turn_id": turn_id,
             "question_id": question_id, "detail": detail_value,
             "choices": choices, "support": supported, "native_ref": native_ref}
@@ -1305,11 +1599,573 @@ def _codex_current_selected(base, *, requested_id=None):
             "gateway": control}
 
 
+_OWNER_INPUT_BINDING_KEYS = ("attempt_id", "harness", "owner_route_id", "owner_route_hash",
+                             "route_id", "route_hash", "parent_sid", "supervisor_lease_nonce",
+                             "parent_harness", "owner_route_file", "route_file")
+
+
+def _workflow_registry_paths():
+    try:
+        project_root = str(Path(__file__).resolve().parents[1])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from tools.fleet.collectors import dispatch
+        return tuple(Path(path).expanduser().resolve(strict=True)
+                     for path in dispatch.human_gate_registry_paths())
+    except (OSError, ValueError, TypeError, ImportError):
+        return ()
+
+
+def _workflow_current_item(item_id, source):
+    """Re-read the exact S2/S3 wait from its registry source before showing detail."""
+    try:
+        import human_gate_observation
+    except ImportError:
+        return None, "workflow-wait-observer-unavailable"
+    paths = _workflow_registry_paths()
+    if not paths:
+        return None, "workflow-registry-unavailable"
+    matches = []
+    for path in paths:
+        try:
+            result = human_gate_observation.read_answer_waits(jobs_paths=(path,))
+        except Exception:
+            return None, "workflow-wait-source-unknown"
+        if result.get("complete") is not True:
+            return None, "workflow-wait-source-incomplete"
+        matches.extend((path, item) for item in result.get("items", ())
+                       if isinstance(item, dict) and item.get("id") == item_id
+                       and item.get("source") == source)
+    if len(matches) != 1:
+        return None, ("workflow-wait-source-ambiguous" if matches else
+                      "workflow-wait-no-longer-current")
+    return matches[0], None
+
+
+def _workflow_item_matches(base, item):
+    for key in ("id", "source", "route_id", "attempt_id", "gate_id"):
+        if base.get(key) != item.get(key):
+            return False
+    try:
+        if abs(float(base.get("since")) - float(item.get("since"))) >= 0.001:
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    old_hash = base.get("route_hash")
+    if old_hash is not None and old_hash != item.get("route_hash"):
+        return False
+    old_owner, owner = base.get("owner") or {}, item.get("owner") or {}
+    return (old_owner.get("harness") == owner.get("harness")
+            and old_owner.get("session_id") == owner.get("session_id"))
+
+
+def _owner_binding(metadata):
+    return {key: str(metadata.get(key) or "") for key in _OWNER_INPUT_BINDING_KEYS}
+
+
+def _workflow_owner_person_context(base, metadata, jobs):
+    """Require the selected route's current effective native parent to answer."""
+    env = os.environ
+    if (env.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1"
+            or env.get("AGENT_DISPATCH_CHILD") == "1"
+            or env.get("AGENT_DISPATCH_ATTEMPT_ID")):
+        return False
+    depth = env.get("AGENT_DISPATCH_DEPTH")
+    if depth not in (None, "", "0"):
+        return False
+    try:
+        import route_authority
+        harness, session_id = route_authority.caller_identity()
+    except Exception:
+        return False
+    owner = base.get("owner") if isinstance(base.get("owner"), dict) else {}
+    parent_harness = metadata.get("parent_harness")
+    parent_session = metadata.get("parent_sid")
+    if not (harness and session_id and parent_harness and parent_session):
+        return False
+    try:
+        import dispatch_seat_handover
+        from peer_read_context import PeerReadContext
+
+        read_context = PeerReadContext()
+        effective_session = dispatch_seat_handover.effective_parent(
+            metadata, jobs, read_context=read_context)
+        effective_harness = dispatch_seat_handover.effective_parent_harness(
+            metadata, jobs, read_context=read_context)
+        owns = route_authority.owns(metadata, session_id, jobs, read_context=read_context)
+    except Exception:
+        return False
+    return bool(owns and harness == effective_harness == owner.get("harness")
+                and session_id == effective_session == owner.get("session_id"))
+
+
+def _workflow_owner_lineage(jobs, native_ref):
+    """Return exact same-route owner attempts after validating the full replacement chain."""
+    if not isinstance(native_ref, dict):
+        return None
+    selected = native_ref.get("attempt_id")
+    expected = native_ref.get("owner_binding")
+    if not _safe_native_ref(selected) or not isinstance(expected, dict):
+        return None
+    try:
+        import dispatch_completion_join
+        import dispatch_replacement
+
+        effective, _mapping = dispatch_replacement.effective_attempts(jobs, {selected})
+        if len(effective) != 1:
+            return None
+        effective_attempt = next(iter(effective))
+        chain = []
+        seen = set()
+        current = selected
+        for _ in range(64):
+            if current in seen:
+                return None
+            seen.add(current)
+            row = dispatch_completion_join.exact_attempt_row(jobs, current)
+            metadata = row.metadata
+            if (metadata.get("attempt_id") != current
+                    or metadata.get("worker_type") != "owner"
+                    or str(metadata.get("dispatch_depth")) != "1"):
+                return None
+            actual = _owner_binding(metadata)
+            if current == selected:
+                if actual != expected:
+                    return None
+            elif any(actual.get(key) != expected.get(key)
+                     for key in _OWNER_INPUT_BINDING_KEYS
+                     if key not in {"attempt_id", "supervisor_lease_nonce"}):
+                return None
+            chain.append(current)
+            source = dispatch_replacement.source_binding(jobs, metadata)
+            replacement = source[1] if source else None
+            if not replacement:
+                break
+            try:
+                dispatch_completion_join.exact_attempt_row(jobs, replacement)
+            except Exception:
+                # A durable reservation without a launched registry row cannot take delivery.
+                break
+            current = replacement
+        else:
+            return None
+        if effective_attempt not in chain:
+            return None
+        return {"attempts": chain, "effective_attempt": effective_attempt}
+    except Exception:
+        return None
+
+
+def _workflow_owner_snapshot(base, *, expected_native_ref=None):
+    """Resolve a current S3 owner row and its existing public input surface."""
+    match, error = _workflow_current_item(base.get("id"), "S3")
+    if match is None:
+        return None, error
+    jobs, item = match
+    if not _workflow_item_matches(base, item):
+        return None, "workflow-owner-request-binding-changed"
+    try:
+        import dispatch_completion_join
+        import dispatch_owner_input
+        import route_authority
+        row = dispatch_completion_join.exact_attempt_row(jobs, item["attempt_id"])
+        metadata = row.metadata
+        route_id = metadata.get("owner_route_id") or metadata.get("route_id")
+        route_hash = metadata.get("owner_route_hash") or metadata.get("route_hash")
+        if (metadata.get("worker_type") != "owner"
+                or str(metadata.get("dispatch_depth")) != "1"
+                or row.status != "done"
+                or route_authority.answerable_owner_end(row.status, metadata) not in {"BLOCKED", "FAIL"}
+                or route_id != item.get("route_id") or route_hash != item.get("route_hash")):
+            return None, "workflow-owner-target-not-answerable"
+        binding = _owner_binding(metadata)
+        native_ref = {"transport": "hearting-owner-input", "jobs_path": str(jobs),
+                      "source_id": item["id"], "attempt_id": item["attempt_id"],
+                      "route_id": route_id, "route_hash": route_hash,
+                      "owner_binding": binding}
+        if expected_native_ref is not None and expected_native_ref != native_ref:
+            return None, "workflow-owner-binding-changed"
+        if not _workflow_owner_person_context(base, metadata, jobs):
+            return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "observed": None, "support": False,
+                    "reason": "owner-correction-native-parent-context-required"}, None
+        lineage = _workflow_owner_lineage(jobs, native_ref)
+        if not lineage:
+            return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "observed": None, "support": False,
+                    "reason": "owner-correction-lineage-unverified"}, None
+        current_attempt = lineage["effective_attempt"]
+        try:
+            observed = dispatch_owner_input.inspect(jobs, current_attempt)
+        except Exception as exc:
+            return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "current_attempt_id": current_attempt,
+                    "observed": None, "support": False,
+                    "reason": "owner-correction-surface-unavailable:" + type(exc).__name__}, None
+        unsettled = {"retained", "queued", "undelivered", "sending", "delivery-unknown"}
+        if any((request.get("state") in unsettled
+                or request.get("delivery_observation") in unsettled)
+               for request in observed.get("requests", ()) if isinstance(request, dict)):
+            return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "current_attempt_id": current_attempt,
+                    "observed": observed, "support": False,
+                    "reason": "owner-correction-already-pending"}, None
+        return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                "current_attempt_id": current_attempt,
+                "observed": observed, "support": True}, None
+    except Exception as exc:
+        return None, "owner-correction-target-unavailable:" + type(exc).__name__
+
+
+def _workflow_owner_receipt(base, entry):
+    """Read an already-claimed S3 correction receipt; never retry its delivery."""
+    native_ref = base.get("native_ref")
+    if (not isinstance(native_ref, dict)
+            or native_ref.get("transport") != "hearting-owner-input"
+            or not isinstance(entry, dict) or not entry.get("action_id")):
+        return {"state": "unknown", "reason": "owner-correction-receipt-binding-missing"}
+    try:
+        paths = _workflow_registry_paths()
+        jobs = Path(native_ref["jobs_path"]).resolve(strict=True)
+        if jobs not in paths:
+            return {"state": "unknown", "reason": "owner-correction-registry-changed"}
+        import dispatch_owner_input
+        lineage = _workflow_owner_lineage(jobs, native_ref)
+        if not lineage:
+            return {"state": "unknown", "reason": "owner-correction-target-replaced"}
+        prior_result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+        target = prior_result.get("target_attempt_id")
+        lineage_attempts = lineage["attempts"]
+        targets = [target] if target is not None else lineage_attempts
+        if any(attempt not in lineage_attempts for attempt in targets):
+            return {"state": "unknown", "reason": "owner-correction-target-outside-lineage"}
+        matches = []
+        for attempt in targets:
+            try:
+                observed = dispatch_owner_input.inspect(jobs, attempt)
+            except Exception:
+                continue
+            matches.extend((attempt, request) for request in observed.get("requests", ())
+                           if isinstance(request, dict)
+                           and request.get("id") == entry.get("action_id"))
+        if len(matches) != 1:
+            return {"state": "unknown", "reason": "owner-correction-receipt-unavailable"}
+        target, request = matches[0]
+        request_state = request.get("state")
+        if request_state == "turn-completed":
+            state = "applied"
+        elif request_state in {"retained", "queued", "accepted"}:
+            state = "received"
+        else:
+            state = "unknown"
+        result = {"status": request_state, "request_id": entry.get("action_id"),
+                  "target_attempt_id": target}
+        if request.get("delivery_observation"):
+            result["delivery_observation"] = request["delivery_observation"]
+        continuation = prior_result.get("continuation")
+        if isinstance(continuation, dict):
+            result["continuation"] = continuation
+        return {"state": state, "result": result}
+    except Exception as exc:
+        return {"state": "unknown", "reason": "owner-correction-receipt-unavailable:" +
+                type(exc).__name__}
+
+
+def _stored_workflow_action(ref):
+    """Recover a selected workflow receipt after its source wait leaves the projection."""
+    if not isinstance(ref, dict):
+        return None
+    native_ref = ref.get("native_ref")
+    if (not isinstance(native_ref, dict)
+            or native_ref.get("transport") not in {"hearting-owner-input", "hearting-human-gate"}):
+        return None
+    entry = _selected_entry(ref)
+    if not entry or not entry.get("action_id"):
+        return None
+    identity = _selected_identity(ref)
+    if identity is None:
+        return None
+    source = "S2" if native_ref.get("transport") == "hearting-human-gate" else "S3"
+    return {**identity, "id": ref.get("selected_id") or ref.get("id"),
+            "selected_id": ref.get("selected_id") or ref.get("id"),
+            "item_id": identity.get("item_id"), "source": source,
+            "attempt_id": native_ref.get("attempt_id"), "since": ref.get("since"),
+            "detail": ref.get("detail"),
+            "native_ref": native_ref}
+
+
+def _selected_hints_match(values, base):
+    for key in ("request_id", "turn_id", "item_id", "question_id", "gate_epoch"):
+        supplied = values.get(key)
+        actual = base.get(key)
+        if supplied is None:
+            continue
+        if key == "gate_epoch":
+            if type(supplied) is not int or supplied != actual:
+                return False
+            continue
+        safe = _safe_request_id(supplied) if key == "request_id" else _safe_native_ref(supplied)
+        if safe is None or (not _same_request_id(safe, actual) if key == "request_id"
+                            else safe != actual):
+            return False
+    for key in ("source", "attempt_id", "gate_id"):
+        if values.get(key) is not None and values.get(key) != base.get(key):
+            return False
+    return True
+
+
+def _workflow_route_source(jobs, item):
+    """Resolve the unique sealed route named by this current registry source."""
+    try:
+        from dispatch_registry_cache import registry_snapshot
+        from tools.fleet import route as route_module
+
+        snapshot = registry_snapshot(jobs)
+        if not snapshot.complete:
+            return None, None, "workflow-route-registry-incomplete"
+        matches = set()
+        for row in snapshot.view.route_alias_candidates():
+            meta = row.completion_metadata()
+            route_id = meta.get("owner_route_id") or meta.get("route_id")
+            route_hash = meta.get("owner_route_hash") or meta.get("route_hash")
+            route_file = meta.get("owner_route_file") or meta.get("route_file")
+            if route_id == item.get("route_id") and route_hash == item.get("route_hash") and route_file:
+                matches.add(str(route_file))
+        if len(matches) != 1:
+            return None, None, ("workflow-route-source-ambiguous" if matches else
+                                "workflow-route-source-unavailable")
+        path = Path(next(iter(matches))).expanduser().resolve(strict=True)
+        route = route_module.load(str(path), item.get("route_hash"), item.get("route_id"))
+        if (not isinstance(route, dict) or route.get("route_id") != item.get("route_id")
+                or route.get("route_hash") != item.get("route_hash")):
+            return None, None, "workflow-route-binding-changed"
+        return path, route, None
+    except Exception as exc:
+        return None, None, "workflow-route-source-unavailable:" + type(exc).__name__
+
+
+def _workflow_gate_source(jobs, item, *, allow_missing_artifact=False):
+    """Bind a selected S2 row to the journal's current raise and sealed route."""
+    route_path, route, error = _workflow_route_source(jobs, item)
+    if route is None:
+        return None, error
+    try:
+        import workflow_state as WS
+
+        ledger_root, _ = WS.ledger_root_for(jobs)
+        ledger = WS.WorkflowLedger(item["route_id"], item["route_hash"], root=ledger_root)
+        journal = [row for row in ledger.journal()
+                   if row.get("route_id") == item["route_id"]
+                   and row.get("route_hash") == item["route_hash"]]
+        resolution = WS.human_gate_resolution(journal, item.get("gate_id"))
+        epoch = resolution.get("epoch")
+        if (resolution.get("status") != "blocked" or type(epoch) is not int or epoch < 1
+                or not resolution.get("raised_at")):
+            return None, "workflow-gate-no-longer-current"
+        try:
+            raised_at = float(datetime.fromisoformat(
+                str(resolution["raised_at"]).replace("Z", "+00:00")).timestamp())
+            item_since = float(item.get("since"))
+        except (TypeError, ValueError, OverflowError):
+            return None, "workflow-gate-raise-time-invalid"
+        if not math.isfinite(raised_at) or abs(raised_at - item_since) >= 0.001:
+            return None, "workflow-gate-raise-changed"
+        artifact = resolution.get("artifact")
+        artifact_root = route.get("artifact_root")
+        if not isinstance(artifact, str) or not isinstance(artifact_root, str):
+            if allow_missing_artifact:
+                return {"route_path": str(route_path), "route": route,
+                        "resolution": resolution, "gate_epoch": epoch,
+                        "artifact_sha256": None,
+                        "response_error": "workflow-gate-artifact-unavailable"}, None
+            return None, "workflow-gate-artifact-unavailable"
+        artifact_path = Path(artifact).expanduser().resolve(strict=True)
+        root_path = Path(artifact_root).expanduser().resolve(strict=True)
+        if (not artifact_path.is_file()
+                or root_path not in artifact_path.parents):
+            return None, "workflow-gate-artifact-outside-root"
+        artifact_sha256 = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+        recorded_digest = resolution.get("artifact_sha256")
+        if recorded_digest is not None and recorded_digest != artifact_sha256:
+            return None, "workflow-gate-artifact-changed"
+        binding = {"route_path": str(route_path), "route": route,
+                   "resolution": resolution, "gate_epoch": epoch,
+                   "artifact_sha256": "sha256:" + artifact_sha256}
+        return binding, None
+    except Exception as exc:
+        return None, "workflow-gate-journal-unavailable:" + type(exc).__name__
+
+
+def _workflow_gate_interview(binding, item):
+    """Load only the exact interview sealed on this gate raise, using its validator."""
+    resolution = binding["resolution"]
+    artifact = resolution.get("artifact")
+    digest = binding.get("artifact_sha256")
+    route = binding["route"]
+    if not artifact or not digest or not isinstance(route.get("artifact_root"), str):
+        return None, None
+    try:
+        import frame_interview as FI
+        import human_gate_observation as HGO
+
+        path = Path(artifact).expanduser().resolve(strict=True)
+        if path.suffix.lower() != ".json":
+            return None, None
+        if not HGO._inside(path, route["artifact_root"]):
+            return None, "workflow-interview-outside-artifact-root"
+        if "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            return None, "workflow-interview-artifact-changed"
+        interview = FI.load_json_file(path, kind="interview")
+        if not FI.is_interview(interview):
+            return None, None
+        if (interview.get("route_id") != item.get("route_id") or FI.validate(interview)):
+            return None, "workflow-interview-invalid"
+        return interview, None
+    except Exception as exc:
+        return None, "workflow-interview-unavailable:" + type(exc).__name__
+
+
+def _workflow_gate_detail(binding, item):
+    """Build selected-only questions from the current gate or its sealed interview."""
+    route = binding["route"]
+    gate = item.get("gate_id")
+    if binding.get("response_error"):
+        # A current legacy raise can still keep its selected private draft.
+        # Missing release input never becomes permission to release the gate.
+        return {"detail": {"gate": gate, "question": item.get("question"),
+                           "choices": item.get("choices") or []},
+                "choices": [], "interview": None}, binding["response_error"]
+    interview, error = _workflow_gate_interview(binding, item)
+    if error:
+        return None, error
+    bindings = [row for row in route.get("human_gate_bindings", ())
+                if isinstance(row, dict) and row.get("gate") == gate]
+    if len(bindings) != 1:
+        return None, "workflow-gate-route-binding-ambiguous"
+    target_node = bindings[0].get("node")
+    node = next((row for row in route.get("nodes", ())
+                 if isinstance(row, dict) and row.get("id") == target_node), None)
+    target = {"route_id": route.get("route_id"), "gate": gate, "node": target_node}
+    if node:
+        for key in ("title", "task", "description"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                target[key] = value.strip()[:240]
+                break
+    if interview is None:
+        if binding["resolution"].get("interview"):
+            return None, "workflow-interview-unavailable"
+        detail = {"gate": gate, "target": target, "response_mode": "gate-decision",
+                  "decision": "explicit", "questions": [{
+                      "id": "gate-decision", "question": "Choose what to do with this human gate.",
+                      "choices": [{"value": decision, "label": decision}
+                                  for decision in ("proceed", "revise", "stop")],
+                      "is_other": False,
+                  }]}
+        return {"detail": detail, "choices": ["proceed", "revise", "stop"],
+                "interview": None}, None
+    import frame_interview as FI
+    questions = [{"id": FI.UNDERSTANDING_SLOT,
+                  "question": interview["understanding"],
+                  "choices": [{"value": "I understand the restatement",
+                               "label": "I understand the restatement"}],
+                  "is_other": True}]
+    for question in interview.get("questions", ()):
+        if not isinstance(question, dict):
+            continue
+        options = question.get("options") if isinstance(question.get("options"), list) else []
+        questions.append({"id": question["id"], "question": question["question"],
+                          "choices": [{"value": option["label"], "label": option["label"],
+                                       **({"means": option["means"]} if isinstance(option.get("means"), str)
+                                          else {})}
+                                      for option in options if isinstance(option, dict)
+                                      and isinstance(option.get("label"), str)],
+                          # The existing frame answer validator accepts off-menu notes.
+                          "is_other": True})
+    detail = {"gate": gate, "target": target, "response_mode": "frame-interview",
+              "decision": "proceed", "questions": questions}
+    return {"detail": detail, "choices": [], "interview": interview}, None
+
+
+def _workflow_gate_receipt(base, entry):
+    """Confirm one selected gate action from the release receipt and journal transition."""
+    native = base.get("native_ref") if isinstance(base, dict) else None
+    if (not isinstance(native, dict) or native.get("transport") != "hearting-human-gate"
+            or not isinstance(entry, dict) or not entry.get("action_id")):
+        return {"state": "unknown", "reason": "workflow-release-receipt-binding-missing"}
+    jobs = native.get("jobs_path")
+    route_path = native.get("route_path")
+    route_id, route_hash, gate = native.get("route_id"), native.get("route_hash"), native.get("gate_id")
+    epoch, request_id = native.get("gate_epoch"), entry.get("action_id")
+    if (not isinstance(jobs, str) or not isinstance(route_path, str)
+            or type(epoch) is not int or epoch < 1 or not isinstance(request_id, str)):
+        return {"state": "unknown", "reason": "workflow-release-receipt-binding-invalid"}
+    public_receipt = entry.get("result")
+    if (not isinstance(public_receipt, dict) or public_receipt.get("route_id") != route_id
+            or public_receipt.get("route_hash") != route_hash
+            or public_receipt.get("gate") != gate or public_receipt.get("gate_epoch") != epoch
+            or public_receipt.get("request_id") != request_id
+            or public_receipt.get("decision") not in {"proceed", "revise", "stop"}
+            or public_receipt.get("actor_kind") != "user"):
+        return {"state": "unknown", "reason": "workflow-release-receipt-unconfirmed"}
+    try:
+        import workflow_state as WS
+
+        ledger_root, _ = WS.ledger_root_for(jobs)
+        ledger = WS.WorkflowLedger(route_id, route_hash, root=ledger_root)
+        journal = [row for row in ledger.journal()
+                   if row.get("route_id") == route_id and row.get("route_hash") == route_hash]
+        releases = [(row, row.get("evidence")) for row in journal
+                    if isinstance(row.get("evidence"), dict)
+                    and row["evidence"].get("selected_request_id") == request_id]
+        if any(evidence.get("released_gate") != gate
+               or evidence.get("gate_epoch") != epoch
+               or evidence.get("route_hash") != route_hash
+               or evidence.get("decision") != public_receipt["decision"]
+               for _row, evidence in releases):
+            return {"state": "unknown", "reason": "workflow-release-request-binding-changed"}
+        release = next((row for row, evidence in reversed(releases)
+                        if evidence.get("released_gate") == gate
+                        and evidence.get("gate_epoch") == epoch), None)
+        person_release = any(evidence.get("actor_kind") == "user"
+                             and evidence.get("released_gate") == gate
+                             and evidence.get("decision") == public_receipt["decision"]
+                             for _row, evidence in releases)
+        sidecar = Path(route_path).with_name(Path(route_path).stem + ".gate-release.json")
+        try:
+            value = json.loads(sidecar.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            value = None
+        rows = value.get("gate_releases") if isinstance(value, dict) else None
+        sidecar_row = (next((row for row in reversed(rows or ())
+                            if isinstance(row, dict) and row.get("request_id") == request_id
+                            and row.get("gate") == gate and row.get("route_hash") == route_hash
+                            and row.get("gate_epoch") == epoch), None)
+                       if isinstance(value, dict) and value.get("route_id") == route_id else None)
+        if (release is None
+                or release.get("workflow_state") not in {
+                    "RUNNING", "NEXT_REGISTERED", "FAILED_RETRYABLE", "CANCELLED"}
+                or not person_release):
+            return {"state": "unknown", "reason": "workflow-release-receipt-unconfirmed"}
+        if sidecar_row is not None:
+            recorded = sidecar_row.get("receipt")
+            if (not isinstance(recorded, dict)
+                    or any(recorded.get(key) != public_receipt.get(key) for key in
+                           ("route_id", "route_hash", "gate", "gate_epoch", "request_id",
+                            "decision", "actor_kind"))):
+                return {"state": "unknown", "reason": "workflow-release-sidecar-mismatch"}
+        return {"state": "applied", "result": {
+            "action_id": request_id, "route_id": route_id, "route_hash": route_hash,
+            "gate": gate, "gate_epoch": epoch, "decision": public_receipt["decision"],
+            "workflow_state": public_receipt.get("workflow_state") or release.get("workflow_state"),
+            "actor_kind": "user"}}
+    except Exception as exc:
+        return {"state": "unknown", "reason": "workflow-release-receipt-unavailable:" +
+                type(exc).__name__}
+
+
 def _selected_base(ref):
     cache = _read_cache()
-    if cache is None:
-        _request_producer()
-        return None, "selected-wait-cache-unknown"
     if isinstance(ref, str):
         values = {"id": ref}
     elif isinstance(ref, dict):
@@ -1321,8 +2177,17 @@ def _selected_base(ref):
     item_id = values.get("id") or values.get("selected_id")
     if not isinstance(item_id, str):
         return None, "selected-wait-reference-invalid"
+    if cache is None:
+        stored = _stored_workflow_action(ref)
+        if stored is not None:
+            return stored, None
+        _request_producer()
+        return None, "selected-wait-cache-unknown"
     item = next((row for row in cache["items"] if row.get("id") == item_id), None)
-    if not isinstance(item, dict) or item.get("source") != "S1":
+    if not isinstance(item, dict):
+        stored = _stored_workflow_action(ref)
+        if stored is not None:
+            return stored, None
         return None, "selected-item-not-current"
     owner = item.get("owner") or {}
     harness, session_id = owner.get("harness"), owner.get("session_id")
@@ -1336,24 +2201,103 @@ def _selected_base(ref):
     supplied_route = values.get("route_id")
     if route_id is not None and supplied_route not in (None, route_id):
         return None, "selected-route-changed"
-    hints = {}
-    for key in ("request_id", "turn_id", "item_id", "question_id"):
-        safe_ref = _safe_request_id if key == "request_id" else _safe_native_ref
-        actual = safe_ref(item.get(key))
-        supplied = safe_ref(values.get(key))
-        if item.get(key) is not None and actual is None:
-            return None, "selected-native-reference-invalid"
-        if (actual is not None and supplied is not None
-                and (not _same_request_id(actual, supplied) if key == "request_id"
-                     else actual != supplied)):
-            return None, "selected-native-reference-changed"
-        hints[key] = actual if actual is not None else supplied
-    raw_kind = item.get("kind")
-    if raw_kind not in {"decision", "approval", "permission", "elicitation"}:
-        return None, "selected-kind-unsupported"
-    return {"id": item_id, "harness": harness, "session_id": session_id,
-            "route_id": route_id, "kind": raw_kind, **hints,
-            "native_ref": ref.get("native_ref") if isinstance(ref, dict) else None}, None
+    source = item.get("source")
+    if source == "S1":
+        hints = {}
+        for key in ("request_id", "turn_id", "item_id", "question_id"):
+            safe_ref = _safe_request_id if key == "request_id" else _safe_native_ref
+            actual = safe_ref(item.get(key))
+            supplied = safe_ref(values.get(key))
+            if item.get(key) is not None and actual is None:
+                return None, "selected-native-reference-invalid"
+            if (actual is not None and supplied is not None
+                    and (not _same_request_id(actual, supplied) if key == "request_id"
+                         else actual != supplied)):
+                return None, "selected-native-reference-changed"
+            hints[key] = actual if actual is not None else supplied
+        raw_kind = item.get("kind")
+        if raw_kind not in {"decision", "approval", "permission", "elicitation"}:
+            return None, "selected-kind-unsupported"
+        return {"id": item_id, "source": source, "harness": harness,
+                "session_id": session_id, "route_id": route_id, "kind": raw_kind,
+                "since": item.get("since"), **hints,
+                "native_ref": ref.get("native_ref") if isinstance(ref, dict) else None}, None
+
+    if source == "S4":
+        signal = next((value for value in read_signals()
+                       if value.get("id") == item_id), None)
+        if (signal is None or signal.get("harness") != harness
+                or signal.get("session_id") != session_id):
+            return None, "selected-marker-no-longer-current"
+        native_ref = {"transport": "hearting-answer-marker", "signal_id": item_id,
+                      "seat_key": signal["seat_key"], "sequence": signal.get("sequence")}
+        supplied = ref.get("native_ref") if isinstance(ref, dict) else None
+        if supplied is not None and supplied != native_ref:
+            return None, "selected-marker-binding-changed"
+        base = {"id": item_id, "source": source, "harness": harness,
+                "session_id": session_id, "route_id": None, "kind": "decision",
+                "request_id": item_id, "turn_id": None, "question_id": "marker-response",
+                "since": item.get("since"), "question": signal.get("question"),
+                "native_ref": native_ref}
+        if not _selected_hints_match(values, base):
+            return None, "selected-marker-reference-changed"
+        return base, None
+
+    if source not in {"S2", "S3"}:
+        return None, "selected-item-source-unsupported"
+    base = {"id": item_id, "source": source, "harness": harness,
+            "session_id": session_id, "route_id": route_id, "route_hash": item.get("route_hash"),
+            "attempt_id": item.get("attempt_id"), "gate_id": item.get("gate_id"),
+            "kind": "decision", "since": item.get("since"), "owner": owner,
+            "question": item.get("question"), "choices": item.get("choices") or []}
+    if source == "S2":
+        base.update({"request_id": item_id,
+                     "turn_id": None,
+                     "question_id": item.get("gate_id"),
+                     "item_id": item.get("attempt_id")
+                     if _safe_native_ref(item.get("attempt_id")) else None})
+        match, error = _workflow_current_item(item_id, source)
+        if match is None:
+            stored = _stored_workflow_action(ref)
+            if stored is not None:
+                return stored, None
+            return None, error
+        jobs, current = match
+        if not _workflow_item_matches(base, current):
+            return None, "workflow-gate-binding-changed"
+        binding, error = _workflow_gate_source(jobs, current, allow_missing_artifact=True)
+        if binding is None:
+            return None, error
+        base["gate_epoch"] = binding["gate_epoch"]
+        base["route_path"] = binding["route_path"]
+        native_ref = {"transport": "hearting-human-gate", "jobs_path": str(jobs),
+                      "source_id": item_id, "route_id": current.get("route_id"),
+                      "route_hash": current.get("route_hash"), "gate_id": current.get("gate_id"),
+                      "attempt_id": current.get("attempt_id"),
+                      "route_path": binding["route_path"],
+                      "artifact_sha256": binding["artifact_sha256"],
+                      "gate_epoch": binding["gate_epoch"],
+                      "raised_at": float(current.get("since"))}
+    else:
+        attempt_id = item.get("attempt_id")
+        if not _safe_native_ref(attempt_id):
+            return None, "workflow-owner-attempt-unknown"
+        base.update({"request_id": item_id, "turn_id": None,
+                     "question_id": "owner-correction", "item_id": attempt_id})
+        snapshot, error = _workflow_owner_snapshot(base)
+        if snapshot is None:
+            stored = _stored_workflow_action(ref)
+            if stored is not None:
+                return stored, None
+            return None, error
+        native_ref = snapshot["native_ref"]
+    if not _selected_hints_match(values, base):
+        return None, "selected-workflow-reference-changed"
+    supplied = ref.get("native_ref") if isinstance(ref, dict) else None
+    if supplied is not None and supplied != native_ref:
+        return None, "workflow-selected-binding-changed"
+    base["native_ref"] = native_ref
+    return base, None
 
 
 def _selected_fallback(base, reason, *, state="unknown"):
@@ -1430,9 +2374,16 @@ def _selected_envelope(base, resolved):
                 "state": resolved.get("state") if resolved.get("state") in _SELECTED_STATES else "unknown"}
     if route_id is not None:
         envelope["route_id"] = route_id
+    if base.get("source") in {"S2", "S3", "S4"}:
+        envelope["source"] = base["source"]
+    if type(base.get("gate_epoch")) is int and base["gate_epoch"] > 0:
+        envelope["gate_epoch"] = base["gate_epoch"]
     question_id = _safe_native_ref(resolved.get("question_id")) or base.get("question_id")
     if question_id is not None:
         envelope["question_id"] = question_id
+    item_id = _safe_native_ref(resolved.get("item_id")) or base.get("item_id")
+    if item_id is not None:
+        envelope["item_id"] = item_id
     choices = resolved.get("choices")
     if isinstance(choices, list):
         envelope["choices"] = choices
@@ -1466,6 +2417,8 @@ def _selected_envelope(base, resolved):
 
 def _selected_transport(base, requested_id=None):
     try:
+        if base.get("source") in {"S2", "S3", "S4"}:
+            return _workflow_selected_transport(base)
         if base["harness"] == "codex":
             return _codex_current_selected(base, requested_id=requested_id)
         if base["harness"] == "opencode":
@@ -1473,6 +2426,86 @@ def _selected_transport(base, requested_id=None):
         return {"state": "unknown", "reason": "claude-native-response-surface-unavailable"}
     except Exception:
         return {"state": "unknown", "reason": "native-request-observation-failed"}
+
+
+def _workflow_selected_transport(base):
+    source = base.get("source")
+    if source == "S4":
+        signal = next((value for value in read_signals()
+                       if value.get("id") == base.get("id")), None)
+        if (signal is None or signal.get("harness") != base.get("harness")
+                or signal.get("session_id") != base.get("session_id")):
+            return {"state": "unknown", "reason": "selected-marker-no-longer-current"}
+        native_ref = {"transport": "hearting-answer-marker", "signal_id": signal["id"],
+                      "seat_key": signal["seat_key"], "sequence": signal.get("sequence")}
+        if base.get("native_ref") != native_ref:
+            return {"state": "unknown", "reason": "selected-marker-binding-changed"}
+        return {"state": "open", "kind": "question", "request_id": base["request_id"],
+                "turn_id": None, "question_id": base["question_id"],
+                "detail": {"question": signal.get("question"), "choices": []},
+                "choices": [], "support": False,
+                "reason": "marker-has-no-bound-native-response-surface",
+                "native_ref": native_ref}
+
+    entry = _selected_entry(base)
+    if source == "S3" and entry and entry.get("action_id"):
+        receipt = _workflow_owner_receipt(base, entry)
+        return {"state": receipt["state"], "kind": "question",
+                "request_id": base["request_id"], "turn_id": base["turn_id"],
+                "route_id": base.get("route_id"), "question_id": base.get("question_id"),
+                "item_id": base.get("item_id"),
+                "detail": base.get("detail") or {"question": base.get("question"), "choices": []},
+                "choices": [], "support": True, "reason": receipt.get("reason"),
+                "result": receipt.get("result"), "native_ref": base.get("native_ref")}
+
+    if source == "S2" and entry and entry.get("action_id"):
+        receipt = _workflow_gate_receipt(base, entry)
+        return {"state": receipt["state"], "kind": "question",
+                "request_id": base.get("request_id"), "turn_id": None,
+                "route_id": base.get("route_id"), "question_id": base.get("question_id"),
+                "gate_epoch": base.get("gate_epoch"), "detail": base.get("detail"),
+                "choices": [], "support": True, "reason": receipt.get("reason"),
+                "result": receipt.get("result"), "native_ref": base.get("native_ref")}
+
+    match, error = _workflow_current_item(base.get("id"), source)
+    if match is None:
+        return {"state": "unknown", "reason": error}
+    jobs, item = match
+    if not _workflow_item_matches(base, item):
+        return {"state": "unknown", "reason": "workflow-selected-binding-changed"}
+    if source == "S2":
+        binding, error = _workflow_gate_source(jobs, item, allow_missing_artifact=True)
+        if binding is None:
+            return {"state": "unknown", "reason": error}
+        native_ref = {"transport": "hearting-human-gate", "jobs_path": str(jobs),
+                      "source_id": item["id"], "route_id": item.get("route_id"),
+                      "route_hash": item.get("route_hash"), "gate_id": item.get("gate_id"),
+                      "attempt_id": item.get("attempt_id"), "route_path": binding["route_path"],
+                      "artifact_sha256": binding["artifact_sha256"],
+                      "gate_epoch": binding["gate_epoch"],
+                      "raised_at": float(item.get("since"))}
+        if base.get("native_ref") != native_ref:
+            return {"state": "unknown", "reason": "workflow-gate-binding-changed"}
+        detail, detail_error = _workflow_gate_detail(binding, item)
+        return {"state": "open", "kind": "question", "request_id": base["request_id"],
+                "turn_id": None, "route_id": item.get("route_id"),
+                "question_id": item.get("gate_id"), "gate_epoch": binding["gate_epoch"],
+                "detail": detail.get("detail") if detail else None,
+                "choices": detail.get("choices", []) if detail else [],
+                "support": bool(detail) and not detail_error, "reason": detail_error,
+                "native_ref": native_ref}
+
+    snapshot, error = _workflow_owner_snapshot(base, expected_native_ref=base.get("native_ref"))
+    if snapshot is None:
+        return {"state": "unknown", "reason": error}
+    support = bool(snapshot.get("support"))
+    return {"state": "open", "kind": "question", "request_id": base["request_id"],
+            "turn_id": base["turn_id"], "route_id": item.get("route_id"),
+            "question_id": "owner-correction", "item_id": item.get("attempt_id"),
+            "detail": {"question": item.get("question"), "choices": []}, "choices": [],
+            "support": support,
+            "reason": snapshot.get("reason") or (None if support else "owner-correction-surface-unavailable"),
+            "native_ref": snapshot["native_ref"]}
 
 
 def read_selected_request(ref):
@@ -1513,8 +2546,11 @@ def read_selected_request(ref):
                 previous["state"] = envelope["state"]
                 if envelope["state"] == "applied":
                     previous["draft"] = ""
-                previous["result"] = {"source": "codex-managed-gateway",
-                                       "status": envelope["state"]}
+                receipt = resolved.get("result")
+                previous["result"] = ({"source": "hearting-owner-input", **receipt}
+                                      if base.get("source") == "S3" and isinstance(receipt, dict)
+                                      else {"source": "codex-managed-gateway",
+                                            "status": envelope["state"]})
                 if _store_selected_entry(envelope, previous):
                     stored = _selected_entry(envelope)
                     if stored:
@@ -1557,6 +2593,167 @@ def write_selected_draft(ref, draft):
     return updated
 
 
+def _opencode_form_active(question, native_answers):
+    for condition in question.get("when", []):
+        value = native_answers.get(condition["key"])
+        if value is None:
+            return False
+        hit = (any(item == condition["value"] for item in value)
+               if isinstance(value, list) else value == condition["value"])
+        if (condition["op"] == "eq" and not hit) or (condition["op"] == "neq" and hit):
+            return False
+    return True
+
+
+def _opencode_form_answers(envelope, answers):
+    """Validate portable field answers and return the exact native typed answer map."""
+    detail = envelope.get("detail") if isinstance(envelope, dict) else None
+    native_ref = envelope.get("native_ref") if isinstance(envelope, dict) else None
+    questions = detail.get("questions") if isinstance(detail, dict) else None
+    if (not isinstance(native_ref, dict) or native_ref.get("transport") != "opencode-http-v2"
+            or not isinstance(questions, list) or not questions
+            or not isinstance(answers, dict)):
+        return None, "opencode-form-schema-unavailable"
+    field_keys = [question.get("id") for question in questions
+                  if isinstance(question, dict)]
+    if (len(field_keys) != len(questions) or not field_keys
+            or len(set(field_keys)) != len(field_keys)
+            or native_ref.get("field_keys") != field_keys
+            or not set(answers).issubset(set(field_keys))):
+        return None, "opencode-form-answer-keys-invalid"
+
+    result, native_answers = {}, {}
+    for question in questions:
+        key = question["id"]
+        active = _opencode_form_active(question, native_answers)
+        supplied = key in answers
+        if not active:
+            if supplied:
+                return None, "opencode-form-inactive-field-answer"
+            continue
+        if question.get("hidden") is True:
+            if supplied:
+                return None, "opencode-form-hidden-field-answer"
+            if question.get("required") is True:
+                return None, "opencode-form-hidden-required-field-unsupported"
+            continue
+        if not supplied:
+            if question.get("required") is True:
+                return None, "opencode-form-required-answer-missing"
+            continue
+        values = answers[key]
+        if not isinstance(values, list):
+            return None, "opencode-form-answer-shape-invalid"
+        field_type = question.get("field_type")
+        required = question.get("required") is True
+        option_values = question.get("option_values", [])
+        custom = question.get("custom") is True
+
+        if field_type == "string":
+            if len(values) != 1:
+                return None, "opencode-string-answer-count-invalid"
+            if not isinstance(values[0], str):
+                return None, "opencode-form-string-answer-invalid"
+            value = values[0]
+            if not value and not required:
+                continue
+            if not value:
+                return None, "opencode-form-required-answer-empty"
+            try:
+                length = len(value.encode("utf-16-le")) // 2
+            except UnicodeEncodeError:
+                return None, "opencode-form-string-answer-invalid"
+            minimum, maximum = question.get("min_length"), question.get("max_length")
+            if ((minimum is not None and length < minimum)
+                    or (maximum is not None and length > maximum)):
+                return None, "opencode-form-string-answer-length-invalid"
+            if question.get("options_present") and not custom and value not in option_values:
+                return None, "opencode-answer-not-in-current-options"
+            native_value = value
+
+        elif field_type in {"number", "integer"}:
+            if len(values) != 1:
+                return None, "opencode-form-numeric-answer-invalid"
+            raw = values[0]
+            if isinstance(raw, str) and not raw.strip() and not required:
+                continue
+            numeric = _opencode_form_decimal(raw)
+            if numeric is None:
+                return None, "opencode-form-numeric-answer-invalid"
+            minimum = _opencode_form_decimal(question.get("minimum"), allow_infinity=True)
+            maximum = _opencode_form_decimal(question.get("maximum"), allow_infinity=True)
+            if ((question.get("minimum") is not None and minimum is None)
+                    or (question.get("maximum") is not None and maximum is None)):
+                return None, "opencode-form-numeric-bound-invalid"
+            if ((minimum is not None and numeric < minimum)
+                    or (maximum is not None and numeric > maximum)):
+                return None, "opencode-form-numeric-answer-out-of-bounds"
+            if field_type == "integer":
+                if numeric != numeric.to_integral_value():
+                    return None, "opencode-form-integer-answer-invalid"
+                if not -9007199254740991 <= numeric <= 9007199254740991:
+                    return None, "opencode-form-integer-answer-unsafe"
+                native_value = int(numeric)
+            else:
+                native_value = float(numeric)
+                if (not math.isfinite(native_value)
+                        or Decimal(str(native_value)) != numeric):
+                    return None, "opencode-form-number-answer-unsafe"
+
+        elif field_type == "boolean":
+            if len(values) != 1 or type(values[0]) is not bool:
+                return None, "opencode-form-boolean-answer-explicit-required"
+            native_value = values[0]
+
+        elif field_type == "multiselect":
+            if any(not isinstance(value, str) for value in values):
+                return None, "opencode-form-multiselect-answer-invalid"
+            if not values and not required and question.get("min_items") in (None, 0):
+                continue
+            minimum, maximum = question.get("min_items"), question.get("max_items")
+            if ((minimum is not None and len(values) < minimum)
+                    or (maximum is not None and len(values) > maximum)):
+                return None, "opencode-answer-count-invalid"
+            if len(set(values)) != len(values):
+                return None, "opencode-answer-duplicate-option"
+            if not custom and any(value not in option_values for value in values):
+                return None, "opencode-answer-not-in-current-options"
+            native_value = list(values)
+
+        else:
+            return None, "opencode-form-type-unsupported"
+        result[key] = native_value
+        native_answers[key] = native_value
+
+    return result, None
+
+
+def _opencode_turnless_form_binding(envelope):
+    if (not isinstance(envelope, dict) or envelope.get("harness") != "opencode"
+            or envelope.get("kind") != "question" or envelope.get("turn_id") is not None):
+        return False
+    native_ref = envelope.get("native_ref")
+    detail = envelope.get("detail")
+    questions = detail.get("questions") if isinstance(detail, dict) else None
+    if (not isinstance(native_ref, dict) or native_ref.get("transport") != "opencode-http-v2"
+            or native_ref.get("session_id") != envelope.get("session_id")
+            or native_ref.get("request_id") != envelope.get("request_id")
+            or not isinstance(native_ref.get("generation"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", native_ref["generation"])
+            or not isinstance(native_ref.get("schema_binding"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", native_ref["schema_binding"])
+            or type(native_ref.get("server_pid")) is not int or native_ref["server_pid"] < 1
+            or not _safe_native_ref(native_ref.get("proc_start"))
+            or not isinstance(native_ref.get("field_keys"), list)
+            or not isinstance(questions, list) or not questions):
+        return False
+    keys = [question.get("id") for question in questions if isinstance(question, dict)]
+    return (len(keys) == len(questions) and len(set(keys)) == len(keys)
+            and keys == native_ref["field_keys"]
+            and _safe_request_id(envelope.get("request_id")) is not None
+            and _safe_native_ref(envelope.get("session_id")) is not None)
+
+
 def _portable_response(envelope, response):
     if not isinstance(response, dict):
         return None, "response-shape-invalid"
@@ -1569,6 +2766,48 @@ def _portable_response(envelope, response):
     answers = response.get("answers")
     detail = envelope.get("detail")
     questions = detail.get("questions") if isinstance(detail, dict) else None
+    native_ref = envelope.get("native_ref")
+    if (envelope.get("harness") == "opencode" and isinstance(native_ref, dict)
+            and native_ref.get("transport") == "opencode-http-v2"):
+        if not isinstance(questions, list) or not questions:
+            return None, "opencode-form-schema-unavailable"
+        question_by_id = {question.get("id"): question for question in questions
+                          if isinstance(question, dict)}
+        if (len(question_by_id) != len(questions) or not isinstance(answers, dict)
+                or not set(answers).issubset(set(question_by_id))):
+            return None, "opencode-form-answer-keys-invalid"
+        normalized = {}
+        for question_id, values in answers.items():
+            question = question_by_id[question_id]
+            if not isinstance(values, list):
+                return None, "opencode-form-answer-shape-invalid"
+            field_type = question.get("field_type")
+            if field_type in {"string", "multiselect"}:
+                valid = all(isinstance(value, str)
+                            and len(value.encode("utf-8")) <= _SELECTED_DRAFT_MAX
+                            for value in values)
+            elif field_type in {"number", "integer"}:
+                valid = all(not isinstance(value, bool)
+                            and isinstance(value, (int, float, str))
+                            and (not isinstance(value, float) or math.isfinite(value))
+                            and (not isinstance(value, str)
+                                 or len(value.encode("utf-8")) <= _SELECTED_DRAFT_MAX)
+                            for value in values)
+            elif field_type == "boolean":
+                if not all(type(value) is bool for value in values):
+                    return None, "opencode-form-boolean-answer-explicit-required"
+                valid = True
+            else:
+                valid = False
+            if not valid:
+                return None, "opencode-form-answer-value-invalid"
+            normalized[question_id] = list(values)
+        try:
+            if len(json.dumps(normalized, ensure_ascii=False, allow_nan=False).encode("utf-8")) > 16_384:
+                return None, "opencode-form-answer-too-large"
+        except (TypeError, ValueError):
+            return None, "opencode-form-answer-value-invalid"
+        return {"answers": normalized}, None
     if isinstance(questions, list) and questions:
         question_ids = [_safe_native_ref(question.get("id"))
                         if isinstance(question, dict) else None for question in questions]
@@ -1595,6 +2834,37 @@ def _native_response_error(envelope, portable):
     """Check a portable response against the exact selected native request shape."""
     native_ref = envelope.get("native_ref")
     detail = envelope.get("detail")
+    if (envelope.get("harness") == "opencode" and envelope.get("kind") == "question"
+            and isinstance(native_ref, dict)
+            and native_ref.get("transport") == "opencode-http-v2"):
+        return _opencode_form_answers(envelope, portable.get("answers"))[1]
+    if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-owner-input":
+        return None
+    if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-human-gate":
+        if (envelope.get("source") != "S2" or type(envelope.get("gate_epoch")) is not int
+                or envelope.get("gate_epoch") != native_ref.get("gate_epoch")
+                or not isinstance(detail, dict)):
+            return "workflow-gate-binding-invalid"
+        questions = detail.get("questions")
+        if not isinstance(questions, list) or not questions:
+            return "workflow-gate-questions-unavailable"
+        answers = portable.get("answers") if isinstance(portable, dict) else None
+        if not isinstance(answers, dict) or set(answers) != {row.get("id") for row in questions}:
+            return "workflow-gate-answer-set-incomplete"
+        for question in questions:
+            if not isinstance(question, dict):
+                return "workflow-gate-question-invalid"
+            values = answers.get(question.get("id"))
+            if not isinstance(values, list) or len(values) != 1:
+                return "workflow-gate-answer-count-invalid"
+            choices = question.get("choices")
+            allowed = {choice.get("value", choice.get("label")) for choice in choices
+                       if isinstance(choice, dict)} if isinstance(choices, list) else set()
+            if values[0] not in allowed and question.get("is_other") is not True:
+                return "workflow-gate-answer-not-current-option"
+        return None
+    if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-answer-marker":
+        return "workflow-response-surface-unavailable"
     if envelope.get("kind") == "approval":
         decision = portable.get("decision")
         if decision == "defer":
@@ -1613,30 +2883,6 @@ def _native_response_error(envelope, portable):
 
     answers = portable["answers"]
     harness = envelope.get("harness")
-    if harness == "opencode":
-        field_type = native_ref.get("field_type") if isinstance(native_ref, dict) else None
-        values = answers.get(envelope.get("question_id"), [])
-        if field_type == "string":
-            return None if len(values) == 1 else "opencode-string-answer-count-invalid"
-        if field_type != "multiselect":
-            return "opencode-form-type-unsupported"
-        allowed = native_ref.get("option_values")
-        if not isinstance(allowed, list):
-            return "opencode-options-unavailable"
-        if len(set(values)) != len(values):
-            return "opencode-answer-duplicate-option"
-        if not native_ref.get("custom") and any(value not in allowed for value in values):
-            return "opencode-answer-not-in-current-options"
-        minimum, maximum = native_ref.get("min_items"), native_ref.get("max_items")
-        if ((minimum is not None and (type(minimum) is not int or minimum < 0))
-                or (maximum is not None and (type(maximum) is not int or maximum < 0))
-                or (minimum is not None and maximum is not None and minimum > maximum)):
-            return "opencode-answer-constraints-invalid"
-        if ((minimum is not None and len(values) < minimum)
-                or (maximum is not None and len(values) > maximum)):
-            return "opencode-answer-count-invalid"
-        return None
-
     if harness == "codex" and isinstance(detail, dict):
         questions = detail.get("questions")
         if not isinstance(questions, list):
@@ -1657,6 +2903,220 @@ def _native_response_error(envelope, portable):
                     } for value in values)):
                 return "codex-answer-not-in-current-options"
     return None
+
+
+def _workflow_gate_submit(envelope, portable, action_id):
+    """Submit a current person's explicit S2 decision through the normal release CLI."""
+    base, error = _selected_base(envelope)
+    if base is None:
+        return "unknown", {"reason": error}
+    match, error = _workflow_current_item(base.get("id"), "S2")
+    if match is None:
+        return "unknown", {"reason": error}
+    jobs, item = match
+    if not _workflow_item_matches(base, item):
+        return "unknown", {"reason": "workflow-gate-binding-changed"}
+    binding, error = _workflow_gate_source(jobs, item)
+    if binding is None:
+        return "unknown", {"reason": error}
+    current, error = _workflow_gate_detail(binding, item)
+    native = envelope.get("native_ref")
+    expected_native = {"transport": "hearting-human-gate", "jobs_path": str(jobs),
+                       "source_id": item["id"], "route_id": item.get("route_id"),
+                       "route_hash": item.get("route_hash"), "gate_id": item.get("gate_id"),
+                       "attempt_id": item.get("attempt_id"), "route_path": binding["route_path"],
+                       "artifact_sha256": binding["artifact_sha256"],
+                       "gate_epoch": binding["gate_epoch"],
+                       "raised_at": float(item.get("since"))}
+    if (current is None or error or native != expected_native
+            or envelope.get("gate_epoch") != binding["gate_epoch"]
+            or current.get("detail") != envelope.get("detail")):
+        return "unknown", {"reason": error or "workflow-gate-detail-changed"}
+    answers = portable.get("answers") if isinstance(portable, dict) else None
+    mode = current["detail"].get("response_mode")
+    answer_file = None
+    temp_dir = None
+    if mode == "gate-decision":
+        decision = answers.get("gate-decision", [None])[0]
+        if decision not in {"proceed", "revise", "stop"}:
+            return "unknown", {"reason": "workflow-gate-decision-invalid"}
+    elif mode == "frame-interview":
+        import frame_interview as FI
+
+        asked = []
+        for question in current["detail"].get("questions", ()):
+            values = answers.get(question.get("id"))
+            if not isinstance(values, list) or len(values) != 1:
+                return "unknown", {"reason": "workflow-interview-answer-incomplete"}
+            options = [choice.get("label", choice.get("value"))
+                       for choice in question.get("choices", ()) if isinstance(choice, dict)]
+            asked.append({"question": question.get("question"), "options": options,
+                          "answer": values[0]})
+        answers_file_value = FI.answers_from_native(current["interview"], asked)
+        if (not isinstance(answers_file_value, dict)
+                or FI.validate_answers(current["interview"], answers_file_value)):
+            return "unknown", {"reason": "workflow-interview-answer-invalid"}
+        decision = "proceed"
+        try:
+            temp_dir = tempfile.TemporaryDirectory(prefix="hearting-s2-", dir="/tmp")
+            answer_file = Path(temp_dir.name) / "answers.json"
+            fd = os.open(answer_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(answers_file_value, handle, ensure_ascii=False,
+                              separators=(",", ":"))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            if temp_dir is not None:
+                temp_dir.cleanup()
+            return "unknown", {"reason": "workflow-answer-file-unavailable:" + type(exc).__name__}
+    else:
+        return "unknown", {"reason": "workflow-gate-response-mode-unsupported"}
+
+    command = [sys.executable, str(Path(__file__).resolve().parent / "workflow-supervisor.py"),
+               "release", "--route", binding["route_path"], "--gate", str(item["gate_id"]),
+               "--decision", decision, "--jobs", str(jobs),
+               "--expected-route-hash", str(item["route_hash"]),
+               "--expected-gate-epoch", str(binding["gate_epoch"]),
+               "--request-id", action_id]
+    if answer_file is not None:
+        command.extend(("--answers", str(answer_file)))
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=120, check=False)
+        if completed.returncode != 0:
+            return "unknown", {"reason": "workflow-release-command-refused",
+                                "returncode": completed.returncode}
+        try:
+            receipt = json.loads(completed.stdout)
+        except (TypeError, ValueError):
+            return "unknown", {"reason": "workflow-release-receipt-invalid"}
+        required = {"route_id": item["route_id"], "route_hash": item["route_hash"],
+                    "gate": item["gate_id"], "gate_epoch": binding["gate_epoch"],
+                    "request_id": action_id, "decision": decision, "actor_kind": "user"}
+        if not isinstance(receipt, dict) or any(receipt.get(key) != value
+                                                for key, value in required.items()):
+            return "unknown", {"reason": "workflow-release-receipt-mismatch"}
+        verified = _workflow_gate_receipt(
+            {**base, "native_ref": expected_native},
+            {"action_id": action_id, "result": receipt})
+        if verified["state"] != "applied":
+            return "unknown", {"reason": verified.get("reason") or
+                                "workflow-release-source-transition-unconfirmed"}
+        return "applied", receipt
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "unknown", {"reason": "workflow-release-command-ambiguous:" + type(exc).__name__}
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+
+
+def _workflow_owner_submit(envelope, portable, action_id):
+    """Use the public exact-owner correction command once and read its durable receipt."""
+    base, error = _selected_base(envelope)
+    if base is None:
+        return "unknown", {"reason": error}
+    snapshot, error = _workflow_owner_snapshot(
+        base, expected_native_ref=envelope.get("native_ref"))
+    if snapshot is None:
+        return "unknown", {"reason": error}
+    if not snapshot.get("support"):
+        return "unknown", {"reason": snapshot.get("reason") or "owner-correction-unavailable"}
+    answers = portable.get("answers") if isinstance(portable, dict) else None
+    values = answers.get("owner-correction") if isinstance(answers, dict) else None
+    if not isinstance(values, list) or len(values) != 1:
+        return "unknown", {"reason": "owner-correction-answer-shape-invalid"}
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", action_id):
+        return "unknown", {"reason": "owner-correction-action-id-invalid"}
+    attempt_id = envelope["native_ref"]["attempt_id"]
+    lineage = _workflow_owner_lineage(snapshot["jobs"], envelope.get("native_ref"))
+    if (not lineage or snapshot.get("current_attempt_id") != lineage["effective_attempt"]):
+        return "unknown", {"reason": "owner-correction-lineage-changed"}
+    temp_dir = None
+    try:
+        temp_dir = tempfile.TemporaryDirectory(prefix="hearting-owner-correction-")
+        fd, message_path = tempfile.mkstemp(prefix="answer-", suffix=".txt", dir=temp_dir.name)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(values[0])
+            handle.flush()
+            os.fsync(handle.fileno())
+        command = [sys.executable, str(Path(__file__).resolve().with_name("capability-route.py")),
+                   "correct", "--attempt-id", attempt_id, "--jobs", str(snapshot["jobs"]),
+                   "--message-file", message_path, "--request-id", action_id]
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=30, check=False)
+        if completed.returncode != 0:
+            return "unknown", {"reason": "owner-correction-command-unconfirmed",
+                                "returncode": completed.returncode}
+        receipts = []
+        for line in (completed.stdout or "").splitlines():
+            try:
+                value = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                receipts.append(value)
+        if len(receipts) != 1:
+            return "unknown", {"reason": "owner-correction-command-receipt-ambiguous"}
+        public_receipt = receipts[0]
+        correction = public_receipt.get("correction", public_receipt)
+        if not isinstance(correction, dict):
+            return "unknown", {"reason": "owner-correction-request-receipt-missing"}
+        redirected_from = correction.get("redirected_from", public_receipt.get("redirected_from"))
+        if redirected_from is not None and redirected_from != attempt_id:
+            return "unknown", {"reason": "owner-correction-selection-redirected"}
+        if (correction.get("request_id") != action_id
+                or not isinstance(correction.get("attempt_id"), str)):
+            return "unknown", {"reason": "owner-correction-request-binding-missing"}
+        request = next((row for row in correction.get("requests", ())
+                        if isinstance(row, dict) and row.get("id") == action_id), None)
+        if request is None:
+            return "unknown", {"reason": "owner-correction-request-receipt-missing"}
+        target_attempt = correction["attempt_id"]
+        lineage = _workflow_owner_lineage(snapshot["jobs"], envelope.get("native_ref"))
+        if not lineage or target_attempt not in lineage["attempts"]:
+            return "unknown", {"reason": "owner-correction-target-outside-lineage"}
+        import dispatch_owner_input
+        try:
+            observed = dispatch_owner_input.inspect(snapshot["jobs"], target_attempt)
+        except Exception as exc:
+            return "unknown", {"reason": "owner-correction-receipt-unavailable:" +
+                                type(exc).__name__}
+        request = next((row for row in observed.get("requests", ())
+                        if isinstance(row, dict) and row.get("id") == action_id), None)
+        if request is None:
+            return "unknown", {"reason": "owner-correction-receipt-missing"}
+        request_state = request.get("state")
+        if request_state == "turn-completed":
+            state = "applied"
+        elif request_state in {"retained", "queued", "accepted"}:
+            state = "received"
+        else:
+            state = "unknown"
+        result = {"status": request_state, "request_id": action_id,
+                  "target_attempt_id": target_attempt,
+                  "duplicate": bool(correction.get("duplicate"))}
+        continuation = {key: public_receipt[key] for key in
+                        ("state", "reason", "required_action", "owner_attempt_id", "parent_next")
+                        if isinstance(public_receipt.get(key), (str, int, float, bool))}
+        if continuation:
+            result["continuation"] = continuation
+        if request.get("delivery_observation"):
+            result["delivery_observation"] = request["delivery_observation"]
+        return state, result
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
+        return "unknown", {"reason": "owner-correction-command-ambiguous:" + type(exc).__name__}
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
 
 def _selected_invalid_response(envelope, reason):
@@ -1696,28 +3156,13 @@ def _opencode_submit(envelope, portable):
         if not _opencode_identity_matches(endpoint, base["session_id"]):
             return "unknown", {"reason": "opencode-server-replaced-after-response"}
         return "applied", {"transport": "received", "runtime": "applied", "http_status": 204}
-    field_type = native_ref.get("field_type")
-    values = portable["answers"][envelope["question_id"]]
-    if field_type == "string":
-        if len(values) != 1:
-            return "unknown", {"reason": "opencode-string-answer-shape-invalid"}
-        answer_value = values[0]
-    elif field_type == "multiselect":
-        allowed = native_ref.get("option_values")
-        if not isinstance(allowed, list):
-            return "unknown", {"reason": "opencode-options-unavailable"}
-        if (not native_ref.get("custom") and any(value not in allowed for value in values)):
-            return "unknown", {"reason": "opencode-answer-not-in-current-options"}
-        minimum, maximum = native_ref.get("min_items"), native_ref.get("max_items")
-        if (isinstance(minimum, int) and len(values) < minimum
-                or isinstance(maximum, int) and len(values) > maximum):
-            return "unknown", {"reason": "opencode-answer-count-invalid"}
-        answer_value = values
-    else:
-        return "unknown", {"reason": "opencode-form-type-unsupported"}
+    answer_value, validation_error = _opencode_form_answers(
+        envelope, portable.get("answers") if isinstance(portable, dict) else None)
+    if validation_error:
+        return "unknown", {"reason": validation_error}
     reply_path = f"/api/session/{session_path}/form/{request_path}/reply"
     result = _opencode_http(endpoint, "POST", reply_path,
-                            {"answer": {envelope["question_id"]: answer_value}})
+                            {"answer": answer_value})
     if result.get("status") != 204:
         return "unknown", {"reason": "opencode-form-response-ambiguous"}
     confirmation = _opencode_http(endpoint, "GET",
@@ -1783,8 +3228,7 @@ def submit_selected_response(ref, response, *, action_id=None):
     identity = _selected_identity(ref) if isinstance(ref, dict) else None
     if (identity is None or identity.get("harness") != base["harness"]
             or identity.get("session_id") != base["session_id"]
-            or identity.get("route_id") != base.get("route_id")
-            or identity.get("turn_id") is None):
+            or identity.get("route_id") != base.get("route_id")):
         return _selected_fallback(base, "exact-request-turn-binding-required")
     current = read_selected_request(ref)
     current_identity = _selected_identity(current)
@@ -1792,6 +3236,24 @@ def submit_selected_response(ref, response, *, action_id=None):
             or current_identity != identity
             or current.get("native_ref") != ref.get("native_ref")):
         return current
+    native_ref = current.get("native_ref")
+    workflow_owner_request = (
+        isinstance(native_ref, dict)
+        and native_ref.get("transport") == "hearting-owner-input"
+        and identity.get("turn_id") is None
+        and identity.get("item_id") == native_ref.get("attempt_id")
+        and identity.get("route_id") == native_ref.get("route_id"))
+    workflow_gate_request = (
+        isinstance(native_ref, dict)
+        and native_ref.get("transport") == "hearting-human-gate"
+        and identity.get("turn_id") is None
+        and identity.get("gate_epoch") == native_ref.get("gate_epoch")
+        and identity.get("route_id") == native_ref.get("route_id"))
+    opencode_turnless_form = (identity.get("turn_id") is None
+                              and _opencode_turnless_form_binding(current))
+    if (identity.get("turn_id") is None and not workflow_owner_request
+            and not workflow_gate_request and not opencode_turnless_form):
+        return _selected_fallback(base, "exact-request-turn-binding-required")
     portable, response_error = _portable_response(current, response)
     if portable is None:
         return _selected_invalid_response(current, response_error)
@@ -1811,13 +3273,24 @@ def submit_selected_response(ref, response, *, action_id=None):
         action_id = uuid.uuid4().hex
     if not isinstance(action_id, str) or not _SAFE.fullmatch(action_id):
         return _selected_invalid_response(current, "action-id-invalid")
+    native_ref = current.get("native_ref")
+    if (isinstance(native_ref, dict)
+            and native_ref.get("transport") == "hearting-owner-input"
+            and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", action_id)):
+        return _selected_invalid_response(current, "owner-correction-action-id-invalid")
     response_error = _native_response_error(current, portable)
     if response_error:
         return _selected_invalid_response(current, response_error)
     claimed, entry = _claim_selected_action(current, action_id, portable)
     if not claimed:
         return read_selected_request(current)
-    if current["harness"] == "opencode":
+    if (isinstance(native_ref, dict)
+            and native_ref.get("transport") == "hearting-owner-input"):
+        state, result = _workflow_owner_submit(current, portable, action_id)
+    elif (isinstance(native_ref, dict)
+          and native_ref.get("transport") == "hearting-human-gate"):
+        state, result = _workflow_gate_submit(current, portable, action_id)
+    elif current["harness"] == "opencode":
         state, result = _opencode_submit(current, portable)
     elif current["harness"] == "codex":
         state, result = _codex_submit(current, portable, action_id)

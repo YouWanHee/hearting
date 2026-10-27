@@ -114,6 +114,11 @@ make_fixture() {
     > "$root/adapters/opencode/plugins/hearting-guards.js"
   cp "$ROOT/adapters/opencode/plugins/hearting-guards/index.ts" \
     "$root/adapters/opencode/plugins/hearting-guards/index.ts"
+  mkdir -p "$root/adapters/opencode/plugins/hearting-tui-identity" "$root/adapters/opencode/tui"
+  cp "$ROOT/adapters/opencode/plugins/hearting-tui-identity/tui.ts" \
+    "$root/adapters/opencode/plugins/hearting-tui-identity/tui.ts"
+  printf '%s\n' 'export default { id: "hearting.tui-identity", setup() {} }' \
+    > "$root/adapters/opencode/tui/hearting-tui-identity.ts"
 
   git -C "$root" init -q
   git -C "$root" config user.email fixture@example.com
@@ -378,6 +383,13 @@ v2_entry="$HOME/.config/opencode/plugins/hearting-guards/index.ts"
   || fail "OpenCode V2 package plugin entry must be a regular file"
 grep -Fq "from \"$(readlink "$HOME/.config/opencode/plugins/hearting-guards.js")\"" "$v2_entry" \
   || fail "OpenCode V2 package plugin entry must import the activated server export"
+# OpenCode 2 skips a tui.json/cli.json entry that names a plain file; the TUI
+# identity plugin loads as the discovered package's rendered `tui` entry.
+v2_tui_entry="$HOME/.config/opencode/plugins/hearting-tui-identity/tui.ts"
+{ test -f "$v2_tui_entry" && test ! -L "$v2_tui_entry"; } \
+  || fail "OpenCode V2 TUI identity entry must be a regular file"
+grep -Fq "from \"$(readlink "$HOME/.config/opencode/tui/hearting-tui-identity.ts")\"" "$v2_tui_entry" \
+  || fail "OpenCode V2 TUI identity entry must import the activated identity plugin"
 test -L "$HOME/.claude/tools" || fail "Claude tools projection missing"
 test -L "$HOME/.claude/utilities" || fail "Claude utilities projection missing"
 test -L "$HOME/.claude/statusline.sh" || fail "Claude statusline projection missing"

@@ -594,6 +594,26 @@ class CardConsumeTest(TidyCase):
         self.assertIn("표식-E", text)
         self.assertEqual(sent, [text])
 
+    def test_deferred_consumption_stays_due_until_the_caller_applies_it(self):
+        self.card("sid-A", "표식-D")
+        with self.library():
+            deferred = []
+            sent = []
+            text = st.run_hook("claude", "start", "sid-A", source="compact",
+                               cwd=str(self.cwd), emit=sent.append, deferred=deferred)
+            self.assertIn("표식-D", text)
+            self.assertTrue(deferred)
+            still_due = []
+            st.run_hook("claude", "start", "sid-A", source="compact",
+                        cwd=str(self.cwd), emit=still_due.append)
+            self.assertIn("표식-D", still_due[0],
+                          "a deferred receipt must not consume the card before delivery")
+            self.assertEqual(st.apply_deferred(deferred), len(deferred))
+            after = []
+            st.run_hook("claude", "start", "sid-A", source="compact",
+                        cwd=str(self.cwd), emit=after.append)
+            self.assertEqual(after, [])
+
     def test_output_never_exceeds_2400_bytes_and_always_names_the_file(self):
         self.card("sid-A", "가나다라 " * 900)
         self.confirmed_handover("claude", "sid-A", "sid-B")
@@ -4887,6 +4907,17 @@ class SeatHandoverTest(TidyCase):
         self.assertEqual(self.retire("sid-A", "codex", "sid-B", "claude"), row)    # repeated: the same row
         self.assertIsNone(self.retire("sid-A", "codex", "sid-C", "claude", pane="test:pane-c"))  # A answers for nothing now
         self.assertEqual(self.effective(meta), "sid-B")
+
+    def test_an_unreadable_registry_is_not_reported_as_nothing_to_hand_over(self):
+        self.row("att-1", parent="sid-A")
+        import dispatch_registry_cache
+        with mock.patch.object(dispatch_registry_cache, "registry_view",
+                               side_effect=OSError("registry unreadable")):
+            with self.assertRaises(self.handover.RegistryUnreadable):
+                self.retire("sid-A", "claude", "sid-B", "claude")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE_BESIDE}):
+            self.assertEqual(self.handover.handover_rows(self.seat(PANE_BESIDE)), [])
+        self.assertIsNotNone(self.retire("sid-A", "claude", "sid-B", "claude"))  # the retry binds
 
     def test_a_retire_after_a_clear_carries_the_whole_chain_across_panes(self):
         meta = self.row("att-1")

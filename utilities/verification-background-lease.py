@@ -25,6 +25,8 @@ import os
 import secrets
 from pathlib import Path
 import signal
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -187,21 +189,36 @@ def become_subreaper() -> bool:
         return False
 
 
-def process_table() -> dict[int, tuple[int, int]]:
-    """pid -> (ppid, resident bytes) for every live, non-zombie process."""
+def _read_process_stat(pid: int) -> tuple[bytes, int, int, int]:
+    """Return (state, ppid, resident bytes, start ticks) for one PID."""
+    fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
+    if len(fields) <= 21:
+        raise ValueError("incomplete proc stat")
     page = os.sysconf("SC_PAGE_SIZE")
-    table: dict[int, tuple[int, int]] = {}
+    return fields[0], int(fields[1]), int(fields[21]) * page, int(fields[19])
+
+
+def process_snapshot() -> dict[int, tuple[bytes, int, int, int]]:
+    """pid -> (state, ppid, resident bytes, start ticks) for readable processes."""
+    snapshot: dict[int, tuple[bytes, int, int, int]] = {}
     for name in os.listdir("/proc"):
         if not name.isdigit():
             continue
         try:
-            fields = Path(f"/proc/{name}/stat").read_bytes().rsplit(b")", 1)[1].split()
-        except (OSError, IndexError):
+            snapshot[int(name)] = _read_process_stat(int(name))
+        except (OSError, IndexError, ValueError):
             continue
-        if fields[0] in (b"Z", b"X"):
-            continue
-        table[int(name)] = (int(fields[1]), int(fields[21]) * page)
-    return table
+    return snapshot
+
+
+def _live_process_table(snapshot: dict[int, tuple[bytes, int, int, int]]) -> dict[int, tuple[int, int]]:
+    return {pid: (ppid, rss) for pid, (state, ppid, rss, _start) in snapshot.items()
+            if state not in (b"Z", b"X")}
+
+
+def process_table() -> dict[int, tuple[int, int]]:
+    """pid -> (ppid, resident bytes) for every live, non-zombie process."""
+    return _live_process_table(process_snapshot())
 
 
 def pss_bytes(pid: int) -> int | None:
@@ -301,6 +318,109 @@ def scope_pids(table: dict[int, tuple[int, int]], scope: str | None) -> set[int]
     return found
 
 
+def _process_children(pid: int) -> set[int]:
+    """Read children from proc task files, including children with unreadable stat."""
+    tasks = Path(f"/proc/{pid}/task")
+    try:
+        tids = [name for name in os.listdir(tasks) if name.isdigit()]
+    except FileNotFoundError:
+        return set()
+    children: set[int] = set()
+    for tid in tids:
+        try:
+            raw = Path(f"/proc/{pid}/task/{tid}/children").read_bytes()
+        except FileNotFoundError:
+            continue
+        for item in raw.split():
+            children.add(int(item))
+    return children
+
+
+def _remember_scope(snapshot: dict[int, tuple[bytes, int, int, int]], scope: str | None,
+                    observed: dict[int, int | None]) -> set[int]:
+    pids = scope_pids(_live_process_table(snapshot), scope)
+    pending = list(pids | _process_children(os.getpid()) | set(observed))
+    visited: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in visited or pid == os.getpid():
+            continue
+        visited.add(pid)
+        identity = snapshot.get(pid)
+        if identity is None:
+            try:
+                identity = _read_process_stat(pid)
+            except FileNotFoundError:
+                continue
+            except (OSError, IndexError, ValueError):
+                observed.setdefault(pid, None)
+                continue
+        state, _ppid, _rss, start = identity
+        if state in (b"Z", b"X"):
+            continue
+        expected = observed.get(pid)
+        if expected is not None and expected != start:
+            continue
+        observed[pid] = start
+        pids.add(pid)
+        pending.extend(_process_children(pid) - visited)
+    return pids
+
+
+def _owned_process_state(observed: dict[int, int | None]) -> tuple[set[int], dict[int, str]]:
+    """Return same-identity live PIDs and owned PIDs whose state is unknown."""
+    live: set[int] = set()
+    unknown: dict[int, str] = {}
+    for pid, expected_start in observed.items():
+        try:
+            state, _ppid, _rss, current_start = _read_process_stat(pid)
+        except FileNotFoundError:
+            continue
+        except (OSError, IndexError, ValueError):
+            unknown[pid] = "unreadable"
+            continue
+        if expected_start is None:
+            unknown[pid] = "identity-unavailable"
+        elif current_start != expected_start or state in (b"Z", b"X"):
+            continue
+        else:
+            live.add(pid)
+    return live, unknown
+
+
+def create_private_scratch(command_env: dict[str, str]) -> tuple[Path, tuple[int, int]]:
+    """Create one lease-owned root below the command's selected TMPDIR parent."""
+    parent_value = command_env.get("TMPDIR") or tempfile.gettempdir()
+    parent = Path(parent_value).expanduser().resolve(strict=True)
+    if not parent.is_dir():
+        raise NotADirectoryError(parent)
+    root = Path(tempfile.mkdtemp(prefix="hearting-verification-", dir=parent))
+    info = root.lstat()
+    return root, (info.st_dev, info.st_ino)
+
+
+def remove_private_scratch(root: Path, identity: tuple[int, int]) -> str | None:
+    """Remove only the original private directory; return a reason if retained."""
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"root-stat-failed:{type(exc).__name__}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return "root-replaced"
+    if (info.st_dev, info.st_ino) != identity:
+        return "root-replaced"
+    try:
+        shutil.rmtree(root)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        return f"remove-failed:{reason.replace(' ', '_')}"
+    return None
+
+
 def reap_zombies(keep: int | None = None) -> None:
     """Collect exited adopted children; `keep` (the command) stays for its own wait."""
     own = str(os.getpid()).encode()
@@ -315,38 +435,54 @@ def reap_zombies(keep: int | None = None) -> None:
             continue
 
 
-def end_scope(scope: str | None, *, grace: float = 2.0) -> list[int]:
+def end_scope(scope: str | None, *, grace: float = 2.0,
+              observed: dict[int, int | None] | None = None) -> list[int]:
     """Terminate everything still in this run's scope; a killed parent can
     re-parent its own children here, so repeat until nothing is left."""
+    observed = {} if observed is None else observed
     ended: list[int] = []
     for _round in range(5):
-        pids = scope_pids(process_table(), scope)
+        snapshot = process_snapshot()
+        pids = _remember_scope(snapshot, scope, observed)
+        live, _unknown = _owned_process_state(observed)
+        pids.update(live)
         if not pids:
             break
         for sig in (signal.SIGTERM, signal.SIGKILL):
+            signaled: set[int] = set()
             for pid in pids:
+                expected_start = observed.get(pid)
+                if expected_start is None:
+                    continue
                 try:
+                    state, _ppid, _rss, current_start = _read_process_stat(pid)
+                    if current_start != expected_start or state in (b"Z", b"X"):
+                        continue
                     os.kill(pid, sig)
-                except OSError:
+                    signaled.add(pid)
+                except (OSError, IndexError, ValueError):
                     pass
             deadline = time.monotonic() + grace
             while time.monotonic() < deadline:
                 reap_zombies()
-                live = process_table()
-                if not any(pid in live for pid in pids):
+                current = process_snapshot()
+                _remember_scope(current, scope, observed)
+                live, _unknown = _owned_process_state(observed)
+                if not live:
                     break
                 time.sleep(.05)
             else:
                 continue
             break
-        ended.extend(sorted(pids))
+        ended.extend(sorted(signaled))
         reap_zombies()
     return ended
 
 
 def wait_within_budget(process: subprocess.Popen[bytes], timeout: float, scope: str,
                        budget: int | None = None, source: str = "default",
-                       peak: MemoryPeak | None = None, on_peak=None) -> int | None:
+                       peak: MemoryPeak | None = None, on_peak=None,
+                       observed: dict[int, int | None] | None = None) -> int | None:
     """The command's exit status; None on expiry. Raises MemoryError past the budget."""
     budget = memory_budget_bytes() if budget is None else budget
     peak = MemoryPeak() if peak is None else peak
@@ -361,8 +497,14 @@ def wait_within_budget(process: subprocess.Popen[bytes], timeout: float, scope: 
             return process.wait(timeout=min(MEMORY_POLL_SECONDS, remaining))
         except subprocess.TimeoutExpired:
             pass
-        table = process_table()
-        pids = {pid for pid in scope_pids(table, scope) if pid in table}
+        snapshot = process_snapshot()
+        table = _live_process_table(snapshot)
+        pids = scope_pids(table, scope)
+        if observed is not None:
+            for pid in pids:
+                identity = snapshot.get(pid)
+                if identity is not None:
+                    observed.setdefault(pid, identity[3])
         rss_sum = sum(table[pid][1] for pid in pids)
         peak.record_rss(rss_sum)
         if rss_sum - overlap > budget or time.monotonic() >= next_pss:
@@ -434,6 +576,9 @@ def main(argv: list[str] | None = None) -> int:
     scope = secrets.token_hex(8)
     process: subprocess.Popen | None = None
     lease_path: Path | None = None
+    scratch_root: Path | None = None
+    scratch_identity: tuple[int, int] | None = None
+    observed: dict[int, int | None] = {}
     peak = MemoryPeak()
     on_peak = None
     status = 1
@@ -441,12 +586,18 @@ def main(argv: list[str] | None = None) -> int:
     _DEFERRED_STOP = None
     _LAUNCHING = True
     try:
+        scratch_root, scratch_identity = create_private_scratch(command_env)
+        command_env = {**command_env, "TMPDIR": str(scratch_root)}
         # A stop delivered between Popen's return and the assignment must not
         # lose the child identity. Defer only that window; all setup after it
         # is already inside this lifetime's cleanup boundary.
         process = subprocess.Popen(command, start_new_session=True,
                                    env={**command_env, SCOPE_ENV: scope})
         _LAUNCHING = False
+        try:
+            observed[process.pid] = _read_process_stat(process.pid)[3]
+        except (OSError, IndexError, ValueError):
+            observed[process.pid] = None
         if _DEFERRED_STOP is not None:
             raise SystemExit(128 + _DEFERRED_STOP)
         # Adopted descendants are reaped without taking the command's status.
@@ -474,7 +625,7 @@ def main(argv: list[str] | None = None) -> int:
                     return
                 current.written = current.bytes
         status = wait_within_budget(process, args.timeout, scope, budget, source,
-                                    peak, on_peak)
+                                    peak, on_peak, observed)
         if status is None:
             terminate_group(process)
             status = 124
@@ -487,21 +638,46 @@ def main(argv: list[str] | None = None) -> int:
         _CLEANUP_ACTIVE = True
         _LAUNCHING = False
         print(peak.line(budget, source), file=sys.stderr, flush=True)
-        if process is not None and process.poll() is None:
-            terminate_group(process)
-        ended = end_scope(scope)
-        remaining = sorted(scope_pids(process_table(), scope))
-        if ended:
-            print(f"verification-scope-ended pids={','.join(map(str, ended))}", file=sys.stderr)
-        if remaining:
-            print(f"verification-scope-cleanup-incomplete pids={','.join(map(str, remaining))}",
+        try:
+            if process is not None and process.poll() is None:
+                terminate_group(process)
+            ended = end_scope(scope, observed=observed)
+            snapshot = process_snapshot()
+            _remember_scope(snapshot, scope, observed)
+            live, unknown = _owned_process_state(observed)
+            incomplete = live | unknown.keys()
+            if ended:
+                print(f"verification-scope-ended pids={','.join(map(str, ended))}",
+                      file=sys.stderr)
+            if incomplete:
+                details = ",".join(f"{pid}:{'live' if pid in live else unknown[pid]}"
+                                    for pid in sorted(incomplete))
+                print(f"verification-scope-cleanup-incomplete pids={details}",
+                      file=sys.stderr)
+                if scratch_root is not None:
+                    print(f"verification-scratch-preserved path={scratch_root} "
+                          f"reason=owned-scope-incomplete identities={details}",
+                          file=sys.stderr)
+                status = SCOPE_CLEANUP_FAILED_EXIT
+            elif scratch_root is not None and scratch_identity is not None:
+                reason = remove_private_scratch(scratch_root, scratch_identity)
+                if reason is not None:
+                    print(f"verification-scratch-preserved path={scratch_root} reason={reason}",
+                          file=sys.stderr)
+                    status = SCOPE_CLEANUP_FAILED_EXIT
+        except Exception as exc:
+            print(f"verification-scope-cleanup-incomplete reason={type(exc).__name__}",
                   file=sys.stderr)
+            if scratch_root is not None:
+                print(f"verification-scratch-preserved path={scratch_root} "
+                      f"reason=scope-cleanup-unknown:{type(exc).__name__}", file=sys.stderr)
             status = SCOPE_CLEANUP_FAILED_EXIT
-        if lease_path is not None:
-            try:
-                lease_path.unlink()
-            except FileNotFoundError:
-                pass
+        finally:
+            if lease_path is not None:
+                try:
+                    lease_path.unlink()
+                except FileNotFoundError:
+                    pass
     return status
 
 
