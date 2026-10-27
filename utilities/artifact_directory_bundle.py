@@ -135,9 +135,12 @@ def validate_body(body: Any) -> None:
 
 
 def select_outermost(artifacts: Path, *, prune_directory: Callable[[Path], bool] | None = None) -> Tuple[str, ...]:
-    """Find outermost raw-results directories, optionally pruning candidate directories.
+    """Find outermost raw-results directories, optionally applying candidate policy.
 
-    The default keeps historical selection behavior for sealed descriptor coverage.
+    Candidate collection excludes links without following them. A tree containing
+    one stays in ordinary file collection, which records the excluded link.
+    Without a candidate policy, sealed descriptor coverage keeps its strict
+    historical selection behavior.
     """
     root = Path(artifacts)
     try:
@@ -151,8 +154,8 @@ def select_outermost(artifacts: Path, *, prune_directory: Callable[[Path], bool]
     selected: List[str] = []
     stack = [(root, "artifacts")]
 
-    def has_pruned_descendant(start: Path) -> bool:
-        """A bundle candidate cannot cover a subtree that candidate collection prunes."""
+    def has_excluded_descendant(start: Path) -> bool:
+        """A bundle cannot cover links or subtrees that candidate collection excludes."""
         pending = [start]
         found = False
         while pending:
@@ -167,7 +170,10 @@ def select_outermost(artifacts: Path, *, prune_directory: Callable[[Path], bool]
                     info = child.stat(follow_symlinks=False)
                 except OSError as exc:
                     raise DirectoryBundleError("tree-read-failed", child.path, str(exc)) from exc
-                if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                if stat.S_ISLNK(info.st_mode):
+                    found = True
+                    continue
+                if not stat.S_ISDIR(info.st_mode):
                     continue
                 child_path = Path(child.path)
                 if prune_directory is not None and prune_directory(child_path):
@@ -189,15 +195,17 @@ def select_outermost(artifacts: Path, *, prune_directory: Callable[[Path], bool]
                 info = entry.stat(follow_symlinks=False)
             except OSError as exc:
                 raise DirectoryBundleError("tree-read-failed", child_rel, str(exc)) from exc
+            if prune_directory is not None and stat.S_ISLNK(info.st_mode):
+                continue
             if stat.S_ISDIR(info.st_mode) and prune_directory is not None:
                 if prune_directory(Path(entry.path)):
                     continue
             if entry.name == "raw-results":
                 if stat.S_ISDIR(info.st_mode):
-                    if prune_directory is None or not has_pruned_descendant(Path(entry.path)):
+                    if prune_directory is None or not has_excluded_descendant(Path(entry.path)):
                         selected.append(child_rel)
                         continue
-                    # Keep searching for nested candidates outside marked directories;
+                    # Keep searching for nested candidates outside excluded entries;
                     # the outer tree will be collected as ordinary files instead.
                     stack.append((Path(entry.path), child_rel))
                     continue

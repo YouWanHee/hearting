@@ -2188,5 +2188,414 @@ class DeliveryLedgerProjectionTest(unittest.TestCase):
         self.assertFalse(self.ledger_path.exists())
 
 
+class FleetResponseIngressTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.upstream = self.root / "upstream.sock"
+        self.front = self.root / "front.sock"
+        self.control = self.root / "control.sock"
+        self.interaction_env = mock.patch.dict(
+            os.environ,
+            {"FLEET_INTERACTION_STATE_DIR": str(self.root / "interactions")},
+            clear=False,
+        )
+        self.interaction_env.start()
+        self.server = FakeAppServer(self.upstream)
+        self.gateway = GATEWAY.ManagedGateway(
+            listen_path=self.front,
+            upstream_path=self.upstream,
+            control_path=self.control,
+            ledger_path=self.root / "ledger.json",
+        )
+        self.gateway_thread = threading.Thread(
+            target=self.gateway.serve_forever, daemon=True
+        )
+        self.gateway_thread.start()
+        wait_path(self.front)
+        wait_path(self.control)
+        self.client = self._connect_client()
+
+    def _connect_client(self) -> RpcClient:
+        client = RpcClient(self.front)
+        client.request(
+            "initialize",
+            {
+                "clientInfo": {"name": "fleet-response-test", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        client.notify("initialized", {})
+        client.request("thread/start", {})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            status = control(
+                self.control, {"schema_version": 1, "op": "status"}
+            )
+            if status.get("thread_id") == "thread-1":
+                return client
+            time.sleep(0.01)
+        client.close()
+        raise AssertionError("gateway did not learn thread")
+
+    def tearDown(self) -> None:
+        self.client.close()
+        self.gateway.close()
+        self.server.close()
+        self.gateway_thread.join(timeout=2)
+        self.interaction_env.stop()
+
+    def _server_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        current = self.server.current
+        if current is None:
+            raise AssertionError("fake App Server has no owning connection")
+        current.write_json(request)
+        return self.client.wait_for(
+            lambda item: item.get("id") == request.get("id")
+            and item.get("method") == request.get("method")
+        )
+
+    def _wait_native_response(self, request_id: Any, count: int = 1) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with self.server.lock:
+                matches = [
+                    item for item in self.server.messages
+                    if item.get("id") == request_id
+                    and "method" not in item
+                    and ("result" in item or "error" in item)
+                ]
+            if len(matches) >= count:
+                return matches
+            time.sleep(0.01)
+        raise AssertionError(f"native response {request_id!r} did not arrive")
+
+    def _ref(self, request_id: Any) -> dict[str, Any]:
+        result = control(self.control, {
+            "schema_version": 1, "op": "interaction-list", "session_id": "thread-1"
+        })
+        refs = result["requests"]
+        for ref in refs:
+            if ref.get("request_id") == request_id:
+                return ref
+        raise AssertionError(f"request {request_id!r} not listed: {result}")
+
+    def _reply(
+        self, ref: dict[str, Any], response: dict[str, Any], action_id: str
+    ) -> dict[str, Any]:
+        return control(self.control, {
+            "schema_version": 1,
+            "op": "interaction-reply",
+            "ref": ref,
+            "response": response,
+            "action_id": action_id,
+        })
+
+    def test_question_detail_answer_defer_duplicate_and_tui_race(self) -> None:
+        request = {
+            "jsonrpc": "2.0",
+            "id": 501,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-question",
+                "itemId": "item-question",
+                "questions": [{
+                    "id": "q1",
+                    "header": "Language",
+                    "question": "Which language should I use?",
+                    "isOther": False,
+                    "isSecret": False,
+                    "options": [
+                        {"label": "Rust", "description": "Systems code"},
+                        {"label": "Python", "description": "Scripts"},
+                    ],
+                }],
+                "isBlocking": False,
+                "autoResolutionMs": 1200,
+            },
+        }
+        forwarded = self._server_request(request)
+        self.assertTrue(forwarded["params"]["isBlocking"])
+        self.assertIsNone(forwarded["params"]["autoResolutionMs"])
+        ref = self._ref(501)
+        listing = control(self.control, {
+            "schema_version": 1, "op": "interaction-list", "session_id": "thread-1"
+        })
+        self.assertNotIn("Which language", json.dumps(listing))
+        self.assertNotIn("Rust", json.dumps(listing))
+        status = control(self.control, {"schema_version": 1, "op": "status"})
+        self.assertNotIn("Which language", json.dumps(status))
+        self.assertNotIn("Rust", json.dumps(status))
+        detail = control(self.control, {
+            "schema_version": 1, "op": "interaction-detail", "ref": ref
+        })
+        self.assertEqual(detail["request"]["detail"]["questions"][0]["question"],
+                         "Which language should I use?")
+        self.assertFalse(detail["request"]["detail"]["isBlocking"])
+        self.assertEqual(detail["request"]["detail"]["autoResolutionMs"], 1200)
+
+        wrong_ref = dict(ref, item_id="item-replaced")
+        rejected = self._reply(wrong_ref, {"answers": {"q1": ["Rust"]}}, "answer-1")
+        self.assertEqual(rejected["status"], "rejected")
+        # Detail open and invalid answers never resolve the question.
+        self.assertEqual(self._ref(501), ref)
+        self.assertEqual(
+            self._reply(ref, {"answers": {"q1": []}}, "empty-answer")["status"],
+            "rejected",
+        )
+        self.assertEqual(
+            self._reply(ref, {"answers": {"q1": ["Other"]}}, "bad-choice")["status"],
+            "rejected",
+        )
+        submitted = self._reply(ref, {"answers": {"q1": ["Rust"]}}, "answer-1")
+        self.assertEqual(submitted["status"], "submitted")
+        self.assertEqual(self._wait_native_response(501)[0]["result"], {
+            "answers": {"q1": {"answers": ["Rust"]}}
+        })
+        self.assertEqual(self._reply(ref, {"answers": {"q1": ["Rust"]}}, "answer-1"),
+                         submitted)
+        self.client.respond(501, {"answers": {"q1": {"answers": ["Python"]}}})
+        time.sleep(0.05)
+        self.assertEqual(len(self._wait_native_response(501)), 1)
+        current = self.server.current
+        assert current is not None
+        current.write_json({
+            "jsonrpc": "2.0",
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-1", "requestId": 501},
+        })
+        self.client.wait_for(lambda item: item.get("method") == "serverRequest/resolved")
+        received = control(self.control, {
+            "schema_version": 1, "op": "interaction-detail", "ref": ref
+        })
+        self.assertEqual(received["request"]["state"], "received")
+        self.assertEqual(self._reply(ref, {"answers": {"q1": ["Rust"]}}, "answer-1")["status"],
+                         "received")
+
+    def test_native_tui_response_is_submitted_until_exact_resolution(self) -> None:
+        request = {
+            "jsonrpc": "2.0", "id": 506,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-native", "itemId": "item-native",
+                "questions": [{
+                    "id": "native-q", "header": "Confirm", "question": "Continue?",
+                    "isOther": False, "isSecret": False,
+                    "options": [{"label": "Yes", "description": "Continue"}],
+                }],
+                "isBlocking": True, "autoResolutionMs": None,
+            },
+        }
+        self._server_request(request)
+        ref = self._ref(506)
+        self.client.respond(506, {"answers": {"native-q": {"answers": ["Yes"]}}})
+        self._wait_native_response(506)
+        submitted = control(self.control, {
+            "schema_version": 1, "op": "interaction-detail", "ref": ref
+        })
+        self.assertEqual(submitted["request"]["state"], "submitted")
+
+        current = self.server.current
+        assert current is not None
+        current.write_json({
+            "jsonrpc": "2.0", "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-1", "requestId": 506},
+        })
+        self.client.wait_for(lambda item: item.get("method") == "serverRequest/resolved")
+        received = control(self.control, {
+            "schema_version": 1, "op": "interaction-detail", "ref": ref
+        })
+        self.assertEqual(received["request"]["state"], "received")
+
+    def test_command_file_and_turn_scoped_permission_approvals(self) -> None:
+        command = {
+            "jsonrpc": "2.0", "id": 511,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "kind": "command", "threadId": "thread-1", "turnId": "turn-approval",
+                "itemId": "item-command", "startedAtMs": 1, "environmentId": None,
+                "command": "python3 report.py", "cwd": "/repo", "reason": "Run report",
+                "availableDecisions": ["accept", "decline", "cancel"],
+            },
+        }
+        self._server_request(command)
+        command_ref = self._ref(511)
+        details = control(self.control, {
+            "schema_version": 1, "op": "interaction-detail", "ref": command_ref
+        })
+        self.assertEqual(details["request"]["detail"]["command"], "python3 report.py")
+        deferred = self._reply(command_ref, {"decision": "defer"}, "command-defer")
+        self.assertEqual(deferred["status"], "deferred")
+        self.assertEqual(self._ref(511), command_ref)
+        self.assertEqual(self._reply(command_ref, {"decision": "approve"}, "command-approve")["status"],
+                         "submitted")
+        self.assertEqual(self._wait_native_response(511)[0]["result"], {"decision": "accept"})
+        current = self.server.current
+        assert current is not None
+        current.write_json({
+            "jsonrpc": "2.0", "method": "serverRequest/resolved",
+            "params": {"threadId": "thread-1", "requestId": 511},
+        })
+        self.client.wait_for(lambda item: item.get("method") == "serverRequest/resolved")
+        current.write_json({
+            "jsonrpc": "2.0", "method": "item/completed",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-approval",
+                "item": {"id": "item-command", "type": "commandExecution", "status": "completed"},
+            },
+        })
+        self.client.wait_for(lambda item: item.get("method") == "item/completed")
+        self.assertEqual(control(self.control, {
+            "schema_version": 1, "op": "interaction-detail", "ref": command_ref
+        })["request"]["state"], "applied")
+        self.assertEqual(self._reply(command_ref, {"decision": "approve"}, "command-approve")["status"],
+                         "applied")
+
+        file_change = {
+            "jsonrpc": "2.0", "id": 512,
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-approval", "itemId": "item-file",
+                "startedAtMs": 2, "reason": "Write generated file", "grantRoot": None,
+            },
+        }
+        self._server_request(file_change)
+        file_ref = self._ref(512)
+        self.assertEqual(self._reply(file_ref, {"decision": "reject"}, "file-reject")["status"],
+                         "submitted")
+        self.assertEqual(self._wait_native_response(512)[0]["result"], {"decision": "decline"})
+
+        permission = {
+            "jsonrpc": "2.0", "id": 513,
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-approval", "itemId": "item-permission",
+                "environmentId": None, "startedAtMs": 3, "cwd": "/repo", "reason": "Network",
+                "permissions": {"network": {"enabled": True}, "fileSystem": None},
+            },
+        }
+        self._server_request(permission)
+        permission_ref = self._ref(513)
+        forged = self._reply(permission_ref, {
+            "decision": "approve", "scope": "session",
+            "permissions": {"network": {"enabled": True}, "fileSystem": {"write": ["/"]}},
+        }, "permission-approve")
+        self.assertEqual(forged["status"], "rejected")
+        with self.server.lock:
+            before = sum(item.get("id") == 513 and "method" not in item for item in self.server.messages)
+        self.assertEqual(before, 0)
+        self.assertEqual(self._reply(permission_ref, {"decision": "approve"}, "permission-approve")["status"],
+                         "submitted")
+        self.assertEqual(self._wait_native_response(513)[0]["result"], {
+            "permissions": {"network": {"enabled": True}}, "scope": "turn"
+        })
+
+    def test_mcp_elicitation_native_accept_decline_and_cancel(self) -> None:
+        url_request = {
+            "jsonrpc": "2.0", "id": 521,
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-mcp", "serverName": "sample",
+                "mode": "url", "_meta": None, "message": "Open the sign-in page?",
+                "url": "https://example.invalid/login", "elicitationId": "elicit-1",
+            },
+        }
+        self._server_request(url_request)
+        url_ref = self._ref(521)
+        url_detail = control(self.control, {
+            "schema_version": 1, "op": "interaction-detail", "ref": url_ref
+        })
+        self.assertNotIn("_meta", url_detail["request"]["detail"])
+        self.assertEqual(self._reply(url_ref, {"decision": "approve"}, "mcp-accept")["status"],
+                         "submitted")
+        self.assertEqual(self._wait_native_response(521)[0]["result"], {
+            "action": "accept", "content": None, "_meta": None
+        })
+
+        form_request = {
+            "jsonrpc": "2.0", "id": 522,
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-mcp", "serverName": "sample",
+                "mode": "form", "_meta": None, "message": "Enter the requested value",
+                "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}},
+            },
+        }
+        self._server_request(form_request)
+        form_ref = self._ref(522)
+        unsupported = self._reply(form_ref, {"decision": "approve"}, "mcp-form-approve")
+        self.assertEqual(unsupported["status"], "rejected")
+        self.assertIn("elicitation-accept-requires-explicit-content", unsupported["reason"])
+        self.assertEqual(self._reply(form_ref, {"decision": "reject"}, "mcp-form-decline")["status"],
+                         "submitted")
+        self.assertEqual(self._wait_native_response(522)[0]["result"], {
+            "action": "decline", "content": None, "_meta": None
+        })
+
+        cancel_request = {
+            "jsonrpc": "2.0", "id": 523,
+            "method": "mcpServer/elicitation/request",
+            "params": {
+                "threadId": "thread-1", "turnId": None, "serverName": "sample",
+                "mode": "openai/userVerification", "_meta": None,
+                "title": "Verify", "description": "Confirm the requested action", "challenge": "confirm",
+            },
+        }
+        self._server_request(cancel_request)
+        cancel_ref = self._ref(523)
+        self.assertEqual(self._reply(cancel_ref, {"decision": "cancel"}, "mcp-cancel")["status"],
+                         "submitted")
+        self.assertEqual(self._wait_native_response(523)[0]["result"], {
+            "action": "cancel", "content": None, "_meta": None
+        })
+
+    def test_cancellation_identity_and_reconnect_expire_old_refs(self) -> None:
+        request = {
+            "jsonrpc": "2.0", "id": 531,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-cancel", "itemId": "item-cancel",
+                "questions": [{
+                    "id": "q", "header": "Confirm", "question": "Continue?",
+                    "isOther": False, "isSecret": False, "options": None,
+                }],
+                "isBlocking": True, "autoResolutionMs": None,
+            },
+        }
+        self._server_request(request)
+        ref = self._ref(531)
+        current = self.server.current
+        assert current is not None
+        current.write_json({
+            "jsonrpc": "2.0", "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turnId": "turn-cancel"},
+        })
+        self.client.wait_for(lambda item: item.get("method") == "turn/completed")
+        self.assertEqual(control(self.control, {
+            "schema_version": 1, "op": "interaction-list", "session_id": "thread-1"
+        })["requests"], [])
+        self.assertEqual(self._reply(ref, {"answers": {"q": ["yes"]}}, "late-answer")["status"],
+                         "rejected")
+
+        replacement = dict(request, id=532)
+        replacement["params"] = dict(request["params"], turnId="turn-reconnect", itemId="item-reconnect")
+        self._server_request(replacement)
+        old_ref = self._ref(532)
+        old_epoch = old_ref["epoch"]
+        self.client.close()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if control(self.control, {"schema_version": 1, "op": "status"})["status"] == "disconnected":
+                break
+            time.sleep(0.01)
+        self.client = self._connect_client()
+        self.assertGreater(control(self.control, {"schema_version": 1, "op": "status"})["epoch"], old_epoch)
+        expired = self._reply(old_ref, {"answers": {"q": ["yes"]}}, "old-epoch-answer")
+        self.assertEqual(expired["status"], "rejected")
+        self.assertIn("interaction-request-expired", expired["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

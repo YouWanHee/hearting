@@ -371,7 +371,10 @@ class BundleTest(unittest.TestCase):
                 os.environ.pop("FLEET_DEMO", None)
                 render._collect_memory()
                 fleet._collect_memory()
-        self.assertEqual(collect.call_args_list, [mock.call(include_summary=False)] * 2)
+        self.assertEqual(collect.call_args_list, [
+            mock.call(include_summary=False, include_backlog=False),
+            mock.call(include_summary=False),
+        ])
 
     def test_gpu_mouse_map_uses_actual_draw_scroll_offset_in_both_views(self):
         from fleet.tests.test_f27_mouse import FakeScreen

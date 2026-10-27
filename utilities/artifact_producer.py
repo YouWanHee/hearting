@@ -3194,6 +3194,11 @@ def _scan_directory_bundles(directory: Path, *, selected_out: Optional[List[str]
                             marker_observations: Optional[Dict[str, Any]] = None,
                             excluded_roots: Optional[List[str]] = None,
                             excluded: Optional[List[str]] = None) -> List[artifact_directory_bundle.Tree]:
+    """Select candidate bundles; ordinary collection records excluded symlinks.
+
+    Published descriptor verification uses the bundle reader's strict default
+    selection instead of this candidate policy.
+    """
     try:
         def prune(path: Path) -> bool:
             return _observe_marker_directory(

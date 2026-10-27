@@ -118,17 +118,27 @@ class HeaderRule(unittest.TestCase):
 
 class CutRule(unittest.TestCase):
     def test_route_header_uses_the_cell_before_age_without_overlapping_it(self):
-        frame = _frame(_vm(), "ROUTES", cols=100)
-        header = next(index for index, row in enumerate(frame.text_rows()) if "HARNESS" in row)
-        self.assertEqual(frame.cells[header][94][0], "P")
-        self.assertEqual(frame.cells[header][95][0], "R")
-        self.assertEqual(frame.cells[header][96][0], "A")
+        for cols in (80, 100, 140, 168):
+            with self.subTest(cols=cols):
+                rows = _frame(_vm(), "ROUTES", cols=cols).text_rows()
+                header = next(row[34:] for row in rows if "HARNESS" in row and "PROGRESS" in row)
+                labels = ("ROUTE", "KIND", "HARNESS", "PROGRESS", "AGE")
+                positions = [header.index(label) for label in labels]
+                self.assertEqual(positions, sorted(positions))
+                for position, label in zip(positions, labels):
+                    self.assertEqual(header[position:position + len(label)], label)
+                self.assertLess(positions[3] + len("PROGRESS"), positions[4])
 
     def test_route_kind_uses_the_cell_before_age_instead_of_dropping_its_last_glyph(self):
         route = _route(capability="lab", mode="eval", intensity="standard", age="22h 32m")
         rows = _frame(_vm(routes=[route], repos=[]), "ROUTES", cols=80).text_rows()
         line = next(row for row in rows if "lab(eval" in row)
-        self.assertIn("lab(eval·s22h 32m", line)
+        kind = line.index("lab(eval")
+        age = line.index("22h 32m")
+        self.assertEqual(line[kind:kind + 8], "lab(eval")
+        self.assertLess(kind + 8, age)
+        self.assertEqual(line[age:age + 7], "22h 32m")
+        self.assertIn(str(route.get("harness")), line)
 
     def test_system_field_lines_are_cut_at_the_pane_edge_without_an_ellipsis(self):
         system = dict(_mapping()["system"], install={"version": "v1.2.3", "managed": True, "pinned": True,

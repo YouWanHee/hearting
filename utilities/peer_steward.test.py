@@ -4604,6 +4604,55 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual((resolved[0]["harness"], resolved[0]["session_id"],
                           resolved[0]["pane"]), ("claude", "sid-child", "w1:pX"))
 
+    def test_unrelated_unknown_identity_does_not_block_exact_name_or_tag(self):
+        rows = [self._inventory_row(), self._inventory_row(
+            harness="claude", sid="sid-unrelated", name="other", pane="w1:pU")]
+        self._set_inventory(rows)
+        self._native_sid_by_pid.pop(40001, None)
+        self._native_sid_by_harness["claude"] = ""
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_retire_target", side_effect=self._target_for), \
+             mock.patch.object(peer_steward, "_retire_pane_info", side_effect=self._pane_info_for), \
+             mock.patch.object(peer_steward, "_prompt_process_session",
+                               wraps=peer_steward._prompt_process_session) as process_session, \
+             mock.patch.object(peer_steward, "_prompt_fleet_tag",
+                               side_effect=lambda _harness, sid, **_kw:
+                               ({"sid-child": "3e", "sid-unrelated": "7a"}.get(sid), None)):
+            named = peer_steward._resolve_prompt_target("child")
+            tagged = peer_steward._resolve_prompt_target("[3e]")
+        self.assertIsNone(named[1])
+        self.assertIsNone(tagged[1])
+        self.assertEqual((named[0]["pane"], tagged[0]["pane"]), ("w1:pX", "w1:pX"))
+        self.assertEqual(process_session.call_count, 4,
+                         "only the matching pane needs native identity proof per address")
+
+        self._native_sid_by_pid.pop(40000, None)
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_retire_target", side_effect=self._target_for), \
+             mock.patch.object(peer_steward, "_retire_pane_info", side_effect=self._pane_info_for):
+            uncertain = peer_steward._resolve_prompt_target("child")
+        self.assertIsNone(uncertain[0])
+        self.assertEqual(uncertain[1:], ("target-identity-unverified", ["w1:pX"]))
+
+    def test_native_identity_can_discover_a_registry_name_when_census_has_no_name(self):
+        row = self._inventory_row(sid=None, name=None)
+        self._set_inventory([row])
+        self._census_panes[0].pop("agent_session", None)
+        self._native_sid_by_pid[40000] = "sid-native-only"
+        target = ("idle", {"harness": "claude", "session_id": "-",
+                            "name": None, "pane": "w1:pX"}, 0, None)
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=([row], None)), \
+             mock.patch.object(peer_steward, "_retire_target", return_value=target), \
+             mock.patch.object(peer_steward, "_retire_pane_info", side_effect=self._pane_info_for), \
+             mock.patch.object(peer_steward, "_from_name", return_value="registry-only"):
+            resolved = peer_steward._resolve_prompt_target("registry-only")
+        self.assertIsNone(resolved[1])
+        self.assertEqual((resolved[0]["session_id"], resolved[0]["pane"]),
+                         ("sid-native-only", "w1:pX"))
+
     def test_same_pane_duplicate_observation_merges_optional_name_and_identity(self):
         rows = [self._inventory_row(sid=None, name=None), self._inventory_row()]
         collapsed = peer_steward._prompt_collapse_rows([

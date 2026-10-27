@@ -6,7 +6,7 @@ from unittest import mock
 
 from tools.fleet import details, projection, route_chain
 from tools.fleet.collectors import _usage_cache_observation
-from tools.fleet.model import DispatchJob, WorkProjection
+from tools.fleet.model import DispatchJob, Session, WorkProjection
 from tools.fleet.projection import required_projection_details_complete
 from tools.fleet.refresh import (
     LiveSnapshot,
@@ -26,6 +26,134 @@ def _basic(identity):
 
 
 class Fleet2DetailReadinessTests(unittest.TestCase):
+    @staticmethod
+    def _session(*, route_id=None):
+        row = Session(harness="claude", pid=17, proc_start=100, session_id="sid-a",
+                      cwd="/repo", liveness="idle", route_id=route_id)
+        row.peer_last_recv = {"from_session_id": "sid-peer", "age_min": 2}
+        row.peer_last_sent = {"to_session_id": "sid-peer", "age_min": 3}
+        row.peer_sent_1h = 2
+        row.peer_recv_1h = 1
+        row.peer_obligations = [{"kind": "watch"}]
+        return row
+
+    def test_optional_last_good_survives_required_only_pass_for_exact_row(self):
+        previous = LiveSnapshot(
+            sessions=[self._session()], memory={
+                "by_repo": {"repo": [{"id": "record"}]},
+                "database": {"state": "success", "by_repo": {"repo": [{"id": "backlog"}]}}},
+            observations={"optional:memory": {"state": "success"},
+                          "optional:memory-db": {"state": "success"},
+                          "optional:peers": {"state": "success"}})
+        current = LiveSnapshot(sessions=[self._session()], memory=None)
+        retained = details.retain_optional_last_good(
+            details.DetailSnapshot({}, previous), details.DetailSnapshot({}, current))
+        row = retained.snapshot.sessions[0]
+        self.assertEqual(retained.snapshot.memory, previous.memory)
+        self.assertEqual(row.peer_last_recv["from_session_id"], "sid-peer")
+        self.assertEqual(row.peer_sent_1h, 2)
+        self.assertEqual(row.peer_obligations, [{"kind": "watch"}])
+        self.assertEqual(retained.snapshot.observations["optional:peers"]["state"], "success")
+        self.assertEqual(retained.snapshot.memory["database"]["by_repo"]["repo"][0]["id"],
+                         "backlog")
+
+    def test_failed_database_read_keeps_prior_backlog_with_failed_health(self):
+        previous = LiveSnapshot(
+            memory={"database": {"state": "success", "by_repo": {"repo": [{"id": "task-1"}]}}},
+            observations={"optional:memory-db": {"state": "success"}})
+        current = LiveSnapshot(
+            memory={"database": {"state": "failed", "by_repo": {}}},
+            observations={"optional:memory-db": {"state": "failed"}})
+        retained = details.retain_optional_last_good(
+            details.DetailSnapshot({}, previous), details.DetailSnapshot({}, current))
+        database = retained.snapshot.memory["database"]
+        self.assertEqual(database["state"], "failed")
+        self.assertTrue(database["last_good"])
+        self.assertEqual(database["last_good_by_repo"]["repo"][0]["id"], "task-1")
+
+    def test_unknown_peer_observation_keeps_exact_last_good_and_marks_stale(self):
+        prior_session = self._session()
+        previous = LiveSnapshot(sessions=[prior_session],
+                                observations={"optional:peers": {"state": "success",
+                                                                  "observed_at": 10}})
+        current_session = self._session()
+        current_session.peer_last_recv = None
+        current_session.peer_last_sent = None
+        current_session.peer_sent_1h = 0
+        current_session.peer_recv_1h = 0
+        current_session.peer_obligations = []
+        current = LiveSnapshot(sessions=[current_session],
+                               observations={"optional:peers": {"state": "unknown",
+                                                                 "observed_at": 11}})
+        retained = details.retain_optional_last_good(
+            details.DetailSnapshot({}, previous), details.DetailSnapshot({}, current))
+        self.assertEqual(retained.snapshot.sessions[0].peer_last_recv["from_session_id"], "sid-peer")
+        self.assertEqual(retained.snapshot.observations["optional:peers"]["state"], "unknown")
+        self.assertTrue(retained.snapshot.observations["optional:peers"]["last_good"])
+
+    def test_peer_health_success_empty_clears_and_failed_partial_preserves(self):
+        from types import SimpleNamespace
+
+        empty = {"records": [], "by_session": {}}
+        row = self._session()
+        success = details._apply_peer_observation(
+            lambda *, include_health: (empty, SimpleNamespace(state="success")), [row])
+        self.assertEqual(success, "success")
+        self.assertIsNone(row.peer_last_recv)
+        self.assertIsNone(row.peer_last_sent)
+        self.assertEqual(row.peer_sent_1h, 0)
+        self.assertEqual(row.peer_obligations, [])
+
+        row = self._session()
+        prior = (copy.deepcopy(row.peer_last_recv), copy.deepcopy(row.peer_last_sent),
+                 row.peer_sent_1h, row.peer_recv_1h, copy.deepcopy(row.peer_obligations))
+        partial = {"records": [{"kind": "partial"}], "by_session": {}}
+        failed = details._apply_peer_observation(
+            lambda *, include_health: (partial, SimpleNamespace(state="failed")), [row])
+        self.assertEqual(failed, "failed")
+        self.assertEqual((row.peer_last_recv, row.peer_last_sent, row.peer_sent_1h,
+                          row.peer_recv_1h, row.peer_obligations), prior)
+
+    def test_legacy_empty_peer_mapping_is_unknown_and_absent_does_not_clear_last_good(self):
+        row = self._session()
+        prior = copy.deepcopy(row.peer_last_recv)
+        state = details._apply_peer_observation(
+            lambda: {"records": [], "by_session": {}}, [row])
+        self.assertEqual(state, "unknown")
+        self.assertEqual(row.peer_last_recv, prior)
+
+        current = self._session()
+        current.peer_last_recv = current.peer_last_sent = None
+        current.peer_sent_1h = current.peer_recv_1h = 0
+        current.peer_obligations = []
+        previous = LiveSnapshot(sessions=[self._session()],
+                                observations={"optional:peers": {"state": "success"}})
+        current_snapshot = LiveSnapshot(sessions=[current],
+                                        observations={"optional:peers": {"state": "absent"}})
+        retained = details.retain_optional_last_good(
+            details.DetailSnapshot({}, previous), details.DetailSnapshot({}, current_snapshot))
+        self.assertEqual(retained.snapshot.sessions[0].peer_last_recv["from_session_id"], "sid-peer")
+
+    def test_optional_last_good_does_not_cross_changed_binding_or_confirmed_empty(self):
+        previous = LiveSnapshot(
+            sessions=[self._session(route_id="route-old")], memory={"by_repo": {"repo": [1]}},
+            observations={"optional:memory": {"state": "success"},
+                          "optional:peers": {"state": "success"}})
+        changed_row = self._session(route_id="route-new")
+        changed_row.peer_last_recv = None
+        changed_row.peer_last_sent = None
+        changed_row.peer_sent_1h = 0
+        changed_row.peer_recv_1h = 0
+        changed_row.peer_obligations = []
+        changed = LiveSnapshot(sessions=[changed_row], memory=None)
+        changed.observations = {"optional:memory": {"state": "absent"},
+                                "optional:peers": {"state": "success"}}
+        retained = details.retain_optional_last_good(
+            details.DetailSnapshot({}, previous), details.DetailSnapshot({}, changed))
+        self.assertIsNone(retained.snapshot.memory)
+        self.assertIsNone(retained.snapshot.sessions[0].peer_last_recv)
+        self.assertEqual(retained.snapshot.sessions[0].peer_sent_1h, 0)
+
     def test_required_details_need_success_and_exact_basic_identity(self):
         pending = _basic("basic-1")
         self.assertFalse(pending.required_details_ready)

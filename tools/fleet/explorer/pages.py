@@ -94,7 +94,8 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
                           "blocked": ("●", "g_blocked"), "dead": ("✕", "g_dead"),
                           "done": ("✓", "done")}.get(session_state, ("·", "dim"))
     if ask:
-        marker, marker_key = "●", "g_blocked"
+        answer_marker = session.get("answer_wait_marker")
+        marker, marker_key = (answer_marker or "●", "lvl_y" if answer_marker == "◑" else "g_blocked")
     word = "answer needed" if ask else {"dead": "ended", "done": "ended"}.get(session_state, session_state)
     grid.put(x + 3, y, "state:", "label", limit=right)
     _segs(grid, x + 16, y, [(marker, marker_key), (" " + word, "blocked" if ask else "soft"),
@@ -122,6 +123,15 @@ def _session_page(grid, vm, tag, x, right, bottom, state=None):
     grid.put(x + 3, y, "now:", "label", limit=right)
     grid.put(x + 16, y, clip(str(now or "·"), right - x - 21), "now_sub" if now else "dim", limit=right)
     y += 1
+    system = vm.system if hasattr(vm.system, "get") else {}
+    task = system.get("task_summary") if hasattr(system, "get") else None
+    if isinstance(task, Mapping) and task.get("session_tag") == tag and task.get("state") not in (None, "unknown", "failed"):
+        for name, key in (("TODO", "lvl_y"), ("DOING", "g_spin_dim"), ("DONE", "done")):
+            values = tuple(task.get(name.casefold()) or ())
+            grid.put(x + 3, y, name.lower() + ":", key, limit=right)
+            grid.put(x + 16, y, clip(", ".join(values[:4]) or "·", right - x - 19),
+                     "soft" if values else "dim", limit=right)
+            y += 1
     grid.put(x + 3, y, "running:", "label", limit=right)
     _segs(grid, x + 16, y, tuple(session.get("running") or ()) or (("·", "dim"),), right)
     y += 1
@@ -194,7 +204,18 @@ def _route_page(grid, vm, ident, x, right, bottom, state):
     route = next((item for item in vm.routes if str(item.get("id")) == ident), None)
     if route is None:
         return
-    y = _draw_route_subset(grid, vm, (route,), x, 3, bottom, opened=ident, no_repo_group=True,
+    system = vm.system if hasattr(vm.system, "get") else {}
+    summary = (system.get("task_summary", {}).get("by_route", {}).get(ident)
+               if hasattr(system, "get") and hasattr(system.get("task_summary"), "get") else None)
+    y = 3
+    if isinstance(summary, Mapping):
+        for name, key in (("TODO", "lvl_y"), ("DOING", "g_spin_dim"), ("DONE", "done")):
+            values = tuple(summary.get(name.casefold()) or ())
+            grid.put(x + 3, y, name.lower() + ":", key, limit=right)
+            grid.put(x + 16, y, clip(", ".join(values[:4]) or "·", right - x - 19),
+                     "soft" if values else "dim", limit=right)
+            y += 1
+    y = _draw_route_subset(grid, vm, (route,), x, y, bottom, opened=ident, no_repo_group=True,
                            view_key="route:" + ident, state=state)
     draw_route_detail(grid, vm, route, x, grid.cols - x - 2, y + 1, state,
                       bottom=min(bottom, grid.rows - 6))
@@ -380,23 +401,44 @@ def _stage_grid(grid, x0, y, stages, room, bottom, loops=()):
     if loops and (room + gap) // (_LOOP_MIN_W + gap) >= len(stages):
         per = len(stages)
     per = min(per, len(stages))
-    nrows = (len(stages) - 1) // per + 1
+    graph_known = any(stage.get("graph_known") for stage in stages)
+    rows_for, columns_for = {}, {}
+    if graph_known:
+        by_level = {}
+        for index, stage in enumerate(stages):
+            level = stage.get("level")
+            level = int(level) if isinstance(level, int) and not isinstance(level, bool) else 0
+            by_level.setdefault(level, []).append(index)
+        row_base = 0
+        for level in sorted(by_level):
+            members = by_level[level]
+            row_count = (len(members) - 1) // per + 1
+            for local, index in enumerate(members):
+                row_in_level, slot = divmod(local, per)
+                rows_for[index] = row_base + row_in_level
+                columns_for[index] = slot if (row_base + row_in_level) % 2 == 0 else per - 1 - slot
+            row_base += row_count
+        nrows = row_base
+        last_row_size = sum(1 for row in rows_for.values() if row == nrows - 1)
+        spare = per - last_row_size
+    else:
+        nrows = (len(stages) - 1) // per + 1
+        spare = per - (len(stages) - (nrows - 1) * per)
     w = (room - gap * (per - 1)) // per
     pitch_gap = 1
     lanes = len(loops) + 1 if loops and nrows == 1 else 0
-    spare = per - (len(stages) - (nrows - 1) * per)
     listed = len(loops) + 2 if loops and nrows > 1 and not spare else 0
     avail = bottom - y - lanes - listed
     if avail - (nrows - 1) < 6 * nrows:
         pitch_gap = 0
     h = max(4, min(10, (avail - pitch_gap * (nrows - 1)) // nrows))
-    pos = []
+    pos = [None] * len(stages)
     hh = (h - 1) // 2
     for index, stage in enumerate(stages):
-        row, k = divmod(index, per)
-        col = k if row % 2 == 0 else per - 1 - k
-        pos.append((x0 + col * (w + gap), y + row * (h + pitch_gap), row))
-        bx, by = pos[-1][0], pos[-1][1]
+        row, k = ((rows_for[index], columns_for[index]) if graph_known else divmod(index, per))
+        col = k if graph_known or row % 2 == 0 else per - 1 - k
+        pos[index] = (x0 + col * (w + gap), y + row * (h + pitch_gap), row)
+        bx, by = pos[index][0], pos[index][1]
         if "group" in stage:
             group = stage["group"]
             _stage_box(grid, bx, by, w, hh, index, group[0])
@@ -410,18 +452,36 @@ def _stage_grid(grid, x0, y, stages, room, bottom, loops=()):
     def mids(stage, by):
         return [by + hh // 2, by + h - hh + hh // 2] if "group" in stage else [by + h // 2]
 
-    for index in range(len(stages) - 1):
-        (bx, by, row), (nx, ny, nrow) = pos[index], pos[index + 1]
-        style = _edge_style(stages[index + 1])
-        if nrow == row:
-            gx = (bx + w if nx > bx else nx + w) + gap // 2 - 1
-            for my in sorted(set(mids(stages[index], by)) | set(mids(stages[index + 1], by))):
-                grid.put(gx, my, _ARROWS[0] if nx > bx else _ARROWS[1], style)
-        else:
-            arrow_y, arrow_x = by + h, bx + w // 2
-            if 0 <= arrow_y < grid.rows and 0 <= arrow_x < grid.cols and \
-                    grid.cells[arrow_y][arrow_x][0] in (" ", "─"):
-                grid.put(arrow_x, arrow_y, _ARROWS[2], style)
+    if graph_known:
+        visual_for = {}
+        for index, stage in enumerate(stages):
+            members = stage.get("members") or (stage.get("n"),)
+            for member in members:
+                if member:
+                    visual_for[str(member)] = index
+        for target_index, target in enumerate(stages):
+            dependencies = set(str(item) for item in (target.get("depends_on") or ()))
+            for dependency in dependencies:
+                source_index = visual_for.get(dependency)
+                if source_index is None or source_index == target_index:
+                    continue
+                bx, by, row = pos[source_index]
+                nx, ny, nrow = pos[target_index]
+                target_states = ([item.get("st") for item in target.get("group", ())]
+                                 if "group" in target else [target.get("st")])
+                status = ("active" if "active" in target_states else
+                          "todo" if all(value == "todo" for value in target_states) else "done")
+                style = _edge_style({"st": status})
+                if nrow == row and abs(target_index - source_index) == 1:
+                    gx = (bx + w if nx > bx else nx + w) + gap // 2 - 1
+                    for my in sorted(set(mids(stages[source_index], by)) |
+                                     set(mids(target, ny))):
+                        grid.put(gx, my, _ARROWS[0] if nx > bx else _ARROWS[1], style)
+                elif nrow == row + 1:
+                    arrow_y, arrow_x = by + h, bx + w // 2
+                    if 0 <= arrow_y < grid.rows and 0 <= arrow_x < grid.cols and \
+                            grid.cells[arrow_y][arrow_x][0] in (" ", "─"):
+                        grid.put(arrow_x, arrow_y, _ARROWS[2], style)
     if lanes:
         _loop_lanes(grid, pos, w, y, h, stages, loops)
         return y + h + lanes

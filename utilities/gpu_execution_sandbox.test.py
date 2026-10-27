@@ -34,7 +34,7 @@ P = load("gpu_readiness", "utilities/dispatch-readiness.py")
 S = load("gpu_supervisor", "utilities/codex-app-server-supervisor.py")
 
 
-class GpuSandboxTest(unittest.TestCase):
+class SandboxFixture(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -94,6 +94,8 @@ class GpuSandboxTest(unittest.TestCase):
         self.request_file.write_text(json.dumps(data))
         return E.load_request(self.request_file, context=self.context)
 
+
+class GpuSandboxTest(SandboxFixture):
     def test_typed_scope_does_not_infer_task_prose_or_change_normal_children(self):
         self.assertEqual(G.select(self.route)["sandbox"], "danger-full-access")
         self.assertFalse(G.select(self.route, owner=False, node="scaffold")["gpu_scope"])
@@ -576,6 +578,137 @@ class GpuSandboxTest(unittest.TestCase):
             self.assertIn("OS enforcement가 없습니다", row["message"])
             self.assertEqual(row["file_enforcement"], "none")
             self.assertEqual(A.receipt_advisories(A.RECEIPT_KEY + json.dumps(row)), [row])
+
+
+class HostPayloadSandboxTest(SandboxFixture):
+    """A typed GPU-free host resource lifts only its own payload; owners and models stay put."""
+
+    def host_node(self, **changes):
+        node = {"id": "autopilot-lab-host-run", "part": "autopilot-lab:host-run", "kind": "resource-runner",
+                "resource_class": "long-running", "resource_transport": "detached-process",
+                "continuation": {"kind": "supervised"}}
+        node.update(changes)
+        return node
+
+    def host_route(self, **changes):
+        route = {"capability": "autopilot-code", "owner_dispatch_depth": 1, "cwd": str(self.worktree),
+                 "artifact_root": str(self.artifact), "selection": {},
+                 "nodes": [{"id": "execute", "kind": "pipeline-stage", "resource_class": "normal"},
+                           self.host_node(),
+                           {"id": "test", "kind": "review-worker", "resource_class": "normal"}]}
+        route.update(changes)
+        return route
+
+    def test_typed_host_part_selects_only_its_payload(self):
+        route = self.host_route()
+        self.assertEqual(G.fresh_host_payload_nodes(route), ["autopilot-lab-host-run"])
+        self.assertEqual(G.fresh_gpu_resource_nodes(route), [])
+        for kwargs in ({}, {"owner": False, "node": "execute"}, {"owner": False, "node": "autopilot-lab-host-run"}):
+            choice = G.select_fresh(route, **kwargs)
+            self.assertEqual((choice["sandbox"], choice["gpu_scope"], choice["gpu_resource_nodes"]),
+                             ("workspace-write", False, []), kwargs)
+            self.assertEqual(choice["host_process_payload_nodes"], ["autopilot-lab-host-run"])
+        payload = G.select_payload(route, node="autopilot-lab-host-run", environ={})
+        self.assertEqual((payload["sandbox"], payload["enforcement"], payload["source"]),
+                         ("danger-full-access", "none", "host-process-payload"))
+        self.assertIsNone(G.select_payload(route, node="execute", environ={}))
+        self.assertIsNone(G.select_payload(route, node=None, environ={}))
+
+    def test_only_a_registered_detached_supervised_resource_qualifies(self):
+        cases = {
+            "name only": self.host_node(part=None, id="host-run"),
+            "unregistered part": self.host_node(part="autopilot-code:host-run"),
+            "inline continuation": self.host_node(continuation={"kind": "inline-next"}),
+            "not detached": self.host_node(resource_transport="inline"),
+            "not a resource": self.host_node(kind="pipeline-stage"),
+            "frame": self.host_node(kind="frame-worker"),
+            "plan frame unit": self.host_node(unit="plan/frame"),
+            "self declared": self.host_node(part="autopilot-lab:diagnose", execution_needs=["host-process"]),
+        }
+        for label, node in cases.items():
+            node = {key: value for key, value in node.items() if value is not None}
+            route = self.host_route(nodes=[node])
+            self.assertEqual(G.fresh_host_payload_nodes(route), [], label)
+            self.assertIsNone(G.select_payload(route, node=node["id"], environ={}), label)
+
+    def test_gpu_signal_and_compute_parts_never_become_host_payload(self):
+        route = self.host_route(selection={"promotion_signals": [{"signal": "gpu"}]})
+        self.assertEqual(G.fresh_gpu_resource_nodes(route), [])
+        self.assertEqual(G.select_fresh(route)["sandbox"], "workspace-write")
+        # A mixed graph keeps the compute part's own GPU choice and a separate host set.
+        mixed = self.host_route(nodes=[
+            self.host_node(),
+            {"id": "autopilot-lab-smoke", "part": "autopilot-lab:smoke", "kind": "review-worker"},
+            {"id": "autopilot-lab-full-run", "part": "autopilot-lab:full-run", "kind": "resource-runner",
+             "resource_class": "long-running", "resource_transport": "detached-process",
+             "continuation": {"kind": "supervised"}}])
+        choice = G.select_fresh(mixed)
+        self.assertEqual((choice["sandbox"], choice["gpu_scope"]), ("danger-full-access", True))
+        self.assertEqual(choice["gpu_resource_nodes"], ["autopilot-lab-smoke", "autopilot-lab-full-run"])
+        self.assertEqual(choice["host_process_payload_nodes"], ["autopilot-lab-host-run"])
+        self.assertFalse(G.select_fresh(mixed, owner=False, node="autopilot-lab-host-run")["gpu_scope"])
+        mixed["codex_execution_sandbox"] = choice
+        self.assertEqual(G.gpu_resource_nodes(mixed), ["autopilot-lab-smoke", "autopilot-lab-full-run"])
+        self.assertEqual(G.host_payload_nodes(mixed), ["autopilot-lab-host-run"])
+
+    def test_a_seal_is_read_as_written_and_never_backfilled(self):
+        route = self.host_route()
+        sealed = G.select_fresh(route)
+        route["codex_execution_sandbox"] = sealed
+        self.assertEqual(G.host_payload_nodes(route), ["autopilot-lab-host-run"])
+        old = {key: value for key, value in sealed.items() if key != "host_process_payload_nodes"}
+        route["codex_execution_sandbox"] = old
+        self.assertEqual(G.host_payload_nodes(route), [])
+        self.assertIsNone(G.select_payload(route, node="autopilot-lab-host-run", environ={}))
+        route["codex_execution_sandbox"] = {**sealed, "host_process_payload_nodes": ["removed-prefix-node"]}
+        self.assertEqual(G.host_payload_nodes(route), [])
+        self.assertIsNone(G.select_payload(route, node="removed-prefix-node", environ={}))
+        # A historical GPU route keeps its owner choice and gains no host payload target.
+        historical = {**self.route, "codex_execution_sandbox": {
+            "sandbox": "danger-full-access", "source": "gpu-compute-resource", "gpu_scope": True,
+            "gpu_resource_nodes": ["full-run"]}}
+        self.assertEqual(G.host_payload_nodes(historical), [])
+        self.assertEqual(G.select(historical)["sandbox"], "danger-full-access")
+        self.assertEqual(G.select(historical)["host_process_payload_nodes"], [])
+        # A checked-Codex pre-seal route keeps its GPU judgment (none) and ordinary owner choice.
+        legacy = {**self.route, "dispatch_evidence": {"tuples": [{"parent_harness": "codex"}]}}
+        self.assertEqual(G.gpu_resource_nodes(legacy), [])
+        self.assertEqual(G.select(legacy)["sandbox"], "workspace-write")
+
+    def test_caller_and_forced_selection_keep_the_payload_inside_the_sandbox(self):
+        route = self.host_route()
+        node = "autopilot-lab-host-run"
+        choice = lambda **kw: G.select_payload(route, node=node, **kw)
+        self.assertEqual(choice(environ={"CODEX_DISPATCH_SANDBOX": "workspace-write"})["sandbox"], "workspace-write")
+        self.assertEqual(choice(environ={}, requested="read-only")["source"], "caller-cli")
+        forced = choice(environ={"CODEX_DISPATCH_SANDBOX_FORCE": "workspace-write"}, requested="danger-full-access")
+        self.assertEqual((forced["sandbox"], forced["source"], forced["enforcement"]),
+                         ("workspace-write", "forced-env", "os-sandbox"))
+        route["codex_execution_sandbox"] = G.select_fresh(
+            route, requested="workspace-write", environ={})
+        self.assertEqual(route["codex_execution_sandbox"]["source"], "caller-cli")
+        sealed = choice(environ={})
+        self.assertEqual((sealed["sandbox"], sealed["source"]), ("workspace-write", "caller-cli"))
+        with self.assertRaisesRegex(ValueError, "invalid-forced-dispatch-sandbox"):
+            choice(environ={"CODEX_DISPATCH_SANDBOX_FORCE": "nope"})
+
+    def test_strict_enforcement_request_refuses_host_payload_without_new_input(self):
+        route = self.host_route()
+        node = "autopilot-lab-host-run"
+        jobs = self.state / "jobs.log"
+        env = lambda: {**self.env, "AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(self.request_file)}
+        G.assert_host_payload_access(route, node, jobs=jobs, environ=self.env)  # no request: nothing asked
+        self.request()
+        G.assert_host_payload_access(route, node, jobs=jobs, environ=env())  # `any`: recorded, not refused
+        self.request(enforcement_required="os-sandbox")
+        with self.assertRaises(E.ExecutionAccessError) as raised:
+            G.assert_host_payload_access(route, node, jobs=jobs, environ=env())
+        self.assertEqual(raised.exception.reason,
+                         "execution-access-enforcement-unavailable:host-process-payload")
+        G.assert_host_payload_access(route, "execute", jobs=jobs, environ=env())  # a non-host node is untouched
+        # A caller-selected sandbox really enforces, so the strict request is then satisfiable.
+        G.assert_host_payload_access(route, node, jobs=jobs, environ={
+            **env(), "CODEX_DISPATCH_SANDBOX": "workspace-write"})
 
 
 if __name__ == "__main__":
