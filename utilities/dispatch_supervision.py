@@ -709,11 +709,11 @@ def _root(rows: dict, attempt: str) -> str:
 def _awaiting_answers(jobs: Path, aid: str) -> list[str]:
     """The kept answers of a BLOCKED owner whose continuation has not launched yet."""
     from dispatch_owner_input import blocked_owner_answers
-    from dispatch_replacement import _replacement_in_flight, _rows as replacement_rows
+    from dispatch_replacement import _replacement_in_flight, registry_rows
     answers = blocked_owner_answers(jobs, aid)
     if not answers:
         return []
-    rows = replacement_rows(Path(jobs).read_text(encoding="utf-8").splitlines())
+    rows = registry_rows(jobs)
     if aid in rows and _replacement_in_flight(jobs, rows, rows[aid][1]):
         return []
     return [item["id"] for item in answers]
@@ -722,10 +722,10 @@ def _awaiting_answers(jobs: Path, aid: str) -> list[str]:
 def _attempt_stall_superseded(jobs: Path, aid: str, metadata: dict) -> bool:
     """A claimed replacement or linked retry owns the route's live attempt now."""
     from dispatch_replacement import (
-        _plain_retry_successor, _replacement_in_flight, _rows as replacement_rows,
+        _plain_retry_successor, _replacement_in_flight, registry_rows,
     )
     try:
-        rows = replacement_rows(Path(jobs).read_text(encoding="utf-8").splitlines())
+        rows = registry_rows(jobs)
     except (OSError, UnicodeError, ValueError):
         return True
     if aid not in rows:
