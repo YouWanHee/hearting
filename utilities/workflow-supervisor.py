@@ -1145,8 +1145,11 @@ def _resource_owner_matches(left, right):
 
 def _owner_input_matches_locked(armed, resource_row, owner_attempt_id, owner_session_id,
                                 value, input_module):
+    import dispatch_contract as DC
     parent, target = input_module._target(armed["jobs"], owner_attempt_id)
     owner = resource_row.get("owner_wait") or {}
+    pinned_owner_identity = (str(owner.get("owner_pid", "")),
+                             str(owner.get("owner_start", "")))
     return not (
         value is None or value.get("target") != target
         or value.get("thread_id") != owner_session_id
@@ -1157,8 +1160,7 @@ def _owner_input_matches_locked(armed, resource_row, owner_attempt_id, owner_ses
         or parent.status not in {"open", "running"}
         or parent.metadata.get("attempt_id") != owner_attempt_id
         or owner.get("parent_attempt_id") != owner_attempt_id
-        or str(owner.get("owner_pid")) != parent.metadata.get("pid")
-        or owner.get("owner_start") != parent.metadata.get("pid_start")
+        or pinned_owner_identity not in DC.attempt_identity_lineage(parent.metadata)
         or not input_module.supervisor_lease_is_held(armed["jobs"], parent.metadata)
         or any(item.get("state") == "queued" for item in value.get("requests", []))
     )

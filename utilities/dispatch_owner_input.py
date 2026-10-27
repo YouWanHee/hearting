@@ -8,10 +8,12 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 import time
 import uuid
@@ -22,6 +24,7 @@ import route_authority
 
 
 PLACEHOLDER_THREAD = "pending-native-session"
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class InputError(ValueError):
@@ -103,6 +106,19 @@ def _reachable(row, value, live):
     return live or (row.status in {"open", "running"} and _preconsumer(value))
 
 
+def _bound(value, target):
+    return (isinstance(value, dict) and value.get("target") == target
+            and isinstance(value.get("generation"), str) and bool(value.get("generation"))
+            and isinstance(value.get("thread_id"), str)
+            and value.get("thread_id") not in {"", PLACEHOLDER_THREAD})
+
+
+def _recovery_result(state, reason="", **evidence):
+    result = {"consumer_recovery": state if state != "not-started" else "not-started:" + reason}
+    result.update({key: value for key, value in evidence.items() if value not in (None, "")})
+    return result
+
+
 def _answers_blocked_owner(row, live, jobs=None):
     choice = route_authority.decide_continuation(action="owner-input", jobs=jobs,
         status=row.status, metadata=row.metadata, facts={"reachable": live})
@@ -122,6 +138,20 @@ def _owner_phase(attempt):
         return "unknown"
 
 
+def bound_input_thread(jobs, attempt):
+    """Return the native thread only for the exact open attempt's bound channel."""
+    try:
+        row, target = _target(jobs, attempt)
+        with _locked(jobs, attempt) as (_, value):
+            row, target = _target(jobs, attempt)
+            if (row.status in {"open", "running"} and value is not None
+                    and _bound(value, target)):
+                return value["thread_id"]
+    except (InputError, JoinContractError, OSError, ValueError, KeyError, TypeError):
+        return None
+    return None
+
+
 def _public(value, *, live=False, reachable=None, owner_phase=None):
     reachable = live if reachable is None else reachable
     phase = owner_phase or _owner_phase(value["attempt_id"])
@@ -134,7 +164,9 @@ def _public(value, *, live=False, reachable=None, owner_phase=None):
                 timing, "Queued corrections are delayed until the next owner turn.")
     notice = (lead + " A parked owner gets its next turn once the children running now finish or "
               "require attention; a serial sub-session chain starts no further sub-session while a "
-              "correction waits. This command does not wake or cancel the owner.")
+              "correction waits. A bound correction is never replayed after a sending or "
+              "delivery-unknown receipt; consumer recovery requires the effective parent and "
+              "positive quiescence evidence.")
     if timing == "phase-unavailable":
         notice = ("Delivery timing is unknown because the exact owner phase is unavailable. " + notice)
     return {"attempt_id": value["attempt_id"], "thread_id": value["thread_id"],
@@ -163,7 +195,11 @@ def inspect(jobs, attempt):
                 "undelivered" if not reachable and item["state"] == "queued" else item["state"])
         if not reachable:
             # Observation does not rewrite uncertain transport history.
-            result["next_step"] = "Supervisor unavailable; retain the correction and inspect its exact receipt before recovery."
+            result["next_step"] = (
+                "If this open owner's input is bound to its native thread, the route's effective "
+                "parent can use normal start to restore the same attempt; inspect the exact delivery "
+                "receipt and never replay a sending or delivery-unknown correction."
+            )
         return result
 
 
@@ -188,30 +224,190 @@ def submit(jobs, attempt, text, request_id=None):
         row, target = _target(jobs, attempt)
         if value["target"] != target:
             raise InputError("owner-input-target-changed")
+        duplicate_item = None
         for item in value["requests"]:
             if item["id"] == request_id:
                 if item["digest"] != digest:
                     raise InputError("correction-id-content-conflict")
-                live = supervisor_lease_is_held(jobs, row.metadata)
-                return {**_public(value, live=live, reachable=_reachable(row, value, live)),
-                        "request_id": request_id, "duplicate": True,
-                        **_retained_fields(item)}
+                duplicate_item = item
+                break
         live = supervisor_lease_is_held(jobs, row.metadata)
-        choice = route_authority.decide_continuation(action="owner-input", jobs=jobs,
-            status=row.status, metadata=row.metadata,
-            facts={"accepting": value["accepting"], "reachable": _reachable(row, value, live)})
-        if not choice.allowed:
-            error = InputError("owner-input-unavailable-retain-correction")
-            error.retry_when, error.next_action = choice.retry_when, choice.next_action
-            raise error
-        retain = choice.state == "retained"
-        item = {"id": request_id, "digest": digest, "text": text, "events": [],
-                "source_session": route_authority.correction_source_session()}
-        _transition(item, "retained" if retain else "queued")
-        value["requests"].append(item)
-        _write(path, value)
-        return {**_public(value, live=live, reachable=not retain), "request_id": request_id,
-                "duplicate": False, **_retained_fields(item)}
+        if duplicate_item is not None:
+            result = {**_public(value, live=live, reachable=_reachable(row, value, live)),
+                      "request_id": request_id, "duplicate": True,
+                      **_retained_fields(duplicate_item)}
+            queued = duplicate_item.get("state") == "queued"
+        else:
+            choice = route_authority.decide_continuation(action="owner-input", jobs=jobs,
+                status=row.status, metadata=row.metadata,
+                facts={"accepting": value["accepting"], "reachable": _reachable(row, value, live),
+                       "bound": _bound(value, target), "lease_held": live,
+                       "recoverable": False})
+            if not choice.allowed:
+                error = InputError("owner-input-unavailable-retain-correction")
+                error.retry_when, error.next_action = choice.retry_when, choice.next_action
+                raise error
+            retain = choice.state == "retained"
+            item = {"id": request_id, "digest": digest, "text": text, "events": [],
+                    "source_session": route_authority.correction_source_session()}
+            _transition(item, "retained" if retain else "queued")
+            value["requests"].append(item)
+            _write(path, value)
+            result = {**_public(value, live=live, reachable=_reachable(row, value, live)),
+                      "request_id": request_id, "duplicate": False, **_retained_fields(item)}
+            queued = not retain
+
+        bound = _bound(value, target)
+        pending_recovery = (queued and bound and row.status in {"open", "running"}
+                            and not live)
+        unresolved_pending = queued and not _reachable(row, value, live)
+        if live and queued and bound and row.status in {"open", "running"}:
+            result.update(_recovery_result("live"))
+        elif queued and not bound and not live:
+            # A never-bound channel is consumed by the first normal launch.
+            pass
+        elif not queued and duplicate_item is not None and duplicate_item.get("state") in {
+                "sending", "delivery-unknown"}:
+            result.update(_recovery_result("not-started", "delivery-unknown-no-replay"))
+
+    # The input lock is deliberately released before any registry, process or
+    # adapter work. The adapter transaction rechecks identity under jobs.lock.
+    if pending_recovery:
+        result.update(recover_consumer(jobs, attempt))
+    if (unresolved_pending and result.get("consumer_recovery") not in {"live", "respawned"}
+            and unresolved(jobs, attempt)):
+        materialize_unresolved(jobs, attempt)
+    if result.get("consumer_recovery") == "awaiting-parent":
+        result["next_step"] = (
+            "The correction is stored once. The route's effective parent can use normal start "
+            "to restore this same owner's consumer; do not start a replacement."
+        )
+    return result
+
+
+def recover_consumer(jobs, attempt, *, session=None, spawn=None):
+    """Restore a positively quiescent Codex input consumer on the same attempt."""
+    from dispatch_contract import (
+        attempt_governed_process_quiescence, supervisor_lease_is_held,
+        supervisor_lease_path, DispatchContractError,
+    )
+    from dispatch_completion_join import read_supervisor_phase_state
+
+    try:
+        row, target = _target(jobs, attempt)
+        with _locked(jobs, attempt) as (_, value):
+            row, target = _target(jobs, attempt)
+            if value is None or value.get("target") != target:
+                return _recovery_result("not-started", "owner-input-target-changed")
+            if row.status not in {"open", "running"}:
+                return _recovery_result("not-started", "owner-not-open")
+            if not _bound(value, target):
+                return _recovery_result("not-started", "owner-input-not-bound")
+            thread_id = value["thread_id"]
+            queued = any(item.get("state") == "queued" for item in value.get("requests", []))
+            accepting = value.get("accepting") is True
+            metadata = dict(row.metadata)
+        if not queued:
+            return _recovery_result("not-started", "no-queued-correction")
+        import route_parent_close
+        if (metadata.get("parent_close_requested") == "1"
+                or route_parent_close.row_requested(metadata, jobs)):
+            return _recovery_result("not-started", "cancelled-by-parent")
+        if supervisor_lease_is_held(jobs, metadata):
+            return (_recovery_result("live") if accepting else
+                    _recovery_result("not-started", "supervisor-live-not-accepting"))
+
+        caller = session
+        if caller is None:
+            try:
+                caller = route_authority.caller_identity()[1]
+            except (DispatchContractError, OSError, ValueError, TypeError):
+                caller = ""
+        if not route_authority.owns(metadata, caller, jobs):
+            return _recovery_result("awaiting-parent")
+        if metadata.get("launch_claimed") != "1" or metadata.get("launch_started") != "1":
+            return _recovery_result("not-started", "owner-launch-not-claimed")
+        if metadata.get("harness") != "codex":
+            return _recovery_result("not-started", "consumer-respawn-unrealized-" +
+                                    str(metadata.get("harness") or "unknown"))
+
+        process = attempt_governed_process_quiescence(metadata)
+        if process.state != "quiescent":
+            return _recovery_result("not-started", "owner-process-" + process.state,
+                                    detail=process.reason)
+        try:
+            continuation, preserved = route_parent_close.owner_continuation_processes(metadata, jobs)
+        except (OSError, ValueError, KeyError, TypeError):
+            return _recovery_result("not-started", "owner-continuation-unverifiable")
+        if (continuation.state != "quiescent"
+                or continuation.reason != "registered-resources-preserved"
+                or not preserved):
+            reason = (continuation.reason if continuation.state == "unverifiable"
+                      else "owner-continuation-" + continuation.state)
+            return _recovery_result("not-started", reason)
+
+        lease_path = supervisor_lease_path(jobs, attempt)
+        if metadata.get("supervisor_lease_file") != str(lease_path):
+            return _recovery_result("not-started", "supervisor-lease-path-invalid")
+        state = read_supervisor_phase_state(lease_path.with_suffix(".json"), attempt)
+        resource_session = (state.resource or {}).get("session_id") if state else None
+        if not resource_session or resource_session != thread_id:
+            return _recovery_result("not-started", "owner-input-thread-mismatch")
+
+        decision = route_authority.decide_continuation(
+            action="owner-input", jobs=jobs, status=row.status, metadata=metadata,
+            facts={"bound": True, "queued": True, "thread_match": True,
+                   "lease_held": False, "caller_owns": True, "harness": "codex",
+                   "accepting": accepting, "reachable": False, "recoverable": True,
+                   "process": process, "owner_continuation": continuation},
+        )
+        if not decision.allowed or decision.state != "recover":
+            return _recovery_result("not-started", decision.reason or decision.detail or
+                                    "owner-input-recovery-not-authorized")
+
+        if spawn is None:
+            adapter_path = ROOT / "adapters" / "codex" / "bin" / "dispatch-headless.py"
+            if adapter_path.is_symlink() or not adapter_path.is_file():
+                return _recovery_result("not-started", "codex-respawn-adapter-unavailable")
+            spec = importlib.util.spec_from_file_location(
+                "hearting_codex_dispatch_headless_recovery", adapter_path)
+            if spec is None or spec.loader is None:
+                return _recovery_result("not-started", "codex-respawn-adapter-unavailable")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            spawn = module.respawn_supervised_owner
+        try:
+            outcome = spawn(jobs, attempt,
+                            expected_identity=(metadata.get("pid", ""), metadata.get("pid_start", "")))
+        except DispatchContractError as exc:
+            if exc.reason == "attempt-respawn-identity-changed":
+                current, _ = _target(jobs, attempt)
+                if (current.metadata.get("pid"), current.metadata.get("pid_start")) != (
+                        metadata.get("pid"), metadata.get("pid_start")):
+                    return _recovery_result("live") if supervisor_lease_is_held(
+                        jobs, current.metadata) else _recovery_result("not-started", "consumer-respawn-raced")
+            return _recovery_result("not-started", exc.reason, detail=exc.detail)
+        except (OSError, ValueError, TypeError, ImportError) as exc:
+            return _recovery_result("not-started", "consumer-respawn-" + type(exc).__name__)
+        if not isinstance(outcome, dict):
+            return _recovery_result("not-started", "consumer-respawn-result-invalid")
+        recovery = outcome.get("consumer_recovery") or outcome.get("state")
+        if recovery == "respawned":
+            return _recovery_result("respawned",
+                pid=outcome.get("pid"), pid_start=outcome.get("pid_start"),
+                owner_identity_lineage=outcome.get("owner_identity_lineage"),
+                launch_home=outcome.get("launch_home"),
+                respawn_release=outcome.get("respawn_release"))
+        reason = outcome.get("reason") or str(recovery or "consumer-respawn-not-started")
+        if reason.startswith("not-started:"):
+            reason = reason.split(":", 1)[1]
+        return _recovery_result("not-started", reason,
+                                detail=outcome.get("detail"),
+                                launch_home=outcome.get("launch_home"),
+                                respawn_release=outcome.get("respawn_release"))
+    except (InputError, JoinContractError, OSError, ValueError, KeyError, TypeError) as exc:
+        return _recovery_result("not-started", "consumer-recovery-" + type(exc).__name__)
 
 
 def _retained_fields(item):

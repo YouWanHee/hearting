@@ -1540,8 +1540,8 @@ class InputContinuationBoundaryTest(unittest.TestCase):
     def test_only_original_input_admissions_pass_for_each_harness(self):
         quiet, unknown = SimpleNamespace(state="quiescent", reason="exited"), SimpleNamespace(state="unverifiable", reason="identity-missing")
         cases = [
-            ("cancelled", {}, quiet, True, True, False, "settle"),
-            ("killed", {}, quiet, True, True, False, "settle"),
+            ("cancelled", {}, quiet, True, True, False, "protected"),
+            ("killed", {}, quiet, True, True, False, "protected"),
             ("done", {"note": "completed-marker"}, quiet, True, True, False, "settle"),
             ("open", {}, quiet, False, True, False, "wait"),
             ("open", {}, unknown, True, False, False, "wait"),
@@ -1560,6 +1560,41 @@ class InputContinuationBoundaryTest(unittest.TestCase):
                     if state == "wait":
                         self.assertEqual(choice.next_action, "same-command")
                         self.assertTrue(choice.retry_when)
+
+    def test_bound_open_input_stores_even_when_consumer_observation_cannot_recover(self):
+        for harness in ("codex", "claude", "opencode"):
+            with self.subTest(harness=harness):
+                stored = RA.decide_continuation(action="owner-input", status="open",
+                    metadata={"harness": harness, "attempt_id": "att-input"},
+                    facts={"bound": True, "accepting": False, "reachable": False,
+                           "recoverable": False, "store_reason": "process-unverifiable"})
+                recover = RA.decide_continuation(action="owner-input", status="running",
+                    metadata={"harness": harness, "attempt_id": "att-input",
+                              "launch_claimed": "1", "launch_started": "1"},
+                    facts={"bound": True, "accepting": False, "reachable": False,
+                           "recoverable": True, "queued": True, "thread_match": True,
+                           "lease_held": False, "caller_owns": True, "harness": "codex",
+                           "process": SimpleNamespace(state="quiescent"),
+                           "owner_continuation": SimpleNamespace(
+                               state="quiescent", reason="registered-resources-preserved")})
+                live = RA.decide_continuation(action="owner-input", status="open",
+                    metadata={"harness": harness, "attempt_id": "att-input"},
+                    facts={"bound": True, "accepting": True, "reachable": True})
+                self.assertEqual((stored.allowed, stored.state, stored.detail),
+                                 (True, "stored", "process-unverifiable"))
+                self.assertEqual((recover.allowed, recover.state, recover.next_action),
+                                 (True, "recover" if harness == "codex" else "stored", "start"))
+                self.assertEqual((live.allowed, live.state, live.next_action),
+                                 (True, "queued", "handback"))
+
+    def test_cancelled_or_parent_closing_owner_never_admits_recovery(self):
+        for status, metadata in (("cancelled", {}), ("open", {"parent_close_requested": "1"})):
+            with self.subTest(status=status, metadata=metadata):
+                decision = RA.decide_continuation(action="owner-input", status=status,
+                    metadata={"harness": "codex", "attempt_id": "att-input", **metadata},
+                    facts={"bound": True, "recoverable": True})
+                self.assertEqual((decision.allowed, decision.state, decision.reason),
+                                 (False, "protected", "cancelled-by-parent"))
 
 
 class OwnerFormatOnlyEndTest(unittest.TestCase):

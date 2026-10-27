@@ -37,6 +37,62 @@ class WorkerHomes(unittest.TestCase):
             for name in ('dispatch_allocation', 'claude_credential_recovery')
         }
 
+    def test_recorded_codex_environment_reads_home_without_refreshing_it(self):
+        native_home = self.base / '.codex'
+        native_home.mkdir()
+        (native_home / 'config.toml').write_text(
+            'model = "gpt-test"\n[agents]\ncustom = false\n', encoding='utf-8')
+        (native_home / 'hooks.json').write_text('{"hooks": []}\n', encoding='utf-8')
+        home_environment = self.base / 'account-home'
+        home_environment.mkdir()
+        destination = self.base / 'worker-home'
+        identity = 'att-recorded-home'
+        built = prepare_worker_home(
+            ROOT, 'codex', 'owner', identity,
+            env={**self.env, 'HOME': str(home_environment), 'CODEX_HOME': str(native_home)},
+            destination=destination,
+        )
+
+        def snapshot():
+            result = {}
+            for path in sorted(destination.rglob('*')):
+                rel = str(path.relative_to(destination))
+                if path.is_symlink():
+                    result[rel] = ('link', os.readlink(path))
+                elif path.is_file():
+                    result[rel] = ('file', path.read_bytes())
+            return result
+
+        before = snapshot()
+        recovered = worker_runtime_home.recorded_codex_worker_environment(
+            ROOT, destination, identity)
+        after = snapshot()
+        self.assertEqual(recovered['HOME'], str(home_environment))
+        for key, value in built.items():
+            self.assertEqual(recovered[key], value, key)
+        self.assertEqual(after, before)
+
+    def test_legacy_codex_home_without_exact_home_provenance_fails_closed(self):
+        native_home = self.base / 'custom-codex-home'
+        native_home.mkdir()
+        (native_home / 'config.toml').write_text('model = "gpt-test"\n', encoding='utf-8')
+        destination = self.base / 'legacy-worker-home'
+        identity = 'att-legacy-home'
+        prepare_worker_home(
+            ROOT, 'codex', 'owner', identity,
+            env={**self.env, 'HOME': str(self.base / 'account-home'),
+                 'CODEX_HOME': str(native_home)},
+            destination=destination,
+        )
+        manifest_path = destination / 'worker-home.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        manifest.pop('codex_config_home')
+        manifest.pop('home_environment')
+        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'home-path-unavailable'):
+            worker_runtime_home.recorded_codex_worker_environment(
+                ROOT, destination, identity)
+
     def test_v2_launch_binding_keeps_native_xdg_store(self):
         root, builder = self._minimal_packaged_builder()
         home = self.base / 'v2-home'
