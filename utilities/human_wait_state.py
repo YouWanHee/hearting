@@ -2637,7 +2637,9 @@ def _opencode_form_answers(envelope, answers):
         custom = question.get("custom") is True
 
         if field_type == "string":
-            if len(values) != 1 or not isinstance(values[0], str):
+            if len(values) != 1:
+                return None, "opencode-string-answer-count-invalid"
+            if not isinstance(values[0], str):
                 return None, "opencode-form-string-answer-invalid"
             value = values[0]
             if not value and not required:
@@ -2653,7 +2655,7 @@ def _opencode_form_answers(envelope, answers):
                     or (maximum is not None and length > maximum)):
                 return None, "opencode-form-string-answer-length-invalid"
             if question.get("options_present") and not custom and value not in option_values:
-                return None, "opencode-form-answer-not-in-current-options"
+                return None, "opencode-answer-not-in-current-options"
             native_value = value
 
         elif field_type in {"number", "integer"}:
@@ -2698,11 +2700,11 @@ def _opencode_form_answers(envelope, answers):
             minimum, maximum = question.get("min_items"), question.get("max_items")
             if ((minimum is not None and len(values) < minimum)
                     or (maximum is not None and len(values) > maximum)):
-                return None, "opencode-form-answer-count-invalid"
+                return None, "opencode-answer-count-invalid"
             if len(set(values)) != len(values):
-                return None, "opencode-form-answer-duplicate-option"
+                return None, "opencode-answer-duplicate-option"
             if not custom and any(value not in option_values for value in values):
-                return None, "opencode-form-answer-not-in-current-options"
+                return None, "opencode-answer-not-in-current-options"
             native_value = list(values)
 
         else:
@@ -2819,7 +2821,8 @@ def _native_response_error(envelope, portable):
     """Check a portable response against the exact selected native request shape."""
     native_ref = envelope.get("native_ref")
     detail = envelope.get("detail")
-    if (envelope.get("harness") == "opencode" and isinstance(native_ref, dict)
+    if (envelope.get("harness") == "opencode" and envelope.get("kind") == "question"
+            and isinstance(native_ref, dict)
             and native_ref.get("transport") == "opencode-http-v2"):
         return _opencode_form_answers(envelope, portable.get("answers"))[1]
     if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-owner-input":
