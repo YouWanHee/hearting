@@ -1329,6 +1329,15 @@ def _frame_peer_recovery_harness(candidate, history, route):
         return False
 
 
+_GRANT_FIELD_WORDS = ("read_roots", "read_enforcement", "network", "writable_roots",
+                      "file_enforcement", "runtime_sandbox", "execution_access")
+
+
+def _adapter_policy_field(label):
+    """A permission field that carries no file, read or network grant."""
+    return not any(word in label for word in _GRANT_FIELD_WORDS)
+
+
 def permission_mismatch_detail(previous, current):
     """Describe a historical permission difference with its exact evidence source."""
     old, new = _granted_permission_pair(previous, current)
@@ -1574,11 +1583,22 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
         if (granted.get("execution_access") or {}).get("request_sha256") != access["request_sha256"]:
             raise _contract_error("replacement-input-tuple-mismatch", "execution_access")
         granted, sealed = _without_recovery_access(granted), _without_recovery_access(sealed)
+    added = set()
+    if drift:
+        # Same rule as the resolved keys above, for adapter policy records only:
+        # file, read and network grants stay strictly comparable.
+        recorded = history.get("applied_permissions") or {}
+        added = {key for key in granted if key not in sealed and key not in recorded
+                 and _adapter_policy_field(key)}
+        granted = {key: value for key, value in granted.items() if key not in added}
     # Cross-harness owner/frame recovery goes through the ordinary access-grant launcher.
     # Its runtime permission spelling differs, while the exact approved request
     # and addresses above remain bound. Same-harness grants stay comparable.
     if not cross_runtime and granted != sealed:
-        detail = permission_mismatch_detail(history, candidate)
+        shown = {**candidate, "applied_permissions": {
+            key: value for key, value in (candidate.get("applied_permissions") or {}).items()
+            if key not in added}}
+        detail = permission_mismatch_detail(history, shown)
         raise _contract_error("replacement-input-tuple-mismatch", detail or "applied_permissions")
     if (not owner and _work_options(candidate.get("argv", []), harness=candidate.get("harness"))
             != _work_options(history.get("argv", []), harness=history.get("harness"))):
