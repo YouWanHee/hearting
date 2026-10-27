@@ -4431,9 +4431,9 @@ class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
 
 
 class FrameCapacityFlow:
-    """argv -> profile -> register -> spawn claim for one adapter, with the real wrapper parser and
-    profile binding, the real transition reader and the real registration/spawn admission. Only the
-    process spawn is a stand-in. Each adapter's `dispatch-headless.sd45.test.py` runs this once."""
+    """argv -> profile -> route guard -> register -> spawn claim for one adapter, with the real
+    guard CLI and transition reader. Guard transport and process spawn are stand-ins; the existing
+    source-proof fixture is shared in-process. Each adapter's sd45 suite runs this flow."""
 
     def __init__(self, wrapper, harness, case):
         self.wrapper, self.harness, self.case = wrapper, harness, case
@@ -4444,6 +4444,36 @@ class FrameCapacityFlow:
         fx.setUp()
         self.case.addCleanup(fx.doCleanups)
         self.case.addCleanup(fx.tmp.cleanup)
+        # The earlier minimal route never reached the real launch guard. Seal
+        # an actual route and isolate the compiler and guard from the
+        # operator's home, artifact root and canonical registry.
+        env = mock.patch.dict(os.environ, {
+            'AGENT_HOME': str(R.ROOT), 'AGENT_DISPATCH_JOBS': str(fx.jobs),
+            'AGENT_ARTIFACT_ROOT': str(fx.root), 'HEARTING_GATES': 'on',
+        })
+        env.start(); fx.addCleanup(env.stop)
+        subprocess.run(['git', 'init', '-q', '--initial-branch=frame-fixture', str(fx.root)], check=True)
+        subprocess.run(['git', '-C', str(fx.root), '-c', 'user.name=Fixture',
+                        '-c', 'user.email=fixture@example.com', 'commit', '--allow-empty',
+                        '-qm', 'base'], check=True)
+        gate = {'spec_read': {'satisfied': True, 'source': 'fixture'},
+                'drift_verdict': 'within-spec', 'workflow_mode': 'tracked',
+                'artifact_guard': {'satisfied': True, 'source': 'fixture'}}
+        dispatch = {'tuples': [{
+            'parent_harness': 'codex', 'parent_transport': 'headless',
+            'parent_sandbox': 'workspace-write', 'child_harness': self.harness,
+            'launch_authority': 'conductor', 'status': 'supported',
+            'probe_source': 'fixture', 'probe_time': '2026-07-16T00:00:00Z',
+            'failure_class': '', 'checked_worktree': str(fx.root),
+            'failure_scope': 'none', 'codex_command': 'ok', 'retry_on_isolated_worktree': 0,
+        }], 'native_subagent': []}
+        compiled = D._route_module().compile_route(
+            'autopilot-code', 'dev', 'standard', fx.root, fx.root,
+            transport='headless', tracking='tracked',
+            tracked_gate_evidence=gate, dispatch_evidence=dispatch, slug='frame-fixture')
+        fx.route.clear(); fx.route.update(compiled)
+        fx.node = next(node for node in fx.route['nodes'] if node['id'] == 'frame')
+        fx.bind_fixture_route()
         (R._directory(fx.jobs)/'inputs/att-source.json').unlink()
         args = self.args(fx, self.cli(fx, 'att-source', 'top'))
         fx.meta.update(death, model=args.resolved_model_settings['model'],
@@ -4457,13 +4487,44 @@ class FrameCapacityFlow:
                 '--capability-mode', 'dev', '--worker-type', 'frame', '--unit', 'plan/frame',
                 '--dispatch-depth', '1', '--registered-worker', '1', '--route-file', str(fx.path),
                 '--route-id', fx.route['route_id'], '--route-hash', fx.route['route_hash'],
-                '--route-node', 'frame', '--model-role', 'deep maker', '--model-profile', profile, *extra]
+                '--route-node', 'frame', '--model-role', 'deep maker', '--model-profile', profile,
+                '--registry-digest', fx.route['registry_digest'],
+                '--intensity', fx.route['effective_intensity'],
+                '--write-scope', ';'.join(fx.node['write_scope']), *extra]
+
+    def guard(self, fx, args):
+        # Execute the guard CLI with the wrapper's exact argv while sharing
+        # this fixture's existing source-proof mocks. Do not stub its model or
+        # claim validation. Git probes still use real subprocesses.
+        path = R.ROOT / 'utilities/worker-route-guard.py'
+        spec = importlib.util.spec_from_file_location('frame_capacity_guard', path)
+        guard = importlib.util.module_from_spec(spec); spec.loader.exec_module(guard)
+        real_run = subprocess.run
+        def run(command, *positional, **kwargs):
+            if len(command) < 2 or command[1] != str(path):
+                return real_run(command, *positional, **kwargs)
+            output, errors = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, 'argv', command[1:]), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                code = guard.main()
+            return subprocess.CompletedProcess(command, code, output.getvalue(), errors.getvalue())
+        # Production has not bound jobs_path at this admission boundary yet.
+        jobs_path = vars(args).pop('jobs_path')
+        try:
+            with mock.patch.object(subprocess, 'run', side_effect=run), \
+                    mock.patch('route_authority.completion_gate', return_value=None):
+                return self.wrapper.validate_route_record(args)
+        finally:
+            args.jobs_path = jobs_path
 
     def args(self, fx, argv):
         args = self.wrapper.parser().parse_args(argv)
         args.replacement_input_argv = list(argv)
         args.jobs_path = Path(args.jobs)
         args.worktree = str(Path(args.worktree).resolve())
+        args.artifact_root = str(fx.root)
+        args.agent_home = R.ROOT
+        args.action = 'start'
         # Read each adapter's shipped whole-file defaults unless this fixture
         # deliberately supplies its own user config; never use the operator's.
         with mock.patch('model_config.user_path', return_value=getattr(fx, 'model_config_path', fx.root/'missing-models.conf')):
@@ -4509,6 +4570,18 @@ class FrameCapacityFlow:
         case.assertEqual(args.resolved_model_settings['profile'], 'deep')
         import model_profile
         case.assertEqual(model_profile.selection_receipt(args)['profile_selection_source'], 'explicit')
+        case.assertNotIn(args.attempt_id, fx.rows())
+        # An explicit foreign registry must not borrow the inherited claim.
+        other_jobs = fx.root / 'other-state/jobs.log'
+        other_jobs.parent.mkdir(); other_jobs.touch()
+        wrong_registry = SimpleNamespace(**vars(args)); wrong_registry.jobs = str(other_jobs)
+        before = fx.jobs.read_bytes()
+        case.assertEqual(self.guard(fx, wrong_registry), 65)
+        case.assertEqual(fx.jobs.read_bytes(), before)
+        case.assertEqual(self.guard(fx, args), 0)
+        case.assertEqual(json.loads(args.route_validation)['status'], 'ok')
+        case.assertEqual(json.loads(fx.path.read_text())['route_hash'], record['route_hash'])
+        case.assertEqual(fx.node['model_profile'], 'top')
         case.assertTrue(self.register(fx, args))
         row = fx.rows()[args.attempt_id][1]
         case.assertEqual((row['model_profile'], row['replacement_claim_digest']), ('deep', R._digest(record)))
@@ -4542,6 +4615,9 @@ class FrameCapacityFlow:
         with case.assertRaises(model_profile.ModelProfileError) as refused:
             model_profile.selection_receipt(args)
         case.assertEqual(refused.exception.reason, 'profile-selection-mismatch')
+        before = fx.jobs.read_bytes()
+        case.assertEqual(self.guard(fx, args), 65)
+        case.assertEqual(fx.jobs.read_bytes(), before)
         with case.assertRaises(D.DispatchContractError) as refused:   # even past the wrapper, the registry says no
             self.register(fx, args)
         case.assertEqual(refused.exception.reason, 'replacement-input-tuple-mismatch')

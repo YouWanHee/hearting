@@ -892,6 +892,9 @@ class ValidateRouteRecordTest(unittest.TestCase):
                         rc = wrapper.validate_route_record(self.args(tmp))
                     self.assertEqual(rc, 0)
                     self.assertIn("--launch-phase", proc.run.call_args.args[0])
+                    command = proc.run.call_args.args[0]
+                    self.assertEqual(command[command.index("--jobs") + 1], "/j/jobs.log")
+                    self.assertEqual(completion.call_args.args[3], Path("/j/jobs.log"))
                     self.assertIs(completion.call_args.kwargs["gate"], marker)
 
 
