@@ -3284,6 +3284,20 @@ class ReplacementTest(unittest.TestCase):
         self.assertIn("candidate='enforced'", widened.exception.detail)
         self.assertIn('child_spawned=0', widened.exception.detail)
 
+    def test_a_release_added_policy_record_follows_the_release_and_grants_stay_strict(self):
+        sealed = {'attempt_id': 'att-release-added', 'jobs': str(self.jobs.resolve()),
+                  'worktree': str(self.root / 'wt'), 'launch_home': '/release/v1', 'resolved': {},
+                  'applied_permissions': {'runtime_sandbox': 'workspace-write'}}
+        newer = {**sealed, 'launch_home': '/release/v2', 'applied_permissions': {
+            **sealed['applied_permissions'], 'commit_policy': {'may_commit': True}}}
+        R._check_tuple(newer, sealed)
+        with self.assertRaises(D.DispatchContractError):
+            R._check_tuple({**newer, 'launch_home': '/release/v1'}, sealed)
+        with self.assertRaises(D.DispatchContractError) as refused:
+            R._check_tuple({**newer, 'applied_permissions': {
+                **newer['applied_permissions'], 'nested_headless_network': True}}, sealed)
+        self.assertIn('axis=network', refused.exception.detail)
+
     def test_a_release_root_spelled_through_its_pointer_is_the_same_permission(self):
         # TF rt-34ca7756: the owner's rules named releases/v3.13.0, the correcting session's
         # replacement named the `current` pointer to it, and the same work was refused.
