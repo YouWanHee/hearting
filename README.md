@@ -252,8 +252,9 @@ databases, logs, and foreign caches remain outside its ownership. See
 ## Model settings
 
 The three adapters share a requested context operating budget, independent of
-profile model and effort. It defaults to `800000` tokens; valid values range
-from `100000` to `1000000`. Query or change it through the existing model
+profile model and effort. It defaults to `800000` tokens for Claude and
+OpenCode and `1000000` for Codex (Codex caps it at the selected model's
+maximum); valid values range from `100000` to `1000000`. Query or change it through the existing model
 command group:
 
 ```bash
