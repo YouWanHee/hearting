@@ -849,7 +849,33 @@ def _interpret_payload(payload, target):
     }, 0, None
 
 
-def _mark_observed(to_harness, to_session_id, to_name, from_identity=None, *, pane=None):
+def _payload_cwd(payload):
+    """The target agent's cwd from a herdr payload, or None."""
+    try:
+        cwd = payload["result"]["agent"].get("cwd")
+    except (KeyError, TypeError, AttributeError):
+        return None
+    return cwd if isinstance(cwd, str) and cwd else None
+
+
+def _print_steward_limited(result):
+    """A refused steward grant never fails the command that asked for it; it only says so."""
+    if isinstance(result, dict) and result.get("status") == "limited":
+        print(peer_message.format_steward_limited(result), file=sys.stderr)
+
+
+def _ensure_steward_runner(result):
+    """A written grant carries a steward-check duty; the shared runner advances it with
+    no later input, so start it now instead of waiting for the next lifecycle event."""
+    if isinstance(result, dict) and result.get("written"):
+        try:
+            peer_obligations.ensure_normal_runner()
+        except Exception:
+            pass
+
+
+def _mark_observed(to_harness, to_session_id, to_name, from_identity=None, *, pane=None,
+                   target_cwd=None):
     """F-100c-2 — the ONE place `source=watch` steward evidence is written: after
     herdr answered about a real target (`wait` returned a typed state other than
     agent-not-found, or `watch` armed its watcher). The `kind=watch` ledger row itself
@@ -863,8 +889,10 @@ def _mark_observed(to_harness, to_session_id, to_name, from_identity=None, *, pa
           "session_id": sid,
           "name": to_name if isinstance(to_name, str) and to_name and to_name != "-" else None,
           "pane": pane if isinstance(pane, str) and pane and pane != "-" else None}
-    return peer_message.mark_steward(from_harness, from_sid, to, "watch", _utc_now(),
-                                     source="watch")
+    result = peer_message.grant_steward(from_harness, from_sid, to, "watch", _utc_now(),
+                                        source="watch", target_cwd=target_cwd)
+    _print_steward_limited(result)
+    return result
 
 
 def cmd_wait(args):
@@ -890,7 +918,7 @@ def cmd_wait(args):
                          _t_name if _t_name and _t_name != "-" else target)
         _mark_observed(agent["harness"] if agent["harness"] != "-" else t_harness,
                        agent["session_id"] if agent["session_id"] != "-" else t_sid,
-                       resolved_name, pane=agent["pane"])
+                       resolved_name, pane=agent["pane"], target_cwd=_payload_cwd(payload))
     print(_typed_line(state, agent["harness"], agent["session_id"], agent["name"], agent["pane"]))
     return code
 
@@ -1754,10 +1782,12 @@ def _mark_started(args, sid, mode):
             summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
             to_session_id=sid)
     from_sid, from_harness = _current_session_identity()
-    peer_message.mark_steward(
+    result = peer_message.grant_steward(
         from_harness, from_sid,
         {"harness": args.kind, "session_id": sid, "name": args.name, "pane": args.pane},
-        "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start")
+        "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
+        target_cwd=getattr(args, "cwd", None))
+    _print_steward_limited(result)
 
 
 def _placement_result(*argv):
@@ -4036,7 +4066,8 @@ def cmd_watch(args):
     # receipt, ledger and native wait; it remains the operator's accepted text.
     if _herdr_missing():
         return _unavailable("herdr-not-found")
-    state, agent, _code, reason = _interpret_payload(_run_herdr_get(target), target)
+    watch_payload = _run_herdr_get(target)
+    state, agent, _code, reason = _interpret_payload(watch_payload, target)
     if state == "agent-not-found":
         print(_typed_line("agent-not-found", "-", "-", target, "-"))
         return 2
@@ -4405,7 +4436,8 @@ def cmd_watch(args):
         # The watcher is armed on a target herdr resolved above: steward evidence.
         resolved_name = agent["name"] if agent["name"] != "-" else target
         _mark_observed(agent["harness"], agent["session_id"], resolved_name,
-                       from_identity=(steward_sid, steward_harness), pane=agent["pane"])
+                       from_identity=(steward_sid, steward_harness), pane=agent["pane"],
+                       target_cwd=_payload_cwd(watch_payload))
     finally:
         if claim_fd is not None:
             os.close(claim_fd)
@@ -8453,7 +8485,7 @@ def _runner_duties(store, duties=None):
         duties = store.list()
     selected = [duty for duty in duties
                 if (duty.get("intent", {}).get("kind") in {"message", "retire", "registered-batch",
-                                                             "run-notice",
+                                                             "run-notice", "steward-check",
                                                              shared_readiness.DUTY_KIND}
                     or duty.get("id", "").startswith(("message-", "delay-")))]
     seen = {duty.get("id") for duty in selected}
@@ -8680,6 +8712,12 @@ def _obligation_retry_fingerprint(duty):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _steward_check_module():
+    """The periodic steward-check schedule (lazy: a missing module only disables it)."""
+    import importlib
+    return importlib.import_module("steward_check")
+
+
 def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state=None):
     """Advance only the accepted duties owned by this runner."""
     if duties is None:
@@ -8711,6 +8749,8 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
                 _resume_registered_obligation(duty, store, read_context=read_context)
             elif kind == "run-notice":
                 _resume_ordinary_notice_obligation(duty, store)
+            elif kind == "steward-check":
+                _steward_check_module().advance(duty, store)
         except Exception:
             try:
                 store.update(duty["id"], observer_error="observer-unavailable")
@@ -8826,6 +8866,10 @@ def cmd_obligation_runner(args):
     duty_retry_state = {}
     terminal_handoff_scan = True
     terminal_handoff_duties = []
+    try:
+        _steward_check_module().reconcile_all(store)
+    except Exception:
+        pass
     while True:
         start_readiness_worker()
         if not _runner_lock_current(store, args.lock_fd):
@@ -9014,6 +9058,10 @@ def cmd_ensure_obligations(_args):
     if lock_fd is None:
         return 0
     try:
+        try:
+            _steward_check_module().reconcile_self(store)
+        except Exception:
+            pass
         try:
             lifecycle_root = getattr(_args, "lifecycle_root", None)
             peer_obligations.ensure_normal_runner(
@@ -10208,10 +10256,22 @@ def cmd_steward(args):
         return 1
     if args.state == "on":
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        ok = peer_message.mark_steward(harness, sid, {"harness": "unknown", "name": "-"},
-                                       "explicit", ts, source="explicit")
+        result = peer_message.grant_steward(harness, sid, {"harness": "unknown", "name": "-"},
+                                            "explicit", ts, source="explicit")
+        if result["status"] == "limited":
+            print(peer_message.format_steward_limited(result))
+            return 1
+        ok = result["written"]
+        _ensure_steward_runner(result)
         print(f"steward={'on' if ok else 'unchanged'} harness={harness} session_id={sid}")
         return 0 if ok else 1
+    if args.state == "check":
+        try:
+            check_module = _steward_check_module()
+        except ImportError:
+            print("steward-check=unavailable reason=module-missing")
+            return 1
+        return check_module.cmd_check(harness, sid)
     rc = peer_message.cmd_release(peer_message.argparse.Namespace(harness=harness, session_id=sid))
     print(f"steward=off harness={harness} session_id={sid}")
     return rc
@@ -10334,7 +10394,7 @@ def build_parser():
     p_continue.set_defaults(func=cmd_continue)
 
     p_mode = sub.add_parser("steward")
-    p_mode.add_argument("state", choices=("on", "off"))
+    p_mode.add_argument("state", choices=("on", "off", "check"))
     p_mode.set_defaults(func=cmd_steward)
 
     return parser

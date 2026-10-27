@@ -67,6 +67,11 @@ SMALL_WORK_CONFIRMATION_MODES = ("notice", "card")
 DEFAULT_SMALL_WORK_CONFIRMATION = "notice"
 STEWARD_CHILD_PERMISSION_MODES = ("bypass", "inherit")
 DEFAULT_STEWARD_CHILD_PERMISSION_MODE = "bypass"
+STEWARD_KEYS = {"child_permission_mode", "check_interval_seconds", "max_supervisors_per_repo"}
+DEFAULT_STEWARD_CHECK_INTERVAL_SECONDS = 7200
+STEWARD_CHECK_INTERVAL_RANGE = (600, 86400)  # inclusive seconds
+DEFAULT_STEWARD_MAX_SUPERVISORS_PER_REPO = 2
+STEWARD_MAX_SUPERVISORS_RANGE = (1, 8)  # inclusive
 
 
 class DefaultsConfigError(Exception):
@@ -75,6 +80,14 @@ class DefaultsConfigError(Exception):
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from dispatch_allocation import inert_allocation_keys  # noqa: E402
+
+
+def _int_in_range(value, bounds):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and bounds[0] <= value <= bounds[1]
+    )
 
 
 def _repo_root():
@@ -463,7 +476,7 @@ def validate(config, capmap):
             if not isinstance(steward, dict):
                 errors.append("steward must be a mapping")
             else:
-                for key in sorted(set(steward) - {"child_permission_mode"}):
+                for key in sorted(set(steward) - STEWARD_KEYS):
                     errors.append(f"unknown steward key: {key!r}")
                 mode = steward.get("child_permission_mode", DEFAULT_STEWARD_CHILD_PERMISSION_MODE)
                 if mode not in STEWARD_CHILD_PERMISSION_MODES:
@@ -471,6 +484,14 @@ def validate(config, capmap):
                         "steward.child_permission_mode must be one of "
                         f"{sorted(STEWARD_CHILD_PERMISSION_MODES)}"
                     )
+                for key, bounds in (
+                    ("check_interval_seconds", STEWARD_CHECK_INTERVAL_RANGE),
+                    ("max_supervisors_per_repo", STEWARD_MAX_SUPERVISORS_RANGE),
+                ):
+                    if key in steward and not _int_in_range(steward[key], bounds):
+                        errors.append(
+                            f"steward.{key} must be an integer from {bounds[0]} to {bounds[1]}"
+                        )
         if runtime is not None:
             if not isinstance(runtime, dict):
                 errors.append("runtime must be a mapping")
@@ -934,17 +955,50 @@ def query_small_work_confirmation(config):
     return DEFAULT_SMALL_WORK_CONFIRMATION
 
 
+def query_steward_policy(config):
+    """Steward settings with every absent or invalid key at its shipped
+    default (schema_version < 4 included):
+    `{"child_permission_mode", "check_interval_seconds",
+    "max_supervisors_per_repo"}`."""
+    steward = config.get("steward")
+    if not isinstance(steward, dict):
+        steward = {}
+    mode = steward.get("child_permission_mode")
+    if mode not in STEWARD_CHILD_PERMISSION_MODES:
+        mode = DEFAULT_STEWARD_CHILD_PERMISSION_MODE
+    interval = steward.get("check_interval_seconds")
+    if not _int_in_range(interval, STEWARD_CHECK_INTERVAL_RANGE):
+        interval = DEFAULT_STEWARD_CHECK_INTERVAL_SECONDS
+    limit = steward.get("max_supervisors_per_repo")
+    if not _int_in_range(limit, STEWARD_MAX_SUPERVISORS_RANGE):
+        limit = DEFAULT_STEWARD_MAX_SUPERVISORS_PER_REPO
+    return {
+        "child_permission_mode": mode,
+        "check_interval_seconds": interval,
+        "max_supervisors_per_repo": limit,
+    }
+
+
+def load_steward_policy(config_path=None, topology_path=None):
+    """The one reader the role grant and the check schedule share. Returns
+    `(policy, warnings)`; an unreadable or invalid file yields the shipped
+    defaults plus one `steward-settings-unreadable: <reason>` warning."""
+    try:
+        config = load_and_validate(
+            config_path or default_config_path(),
+            topology_path or default_topology_path(),
+        )
+    except (DefaultsConfigError, OSError, json.JSONDecodeError) as exc:
+        return query_steward_policy({}), [f"steward-settings-unreadable: {exc}"]
+    return query_steward_policy(config), []
+
+
 def query_steward_child_permission_mode(config):
     """SD-122 (9): default child-session permission mode for `peer-steward.py
     start`. Returns `bypass` whenever the `steward` block or its
     `child_permission_mode` key is absent, including for schema_version < 4.
     """
-    steward = config.get("steward")
-    if isinstance(steward, dict):
-        mode = steward.get("child_permission_mode")
-        if mode in STEWARD_CHILD_PERMISSION_MODES:
-            return mode
-    return DEFAULT_STEWARD_CHILD_PERMISSION_MODE
+    return query_steward_policy(config)["child_permission_mode"]
 
 
 def shipped_allocation_strategy():
@@ -1000,7 +1054,7 @@ def _arg(args, flag, default=None):
 
 def main(argv):
     if not argv:
-        print("usage: dispatch-defaults.py <validate|affinity|owners|policy|allocation|opencode-policy|confirmation-mode> [options]", file=sys.stderr)
+        print("usage: dispatch-defaults.py <validate|affinity|owners|policy|allocation|opencode-policy|confirmation-mode|steward> [options]", file=sys.stderr)
         return 64
 
     op = argv[0]
@@ -1063,6 +1117,11 @@ def main(argv):
         return 0
     if op == "confirmation-mode":
         print(query_confirmation_mode(config))
+        return 0
+    if op == "steward":
+        policy = query_steward_policy(config)
+        for key in ("child_permission_mode", "check_interval_seconds", "max_supervisors_per_repo"):
+            print(f"{key}={policy[key]}")
         return 0
 
     print(f"dispatch-defaults: unknown operation {op!r}", file=sys.stderr)

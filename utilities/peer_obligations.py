@@ -36,7 +36,7 @@ _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
 _DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch", "run-notice",
-                         "readiness-observation"})
+                         "readiness-observation", "steward-check"})
 _RUNNERS: list[subprocess.Popen] = []
 _DISTRIBUTION_MODULES = {}
 _MESSAGE_RECEIVER_PROVENANCE = "validated-peer-ref-receiver-v1"
