@@ -141,7 +141,8 @@ class TreeOverflow(unittest.TestCase):
                 with self.subTest(cols=cols, rows=rows):
                     _x0, top, width, bottom, offset, maximum, total, visible = frame.tree_scroll[:8]
                     compute_top = rows - 4 - (2 + min(5, len(vm.compute)))
-                    self.assertEqual(bottom, compute_top)
+                    # A faint rule row closes the tree above RESOURCES when the tree has a row.
+                    self.assertEqual(bottom, compute_top - 1 if top < compute_top - 1 else compute_top)
                     self.assertEqual(visible, max(0, bottom - top))
                     needed = sum(1 + sum(1 + sum(2 if r.get("subworker") else 1
                                                   for r in vm.routes if r.get("session_tag") == s["tag"]
