@@ -2075,9 +2075,7 @@ class FleetS2WorkflowResponseTests(unittest.TestCase):
 
     def setUp(self):
         FleetWorkflowQuestionIntegrationTests.setUp(self)
-        agent_home = self.root / "agent-home"
-        (agent_home / "core").mkdir(parents=True)
-        (agent_home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
+        agent_home = self.agent_home
         local_env = mock.patch.dict(os.environ, {
             "AGENT_HOME": str(agent_home),
             "AGENT_WORKFLOW_ROOT": str(self.root / "workflow"),
