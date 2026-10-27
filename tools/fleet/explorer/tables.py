@@ -932,9 +932,13 @@ def draw_questions(grid, vm, state, x=34, y=3):
             kind = str(envelope.get("kind") or "").lower()
             approval = ("approval" in kind or "permission" in kind or
                         any(word in kind for word in ("commandexecution", "filechange")))
+            native_ref = envelope.get("native_ref")
+            opencode_v2_form = (envelope.get("harness") == "opencode"
+                                and isinstance(native_ref, Mapping)
+                                and native_ref.get("transport") == "opencode-http-v2")
             private_detail = envelope.get("detail") if envelope.get("state") != "unknown" else None
             content_x = x + (10 if narrow else 20)
-            if question_specs and not approval:
+            if (question_specs or opencode_v2_form) and not approval:
                 detail_lines = []
             elif isinstance(private_detail, dict) or hasattr(private_detail, "items"):
                 detail_lines = []
@@ -1004,6 +1008,7 @@ def draw_questions(grid, vm, state, x=34, y=3):
                                 question_free_text_available, question_multiple_select,
                                 question_values_valid)
             supported = question_action_supported(envelope)
+            can_answer = question_answer_supported(envelope)
             if request_state == "open" and supported and approval and y < bottom:
                 for decision in question_decisions(envelope):
                     cursor = x + 10
@@ -1015,10 +1020,9 @@ def draw_questions(grid, vm, state, x=34, y=3):
                     y += 1
                     if y >= bottom:
                         break
-            elif not approval and question_specs:
+            elif not approval and (question_specs or can_answer):
                 draft = private.get("draft")
                 answers = draft.get("answers", {}) if hasattr(draft, "get") else {}
-                can_answer = question_answer_supported(envelope)
                 can_draft = question_draft_supported(envelope)
                 complete = True
                 for index, question_spec in enumerate(question_specs, 1):

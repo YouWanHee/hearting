@@ -163,10 +163,47 @@ def question_items(detail):
                  if question.get("id") in active and question.get("hidden") is not True)
 
 
+def _question_empty_hidden_optional_v2_form(detail):
+    """Allow explicit empty submission only for a complete optional hidden V2 schema."""
+    if (not isinstance(detail, Mapping) or detail.get("kind") != "question"
+            or detail.get("state") != "open"
+            or detail.get("harness") != "opencode"):
+        return False
+    native = detail.get("native_ref")
+    if (not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"):
+        return False
+    fields = _question_schema_items(detail)
+    field_keys = native.get("field_keys")
+    if (not fields or not isinstance(field_keys, (list, tuple))
+            or len(field_keys) != len(fields)
+            or tuple(field_keys) != tuple(item["id"] for item in fields)
+            or len(set(field_keys)) != len(field_keys)):
+        return False
+    if question_items(detail):
+        return False
+    supported_types = {"string", "number", "integer", "boolean", "multiselect"}
+    return all(item.get("hidden") is True
+               and item.get("required") is False
+               and item.get("field_type") in supported_types
+               for item in fields)
+
+
 def question_answer_supported(detail):
     if not isinstance(detail, Mapping):
         return False
-    return _question_supports_reply(detail) and bool(question_items(detail))
+    if not _question_supports_reply(detail):
+        return False
+    questions = question_items(detail)
+    if questions:
+        if (detail.get("harness") == "opencode"
+                and isinstance(detail.get("native_ref"), Mapping)
+                and detail["native_ref"].get("transport") == "opencode-http-v2"
+                and any(item.get("hidden") is True and item.get("required") is True
+                        for item in _question_schema_items(detail))):
+            return False
+        return True
+    return _question_empty_hidden_optional_v2_form(detail)
 
 
 def question_draft_supported(detail):
