@@ -2371,6 +2371,62 @@ generation; an unresolved accepted watch remains a separate duty. Unknown or int
 adoption stays pending. F-100c-2's existing evidence rule remains in force; SD-147 entry
 admission is a separate, dormant contract and is not part of same-seat continuity.
 
+Periodic steward check. Each role-holding session carries one `steward-check` duty in
+the existing obligation store, advanced by the existing obligation runner; there is no
+new hook event, per-session process, cron or ledger. It is registered by the shared
+grant, by the holder's own role comparison in `__ensure-obligations` (which all three
+lifecycle bridges already call), and once when the runner starts. `steward on` also
+starts the shared runner at once; other grants reach it through the same bridges (for
+Claude, the Stop at the end of the granting turn) or a watcher's completion, so with no
+runner running a Codex or OpenCode watch/start grant can wait for the next lifecycle
+event. When the configured
+interval (`steward.check_interval_seconds`, default 7200, range 600..86400) has
+elapsed since the last check or delivery, the runner sends one request through the
+`session_notice` carrier without waiting for input or a Stop event. Only a session that
+Fleet flags as steward (`role_flag`) receives it; marker evidence for a target in another
+repository is communication and yields no request. While that request
+is undelivered no second one is made, a long gap still yields one request and no
+catch-up, and a visible human-answer wait defers it. The carrier's screen check keeps
+drafts, open questions and approval forms untouched, and a steward stopped with Esc
+still receives the request; `steward off` is how a steward is stopped. `last_checked`
+records only a run of `peer-steward steward check`; creating the notice, queue
+acceptance and native receipt are not a completed check. A harness whose transport is
+unconfirmed stays unconfirmed. `steward check` shows only the caller's own
+`role_targets` (one winner per target) and uses only existing observations (herdr
+state, liveness, undelivered messages and notices): a live PID alone is not health and
+an unobserved session is not declared dead. With no change since the previous check it
+prints `changes=none`, and the steward leaves a line or two of status and starts no new
+work. When the role has no targets, every target is finished or the sessions are ready
+to tidy, one short request recommends closing ended sessions and releasing the flag
+through the ordinary `steward off` path; while that state is unchanged the next due
+point produces no model turn. The runner does not release a role itself. Release, a
+holder change (a confirmed handover moves the schedule to the successor) or a proven
+session end completes the duty and retires its undelivered notice through the existing
+`keep_claim`/`reject_claimed` path, so nothing stays addressed to a former holder or is
+retried; a later grant or a revived session reactivates the same duty as a new
+generation. This check is not a completion watch (S3).
+
+Per-repository steward limit. A new holder is admitted only inside the shared grant
+function `grant_steward`, so `steward on`, `watch`/`wait` and `start` meet the same
+limit (`steward.max_supervisors_per_repo`, default 2, range 1..8). The decision is made
+under one grant lock held inside the seat lock, so concurrent grants cannot pass the
+limit. The repository is the git common dir (a linked worktree folds into its primary),
+the same key as the Fleet ⚑, and `tools/fleet/collectors/steward.py` `repo_supervision`
+is the single count both the grant and the Fleet display read. A watch or start whose
+target sits in another repository is communication (F-100c-2) and is neither counted nor
+limited. A grant whose own session row is not yet visible is admitted without a
+repository and counts once its row appears; the process cwd is not used to guess it. A session counts once
+however many generations it holds. A same-session re-grant, restart, resume or a
+confirmed successor takes no further slot; a session whose end Hearting proved leaves
+its slot while its mark remains and reclaims the role when it revives (a resulting
+overshoot is only displayed); an unknown session keeps counting. At the limit the
+grant skips only the role-evidence write and reports
+`steward=limited repo=<name> holders=<current> limit=<n>`; watch, start and ordinary
+work proceed. Lowering the limit, or an install already above it, revokes no role, job
+or session and limits only new grants. Settings are read through the one
+`load_steward_policy` reader; an unreadable or invalid value falls back to the shipped
+default with a warning and does not bypass the limit.
+
 Fleet and herdr may join pane-session IDs for display through the shared read-only
 session-tidy reader. Its bounded compatibility join uses the exact pane, harness,
 and repository. Confirmed predecessor expansion follows only same-harness clear
@@ -2539,7 +2595,8 @@ wait` exactly once and leaves a disk receipt; no self-written sleep/poll loop), 
 foreground `utilities/peer-steward.py wait`, a one-shot idle-notify subscription (Claude
 `notify_when_idle`, secondary), or a registered continuation supervisor/monitor.
 `ListAgents` loops, "is it done yet?" messages, sleep loops, and periodic recaps are
-forbidden for completion watching. Foreground launch and retirement observations
+forbidden for completion watching. The role-bound periodic steward check above is a
+separate obligation, not completion watching. Foreground launch and retirement observations
 use a fixed monotonic deadline without renewing it or retrying a launch. A wait,
 watch, or subscription is observation, not a §0.6 continuation; a
 tracked workflow's obligation is unchanged.

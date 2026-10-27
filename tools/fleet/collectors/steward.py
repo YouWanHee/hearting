@@ -383,6 +383,215 @@ def role_flag(harness, session_id, *, aliases=(), markers=None, cwd=None, sessio
     return bool(targets)
 
 
+# --- per-repository supervision count (grant limit + Fleet display) -----------------
+
+_DEFAULT_MAX_SUPERVISORS = 2
+_dispatch_defaults_module = None
+
+
+def _steward_limit():
+    """``steward.max_supervisors_per_repo`` from the one policy reader; the shipped
+    default when the settings cannot be read (no bypass of the limit)."""
+    global _dispatch_defaults_module
+    try:
+        if _dispatch_defaults_module is None:
+            import importlib.util
+            path = Path(__file__).resolve().parents[3] / "utilities" / "dispatch-defaults.py"
+            spec = importlib.util.spec_from_file_location("dispatch_defaults_policy", str(path))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _dispatch_defaults_module = module
+        policy, _warnings = _dispatch_defaults_module.load_steward_policy()
+        return int(policy["max_supervisors_per_repo"])
+    except Exception:
+        return _DEFAULT_MAX_SUPERVISORS
+
+
+def _registry_record(harness, session_id):
+    from .. import session_registry
+    try:
+        entries = os.listdir(session_registry._dir_for(harness))
+    except (OSError, ValueError):
+        return None
+    for entry in entries:
+        if not entry.endswith(".json") or not entry[:-5].isdigit():
+            continue
+        record = session_registry.read(harness, int(entry[:-5]))
+        if record and record.get("sessionId") == session_id:
+            return record
+    return None
+
+
+def session_liveness(harness, session_id, *, agents=None):
+    """``"live"`` | ``"ended"`` | ``"unknown"``. Only proof of exit says ``ended``:
+    a herdr row means live; otherwise the registry record's process is checked
+    (dead pid, recycled pid, or an ``exited`` status). Anything unobserved is
+    ``unknown`` and keeps counting."""
+    harness = str(harness or "").lower()
+    if not session_id:
+        return "unknown"
+    if agents is None:
+        try:
+            from . import herdr
+            agents = herdr.list_agents()
+        except Exception:
+            agents = None
+    for agent in agents or ():
+        identity = agent.get("agent_session") or {}
+        if (str(agent.get("agent") or "").lower() == harness and isinstance(identity, dict)
+                and identity.get("value") == session_id):
+            return "live"
+    try:
+        record = _registry_record(harness, session_id)
+        if record is None:
+            return "unknown"
+        pid = record.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int):
+            return "unknown"
+        if record.get("status") == "exited":
+            return "ended"
+        from . import liveness
+        alive, match = liveness._proc_evidence(pid, record.get("procStart"))
+    except Exception:
+        return "unknown"
+    return "ended" if (not alive or match is False) else "live"
+
+
+def repository_for_session(harness, session_id, *, sessions=None):
+    """Canonical repository key of one session, or ``None``. The cwd comes from the
+    session's own row (herdr/registry/native metadata) and only when it is a single
+    value; the process cwd is never a substitute."""
+    harness = str(harness or "").lower()
+    if not session_id:
+        return None
+    rows = _projection_sessions() if sessions is None else list(sessions)
+    own = {(harness, session_id)}
+    cwds = {row.cwd for row in rows if getattr(row, "cwd", None) and own.intersection(_session_keys(row))}
+    if not cwds:
+        cwds = {row.cwd for row in _native_role_sessions({(harness, session_id): {}}, rows)
+                if row.harness == harness and row.session_id == session_id}
+    return _repository_key(cwds.pop()) if len(cwds) == 1 else None
+
+
+def _context_rows(markers, relations, sessions):
+    rows = _projection_sessions() if sessions is None else list(sessions)
+    return rows + _native_role_sessions(markers, rows, relations)
+
+
+def _holder_name(harness, session_id, rows):
+    for row in rows:
+        if (harness, session_id) in _session_keys(row):
+            name = getattr(row, "runtime_name", None) or getattr(row, "_herdr_name", None)
+            if name:
+                return name
+    try:
+        from .. import session_registry
+        return session_registry.name_for_session_id(session_id, harness)
+    except Exception:
+        return None
+
+
+def _repo_holders(repository_key, *, markers=None, relations=None, sessions=None, agents=None,
+                  _rows=None):
+    """Distinct current holders attributed to ``repository_key``.
+
+    A holder belongs to the repository when its role shows there (``basis="role"``,
+    the Fleet flag rule) or its marker recorded the repository at grant time
+    (``basis="grant"``) while no row says otherwise. ``counted`` is False only for
+    a session whose exit is proven."""
+    if not repository_key:
+        return []
+    markers = read_markers() if markers is None else markers
+    relations = read_relations() if relations is None else relations
+    mod = _peer_message_module()
+    evidence = getattr(mod, "steward_evidence_targets", None) if mod is not None else None
+    if evidence is None:
+        return []
+    rows = _context_rows(markers, relations, sessions) if _rows is None else _rows
+    winners = _role_winners(markers, rows, evidence, relations)
+    if agents is None:
+        try:
+            from . import herdr
+            agents = herdr.list_agents()
+        except Exception:
+            agents = None
+    out, seen = [], set()
+    for relation in relations:
+        if relation.get("released") is True:
+            continue
+        holder = relation.get("holder") or {}
+        harness = str(holder.get("harness") or "").lower()
+        sid = holder.get("sid")
+        if not sid or (harness, sid) in seen:
+            continue
+        row_repository = repository_for_session(harness, sid, sessions=rows)
+        basis = None
+        if row_repository == repository_key and role_flag(
+                harness, sid, markers=markers, sessions=rows, _relations=relations,
+                _targets=_owner_targets(winners, harness, sid)):
+            basis = "role"
+        elif row_repository is None or row_repository == repository_key:
+            origin = relation.get("origin") or {}
+            for owner in ((str(origin.get("harness") or "").lower(), origin.get("sid")), (harness, sid)):
+                marker = markers.get(owner)
+                if isinstance(marker, dict) and marker.get("repository") == repository_key:
+                    basis = "grant"
+                    break
+        if basis is None:
+            continue
+        seen.add((harness, sid))
+        liveness = session_liveness(harness, sid, agents=agents)
+        out.append({"harness": harness, "session_id": sid,
+                    "name": _holder_name(harness, sid, rows), "liveness": liveness,
+                    "basis": basis, "counted": liveness != "ended"})
+    return out
+
+
+def repo_supervision(cwd=None, *, repository_key=None, limit=None, markers=None, relations=None,
+                     sessions=None, agents=None):
+    """The one count of current supervisors in a repository (linked worktrees fold
+    into their primary). The grant limit and the Fleet display both call this."""
+    key = repository_key or _repository_key(cwd)
+    limit = _steward_limit() if limit is None else limit
+    holders = _repo_holders(key, markers=markers, relations=relations, sessions=sessions,
+                            agents=agents)
+    counted = sum(1 for holder in holders if holder["counted"])
+    return {"repository": Path(key).parent.name if key else None, "repository_key": key,
+            "holders": holders, "counted": counted, "limit": limit,
+            "over_limit": counted > limit}
+
+
+def supervision_by_repository(sessions=None, *, limit=None, markers=None, relations=None,
+                              agents=None):
+    """``{repository_key: repo_supervision(...)}`` for every repository that has a
+    holder; a thin loop with no counting rule of its own."""
+    markers = read_markers() if markers is None else markers
+    relations = read_relations() if relations is None else relations
+    rows = _context_rows(markers, relations, sessions)
+    keys = set()
+    for relation in relations:
+        if relation.get("released") is True:
+            continue
+        holder = relation.get("holder") or {}
+        harness = str(holder.get("harness") or "").lower()
+        sid = holder.get("sid")
+        if not sid:
+            continue
+        key = repository_for_session(harness, sid, sessions=rows)
+        if key is None:
+            origin = relation.get("origin") or {}
+            for owner in ((str(origin.get("harness") or "").lower(), origin.get("sid")), (harness, sid)):
+                marker = markers.get(owner)
+                if isinstance(marker, dict) and marker.get("repository"):
+                    key = marker["repository"]
+                    break
+        if key:
+            keys.add(key)
+    return {key: repo_supervision(repository_key=key, limit=limit, markers=markers,
+                                  relations=relations, sessions=rows, agents=agents)
+            for key in sorted(keys)}
+
+
 def enrich(sessions, markers=None):
     for s in sessions:
         s.steward = False
