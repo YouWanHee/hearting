@@ -493,6 +493,52 @@ class ParallelRouteProjection(unittest.TestCase):
         self.assertTrue(any(cell[0] in ("▶", "◀", "▼")
                             for row in grid.cells for cell in row))
 
+    def test_recorded_route_graph_keeps_horizontal_flow_and_stacks_parallel_stages(self):
+        from tools.fleet.explorer.live import _parallel_stage_details
+        from tools.fleet.explorer.grid import CellGrid
+        from tools.fleet.explorer.pages import _stage_grid
+
+        def tops(text, names):
+            found = {}
+            for row, line in enumerate(text):
+                for name in names:
+                    column = line.find("┌─ " + name + " ")
+                    if column >= 0 and name not in found:
+                        found[name] = (row, column)
+            return found
+
+        serial = _parallel_stage_details(
+            [{"id": name, "state": "done", "depends_on": [before] if before else []}
+             for name, before in (("plan", None), ("execute", "plan"), ("test", "execute"),
+                                  ("report", "test"))], 1000)
+        grid = CellGrid(280, 40)
+        _stage_grid(grid, 2, 1, serial, 262, 38)
+        boxes = tops(grid.rows_text(), ("plan", "execute", "test", "report"))
+        self.assertEqual({row for row, _column in boxes.values()}, {1})
+        self.assertEqual(sorted(boxes, key=lambda name: boxes[name][1]),
+                         ["plan", "execute", "test", "report"])
+        self.assertEqual(sum(row.count("▶") for row in grid.rows_text()), 3)
+        self.assertFalse(any("▼" in row for row in grid.rows_text()))
+
+        framed = _parallel_stage_details([
+            {"id": "frame", "state": "done", "depends_on": []},
+            {"id": "frame-alternative", "state": "done", "depends_on": []},
+            {"id": "plan", "state": "active", "depends_on": ["frame", "frame-alternative"]},
+            {"id": "execute", "state": "todo", "depends_on": ["plan"]},
+        ], 1000)
+        grid = CellGrid(150, 30)
+        _stage_grid(grid, 2, 1, framed, 140, 28)
+        text = grid.rows_text()
+        boxes = tops(text, ("frame", "frame-alternative", "plan", "execute"))
+        self.assertEqual(boxes["frame"][1], boxes["frame-alternative"][1])
+        self.assertLess(boxes["frame"][0], boxes["frame-alternative"][0])
+        self.assertEqual(boxes["plan"][0], boxes["execute"][0])
+        self.assertLess(boxes["frame"][1], boxes["plan"][1])
+        joint = "".join(line[boxes["plan"][1] - 3] for line in text)
+        self.assertIn("┐", joint)
+        self.assertIn("├", joint)
+        self.assertIn("┘", joint)
+
     def test_stage_array_order_without_dependency_evidence_draws_no_arrows(self):
         from tools.fleet.explorer.live import _parallel_stage_details
         from tools.fleet.explorer.grid import CellGrid
