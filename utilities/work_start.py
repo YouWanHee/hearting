@@ -1652,6 +1652,8 @@ def _owner_pin_handoff(route, path, jobs, result, rows=None):
     if aid not in rows:
         return None
     status, metadata = rows[aid]
+    # Early resource-watch returns also need this verified current owner.
+    result["owner_attempt_id"] = aid
     if (status not in {"open", "running"}
             or not (metadata.get("launch_claimed") == "1" or metadata.get("launch_started") == "1")):
         return None
