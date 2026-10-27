@@ -1712,7 +1712,7 @@ class FirstGenerationObserverReplacementTest(unittest.TestCase):
             process.wait(timeout=5)
             process.stdout.close()
 
-    def _replace(self, process, *, variants=None):
+    def _replace(self, process, *, variants=None, replace_checkout=True):
         required = ["--jobs", self.argv[1], "--resume-obligation", "duty"]
         with mock.patch.object(obligations, "__file__",
                                str(self.current_release / "utilities/peer_obligations.py")), \
@@ -1724,7 +1724,7 @@ class FirstGenerationObserverReplacementTest(unittest.TestCase):
                 self.RELATIVE, required, binding, lock_fd_option="--obligation-lock-fd",
                 exact_arguments=True,
                 argument_variants=[self.argv] if variants is None else variants,
-                root=self.current_release)
+                root=self.current_release, replace_checkout=replace_checkout)
 
     @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
     def test_lock_fd_is_found_from_proc_when_argv_does_not_advertise_it(self):
@@ -1773,6 +1773,25 @@ class FirstGenerationObserverReplacementTest(unittest.TestCase):
         elsewhere = self._start(self._checkout(), agent_home=foreign)
         self.assertFalse(self._replace(elsewhere))
         self.assertIsNone(elsewhere.poll())
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_development_checkout_is_left_alone_without_the_caller_opt_in(self):
+        checkout = self._checkout()
+        process = self._start(checkout, agent_home=checkout,
+                              fixture_home=self.base / "fixture-home")
+        self.assertFalse(self._replace(process, replace_checkout=False))
+        self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_another_installs_release_is_not_a_checkout(self):
+        foreign_data = self.base / "foreign-data"
+        (foreign_data / "releases").mkdir(parents=True)
+        foreign = foreign_data / "releases" / "foreign"
+        shutil.copytree(self.old_release, foreign)
+        process = self._start(foreign, agent_home=foreign,
+                              fixture_home=self.base / "fixture-home")
+        self.assertFalse(self._replace(process))
+        self.assertIsNone(process.poll())
 
     @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
     def test_current_release_observer_is_still_reported_current(self):

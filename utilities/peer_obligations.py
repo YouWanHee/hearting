@@ -354,12 +354,16 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                              root=None, timeout: float = 2.0,
                              exact_arguments: bool = False,
                              argument_variants: Iterable[Iterable[str]] = (),
-                             service_current_option: str = "--service-current"):
+                             service_current_option: str = "--service-current",
+                             replace_checkout: bool = False):
     """Stop one exact old observer after proving its same-install duty lock.
 
     Returns ``current`` for an already-current observer, ``replaced`` after
     that exact process exits, and ``False`` when any part of the proof is
-    unavailable. No duty data is changed here.
+    unavailable. No duty data is changed here. A caller may set
+    ``replace_checkout`` to also replace an observer that runs from a
+    development checkout (never reported current); otherwise such a process
+    is left alone.
     """
     if pid_start is not None and (
             not isinstance(pid_start, str) or not pid_start.isdecimal()):
@@ -419,7 +423,10 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                 if _release_root(source_root, target_layout[2]) is None:
                     # A development checkout is never a managed release; it is
                     # only ever replaced (legacy), never accepted as current.
-                    if (source_root.parent == target_layout[2]
+                    # Another install's release stays foreign.
+                    if (not replace_checkout
+                            or source_root.parent == target_layout[2]
+                            or (source_root / "RELEASE_VERSION").exists()
                             or not all((source_root / marker).is_file() for marker in (
                                 "utilities/peer_obligations.py", "core/CORE.md"))):
                         return None

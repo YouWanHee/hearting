@@ -665,6 +665,7 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None,
                         binding, lock_fd_option="--obligation-lock-fd",
                         exact_arguments=True,
                         argument_variants=_observer_argument_variants(observer["pid"], record),
+                        replace_checkout=True,
                     )
                     if replaced != "replaced":
                         continue
