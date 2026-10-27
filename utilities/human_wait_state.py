@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from datetime import datetime
 import ipaddress
 import socket
+from decimal import Decimal, InvalidOperation
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -783,7 +784,7 @@ def _proc_listening_sockets(pid):
                 port = int(port_hex, 16)
             except (ValueError, OverflowError):
                 continue
-            if not (address.is_loopback or address.is_unspecified) or not port:
+            if not address.is_loopback or not port:
                 continue
             target = listeners.setdefault(port, {"hosts": set(), "inodes": set()})
             target["hosts"].add("127.0.0.1" if address.version == 4 else "::1")
@@ -795,8 +796,115 @@ def _proc_listening_sockets(pid):
     return port, host, tuple(sorted(listener["inodes"]))
 
 
+def _opencode_loopback_url(value):
+    """Parse an HTTP loopback URL without resolving names or following proxies."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        if (parsed.scheme != "http" or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment or parsed.path not in {"", "/"}):
+            return None
+        hostname = parsed.hostname.lower()
+        if hostname == "localhost":
+            hosts = {"127.0.0.1", "::1"}
+        else:
+            if "%" in hostname:
+                return None
+            address = ipaddress.ip_address(hostname)
+            if not address.is_loopback:
+                return None
+            hosts = {str(address)}
+        port = parsed.port or 80
+        if not 1 <= port <= 65535:
+            return None
+        return hosts, port
+    except ValueError:
+        return None
+
+
+def _opencode_info_matches_listener(url, advertised_urls, listener_port, listener_host):
+    requested = _opencode_loopback_url(url)
+    if requested is None:
+        return []
+    requested_hosts, requested_port = requested
+    if requested_port != listener_port or listener_host not in requested_hosts:
+        return []
+    matching = []
+    for advertised in advertised_urls:
+        parsed = _opencode_loopback_url(advertised)
+        if parsed is None:
+            continue
+        hosts, port = parsed
+        if (port == listener_port and listener_host in hosts
+                and requested_hosts.intersection(hosts)):
+            matching.append(advertised)
+    return sorted(set(matching))
+
+
+def _opencode_server_endpoint(base_url, session_id, frontend_pid, frontend_start,
+                              opencode_collector):
+    """Bind a selected TUI to the V2 server PID and its physical loopback socket."""
+    if _opencode_loopback_url(base_url) is None:
+        return None
+    info_result = _opencode_http({"url": base_url}, "GET", "/api/info")
+    info = info_result.get("body") if isinstance(info_result, dict) else None
+    if (not isinstance(info_result, dict) or info_result.get("status") != 200
+            or not isinstance(info, dict)
+            or not isinstance(info.get("version"), str) or not info["version"]
+            or not isinstance(info.get("pid"), int) or isinstance(info.get("pid"), bool)
+            or info["pid"] <= 0
+            or not isinstance(info.get("urls"), list) or not info["urls"]
+            or any(not isinstance(value, str) for value in info["urls"])
+            or not isinstance(info.get("paths"), dict)
+            or not isinstance(info["paths"].get("tmp"), str)):
+        return None
+
+    server_pid = info["pid"]
+    if _proc_uid(server_pid) != os.getuid():
+        return None
+    server_start = _proc_start_ticks(server_pid)
+    if not server_start or not str(server_start).isdigit():
+        return None
+    listener = _proc_listening_sockets(server_pid)
+    if (not isinstance(listener, tuple) or len(listener) != 3
+            or not isinstance(listener[0], int) or isinstance(listener[0], bool)
+            or listener[1] not in {"127.0.0.1", "::1"}
+            or not isinstance(listener[2], (tuple, list)) or not listener[2]
+            or any(not isinstance(inode, str) or not inode.isdigit()
+                   for inode in listener[2])):
+        return None
+    server_urls = _opencode_info_matches_listener(
+        base_url, info["urls"], listener[0], listener[1])
+    if (not server_urls or _proc_start_ticks(server_pid) != server_start
+            or _proc_uid(server_pid) != os.getuid()
+            or _proc_uid(frontend_pid) != os.getuid()
+            or str(_proc_start_ticks(frontend_pid)) != str(frontend_start)):
+        return None
+    try:
+        selected, source = opencode_collector.session_of_process(frontend_pid)
+    except Exception:
+        return None
+    if (selected != session_id or source != "opencode-tui-selection"
+            or str(_proc_start_ticks(frontend_pid)) != str(frontend_start)
+            or _proc_start_ticks(server_pid) != server_start):
+        return None
+
+    socket_ids = sorted(set(listener[2]))
+    identity_parts = [str(frontend_pid), str(frontend_start), str(server_pid),
+                      str(server_start), base_url, *server_urls, *socket_ids]
+    generation = hashlib.sha256("\0".join(identity_parts).encode("utf-8")).hexdigest()
+    return {"url": base_url, "generation": generation,
+            "pid": server_pid, "proc_start": str(server_start),
+            "socket_inodes": socket_ids, "server_pid": server_pid,
+            "server_proc_start": str(server_start), "server_urls": server_urls,
+            "frontend_pid": frontend_pid,
+            "frontend_proc_start": str(frontend_start)}
+
+
 def _opencode_endpoint(session_id):
-    """Resolve one live OpenCode session to its own server process and listener."""
+    """Resolve one current OpenCode TUI selection to its V2 server instance."""
     if not sys.platform.startswith("linux") or not _safe_native_ref(session_id):
         return None
     try:
@@ -820,26 +928,24 @@ def _opencode_endpoint(session_id):
             observed, source = opencode_collector.session_of_process(pid)
         except Exception:
             continue
-        if observed != session_id or source not in {"opencode-tui-selection", "opencode-argv"}:
+        if observed != session_id or source != "opencode-tui-selection":
             continue
         if _proc_start_ticks(pid) != start:
             continue
         explicit = _explicit_opencode_server(argv)
         if explicit:
-            base_url, socket_ids = explicit, ()
+            base_url = explicit
         else:
             listener = _proc_listening_sockets(pid)
             if listener is None:
                 continue
-            port, host, socket_ids = listener
+            port, host, _socket_ids = listener
             formatted_host = "[" + host + "]" if ":" in host else host
             base_url = "http://" + formatted_host + ":" + str(port)
-        generation = hashlib.sha256(
-            (str(pid) + "\0" + str(start) + "\0" + base_url + "\0" +
-             ",".join(socket_ids)).encode("utf-8")).hexdigest()
-        found.append({"url": base_url, "generation": generation,
-                      "pid": pid, "proc_start": str(start),
-                      "socket_inodes": list(socket_ids)})
+        endpoint = _opencode_server_endpoint(
+            base_url, session_id, pid, start, opencode_collector)
+        if endpoint is not None:
+            found.append(endpoint)
     return found[0] if len(found) == 1 else None
 
 
@@ -851,7 +957,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 def _opencode_http(endpoint, method, path, payload=None):
     """Call a checked OpenCode endpoint directly; never follow proxies or redirects."""
     if (not isinstance(endpoint, dict) or not isinstance(endpoint.get("url"), str)
-            or (not path.startswith("/api/") and path != "/global/health")):
+            or not path.startswith("/api/")):
         return {"status": 0, "reason": "endpoint-invalid"}
     url = endpoint["url"].rstrip("/") + path
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -891,18 +997,179 @@ def _opencode_identity_matches(endpoint, session_id):
             and current.get("generation") == endpoint.get("generation") else None)
 
 
+def _opencode_form_decimal(value, *, allow_infinity=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    if allow_infinity and value in ("Infinity", "-Infinity"):
+        return Decimal(value)
+    try:
+        result = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if result.is_nan() or (result.is_infinite() and not allow_infinity):
+        return None
+    return result
+
+
+def _opencode_form_option_rows(value):
+    if not isinstance(value, list):
+        return None
+    rows, seen = [], set()
+    for option in value:
+        if (not isinstance(option, dict) or not isinstance(option.get("value"), str)
+                or not option["value"] or not isinstance(option.get("label"), str)
+                or not option["label"] or option["value"] in seen):
+            return None
+        seen.add(option["value"])
+        rows.append({"value": option["value"], "label": option["label"],
+                     "description": option.get("description")
+                     if isinstance(option.get("description"), str) else ""})
+    return rows
+
+
+def _opencode_form_question(field, form_title):
+    """Normalize one documented V2 field without losing its native key or value."""
+    if not isinstance(field, dict):
+        return None, "opencode-form-field-invalid"
+    field_type = field.get("type")
+    key = _safe_native_ref(field.get("key"))
+    if (not key or not isinstance(field_type, str)
+            or field_type not in {"string", "number", "integer", "boolean",
+                                  "multiselect", "external"}):
+        return None, "opencode-form-field-unsupported"
+    base_keys = {"key", "type", "title", "description", "required", "hidden", "when"}
+    type_keys = {
+        "string": {"format", "minLength", "maxLength", "pattern", "placeholder",
+                   "default", "options", "custom"},
+        "number": {"minimum", "maximum", "default"},
+        "integer": {"minimum", "maximum", "default"},
+        "boolean": {"default"},
+        "multiselect": {"options", "minItems", "maxItems", "custom", "default"},
+        "external": {"url"},
+    }
+    if set(field).difference(base_keys | type_keys[field_type]):
+        return None, "opencode-form-field-property-unsupported"
+    common = {"id": key,
+              "header": field.get("title") if isinstance(field.get("title"), str) else "",
+              "question": field.get("title") if isinstance(field.get("title"), str)
+              and field["title"] else form_title,
+              "description": field.get("description")
+              if isinstance(field.get("description"), str) else "",
+              "field_type": field_type,
+              "required": field.get("required", False),
+              "hidden": field.get("hidden", False),
+              "when": field.get("when", [])}
+    if type(common["required"]) is not bool or type(common["hidden"]) is not bool:
+        return None, "opencode-form-field-flags-invalid"
+    if not isinstance(common["when"], list):
+        return None, "opencode-form-condition-invalid"
+    if field_type == "external":
+        if not isinstance(field.get("url"), str):
+            return None, "opencode-form-external-field-invalid"
+        common["url"] = field["url"]
+        return common, "opencode-form-external-field-unsupported"
+
+    custom = field.get("custom", False)
+    if type(custom) is not bool:
+        return None, "opencode-form-custom-flag-invalid"
+
+    if field_type in {"number", "integer"}:
+        for name in ("minimum", "maximum"):
+            if name in field and _opencode_form_decimal(field[name], allow_infinity=True) is None:
+                return None, "opencode-form-numeric-bound-invalid"
+            if name in field:
+                common[name] = field[name]
+        minimum = _opencode_form_decimal(field.get("minimum"), allow_infinity=True)
+        maximum = _opencode_form_decimal(field.get("maximum"), allow_infinity=True)
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return None, "opencode-form-numeric-bounds-invalid"
+
+    if field_type == "string":
+        for name in ("minLength", "maxLength"):
+            value = field.get(name)
+            if value is not None and (type(value) is not int or value < 0):
+                return None, "opencode-form-string-bounds-invalid"
+            if value is not None:
+                common["min_length" if name == "minLength" else "max_length"] = value
+        minimum, maximum = common.get("min_length"), common.get("max_length")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return None, "opencode-form-string-bounds-invalid"
+        # Python and JavaScript do not share regex, URL, and date parsing semantics.
+        if any(name in field for name in ("format", "pattern")):
+            return common, "opencode-form-string-constraint-unsupported"
+
+    options = field.get("options")
+    common["options_present"] = options is not None
+    if field_type == "multiselect" or options is not None:
+        option_rows = _opencode_form_option_rows(options)
+        if option_rows is None or (field_type == "multiselect" and not option_rows):
+            return None, "opencode-form-options-invalid"
+        if field_type == "string" and not option_rows and not custom:
+            return common, "opencode-form-options-empty"
+        common["choices"] = option_rows
+        common["option_values"] = [row["value"] for row in option_rows]
+    else:
+        common["choices"] = None
+        common["option_values"] = []
+
+    common["custom"] = custom
+
+    if field_type == "multiselect":
+        for name in ("minItems", "maxItems"):
+            value = field.get(name)
+            if value is not None and (type(value) is not int or value < 0):
+                return None, "opencode-form-multiselect-bounds-invalid"
+            common["min_items" if name == "minItems" else "max_items"] = value
+        minimum, maximum = common.get("min_items"), common.get("max_items")
+        if minimum is not None and maximum is not None and minimum > maximum:
+            return None, "opencode-form-multiselect-bounds-invalid"
+
+    # A hidden required value has no user-visible input and no documented server defaulting.
+    if common["hidden"] and common["required"]:
+        return common, "opencode-form-hidden-required-field-unsupported"
+    return common, None
+
+
+def _opencode_form_conditions_supported(questions):
+    earlier = {}
+    for question in questions:
+        for condition in question.get("when", []):
+            if (not isinstance(condition, dict) or condition.get("op") not in {"eq", "neq"}
+                    or not isinstance(condition.get("key"), str)
+                    or condition["key"] not in earlier or "value" not in condition):
+                return False
+            target = earlier[condition["key"]]
+            value = condition["value"]
+            target_type = target["field_type"]
+            if target_type == "boolean":
+                valid = type(value) is bool
+            elif target_type in {"number", "integer"}:
+                valid = _opencode_form_decimal(value) is not None
+            else:
+                valid = isinstance(value, str)
+                values = target.get("option_values", [])
+                if valid and target.get("options_present") and not target.get("custom"):
+                    valid = value in values
+            if not valid:
+                return False
+        earlier[question["id"]] = question
+    return True
+
+
+def _opencode_form_schema_binding(title, fields):
+    try:
+        raw = json.dumps({"title": title, "fields": fields}, sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _opencode_current_selected(base, *, requested_id=None):
     session_id = base["session_id"]
     endpoint = _opencode_endpoint(session_id)
     if endpoint is None:
         return {"state": "unknown", "reason": "opencode-server-identity-unavailable"}
-    health = _opencode_http(endpoint, "GET", "/global/health")
-    health_body = health.get("body") if isinstance(health, dict) else None
-    if (health.get("status") != 200 or not isinstance(health_body, dict)
-            or health_body.get("healthy") is not True
-            or not isinstance(health_body.get("version"), str)
-            or not health_body["version"].startswith("2.")):
-        return {"state": "unknown", "reason": "opencode-v2-server-unavailable"}
     kind = "approval" if base["kind"] in {"approval", "permission"} else "question"
     if kind == "approval":
         collection = "permission"
@@ -935,8 +1202,13 @@ def _opencode_current_selected(base, *, requested_id=None):
     if not _opencode_identity_matches(endpoint, session_id):
         return {"state": "unknown", "reason": "opencode-server-replaced"}
     native_ref = {"transport": "opencode-http-v2", "generation": endpoint["generation"],
-                  "request_id": request_id, "server_pid": endpoint["pid"],
-                  "proc_start": endpoint["proc_start"],
+                  "request_id": request_id, "url": endpoint["url"],
+                  "server_pid": endpoint["server_pid"],
+                  "server_proc_start": endpoint["server_proc_start"],
+                  "proc_start": endpoint["server_proc_start"],
+                  "frontend_pid": endpoint["frontend_pid"],
+                  "frontend_proc_start": endpoint["frontend_proc_start"],
+                  "server_urls": endpoint["server_urls"],
                   "socket_inodes": endpoint["socket_inodes"]}
     if kind == "approval":
         turn_id = _safe_native_ref(detail.get("messageID"))
@@ -965,54 +1237,56 @@ def _opencode_current_selected(base, *, requested_id=None):
                 "reason": "opencode-form-not-pending", "kind": kind,
                 "request_id": request_id, "native_ref": native_ref}
     fields = detail.get("fields")
-    if not isinstance(fields, list) or len(fields) != 1 or not isinstance(fields[0], dict):
+    if not isinstance(fields, list) or not fields:
         return {"state": "unknown", "reason": "opencode-form-needs-native-ui",
                 "kind": kind, "request_id": request_id, "native_ref": native_ref}
-    field = fields[0]
-    question_id = _safe_native_ref(field.get("key"))
+    questions, field_keys, schema_error = [], [], None
+    for field in fields:
+        question, error = _opencode_form_question(
+            field, detail.get("title") if isinstance(detail.get("title"), str) else "")
+        if question is None:
+            return {"state": "unknown", "reason": error,
+                    "kind": kind, "request_id": request_id, "native_ref": native_ref}
+        if question["id"] in field_keys:
+            return {"state": "unknown", "reason": "opencode-form-field-keys-ambiguous",
+                    "kind": kind, "request_id": request_id, "native_ref": native_ref}
+        field_keys.append(question["id"])
+        questions.append(question)
+        schema_error = schema_error or error
+    if not _opencode_form_conditions_supported(questions):
+        schema_error = schema_error or "opencode-form-condition-unsupported"
+    question_id = field_keys[0] if len(field_keys) == 1 else None
     metadata = detail.get("metadata") if isinstance(detail.get("metadata"), dict) else {}
-    # Use an owner message/turn ref only when the native request metadata supplies one.
-    turn_id = (_safe_native_ref(metadata.get("turnID"))
-               or _safe_native_ref(metadata.get("messageID")))
-    field_type = field.get("type")
-    choices = None
-    option_values = []
-    supported = field_type == "string"
-    minimum, maximum = field.get("minItems"), field.get("maxItems")
-    bounds_valid = ((minimum is None or type(minimum) is int and minimum >= 0)
-                    and (maximum is None or type(maximum) is int and maximum >= 0)
-                    and (minimum is None or maximum is None or minimum <= maximum))
-    if field_type == "multiselect" and isinstance(field.get("options"), list):
-        choices = []
-        for option in field["options"]:
-            if not isinstance(option, dict):
-                return {"state": "unknown", "reason": "opencode-form-options-invalid",
-                        "kind": kind, "request_id": request_id, "native_ref": native_ref}
-            value, label = option.get("value"), option.get("label")
-            if not isinstance(value, str) or not value or not isinstance(label, str):
-                return {"state": "unknown", "reason": "opencode-form-options-invalid",
-                        "kind": kind, "request_id": request_id, "native_ref": native_ref}
-            option_values.append(value)
-            choices.append({"value": value, "label": label,
-                            "description": option.get("description")
-                            if isinstance(option.get("description"), str) else ""})
-        supported = bool(choices) or bool(field.get("custom"))
-    if field_type == "multiselect" and not bounds_valid:
-        supported = False
-    if not question_id or not turn_id:
-        supported = False
-    native_ref.update({"field_type": field_type, "option_values": option_values,
-                       "custom": bool(field.get("custom")),
-                       "min_items": minimum, "max_items": maximum})
-    detail_value = {
-        "title": detail.get("title") if isinstance(detail.get("title"), str) else "",
-        "question": field.get("title") if isinstance(field.get("title"), str) else
-                    (detail.get("title") if isinstance(detail.get("title"), str) else ""),
-        "description": field.get("description") if isinstance(field.get("description"), str) else "",
-        "field_type": field_type,
-    }
+    supplied_turns = [metadata[key] for key in ("turnID", "messageID")
+                      if key in metadata and metadata[key] is not None]
+    turn_refs = [_safe_native_ref(value) for value in supplied_turns]
+    if any(value is None for value in turn_refs) or len(set(turn_refs)) > 1:
+        schema_error = schema_error or "opencode-form-native-turn-invalid"
+    turn_id = turn_refs[0] if turn_refs and all(turn_refs) else None
+    title = detail.get("title") if isinstance(detail.get("title"), str) else ""
+    schema_binding = _opencode_form_schema_binding(title, fields)
+    if schema_binding is None:
+        schema_error = schema_error or "opencode-form-schema-unbindable"
+    native_ref.update({"session_id": session_id, "field_keys": field_keys,
+                       "schema_binding": schema_binding})
+    if len(questions) == 1:
+        question = questions[0]
+        native_ref.update({"field_type": question["field_type"],
+                           "option_values": question.get("option_values", []),
+                           "custom": question.get("custom", False),
+                           "min_items": question.get("min_items"),
+                           "max_items": question.get("max_items")})
+    detail_value = {"title": title, "questions": questions}
+    if len(questions) == 1:
+        question = questions[0]
+        detail_value.update({"question": question["question"],
+                             "description": question["description"],
+                             "field_type": question["field_type"]})
+    choices = questions[0].get("choices") if len(questions) == 1 else None
+    supported = schema_error is None and schema_binding is not None
     return {"state": "open" if supported else "unknown",
-            "reason": None if supported else "opencode-form-schema-or-turn-binding-unsupported",
+            "reason": None if supported else
+            (schema_error or "opencode-form-schema-unsupported"),
             "kind": kind, "request_id": request_id, "turn_id": turn_id,
             "question_id": question_id, "detail": detail_value,
             "choices": choices, "support": supported, "native_ref": native_ref}
@@ -2306,6 +2580,167 @@ def write_selected_draft(ref, draft):
     return updated
 
 
+def _opencode_form_active(question, native_answers):
+    for condition in question.get("when", []):
+        value = native_answers.get(condition["key"])
+        if value is None:
+            return False
+        hit = (any(item == condition["value"] for item in value)
+               if isinstance(value, list) else value == condition["value"])
+        if (condition["op"] == "eq" and not hit) or (condition["op"] == "neq" and hit):
+            return False
+    return True
+
+
+def _opencode_form_answers(envelope, answers):
+    """Validate portable field answers and return the exact native typed answer map."""
+    detail = envelope.get("detail") if isinstance(envelope, dict) else None
+    native_ref = envelope.get("native_ref") if isinstance(envelope, dict) else None
+    questions = detail.get("questions") if isinstance(detail, dict) else None
+    if (not isinstance(native_ref, dict) or native_ref.get("transport") != "opencode-http-v2"
+            or not isinstance(questions, list) or not questions
+            or not isinstance(answers, dict)):
+        return None, "opencode-form-schema-unavailable"
+    field_keys = [question.get("id") for question in questions
+                  if isinstance(question, dict)]
+    if (len(field_keys) != len(questions) or not field_keys
+            or len(set(field_keys)) != len(field_keys)
+            or native_ref.get("field_keys") != field_keys
+            or not set(answers).issubset(set(field_keys))):
+        return None, "opencode-form-answer-keys-invalid"
+
+    result, native_answers = {}, {}
+    for question in questions:
+        key = question["id"]
+        active = _opencode_form_active(question, native_answers)
+        supplied = key in answers
+        if not active:
+            if supplied:
+                return None, "opencode-form-inactive-field-answer"
+            continue
+        if question.get("hidden") is True:
+            if supplied:
+                return None, "opencode-form-hidden-field-answer"
+            if question.get("required") is True:
+                return None, "opencode-form-hidden-required-field-unsupported"
+            continue
+        if not supplied:
+            if question.get("required") is True:
+                return None, "opencode-form-required-answer-missing"
+            continue
+        values = answers[key]
+        if not isinstance(values, list):
+            return None, "opencode-form-answer-shape-invalid"
+        field_type = question.get("field_type")
+        required = question.get("required") is True
+        option_values = question.get("option_values", [])
+        custom = question.get("custom") is True
+
+        if field_type == "string":
+            if len(values) != 1:
+                return None, "opencode-string-answer-count-invalid"
+            if not isinstance(values[0], str):
+                return None, "opencode-form-string-answer-invalid"
+            value = values[0]
+            if not value and not required:
+                continue
+            if not value:
+                return None, "opencode-form-required-answer-empty"
+            try:
+                length = len(value.encode("utf-16-le")) // 2
+            except UnicodeEncodeError:
+                return None, "opencode-form-string-answer-invalid"
+            minimum, maximum = question.get("min_length"), question.get("max_length")
+            if ((minimum is not None and length < minimum)
+                    or (maximum is not None and length > maximum)):
+                return None, "opencode-form-string-answer-length-invalid"
+            if question.get("options_present") and not custom and value not in option_values:
+                return None, "opencode-answer-not-in-current-options"
+            native_value = value
+
+        elif field_type in {"number", "integer"}:
+            if len(values) != 1:
+                return None, "opencode-form-numeric-answer-invalid"
+            raw = values[0]
+            if isinstance(raw, str) and not raw.strip() and not required:
+                continue
+            numeric = _opencode_form_decimal(raw)
+            if numeric is None:
+                return None, "opencode-form-numeric-answer-invalid"
+            minimum = _opencode_form_decimal(question.get("minimum"), allow_infinity=True)
+            maximum = _opencode_form_decimal(question.get("maximum"), allow_infinity=True)
+            if ((question.get("minimum") is not None and minimum is None)
+                    or (question.get("maximum") is not None and maximum is None)):
+                return None, "opencode-form-numeric-bound-invalid"
+            if ((minimum is not None and numeric < minimum)
+                    or (maximum is not None and numeric > maximum)):
+                return None, "opencode-form-numeric-answer-out-of-bounds"
+            if field_type == "integer":
+                if numeric != numeric.to_integral_value():
+                    return None, "opencode-form-integer-answer-invalid"
+                if not -9007199254740991 <= numeric <= 9007199254740991:
+                    return None, "opencode-form-integer-answer-unsafe"
+                native_value = int(numeric)
+            else:
+                native_value = float(numeric)
+                if (not math.isfinite(native_value)
+                        or Decimal(str(native_value)) != numeric):
+                    return None, "opencode-form-number-answer-unsafe"
+
+        elif field_type == "boolean":
+            if len(values) != 1 or type(values[0]) is not bool:
+                return None, "opencode-form-boolean-answer-explicit-required"
+            native_value = values[0]
+
+        elif field_type == "multiselect":
+            if any(not isinstance(value, str) for value in values):
+                return None, "opencode-form-multiselect-answer-invalid"
+            if not values and not required and question.get("min_items") in (None, 0):
+                continue
+            minimum, maximum = question.get("min_items"), question.get("max_items")
+            if ((minimum is not None and len(values) < minimum)
+                    or (maximum is not None and len(values) > maximum)):
+                return None, "opencode-answer-count-invalid"
+            if len(set(values)) != len(values):
+                return None, "opencode-answer-duplicate-option"
+            if not custom and any(value not in option_values for value in values):
+                return None, "opencode-answer-not-in-current-options"
+            native_value = list(values)
+
+        else:
+            return None, "opencode-form-type-unsupported"
+        result[key] = native_value
+        native_answers[key] = native_value
+
+    return result, None
+
+
+def _opencode_turnless_form_binding(envelope):
+    if (not isinstance(envelope, dict) or envelope.get("harness") != "opencode"
+            or envelope.get("kind") != "question" or envelope.get("turn_id") is not None):
+        return False
+    native_ref = envelope.get("native_ref")
+    detail = envelope.get("detail")
+    questions = detail.get("questions") if isinstance(detail, dict) else None
+    if (not isinstance(native_ref, dict) or native_ref.get("transport") != "opencode-http-v2"
+            or native_ref.get("session_id") != envelope.get("session_id")
+            or native_ref.get("request_id") != envelope.get("request_id")
+            or not isinstance(native_ref.get("generation"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", native_ref["generation"])
+            or not isinstance(native_ref.get("schema_binding"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", native_ref["schema_binding"])
+            or type(native_ref.get("server_pid")) is not int or native_ref["server_pid"] < 1
+            or not _safe_native_ref(native_ref.get("proc_start"))
+            or not isinstance(native_ref.get("field_keys"), list)
+            or not isinstance(questions, list) or not questions):
+        return False
+    keys = [question.get("id") for question in questions if isinstance(question, dict)]
+    return (len(keys) == len(questions) and len(set(keys)) == len(keys)
+            and keys == native_ref["field_keys"]
+            and _safe_request_id(envelope.get("request_id")) is not None
+            and _safe_native_ref(envelope.get("session_id")) is not None)
+
+
 def _portable_response(envelope, response):
     if not isinstance(response, dict):
         return None, "response-shape-invalid"
@@ -2318,6 +2753,48 @@ def _portable_response(envelope, response):
     answers = response.get("answers")
     detail = envelope.get("detail")
     questions = detail.get("questions") if isinstance(detail, dict) else None
+    native_ref = envelope.get("native_ref")
+    if (envelope.get("harness") == "opencode" and isinstance(native_ref, dict)
+            and native_ref.get("transport") == "opencode-http-v2"):
+        if not isinstance(questions, list) or not questions:
+            return None, "opencode-form-schema-unavailable"
+        question_by_id = {question.get("id"): question for question in questions
+                          if isinstance(question, dict)}
+        if (len(question_by_id) != len(questions) or not isinstance(answers, dict)
+                or not set(answers).issubset(set(question_by_id))):
+            return None, "opencode-form-answer-keys-invalid"
+        normalized = {}
+        for question_id, values in answers.items():
+            question = question_by_id[question_id]
+            if not isinstance(values, list):
+                return None, "opencode-form-answer-shape-invalid"
+            field_type = question.get("field_type")
+            if field_type in {"string", "multiselect"}:
+                valid = all(isinstance(value, str)
+                            and len(value.encode("utf-8")) <= _SELECTED_DRAFT_MAX
+                            for value in values)
+            elif field_type in {"number", "integer"}:
+                valid = all(not isinstance(value, bool)
+                            and isinstance(value, (int, float, str))
+                            and (not isinstance(value, float) or math.isfinite(value))
+                            and (not isinstance(value, str)
+                                 or len(value.encode("utf-8")) <= _SELECTED_DRAFT_MAX)
+                            for value in values)
+            elif field_type == "boolean":
+                if not all(type(value) is bool for value in values):
+                    return None, "opencode-form-boolean-answer-explicit-required"
+                valid = True
+            else:
+                valid = False
+            if not valid:
+                return None, "opencode-form-answer-value-invalid"
+            normalized[question_id] = list(values)
+        try:
+            if len(json.dumps(normalized, ensure_ascii=False, allow_nan=False).encode("utf-8")) > 16_384:
+                return None, "opencode-form-answer-too-large"
+        except (TypeError, ValueError):
+            return None, "opencode-form-answer-value-invalid"
+        return {"answers": normalized}, None
     if isinstance(questions, list) and questions:
         question_ids = [_safe_native_ref(question.get("id"))
                         if isinstance(question, dict) else None for question in questions]
@@ -2344,6 +2821,10 @@ def _native_response_error(envelope, portable):
     """Check a portable response against the exact selected native request shape."""
     native_ref = envelope.get("native_ref")
     detail = envelope.get("detail")
+    if (envelope.get("harness") == "opencode" and envelope.get("kind") == "question"
+            and isinstance(native_ref, dict)
+            and native_ref.get("transport") == "opencode-http-v2"):
+        return _opencode_form_answers(envelope, portable.get("answers"))[1]
     if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-owner-input":
         return None
     if isinstance(native_ref, dict) and native_ref.get("transport") == "hearting-human-gate":
@@ -2389,30 +2870,6 @@ def _native_response_error(envelope, portable):
 
     answers = portable["answers"]
     harness = envelope.get("harness")
-    if harness == "opencode":
-        field_type = native_ref.get("field_type") if isinstance(native_ref, dict) else None
-        values = answers.get(envelope.get("question_id"), [])
-        if field_type == "string":
-            return None if len(values) == 1 else "opencode-string-answer-count-invalid"
-        if field_type != "multiselect":
-            return "opencode-form-type-unsupported"
-        allowed = native_ref.get("option_values")
-        if not isinstance(allowed, list):
-            return "opencode-options-unavailable"
-        if len(set(values)) != len(values):
-            return "opencode-answer-duplicate-option"
-        if not native_ref.get("custom") and any(value not in allowed for value in values):
-            return "opencode-answer-not-in-current-options"
-        minimum, maximum = native_ref.get("min_items"), native_ref.get("max_items")
-        if ((minimum is not None and (type(minimum) is not int or minimum < 0))
-                or (maximum is not None and (type(maximum) is not int or maximum < 0))
-                or (minimum is not None and maximum is not None and minimum > maximum)):
-            return "opencode-answer-constraints-invalid"
-        if ((minimum is not None and len(values) < minimum)
-                or (maximum is not None and len(values) > maximum)):
-            return "opencode-answer-count-invalid"
-        return None
-
     if harness == "codex" and isinstance(detail, dict):
         questions = detail.get("questions")
         if not isinstance(questions, list):
@@ -2686,28 +3143,13 @@ def _opencode_submit(envelope, portable):
         if not _opencode_identity_matches(endpoint, base["session_id"]):
             return "unknown", {"reason": "opencode-server-replaced-after-response"}
         return "applied", {"transport": "received", "runtime": "applied", "http_status": 204}
-    field_type = native_ref.get("field_type")
-    values = portable["answers"][envelope["question_id"]]
-    if field_type == "string":
-        if len(values) != 1:
-            return "unknown", {"reason": "opencode-string-answer-shape-invalid"}
-        answer_value = values[0]
-    elif field_type == "multiselect":
-        allowed = native_ref.get("option_values")
-        if not isinstance(allowed, list):
-            return "unknown", {"reason": "opencode-options-unavailable"}
-        if (not native_ref.get("custom") and any(value not in allowed for value in values)):
-            return "unknown", {"reason": "opencode-answer-not-in-current-options"}
-        minimum, maximum = native_ref.get("min_items"), native_ref.get("max_items")
-        if (isinstance(minimum, int) and len(values) < minimum
-                or isinstance(maximum, int) and len(values) > maximum):
-            return "unknown", {"reason": "opencode-answer-count-invalid"}
-        answer_value = values
-    else:
-        return "unknown", {"reason": "opencode-form-type-unsupported"}
+    answer_value, validation_error = _opencode_form_answers(
+        envelope, portable.get("answers") if isinstance(portable, dict) else None)
+    if validation_error:
+        return "unknown", {"reason": validation_error}
     reply_path = f"/api/session/{session_path}/form/{request_path}/reply"
     result = _opencode_http(endpoint, "POST", reply_path,
-                            {"answer": {envelope["question_id"]: answer_value}})
+                            {"answer": answer_value})
     if result.get("status") != 204:
         return "unknown", {"reason": "opencode-form-response-ambiguous"}
     confirmation = _opencode_http(endpoint, "GET",
@@ -2794,7 +3236,10 @@ def submit_selected_response(ref, response, *, action_id=None):
         and identity.get("turn_id") is None
         and identity.get("gate_epoch") == native_ref.get("gate_epoch")
         and identity.get("route_id") == native_ref.get("route_id"))
-    if identity.get("turn_id") is None and not workflow_owner_request and not workflow_gate_request:
+    opencode_turnless_form = (identity.get("turn_id") is None
+                              and _opencode_turnless_form_binding(current))
+    if (identity.get("turn_id") is None and not workflow_owner_request
+            and not workflow_gate_request and not opencode_turnless_form):
         return _selected_fallback(base, "exact-request-turn-binding-required")
     portable, response_error = _portable_response(current, response)
     if portable is None:

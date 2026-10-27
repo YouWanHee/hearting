@@ -98,6 +98,13 @@ writer that cannot persist the field must not claim.
 
 ## Current Session and Context Evidence
 
+Native form identity uses the fields the runtime actually supplies. A form that
+has no native turn ID stays bound to its exact native session, request, current
+schema and owning connection; never manufacture a turn ID from its form ID.
+Transports that require a native turn keep that requirement. The selected private
+detail and explicit response still revalidate the current request before one
+action; neither a display alias nor a workflow prefix substitutes for that proof.
+
 Codex runtime activation (install, update, or refresh) may record the current native
 hash for Hearting's own projected hook definitions through App Server. It preserves
 disabled decisions, leaves foreign definitions to the user's `/hooks` review, and

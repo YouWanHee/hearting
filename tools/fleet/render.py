@@ -7370,6 +7370,149 @@ def _explorer_question_has_workflow_binding(ref, envelope):
     return False
 
 
+def _explorer_opencode_form_binding(ref, envelope):
+    """Accept a turnless native form only with its exact OpenCode HTTP binding."""
+    row_ref = ref.get("_fleet_row_ref") if isinstance(ref, Mapping) else None
+    row_ref = row_ref if isinstance(row_ref, Mapping) else ref
+    native = envelope.get("native_ref")
+    request_id = envelope.get("request_id")
+    selected_id = envelope.get("selected_id")
+    if (not isinstance(row_ref, Mapping) or row_ref.get("harness") != "opencode"
+            or not isinstance(row_ref.get("id"), str)
+            or not row_ref["id"].startswith("S1:")
+            or selected_id != row_ref.get("id")
+            or type(request_id) is not str or not request_id.startswith("frm_")
+            or row_ref.get("request_id") != request_id
+            or not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"
+            or native.get("request_id") != request_id
+            or type(native.get("generation")) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", native["generation"])
+            or type(native.get("server_pid")) is not int or native["server_pid"] <= 0
+            or type(native.get("proc_start")) is not str
+            or not native["proc_start"].isdigit()
+            or not isinstance(native.get("socket_inodes"), list)
+            or not native["socket_inodes"]
+            or any(type(inode) is not str or not inode.isdigit()
+                   for inode in native["socket_inodes"])):
+        return False
+    if ((row_ref.get("route_id") is not None or envelope.get("route_id") is not None)
+            and row_ref.get("route_id") != envelope.get("route_id")):
+        return False
+    if (native.get("session_id") is not None
+            and native.get("session_id") != envelope.get("session_id")):
+        return False
+    detail = envelope.get("detail")
+    fields = detail.get("questions") if isinstance(detail, Mapping) else None
+    if fields is None and envelope.get("state") in {
+            "submitted", "received", "applied", "cancelled", "expired", "unknown"}:
+        return True
+    if (type(native.get("schema_binding")) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", native["schema_binding"])):
+        return False
+    field_keys = native.get("field_keys")
+    if (not isinstance(field_keys, list) or not field_keys
+            or any(type(key) is not str or not key for key in field_keys)
+            or len(set(field_keys)) != len(field_keys)):
+        return False
+    if not isinstance(fields, list) or not fields:
+        return False
+    seen = set()
+    fields_by_id = {}
+    supported_types = {"string", "number", "integer", "boolean", "multiselect"}
+    for field in fields:
+        if not isinstance(field, Mapping):
+            return False
+        field_id = field.get("id", field.get("key"))
+        field_type = field.get("field_type", field.get("type"))
+        if (type(field_id) is not str or not field_id or field_id in seen
+                or field_type not in supported_types
+                or type(field.get("required")) is not bool
+                or type(field.get("hidden")) is not bool
+                or field.get("hidden") and field.get("required")):
+            return False
+        conditions = field.get("when", [])
+        if not isinstance(conditions, list):
+            return False
+        for condition in conditions:
+            if (not isinstance(condition, Mapping)
+                    or condition.get("op") not in {"eq", "neq"}
+                    or condition.get("key") not in fields_by_id
+                    or "value" not in condition):
+                return False
+            target = fields_by_id[condition["key"]]
+            target_type = target.get("field_type", target.get("type"))
+            value = condition["value"]
+            if target_type == "boolean":
+                valid_condition = type(value) is bool
+            elif target_type in {"number", "integer"}:
+                try:
+                    valid_condition = (type(value) in (int, float, str)
+                                       and math.isfinite(float(value)))
+                except (TypeError, ValueError, OverflowError):
+                    valid_condition = False
+            else:
+                valid_condition = isinstance(value, str)
+                options = target.get("option_values", ())
+                if (valid_condition and target.get("options_present")
+                        and target.get("custom") is not True):
+                    valid_condition = value in options
+            if not valid_condition:
+                return False
+        seen.add(field_id)
+        fields_by_id[field_id] = field
+        choices = field.get("choices", field.get("options"))
+        if choices is not None:
+            if not isinstance(choices, list):
+                return False
+            values = []
+            for choice in choices:
+                if (not isinstance(choice, Mapping)
+                        or type(choice.get("value")) is not str
+                        or not choice["value"]
+                        or type(choice.get("label")) is not str):
+                    return False
+                values.append(choice["value"])
+            if len(set(values)) != len(values):
+                return False
+        if field_type == "multiselect":
+            minimum, maximum = field.get("min_items"), field.get("max_items")
+            if ((minimum is not None and (type(minimum) is not int or minimum < 0))
+                    or (maximum is not None and (type(maximum) is not int or maximum < 0))
+                    or (minimum is not None and maximum is not None and minimum > maximum)):
+                return False
+        elif field_type in {"number", "integer"}:
+            for bound in ("minimum", "maximum"):
+                value = field.get(bound)
+                if (value is not None and (type(value) not in (int, float)
+                                           or not math.isfinite(value))):
+                    return False
+            if (field.get("minimum") is not None and field.get("maximum") is not None
+                    and field["minimum"] > field["maximum"]):
+                return False
+        elif field_type == "boolean" and (
+                "default" in field and type(field.get("default")) is not bool):
+            return False
+    return field_keys == [field.get("id", field.get("key")) for field in fields]
+
+
+def _explorer_opencode_form_ui_supported(envelope):
+    """Accept only backend-approved native schemas the private form editor can express."""
+    detail = envelope.get("detail") if isinstance(envelope, Mapping) else None
+    native = envelope.get("native_ref") if isinstance(envelope, Mapping) else None
+    questions = detail.get("questions") if isinstance(detail, Mapping) else None
+    support = envelope.get("support") if isinstance(envelope, Mapping) else None
+    supported = (support is True or isinstance(support, Mapping)
+                 and support.get("supported") is True)
+    if (envelope.get("state") != "open" or not supported
+            or not isinstance(questions, list) or not questions
+            or not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"):
+        return False
+    return native.get("field_keys") == [question.get("id") for question in questions
+                                          if isinstance(question, Mapping)]
+
+
 def _explorer_question_envelope(ref, value):
     if not isinstance(value, Mapping):
         return None
@@ -7399,8 +7542,13 @@ def _explorer_question_envelope(ref, value):
             return None
     if state != "unknown":
         workflow = isinstance(ref.get("id"), str) and ref["id"].startswith(("S2:", "S3:", "S4:"))
-        turn_bound = (_explorer_question_has_workflow_binding(ref, envelope) if workflow else
-                      isinstance(envelope.get("turn_id"), str) and bool(envelope["turn_id"]))
+        if workflow:
+            turn_bound = _explorer_question_has_workflow_binding(ref, envelope)
+        elif envelope.get("turn_id") is None:
+            turn_bound = (envelope.get("harness") == "opencode"
+                          and _explorer_opencode_form_binding(ref, envelope))
+        else:
+            turn_bound = isinstance(envelope.get("turn_id"), str) and bool(envelope["turn_id"])
         if (envelope.get("v") != 1 or envelope.get("harness") != ref.get("harness")
                 or envelope.get("session_id") != ref.get("session_id")
                 or type(envelope.get("request_id")) not in (str, int)
@@ -7441,10 +7589,24 @@ def _explorer_accept_question_result(update):
                            status=_explorer_question_status(
                                result, "Exact current request unavailable; use the native prompt."))
         else:
-            from .explorer.state import question_draft_from_backend
+            native_ref = envelope.get("native_ref")
+            if (envelope.get("harness") == "opencode" and envelope.get("turn_id") is None
+                    and isinstance(native_ref, Mapping)
+                    and native_ref.get("transport") == "opencode-http-v2"
+                    and envelope.get("state") == "open"
+                    and not _explorer_opencode_form_ui_supported(envelope)):
+                envelope = dict(envelope)
+                support = envelope.get("support")
+                support = dict(support) if isinstance(support, Mapping) else {}
+                support.update({"supported": False,
+                                "reason": "opencode-form-editor-capability-unavailable"})
+                envelope["support"] = support
+                envelope["actions"] = []
+            from .explorer.state import question_draft_from_backend, question_ui_detail
             draft = question_draft_from_backend(envelope, envelope.get("draft"))
             if draft is None:
                 draft = overlay.get("draft")
+            envelope = question_ui_detail(envelope, draft)
             overlay.update(detail=envelope, draft=draft, state=envelope["state"],
                            pending=False, editing=False,
                            status=_explorer_question_status(
@@ -7452,10 +7614,11 @@ def _explorer_accept_question_result(update):
                                else "Request state: " + envelope["state"]))
     elif operation == "questions.draft":
         if envelope is not None and envelope.get("state") == "open":
-            from .explorer.state import question_draft_from_backend
+            from .explorer.state import question_draft_from_backend, question_ui_detail
             draft = question_draft_from_backend(envelope, envelope.get("draft"))
             if draft is None:
                 draft = overlay.get("draft")
+            envelope = question_ui_detail(envelope, draft)
             overlay.update(detail=envelope, draft=draft,
                            state="open", status="Private draft saved; submit explicitly to send.")
         else:
@@ -7464,10 +7627,11 @@ def _explorer_accept_question_result(update):
                                result, "Draft remains on screen; persistence was not confirmed."))
     elif operation == "questions.submit":
         if envelope is not None:
-            from .explorer.state import question_draft_from_backend
+            from .explorer.state import question_draft_from_backend, question_ui_detail
             draft = question_draft_from_backend(envelope, envelope.get("draft"))
             if draft is None:
                 draft = overlay.get("draft")
+            envelope = question_ui_detail(envelope, draft)
             overlay.update(detail=envelope, draft=draft,
                            state=envelope["state"], pending=False, editing=False,
                            status=_explorer_question_status(
