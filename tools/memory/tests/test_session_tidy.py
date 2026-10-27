@@ -594,6 +594,26 @@ class CardConsumeTest(TidyCase):
         self.assertIn("표식-E", text)
         self.assertEqual(sent, [text])
 
+    def test_deferred_consumption_stays_due_until_the_caller_applies_it(self):
+        self.card("sid-A", "표식-D")
+        with self.library():
+            deferred = []
+            sent = []
+            text = st.run_hook("claude", "start", "sid-A", source="compact",
+                               cwd=str(self.cwd), emit=sent.append, deferred=deferred)
+            self.assertIn("표식-D", text)
+            self.assertTrue(deferred)
+            still_due = []
+            st.run_hook("claude", "start", "sid-A", source="compact",
+                        cwd=str(self.cwd), emit=still_due.append)
+            self.assertIn("표식-D", still_due[0],
+                          "a deferred receipt must not consume the card before delivery")
+            self.assertEqual(st.apply_deferred(deferred), len(deferred))
+            after = []
+            st.run_hook("claude", "start", "sid-A", source="compact",
+                        cwd=str(self.cwd), emit=after.append)
+            self.assertEqual(after, [])
+
     def test_output_never_exceeds_2400_bytes_and_always_names_the_file(self):
         self.card("sid-A", "가나다라 " * 900)
         self.confirmed_handover("claude", "sid-A", "sid-B")

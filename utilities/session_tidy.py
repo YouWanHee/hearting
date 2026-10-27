@@ -2194,6 +2194,74 @@ def _write_consumed(seat: Seat, **fields) -> None:
     atomic_write_json(_consumed_path(seat), data)
 
 
+def apply_deferred(entries) -> int:
+    """Apply receipt writes a caller deferred until after its own final output.
+
+    ``run_hook(..., deferred=[...])`` records plain dictionaries here instead of
+    writing them, so a bridge that assembles more context (the Codex hook, the
+    OpenCode plugin) can commit only after its own output returned. Every entry
+    carries the exact state path resolved at emit time, so no seat is rebuilt and
+    no new state file exists. A failed render simply leaves the entries
+    unapplied: the card/candidates stay due for the next prompt.
+    """
+    applied = 0
+    for entry in list(entries or []):
+        if not isinstance(entry, dict):
+            continue
+        path = Path(str(entry.get("path") or ""))
+        if not path.name:
+            continue
+        try:
+            kind = entry.get("kind")
+            if kind in ("card-consumed", "memory-consumed"):
+                data = read_json(path)
+                data = dict(data) if isinstance(data, dict) else {}
+                if kind == "card-consumed":
+                    same = data.get("generation") == entry.get("generation")
+                    receipts = list(data.get("receipts", [])) if same else []
+                    receipts.append(str(entry.get("receipt") or ""))
+                    data.update({"generation": entry.get("generation"),
+                                 "receipts": receipts[-200:]})
+                else:
+                    same = data.get("memory_revision") == entry.get("revision")
+                    receipts = list(data.get("memory_receipts", [])) if same else []
+                    receipts.append(str(entry.get("receipt") or ""))
+                    data.update({"memory_revision": entry.get("revision"),
+                                 "memory_receipts": receipts[-200:]})
+                data["schema"] = SCHEMA
+                atomic_write_json(path, data)
+            elif kind == "notices":
+                data = read_json(path)
+                if entry.get("require_existing") and not isinstance(data, dict):
+                    continue
+                if entry.get("require_items") and not isinstance(
+                        data.get("items") if isinstance(data, dict) else None, list):
+                    continue
+                data = data if isinstance(data, dict) else {}
+                remove = {str(value) for value in entry.get("remove_ids") or [] if value}
+                items = data.get("items") if isinstance(data.get("items"), list) else []
+                delivered = data.get("delivered") if isinstance(data.get("delivered"), list) else []
+                delivered = [value for value in delivered if isinstance(value, str)]
+                delivered.extend(str(value) for value in entry.get("delivered") or [] if value)
+                received = data.get("lineage_received") \
+                    if isinstance(data.get("lineage_received"), list) else []
+                received = [value for value in received if isinstance(value, str)]
+                received.extend(str(value) for value in entry.get("lineage_received") or [] if value)
+                atomic_write_json(path, {
+                    "schema": SCHEMA,
+                    "items": [item for item in items
+                              if not isinstance(item, dict) or item.get("id") not in remove],
+                    "delivered": list(dict.fromkeys(delivered))[-200:],
+                    "lineage_received": list(dict.fromkeys(received))[-200:],
+                })
+            else:
+                continue
+            applied += 1
+        except (OSError, TypeError, ValueError):
+            continue
+    return applied
+
+
 def _receipt(harness: str, sid: str, epoch: int) -> str:
     return f"{harness}:{sid}:{epoch}"
 
@@ -2432,12 +2500,16 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
              emit: Optional[Callable[[str], None]] = None, phase: Optional[str] = None,
              compact_summary: str = "", compact_context: Optional[dict] = None,
              prompt_text: str = "", emit_human: Optional[Callable[[str], None]] = None,
-             human_only: bool = False) -> str:
+             human_only: bool = False,
+             deferred: Optional[list] = None) -> str:
     """Record the session, and print the card / notices it is due exactly once.
 
     Returns the text that was emitted ("" for none). The receipt is written only
     after ``emit`` returned, so a hook whose output never went out keeps the card
-    for the next start or prompt.
+    for the next start or prompt. A caller that only *collects* the text (a JSON
+    bridge that renders more context afterwards) passes ``deferred=[]`` instead;
+    the writes are then appended there for :func:`apply_deferred` after that
+    caller's own final output.
     """
     env = os.environ if env is None else env
     if is_worker(env) or harness not in HARNESSES or not sid or event not in ("start", "prompt", "compact", "runtime-status"):
@@ -2744,32 +2816,30 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
         if not text:
             return ""
         (emit or (lambda t: None))(text)
+        # The receipts are prepared here and applied by the caller when it
+        # renders this text into its own output. A standalone hook (the Claude
+        # card bridge prints in-process, a text CLI prints inside ``emit``) has
+        # no later boundary, so it applies them immediately.
+        receipts = [] if deferred is None else deferred
         if card_due:
-            consumed = read_json(_consumed_path(card_seat))
-            receipts = list(consumed.get("receipts", [])) if isinstance(consumed, dict) \
-                and consumed.get("generation") == card.get("generation") else []
-            receipts.append(_receipt(harness, sid, epoch))
-            _write_consumed(card_seat, generation=card["generation"], receipts=receipts[-200:])
+            receipts.append({"kind": "card-consumed",
+                             "path": str(_consumed_path(card_seat)),
+                             "generation": card["generation"],
+                             "receipt": _receipt(harness, sid, epoch)})
         if memory_due:
-            consumed = read_json(_consumed_path(card_seat))
-            same = isinstance(consumed, dict) and consumed.get("memory_revision") == memory["revision"]
-            receipts = list(consumed.get("memory_receipts", [])) if same else []
-            receipts.append(_receipt(harness, sid, epoch))
-            _write_consumed(card_seat, memory_revision=memory["revision"], memory_receipts=receipts[-200:])
+            receipts.append({"kind": "memory-consumed",
+                             "path": str(_consumed_path(card_seat)),
+                             "revision": memory["revision"],
+                             "receipt": _receipt(harness, sid, epoch)})
         if notices:
             own_ids = {item.get("id") for item in notice_groups[0][1]}
             inherited_ids = {item.get("id") for _origin, group in notice_groups[1:]
                              for item in group}
-            data = read_json(_notices_path(seat))
-            items = data.get("items", []) if isinstance(data, dict) else []
-            rest = [item for item in items if item.get("id") not in own_ids]
-            delivered = list(data.get("delivered", [])) if isinstance(data, dict) else []
-            delivered.extend(sorted(value for value in own_ids if value))
-            received = list(data.get("lineage_received", [])) if isinstance(data, dict) else []
-            received.extend(sorted(value for value in inherited_ids if value))
-            atomic_write_json(_notices_path(seat), {"schema": SCHEMA, "items": rest,
-                                                    "delivered": list(dict.fromkeys(delivered))[-200:],
-                                                    "lineage_received": list(dict.fromkeys(received))[-200:]})
+            receipts.append({"kind": "notices", "path": str(_notices_path(seat)),
+                             "remove_ids": sorted(value for value in own_ids if value),
+                             "delivered": sorted(value for value in own_ids if value),
+                             "lineage_received": sorted(
+                                 value for value in inherited_ids if value)})
             # The successor's receipt also settles the exact predecessor item, so the
             # same result cannot reappear if that native session later prompts again.
             for origin, group in notice_groups[1:]:
@@ -2777,27 +2847,13 @@ def run_hook(harness: str, event: str, sid: str, *, source: str = "", transcript
                               if isinstance(item.get("id"), str) and item["id"]}
                 if not origin_ids:
                     continue
-                origin_data = read_json(_notices_path(origin))
-                if not isinstance(origin_data, dict):
-                    continue
-                origin_items = origin_data.get("items")
-                if not isinstance(origin_items, list):
-                    continue
-                origin_rest = [item for item in origin_items
-                               if not isinstance(item, dict) or item.get("id") not in origin_ids]
-                origin_delivered = origin_data.get("delivered")
-                if not isinstance(origin_delivered, list):
-                    origin_delivered = []
-                origin_delivered = [item for item in origin_delivered if isinstance(item, str)]
-                origin_delivered.extend(sorted(origin_ids))
-                origin_received = origin_data.get("lineage_received")
-                if not isinstance(origin_received, list):
-                    origin_received = []
-                atomic_write_json(_notices_path(origin), {
-                    "schema": SCHEMA, "items": origin_rest,
-                    "delivered": list(dict.fromkeys(origin_delivered))[-200:],
-                    "lineage_received": origin_received[-200:],
-                })
+                receipts.append({"kind": "notices", "path": str(_notices_path(origin)),
+                                 "require_existing": True, "require_items": True,
+                                 "remove_ids": sorted(origin_ids),
+                                 "delivered": sorted(origin_ids),
+                                 "lineage_received": []})
+        if deferred is None:
+            apply_deferred(receipts)
         # OpenCode re-emits this cache every turn: a later "참고할 기억" is added to what the session
         # already received instead of replacing it.
         earlier = read_json(_reread_path(harness, sid))
@@ -3407,6 +3463,10 @@ def cmd_hook(args) -> int:
         emitted = []
         human = []
         output_format = getattr(args, "format", "text")
+        # A JSON caller renders the text into its own final output, so the
+        # helper's own print is not the delivery boundary: hand the receipt
+        # writes back and let that caller apply them after its output returned.
+        deferred = [] if output_format == "json" else None
         sid = args.session_id or session_from_env(args.harness)[1] or ""
         summary = ""
         prompt_text = ""
@@ -3435,10 +3495,16 @@ def cmd_hook(args) -> int:
                           emit_human=human.append,
                           human_only=getattr(args, "human_only", False),
                           phase=args.phase, compact_summary=summary, compact_context=compact_context,
-                          prompt_text=prompt_text)
+                          prompt_text=prompt_text, deferred=deferred)
         if output_format == "json":
-            print(json.dumps({"additionalContext": "\n".join(emitted),
-                              "humanNotice": "\n".join(human)}, ensure_ascii=False))
+            payload = {"additionalContext": "\n".join(emitted),
+                       "humanNotice": "\n".join(human)}
+            if deferred is not None:
+                payload["deferredConsumed"] = deferred
+                deferred = None
+            print(json.dumps(payload, ensure_ascii=False))
+        if deferred:
+            apply_deferred(deferred)
         if (args.event == "compact" and args.phase == "after" and result.startswith("booking=")) \
                 or (args.event == "runtime-status" and result == "booking=pending"):
             _emit_stdout(result)
@@ -3488,6 +3554,23 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_apply_deferred(_args) -> int:
+    """Apply the receipt entries a JSON hook caller carried in its own output.
+
+    The caller pipes the ``deferredConsumed`` value back only after it emitted,
+    so a failed or lost render commits nothing. A malformed payload applies
+    nothing; the call is then a no-op rather than an error.
+    """
+    try:
+        value = json.load(sys.stdin)
+    except (EOFError, ValueError, OSError):
+        value = []
+    entries = value.get("deferredConsumed") if isinstance(value, dict) else value
+    applied = apply_deferred(entries if isinstance(entries, list) else [])
+    print(json.dumps({"applied": applied}))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="session_tidy.py", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
@@ -3510,6 +3593,9 @@ def build_parser() -> argparse.ArgumentParser:
     hook.add_argument("--human-only", action="store_true")
     hook.add_argument("--phase", choices=("before", "after"))
     hook.set_defaults(func=cmd_hook)
+    apply_deferred_parser = sub.add_parser(
+        "_apply-deferred", help="apply receipt entries a JSON hook caller deferred")
+    apply_deferred_parser.set_defaults(func=cmd_apply_deferred)
     enqueue = sub.add_parser("enqueue", help="queue the memory tidy and return at once")
     enqueue.add_argument("--harness", choices=HARNESSES)
     enqueue.add_argument("--session-id")
