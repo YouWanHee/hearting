@@ -834,6 +834,24 @@ def _allocation_editable(module, policy):
             "user_file": os.path.realpath(path) != os.path.realpath(module.SHIPPED_CONFIG_PATH)}
 
 
+_STEWARD_KEYS = ("check_interval_seconds", "max_supervisors_per_repo")
+
+
+def _steward_editable(module, policy):
+    """The steward check interval and per-repo supervisor limit: the file's value, else the shipped one."""
+    try:
+        shipped = module.parse_yaml_subset(Path(module.SHIPPED_CONFIG_PATH).read_text(encoding="utf-8"))
+    except Exception:
+        shipped = {}
+    current = policy.get("steward") if isinstance(policy.get("steward"), dict) else {}
+    defaults = shipped.get("steward") if isinstance(shipped.get("steward"), dict) else {}
+    values = {key: current.get(key, defaults.get(key)) for key in _STEWARD_KEYS}
+    if all(value is None for value in values.values()):
+        return {}
+    # The repo's current supervisor count waits for the steward backend's public slot reader.
+    return {"values": values, "supervisors": None}
+
+
 def _read_tidy_points():
     """Read the context alert thresholds; unavailable or malformed source stays unknown."""
     try:
@@ -899,8 +917,9 @@ def read_model_config():
         allocation = {"fields": _allocation_fields(policy),
                       "note": "new dispatch decisions only · running and sealed routes keep their choice"}
         allocation.update(_allocation_editable(module, policy))
+        steward = _steward_editable(module, policy)
     except Exception:
-        pools, allocation = {}, {}
+        pools, allocation, steward = {}, {}, {}
     try:
         from .. import render
         shown = {}
@@ -917,7 +936,7 @@ def read_model_config():
             "efforts": list(_EFFORTS), "pools": pools, "effort_keys": dict(_EFFORT_KEYS), "shown": shown,
             "context": context, "context_source": dict(_CONTEXT_SOURCE), "catalog_sources": catalog_sources,
             "tidy": _read_tidy_points(),
-            "token_units": dict(_TOKEN_UNITS), "allocation": allocation}
+            "token_units": dict(_TOKEN_UNITS), "allocation": allocation, "steward": steward}
 
 
 def collect_aux(request, *, snapshot=None, now=None):

@@ -1,4 +1,4 @@
-"""Edit the user-owned dispatch allocation keys in place, validated by dispatch-defaults."""
+"""Edit the user-owned dispatch allocation and steward keys in place, validated by dispatch-defaults."""
 from __future__ import annotations
 
 import importlib.util
@@ -16,6 +16,9 @@ SCALAR_KEYS = ("strategy", "window", "usage_gate_used_percent", "usage_headroom_
 NESTED_KEYS = {"depth_affinity": ("owner", "worker"),
                "harness_weights": ("claude", "codex", "opencode")}
 UNSET = None   # a nested value of None removes that line (no fixed affinity harness)
+# The steward block's user-tunable scalars; the 1f backend owns their meaning and ranges.
+STEWARD_KEYS = ("check_interval_seconds", "max_supervisors_per_repo")
+SECTIONS = {"allocation": (SCALAR_KEYS, NESTED_KEYS), "steward": (STEWARD_KEYS, {})}
 
 
 class DispatchSettingsError(RuntimeError):
@@ -90,18 +93,23 @@ def _set_line(lines, index, indent, key, value):
     return old
 
 
-def edit_text(text: str, updates: dict) -> str:
-    """Rewrite only the requested allocation lines; comments and every other line stay as written."""
+def edit_text(text: str, updates: dict, section: str = "allocation") -> str:
+    """Rewrite only the requested lines of one section; comments and every other line stay as written."""
+    if section not in SECTIONS:
+        raise DispatchSettingsUsageError(f"{section} is not an editable section")
+    scalar_keys, nested_keys = SECTIONS[section]
     newline = "\r\n" if "\r\n" in text else "\n"
     lines = text.split(newline)
-    top = _find(lines, 0, len(lines), 0, "allocation")
+    top = _find(lines, 0, len(lines), 0, section)
     if top is None:
-        raise DispatchSettingsError("the policy file has no allocation block")
+        raise DispatchSettingsError(f"the policy file has no {section} block")
+    if _split(lines[top])[2]:
+        raise DispatchSettingsError(f"{section} must be a block mapping to be edited")
     for name, value in updates.items():
         end = _block(lines, top, 0)
-        if name in SCALAR_KEYS:
+        if name in scalar_keys:
             if value is UNSET:
-                raise DispatchSettingsUsageError(f"allocation.{name} needs a value")
+                raise DispatchSettingsUsageError(f"{section}.{name} needs a value")
             index = _find(lines, top + 1, end, 2, name)
             if index is None:
                 lines.insert(end, f"  {name}: {_text(value)}")
@@ -109,8 +117,8 @@ def edit_text(text: str, updates: dict) -> str:
                 _set_line(lines, index, 2, name, _text(value))
             continue
         parent, _dot, child = name.partition(".")
-        if child not in NESTED_KEYS.get(parent, ()):
-            raise DispatchSettingsUsageError(f"allocation.{name} is not an editable key")
+        if child not in nested_keys.get(parent, ()):
+            raise DispatchSettingsUsageError(f"{section}.{name} is not an editable key")
         head = _find(lines, top + 1, end, 2, parent)
         if head is not None and _split(lines[head])[2]:
             raise DispatchSettingsError(f"allocation.{parent} must be a block mapping to be edited")
@@ -144,8 +152,10 @@ def _validated(module, text: str):
     return config
 
 
-def _allocation(module, config) -> dict:
-    return module.query_allocation(config) if isinstance(config.get("allocation"), dict) else {}
+def _section_values(module, config, section) -> dict:
+    if not isinstance(config.get(section), dict):
+        return {}
+    return module.query_allocation(config) if section == "allocation" else dict(config[section])
 
 
 def _diff(before: dict, after: dict, updates: dict) -> list[str]:
@@ -160,15 +170,15 @@ def _diff(before: dict, after: dict, updates: dict) -> list[str]:
 
 
 def set_allocation(updates: dict, *, config: str | Path | None = None, dry_run: bool = False,
-                   _locked: bool = False) -> dict:
-    """Plan or apply allocation edits on the user policy, with the result shape of ``model set``.
+                   section: str = "allocation", _locked: bool = False) -> dict:
+    """Plan or apply ``allocation`` (or ``steward``) edits on the user policy, shaped like ``model set``.
 
     A missing user file is seeded from the shipped policy. The candidate must pass the
     dispatch-defaults validator before anything is written; the old file goes to ``.bak``.
     New dispatch decisions read the result; running and sealed routes keep what they chose.
     """
     if not isinstance(updates, dict) or not updates:
-        raise DispatchSettingsUsageError("no allocation change was requested")
+        raise DispatchSettingsUsageError(f"no {section} change was requested")
     module = _defaults_module()
     path = Path(config) if config is not None else config_path()
     missing = not path.exists() and not path.is_symlink()
@@ -191,25 +201,26 @@ def set_allocation(updates: dict, *, config: str | Path | None = None, dry_run: 
     except UnicodeDecodeError as exc:
         raise DispatchSettingsError(f"policy file is not UTF-8: {path}") from exc
     try:
-        before = _allocation(module, module.parse_yaml_subset(text))
+        before = _section_values(module, module.parse_yaml_subset(text), section)
     except module.DefaultsConfigError as exc:
         raise DispatchSettingsError(f"existing policy file is malformed: {exc}") from exc
-    candidate_text = edit_text(text, updates)
+    candidate_text = edit_text(text, updates, section)
     after_config = _validated(module, candidate_text)
-    after = _allocation(module, after_config)
+    after = _section_values(module, after_config, section)
     changes = _diff(before, after, updates)
-    warnings = [line for line in module.allocation_warnings(after_config, str(path))]
-    result = {"operation": "allocation-set", "config_path": str(path), "source_reason": reason,
+    warnings = ([line for line in module.allocation_warnings(after_config, str(path))]
+                if section == "allocation" else [])
+    result = {"operation": f"{section}-set", "config_path": str(path), "source_reason": reason,
               "changes": changes, "warnings": warnings, "backup": None, "exit": 0}
     if candidate_text == text or not changes:
-        return {**result, "status": "unchanged", "lines": ["allocation: unchanged"]}
+        return {**result, "status": "unchanged", "lines": [f"{section}: unchanged"]}
     if dry_run:
         return {**result, "status": "planned",
-                "lines": ["allocation: would set " + "; ".join(changes), f"config: {path}"]}
+                "lines": [f"{section}: would set " + "; ".join(changes), f"config: {path}"]}
     if not _locked:
         path.parent.mkdir(parents=True, exist_ok=True)
         with safe_fs.TargetLock(path):
-            return set_allocation(updates, config=path, dry_run=False, _locked=True)
+            return set_allocation(updates, config=path, dry_run=False, section=section, _locked=True)
     current = safe_fs.capture_state(path, include_payload=True)
     if missing and current.kind != "missing":
         raise DispatchSettingsError(f"policy file changed during update; preserving successor: {path}")
@@ -221,5 +232,5 @@ def set_allocation(updates: dict, *, config: str | Path | None = None, dry_run: 
     safe_fs.atomic_write_bytes(auth, candidate_text.encode("utf-8"), mode, expected=current,
                                create_parents=True)
     return {**result, "status": "changed", "backup": str(backup) if backup else None,
-            "lines": ["allocation: set " + "; ".join(changes), f"config: {path}",
+            "lines": [f"{section}: set " + "; ".join(changes), f"config: {path}",
                       f"backup: {backup or 'none (new user policy)'}"]}
