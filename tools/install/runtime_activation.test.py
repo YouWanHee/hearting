@@ -2706,10 +2706,11 @@ class NativeAgentRenderTest(unittest.TestCase):
                 report = activation.activate(runtime, "linked", str(REPO_ROOT))
                 self.assertEqual(report["model_config_source"], "user")
                 desired = activation._desired_entries(runtime, "linked", REPO_ROOT, REPO_ROOT, "x", "global")
-                # No agent is rendered; OpenCode's V2 plugin entry always is.
+                # No agent is rendered; OpenCode's V2 server and TUI plugin entries always are.
                 renders = [e for e in desired if e["kind"] == "render"]
                 self.assertEqual([Path(e["dest"]).relative_to(self.home(runtime)).as_posix() for e in renders],
-                                 ["plugins/hearting-guards/index.ts"] if runtime == "opencode" else [])
+                                 ["plugins/hearting-guards/index.ts", "plugins/hearting-tui-identity/tui.ts"]
+                                 if runtime == "opencode" else [])
                 agents = [e for e in desired if Path(e["dest"]).parent == self.home(runtime) / "agents"]
                 self.assertEqual(len(agents), 5)
                 for entry in agents:
