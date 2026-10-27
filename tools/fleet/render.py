@@ -11600,6 +11600,12 @@ def _explorer_question_editing():
                 and isinstance(overlay, Mapping) and overlay.get("editing"))
 
 
+def _explorer_text_input():
+    """Typed characters are text, not commands: a question is being edited or the MODELS list filtered."""
+    from .explorer.state import models_finding
+    return _explorer_question_editing() or models_finding(_EXPLORER_STATE)
+
+
 def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     """Apply one decoded event to the explorer's view-local reducer."""
     global _EXPLORER_STATE, _EXPLORER_TEXT
@@ -11643,7 +11649,8 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
             _EXPLORER_STATE = state
             _explorer_apply_effects(_effects, _EXPLORER_MODEL)
         return
-    editing = (state.view == "QUESTIONS" and _explorer_question_editing())
+    from .explorer.state import models_finding
+    editing = (state.view == "QUESTIONS" and _explorer_question_editing()) or models_finding(state)
     if editing and isinstance(ch, int) and (32 <= ch < 127 or 128 <= ch < 256):
         key = _explorer_text_key(ch)
     else:
@@ -12052,7 +12059,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _EXPLORER_RESULT = focus_result
                     _HIT_VALID = False
 
-            question_editing = _explorer_question_editing()
+            question_editing = _explorer_text_input()
             if (ch in (ord("q"), ord("Q")) and not _explorer_searching()
                     and not question_editing):
                 return 0

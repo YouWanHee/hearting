@@ -55,6 +55,108 @@ def _chips(grid, x, y, items, current, chosen, action_key, right, labels=None):
     return x
 
 
+PICK_ROWS = 8          # visible rows of the model list; the box grows by this many rows, the list scrolls
+
+
+def _same_model(item, model):
+    """``item`` names ``model``; a profile cell may drop the ``opencode-go/`` provider the catalog keeps."""
+    if item is None or model is None:
+        return False
+    item, model = str(item), str(model)
+    return item == model or item == "opencode-go/" + model or model == "opencode-go/" + item
+
+
+def _chips_fit(items, labels, room):
+    return sum(len(str(labels.get(item, item))) + 5 for item in items) <= room
+
+
+def model_matches(items, query, labels=None):
+    """``items`` whose id or shown name holds every space-separated word of ``query`` (case-insensitive)."""
+    labels = labels or {}
+    words = str(query or "").lower().split()
+    return tuple(item for item in items
+                 if all(word in (str(item) + " " + str(labels.get(item, ""))).lower() for word in words))
+
+
+def _provider_counts(items):
+    counts = {}
+    for item in items:
+        provider = str(item).partition("/")[0] if "/" in str(item) else ""
+        if provider:
+            counts[provider] = counts.get(provider, 0) + 1
+    return counts
+
+
+def _model_picker(grid, x, y, right, items, current, chosen, labels, values, offsets, source=None):
+    """A filter row and a scrolling list holding every model: each row is a click target, the
+    wheel scrolls it, and the row hit ``("models.find", count, cursor item)`` lets keys move and pick."""
+    query = values.get("ui:mfind", "")
+    editing = values.get("ui:mfocus") == "1"
+    found = model_matches(items, query, labels)
+    try:
+        cursor = max(0, min(len(found) - 1, int(values.get("ui:mcursor", -1))))
+    except (TypeError, ValueError):
+        cursor = 0
+    if "ui:mcursor" not in values:
+        active = chosen if chosen is not None else current
+        cursor = next((index for index, item in enumerate(found) if _same_model(item, active)), 0)
+    top_max = max(0, len(found) - PICK_ROWS)
+    top = max(0, min(top_max, int(offsets.get("mpick", max(0, cursor - PICK_ROWS + 1)))))
+    field = 26
+    grid.put(x, y, "⌕ ", "line" if editing else "dim", limit=right)
+    shown = clip_cells(query, field - 1) + ("▏" if editing else "")
+    end = grid.put(x + 2, y, shown or "type to filter", "soft" if editing else "dim", limit=right)
+    for col in range(end, x + 2 + field):
+        grid.put(col, y, "·" if not editing else " ", "dim", limit=right)
+    grid.add_hit(y, x, x + 2 + field, ("models.find", len(found), found[cursor] if found else "", cursor, top,
+                                             PICK_ROWS))
+    cursor_x = grid.put(x + 2 + field, y, f"  {len(found)}/{len(items)}", "soft", limit=right)
+    hint = ("  ↑↓ PgUp/PgDn · Enter pick · Esc done" if editing else "  click or e to search")
+    grid.put(cursor_x, y, hint, "dim", limit=right)
+    counts = _provider_counts(items)
+    about = " · ".join(f"{name} {count}" for name, count in counts.items())
+    if source:
+        about = (about + "  · " if about else "") + source
+    if about:
+        grid.put(x, y - 1, about, "dim", limit=right)
+    active = chosen if chosen is not None else current
+    for row in range(PICK_ROWS):
+        yy = y + 1 + row
+        index = top + row
+        if index >= len(found):
+            if row == 0:
+                grid.put(x + 2, yy, "no model matches the filter", "dim", limit=right)
+            continue
+        item = found[index]
+        on = _same_model(item, active)
+        here = _same_model(item, current)
+        mark = "▸ " if editing and index == cursor else "  "
+        cursor_x = grid.put(x - 2, yy, mark, "soft", limit=right)
+        text = str(item)
+        label = str(labels.get(item, ""))
+        cursor_x = grid.put(cursor_x, yy, ("[ " + text + " ]") if on else ("  " + text + "  "),
+                            "chip_on" if on else "title_dim", limit=right - 12)
+        if label and label != text and label != text.partition("/")[2]:
+            cursor_x = grid.put(cursor_x + 1, yy, label, "dim", limit=right - 12)
+        if here:
+            grid.put(cursor_x + 1, yy, "now", "label", limit=right - 2)
+        grid.add_hit(yy, x - 2, right - 8, ("ui", "model", item))
+        grid.add_hit(yy, x - 2, right - 1, ("scroll", "mpick", top_max, -1))
+    if top_max:
+        grid.put(right - 8, y + 1, "▲" if top else " ", "dim", limit=right)
+        grid.put(right - 8, y + PICK_ROWS, "▼" if top < top_max else " ", "dim", limit=right)
+        span = f"{top + 1}-{min(len(found), top + PICK_ROWS)}"
+        grid.put(right - 2 - len(span), y + PICK_ROWS // 2, span, "dim", limit=right)
+    return PICK_ROWS
+
+
+def _catalog_note(data, harness):
+    source = _dict(_dict(data.get("catalog_sources")).get(harness))
+    if source.get("state") != "available":
+        return ""
+    return "from cache, callability not checked"
+
+
 def _model_cell(grid, x, y, harness, value, shown, effort_keys, room, limit=None):
     edge = x + room if limit is None else min(x + room, limit)
     if value is None:
@@ -245,8 +347,12 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
     current_model, current_effort = (tuple(current) + (None, None))[:2] if current else (None, None)
     model_choice = model_choice or current_model or next(iter(choices.get(harness, ())), None)
     effort_choice = effort_choice or current_effort or "high"
-    changed = current is None or (model_choice, effort_choice) != (current_model, current_effort)
-    box_top, box_bottom = y, y + 8
+    changed = current is None or not (_same_model(model_choice, current_model)
+                                      and effort_choice == current_effort)
+    harness_choices = tuple(choices.get(harness, ()))
+    picking = not _chips_fit(harness_choices, shown, right - 2 - (x + 13))
+    extra = PICK_ROWS if picking else 0
+    box_top, box_bottom = y, y + 8 + extra
     box_left = x + 1
     for col in range(box_left + 1, right):
         grid.put(col, box_top, "─", "line")
@@ -271,38 +377,49 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         _model_cell(grid, box_left + 59, y + 1, harness, (model_choice, effort_choice), shown, effort_keys, 40,
                     limit=right)
     grid.put(box_left + 3, y + 3, "model", "label")
-    _chips(grid, box_left + 12, y + 3, choices.get(harness, ()), current_model, values.get("ui:model"), "model", right - 2, shown)
-    grid.put(box_left + 3, y + 4, "effort", "label")
+    if picking:
+        _model_picker(grid, box_left + 12, y + 3, right - 1, harness_choices, current_model,
+                      values.get("ui:model"), shown, values, dict(state.scroll),
+                      _catalog_note(data, harness))
+    else:
+        _chips(grid, box_left + 12, y + 3, harness_choices, current_model, values.get("ui:model"), "model",
+               right - 2, shown)
+    grid.put(box_left + 3, y + 4 + extra, "effort", "label")
     effort_options = tuple(data.get("efforts", ())) + (("runtime-default",) if harness == "opencode" else ())
-    _chips(grid, box_left + 12, y + 4, effort_options, current_effort, values.get("ui:effort"), "effort", right - 2)
+    _chips(grid, box_left + 12, y + 4 + extra, effort_options, current_effort, values.get("ui:effort"), "effort",
+           right - 2)
     command = f"hearting model set {harness} profile/{profile} {model_choice}@{effort_choice}"
-    grid.put(box_left + 3, y + 6, "$ ", "line")
+    command_y = y + 6 + extra
+    grid.put(box_left + 3, command_y, "$ ", "line")
     edge = right                   # the box's right border is column ``right``: nothing crosses it
-    grid.put(box_left + 5, y + 6, command, "soft" if changed else "dim", limit=edge)
+    # the two buttons follow the command on its row and stay inside the box; a long model id
+    # gives up the command's tail, never the buttons
+    dry_x = min(box_left + 5 + cell_width(command) + 3, right - 25)
+    grid.put(box_left + 5, command_y, command, "soft" if changed else "dim",
+             limit=dry_x - 2 if changed else edge)
     if changed:
-        # the two buttons follow the command on its row; the box's border cuts what runs past it
-        dry_x = box_left + 5 + cell_width(command) + 3
-        grid.put(dry_x, y + 6, "[ dry-run ]", "title_dim", limit=edge)
-        grid.add_hit(y + 6, dry_x, dry_x + 11,
+        grid.put(dry_x, command_y, "[ dry-run ]", "title_dim", limit=edge)
+        grid.add_hit(command_y, dry_x, dry_x + 11,
                      ("models.apply", harness, "profile", profile, model_choice,
                       effort_choice, True))
         apply_x = dry_x + 11 + 2
-        grid.put(apply_x, y + 6, "[ apply ]", "chip_on", limit=edge)
-        grid.add_hit(y + 6, apply_x, apply_x + 9,
+        grid.put(apply_x, command_y, "[ apply ]", "chip_on", limit=edge)
+        grid.add_hit(command_y, apply_x, apply_x + 9,
                      ("models.apply", harness, "profile", profile, model_choice,
                       effort_choice, False))
-    y += 10
+    y += 10 + extra
     if slim:
-        grid.put(box_left + 3, box_top + 7, "pool", "label")
+        grid.put(box_left + 3, box_top + 7 + extra, "pool", "label")
         pool = pools.get(profile)
         if pool:
             order, note = pool
             pool_order = order[0] if order and isinstance(order[0], (list, tuple)) else order
-            cursor = grid.put(box_left + 12, box_top + 7, " › ".join(pool_order), "soft", limit=right - 2)
+            cursor = grid.put(box_left + 12, box_top + 7 + extra, " › ".join(pool_order), "soft",
+                              limit=right - 2)
             if note:
-                grid.put(cursor, box_top + 7, "  " + note, "dim", limit=right - 2)
+                grid.put(cursor, box_top + 7 + extra, "  " + note, "dim", limit=right - 2)
         else:
-            grid.put(box_left + 12, box_top + 7, "route-sealed explicit choice only", "dim", limit=right - 2)
+            grid.put(box_left + 12, box_top + 7 + extra, "route-sealed explicit choice only", "dim", limit=right - 2)
     foot = "models.conf → .bak backup · new sessions and launches only · sealed routes keep their choice"
     grid.put(box_left + 2, box_bottom, " ", "branch_s")
     grid.put(box_left + 3, box_bottom, foot, "dim", limit=right)
