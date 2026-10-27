@@ -400,6 +400,34 @@ def steward_changes(steward, folds):
     return tuple(changes)
 
 
+def _draw_supervisors(grid, census, limit, x, y, right):
+    """Current supervisors per repository as counted by the steward collector. The count is
+    that census, not the ⚑ marks: a fresh grant can count before its ⚑ appears."""
+    grid.put(x + 3, y, "supervising", "label", limit=right)
+    if not isinstance(census, (list, tuple)):
+        grid.put(x + 20, y, f"· / {limit} per repo (not counted yet)", "dim", limit=right)
+        return y + 1
+    if not census:
+        grid.put(x + 20, y, f"none · {limit} per repo allowed", "soft", limit=right)
+        return y + 1
+    for repo in census[:4]:
+        repo = _dict(repo)
+        shown = repo.get("limit") if repo.get("limit") is not None else limit
+        holders = [str(holder.get("name") or str(holder.get("session_id") or "?")[:8])
+                   + ("" if holder.get("counted", True) else " (ended)")
+                   for holder in repo.get("holders") or () if isinstance(holder, Mapping)]
+        text = (f"{repo.get('repository') or '?'} · {repo.get('counted', 0)} / {shown} supervising"
+                + (" · " + ", ".join(holders) if holders else ""))
+        over = bool(repo.get("over_limit"))
+        grid.put(x + 20, y, text + (" · over limit" if over else ""), "g_blocked" if over else "soft",
+                 limit=right)
+        y += 1
+    if len(census) > 4:
+        grid.put(x + 20, y, f"+{len(census) - 4} more repositories", "dim", limit=right)
+        y += 1
+    return y
+
+
 def _draw_steward_editor(grid, steward, state, x, y, right):
     """Supervision check interval and per-repo supervisor limit, edited like the allocation keys."""
     folds = state.fold_map()
@@ -417,15 +445,8 @@ def _draw_steward_editor(grid, steward, state, x, y, right):
                         folds.get("ui:steward:" + name), "steward:" + name, right, labels)
         grid.put(cursor + 1, y, notes[name], "dim", limit=right)
         y += 1
-    limit = values.get("max_supervisors_per_repo")
-    count = steward.get("supervisors")
-    grid.put(x + 3, y, "this repo", "label", limit=right)
-    if isinstance(count, Mapping):
-        sessions = ", ".join(str(item) for item in count.get("sessions") or ()) or "none"
-        grid.put(x + 20, y, f"{count.get('count', '·')} / {limit} supervising · {sessions}", "soft", limit=right)
-    else:
-        grid.put(x + 20, y, f"· / {limit} supervising (count not available yet)", "dim", limit=right)
-    y += 1
+    y = _draw_supervisors(grid, steward.get("supervisors"), values.get("max_supervisors_per_repo"),
+                          x, y, right)
     changes = steward_changes(steward, folds)
     if changes:
         preview = "  ·  ".join(f"{_STEWARD_LABELS[name]} {_steward_shown(name, old)} → {_steward_shown(name, new)}"

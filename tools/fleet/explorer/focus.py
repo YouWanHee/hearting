@@ -837,19 +837,30 @@ def _allocation_editable(module, policy):
 _STEWARD_KEYS = ("check_interval_seconds", "max_supervisors_per_repo")
 
 
+def _supervisors():
+    """This repository first, then every other one holding a supervisor, from the steward
+    collector's last pass (``None`` before it ran). Nothing here counts on its own."""
+    from ..collectors import steward
+    census = steward.last_supervision()
+    if census is None:
+        return None
+    here = steward._repository_key(os.getcwd())
+    rows = [census[key] for key in sorted(census, key=lambda key: (key != here, key))]
+    if here and here not in census:
+        rows.insert(0, {"repository": Path(here).parent.name, "repository_key": here,
+                        "holders": [], "counted": 0, "limit": None, "over_limit": False})
+    return rows
+
+
 def _steward_editable(module, policy):
-    """The steward check interval and per-repo supervisor limit: the file's value, else the shipped one."""
+    """The steward check interval and per-repo supervisor limit through the shared policy reader."""
+    current = module.query_steward_policy(policy)
+    values = {key: current[key] for key in _STEWARD_KEYS}
     try:
-        shipped = module.parse_yaml_subset(Path(module.SHIPPED_CONFIG_PATH).read_text(encoding="utf-8"))
+        supervisors = _supervisors()
     except Exception:
-        shipped = {}
-    current = policy.get("steward") if isinstance(policy.get("steward"), dict) else {}
-    defaults = shipped.get("steward") if isinstance(shipped.get("steward"), dict) else {}
-    values = {key: current.get(key, defaults.get(key)) for key in _STEWARD_KEYS}
-    if all(value is None for value in values.values()):
-        return {}
-    # The repo's current supervisor count waits for the steward backend's public slot reader.
-    return {"values": values, "supervisors": None}
+        supervisors = None
+    return {"values": values, "supervisors": supervisors}
 
 
 def _read_tidy_points():

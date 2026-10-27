@@ -37,6 +37,10 @@ class StewardEditor(unittest.TestCase):
         shutil.copyfile(ROOT / "profiles" / "dispatch-defaults.yaml", self.path)
         self.original = self.path.read_bytes()
 
+        patch = mock.patch("tools.fleet.collectors.steward._last_supervision", None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def vm(self):
         values = load_fixture(FIXTURES / "view_model.json").to_mapping()
         values["models"] = dict(values["models"], steward=focus.read_model_config()["steward"])
@@ -50,19 +54,19 @@ class StewardEditor(unittest.TestCase):
     def test_current_values_preview_apply_and_reread(self):
         vm = self.vm()
         self.assertEqual(vm.models["steward"]["values"],
-                         {"check_interval_seconds": 3600, "max_supervisors_per_repo": 2})
+                         {"check_interval_seconds": 7200, "max_supervisors_per_repo": 2})
         state = NavState(view="MODELS", title="MODELS")
         frame = draw(vm, state, 160, 120, beat=1)
         text = "\n".join(frame.text_rows())
         self.assertIn("SUPERVISION", text)
-        self.assertIn("[ 1h ]", text)
-        self.assertIn("· / 2 supervising", text)
+        self.assertIn("[ 2h ]", text)
+        self.assertIn("· / 2 per repo (not counted yet)", text)
         self.assertIn("affects new checks and new supervisor grants only", text)
         state, _effects = self.click(state, frame, ("ui", "steward:check_interval_seconds", "1800"))
         frame = draw(vm, state, 160, 120, beat=1)
         state, _effects = self.click(state, frame, ("ui", "steward:max_supervisors_per_repo", "3"))
         frame = draw(vm, state, 160, 120, beat=1)
-        self.assertIn("check every 1h → 30m  ·  per repo 2 → 3", "\n".join(frame.text_rows()))
+        self.assertIn("check every 2h → 30m  ·  per repo 2 → 3", "\n".join(frame.text_rows()))
         payload = (("steward.check_interval_seconds", "1800"), ("steward.max_supervisors_per_repo", "3"))
         state, effects = self.click(state, frame, ("alloc.apply", payload, True))
         self.assertEqual(effects, (("alloc.apply", payload, True),))
@@ -84,7 +88,7 @@ class StewardEditor(unittest.TestCase):
         state = replace(state, status=applied["message"])
         text = "\n".join(draw(vm, state, 160, 120, beat=1).text_rows())
         self.assertNotIn("[ dry-run ]  [ apply ]", text.split("SUPERVISION", 1)[1])
-        self.assertIn("steward: set check_interval_seconds: 3600 -> 1800", text)
+        self.assertIn("steward: set check_interval_seconds: 7200 -> 1800", text)
 
     def test_out_of_range_and_write_failure_are_shown_and_leave_the_file(self):
         vm = self.vm()
@@ -108,6 +112,40 @@ class StewardEditor(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertTrue(failed["message"].startswith("steward: failed:"))
         self.assertEqual(self.path.read_bytes(), self.original)
+
+    def test_supervisor_census_comes_from_the_collector_pass(self):
+        here = {"repository": "hearting", "repository_key": "/r/hearting/.git", "counted": 3, "limit": 2,
+                "over_limit": True,
+                "holders": [{"harness": "claude", "session_id": "a" * 36, "name": "alpha", "liveness": "live",
+                             "basis": "role", "counted": True},
+                            {"harness": "codex", "session_id": "b" * 36, "name": None, "liveness": "unknown",
+                             "basis": "grant", "counted": True},
+                            {"harness": "claude", "session_id": "c" * 36, "name": "gamma", "liveness": "ended",
+                             "basis": "role", "counted": False},
+                            {"harness": "claude", "session_id": "d" * 36, "name": "delta", "liveness": "live",
+                             "basis": "role", "counted": True}]}
+        other = dict(here, repository="beta", repository_key="/r/beta/.git", counted=1, over_limit=False,
+                     holders=[])
+        census = {"/r/beta/.git": other, "/r/hearting/.git": here}
+        with mock.patch("tools.fleet.collectors.steward._last_supervision", census), \
+                mock.patch("tools.fleet.collectors.steward._repository_key", return_value="/r/hearting/.git"), \
+                mock.patch("tools.fleet.collectors.steward.read_markers") as markers:
+            vm = self.vm()
+            markers.assert_not_called()
+        self.assertEqual([repo["repository"] for repo in vm.models["steward"]["supervisors"]],
+                         ["hearting", "beta"])
+        frame = draw(vm, NavState(view="MODELS", title="MODELS"), 200, 120, beat=1)
+        rows = frame.text_rows()
+        y, row = next((index, row) for index, row in enumerate(rows) if "hearting · 3 / 2" in row)
+        self.assertIn("alpha, bbbbbbbb, gamma (ended), delta · over limit", row)
+        self.assertEqual(frame.cells[y][row.find("hearting · 3")][1], "g_blocked")
+        self.assertTrue(any("beta · 1 / 2 supervising" in row for row in rows))
+
+        with mock.patch("tools.fleet.collectors.steward._last_supervision", {}), \
+                mock.patch("tools.fleet.collectors.steward._repository_key", return_value="/r/hearting/.git"):
+            vm = self.vm()
+        text = "\n".join(draw(vm, NavState(view="MODELS", title="MODELS"), 200, 120, beat=1).text_rows())
+        self.assertIn("hearting · 0 / 2 supervising", text)
 
 
 if __name__ == "__main__":
