@@ -214,9 +214,11 @@ _HUE_OF = {
     "h_claude": ("c", _A_D), "h_codex": ("m", _A_D), "h_opencode": ("l", _A_D),
     "hb_claude": ("c", 0), "hb_codex": ("m", 0), "hb_opencode": ("l", 0), "hb_other": ("d", 0),
     "fam_opus": ("c", 0), "fam_sonnet": ("l", 0), "fam_haiku": ("g", 0),
-    "fam_fable": ("m", 0), "fam_gpt": ("y", 0), "fam_other": ("d", 0),
+    "fam_fable": ("m", 0), "fam_sol": ("y", 0), "fam_astra": ("o", 0),
+    "fam_luna": ("w", 0), "fam_gpt": ("y", 0), "fam_other": ("d", 0),
     "famd_opus": ("c", _A_D), "famd_sonnet": ("l", _A_D), "famd_haiku": ("g", _A_D),
-    "famd_fable": ("m", _A_D), "famd_gpt": ("y", _A_D), "famd_other": ("d", _A_D),
+    "famd_fable": ("m", _A_D), "famd_sol": ("y", _A_D), "famd_astra": ("o", _A_D),
+    "famd_luna": ("w", _A_D), "famd_gpt": ("y", _A_D), "famd_other": ("d", _A_D),
     "gpu_rtx6000": ("l", _A_D), "gpu_rtx4090": ("c", _A_D),
     "gpu_rtx5090": ("g", _A_D),
     "gpu_blackwell": ("g", _A_D), "gpu_hopper": ("m", _A_D),
@@ -375,10 +377,18 @@ def _init_colors():
     # per-MODEL family colors, in TWO intensities (2026-07-02: main↔dispatch contrast = whole-row
     # brightness): fam_* = BRIGHT (main session rows) / famd_* = DIM (dispatch rows recede).
     _hue = {h: _COLOR.get("h_" + h, 0) for h in ("claude", "codex", "opencode")}
+    # The three named Codex models are separate families, not one `gpt` bucket (user
+    # 2026-10-27: "codex 모델들 전부 같은 컬러"). Sol keeps the old gpt yellow, Astra
+    # takes the unused orange, and Luna takes soft white; a bare gpt-* id still lands
+    # on the shared `gpt` key. Names stay the primary identifier — the 8-color
+    # fallback folds orange into yellow — but the 256-color board separates them.
     _fam = {"opus": _palette_fg("cyan", curses.COLOR_CYAN),
             "sonnet": _palette_fg("blue", curses.COLOR_BLUE),
             "haiku": _palette_fg("green", curses.COLOR_GREEN),
             "fable": _palette_fg("magenta", curses.COLOR_MAGENTA),
+            "sol": _palette_fg("yellow", curses.COLOR_YELLOW),
+            "astra": _palette_fg("orange", curses.COLOR_YELLOW),
+            "luna": _palette_fg("soft", curses.COLOR_WHITE),
             "gpt": _palette_fg("yellow", curses.COLOR_YELLOW)}
     n_pair = 10                                     # pairs 1-9 reserved above; families from 10
     for fam, fg in _fam.items():
@@ -643,17 +653,24 @@ def _flat_level(key):
     return "lvl_r_flat" if key == "lvl_r" else key
 
 
-_FAMILIES = ("opus", "sonnet", "haiku", "fable", "gpt")
+_FAMILIES = ("sol", "astra", "luna", "opus", "sonnet", "haiku", "fable", "gpt")
 
 
 def _model_family(model):
     """Model-family token from a model/bucket name: 'Opus 4.8'→opus, 'gpt-5.5'→gpt, 'fable'→fable.
-    Unknown (glm/deepseek/…) → 'other' (default fg — distinct from the colored families)."""
+    The named Codex models keep their own tokens ('gpt-6.1-sol'→sol, 'Astra'→astra,
+    'gpt-6-luna'→luna) so each gets one stable identity colour in every view; any
+    other gpt id stays on the shared 'gpt' token. Unknown (glm/deepseek/…) → 'other'
+    (default fg — distinct from the colored families)."""
     m = (model or "").lower()
-    if re.fullmatch(r"\s*(?:sol|astra)\s*", m) or re.search(r"\bgpt(?:[-_ ]\d+(?:\.\d+)?)?[-_ /]*(?:sol|astra)\b", m):
-        return "gpt"
     for fam in _FAMILIES:
-        if fam in m:
+        if fam in ("sol", "astra", "luna"):
+            matched = re.search(r"\b%s\b" % fam, m)
+        elif fam == "gpt":
+            matched = "gpt" in m
+        else:
+            matched = fam in m
+        if matched:
             return fam
     return "other"
 
