@@ -370,7 +370,7 @@ class PaneOwnershipTest(unittest.TestCase):
         pid = 43123
         sid = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
         record = (pid, 1, 77, 4, 77, "778899")
-        info = {"foreground_process_group_id": 77,
+        info = {"pane_id": "w:p1", "foreground_process_group_id": 77,
                 "foreground_processes": [{"pid": pid}]}
         with codex.daemon_identity_read_scope() as observation, \
                 mock.patch.object(po, "_pane_process_info", return_value=info), \
@@ -641,6 +641,198 @@ class PaneOwnershipTest(unittest.TestCase):
             self.assertEqual(po.verified_pane("wB:p3N", "claude"), "wB:p3N")
             self.assertEqual(recovery.main(["--check", "--socket", "/other.sock"]), recovery.EXIT_INVALID)
             checked.assert_not_called()
+
+
+class NativeCurrentSelectionTest(unittest.TestCase):
+    """Current Codex selection requires native footer and physical pane proof."""
+
+    pane = "w:p1"
+    current = "019facc9-fe83-7480-89f6-9e64fbebf0ca"
+    previous = "019facc9-fe83-7480-89f6-9e64fbebf0cb"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="native-current-selection-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.state = self.root / "herdr-state.json"
+        self.read_count = self.root / "visible-read-count"
+        self.herdr = self.root / "herdr"
+        self.herdr.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"state_path = {str(self.state)!r}\n"
+            f"count_path = {str(self.read_count)!r}\n"
+            "state = json.loads(open(state_path).read())\n"
+            "args = sys.argv[1:]\n"
+            "if args and args[0] == 'pane':\n"
+            "    print(json.dumps(state['pane']))\n"
+            "elif args and args[0] == 'agent':\n"
+            "    try: count = int(open(count_path).read())\n"
+            "    except (OSError, ValueError): count = 0\n"
+            "    open(count_path, 'w').write(str(count + 1))\n"
+            "    screens = state.get('screens', [[]])\n"
+            "    lines = screens[min(count, len(screens) - 1)] if screens else []\n"
+            "    print('\\n'.join(lines))\n"
+        )
+        self.herdr.chmod(0o755)
+        self.codex = self.root / "codex"
+        self.codex.write_text(
+            "#!/bin/bash\n"
+            "exec -a codex /usr/bin/python3 -c 'import time; time.sleep(60)'\n"
+        )
+        self.codex.chmod(0o755)
+        self.proc = self._spawn_codex()
+        self.record = po._process(self.proc.pid)
+        self.assertIsNotNone(self.record)
+        self.assertTrue(self.record[3])
+        self.assertEqual(self.record[2], self.record[4])
+        self._set_screens([[]])
+
+    def _spawn_codex(self, *, tty=True, extra_env=None):
+        env = os.environ.copy()
+        for name in ("AGENT_SESSION_ROLE", *po._WORKER_ENV):
+            env.pop(name, None)
+        env.update(extra_env or {})
+        master = slave = None
+        if tty:
+            master, slave = pty.openpty()
+
+            def terminal():
+                os.setsid()
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        process = subprocess.Popen(
+            [str(self.codex)], stdin=slave if tty else subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+            preexec_fn=terminal if tty else None,
+        )
+        if slave is not None:
+            os.close(slave)
+        if master is not None:
+            self.addCleanup(os.close, master)
+
+        def stop():
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+        self.addCleanup(stop)
+        return process
+
+    def _set_screens(self, screens, *, group=None, foreground_pid=None):
+        pane_info = {
+            "result": {"process_info": {
+                "pane_id": self.pane,
+                "foreground_process_group_id": self.record[2] if group is None else group,
+                "foreground_processes": [{"pid": self.proc.pid if foreground_pid is None
+                                           else foreground_pid}],
+            }}
+        }
+        self.state.write_text(json.dumps({"pane": pane_info, "screens": screens}))
+        self.read_count.write_text("0")
+
+    @staticmethod
+    def _footer(session_id):
+        return ["› Ask Codex", f"gpt-5 · {session_id}", "? for shortcuts"]
+
+    def _current(self, *, pid=None, executable=None):
+        return po.current_codex_thread(self.pane, self.proc.pid if pid is None else pid,
+                                       executable=str(executable or self.herdr))
+
+    def test_missing_or_stale_process_sid_uses_current_footer_in_both_readers(self):
+        self._set_screens([self._footer(self.current)] * 3)
+        with mock.patch.object(po, "_native_session", return_value="") as native:
+            self.assertEqual(self._current(), self.current)
+        native.assert_called_once()
+
+        self._set_screens([self._footer(self.current)] * 3)
+        with mock.patch.object(po, "_native_session", return_value=self.previous):
+            self.assertEqual(self._current(), self.current)
+
+        self._set_screens([self._footer(self.current)] * 3)
+        with mock.patch.object(po, "_native_session", return_value=self.previous):
+            self.assertEqual(po._loader_verified_pane(
+                self.pane, self.previous, self.proc.pid, self.record[5],
+                executable=str(self.herdr)), "")
+
+        self._set_screens([self._footer(self.current)] * 3)
+        with mock.patch.object(po, "_native_session", return_value=self.previous):
+            self.assertEqual(po._loader_verified_pane(
+                self.pane, self.current, self.proc.pid, self.record[5],
+                executable=str(self.herdr)), self.pane)
+
+    def test_disagreeing_footer_refuses_and_unproved_footer_supplies_no_identity(self):
+        disagreeing = [self._footer(self.current), self._footer(self.current),
+                       self._footer(self.previous)]
+        self._set_screens(disagreeing)
+        with mock.patch.object(po, "_native_session", return_value=self.previous):
+            self.assertEqual(self._current(), "")
+
+        malformed = (
+            ["› Ask Codex", f"gpt-5 · {self.current[:-3]}…", "? for shortcuts"],
+            ["› Ask Codex", f"Where should the new conversation run? {self.current}",
+             "? for shortcuts"],
+            ["› Ask Codex", f"title: {self.current}", "? for shortcuts"],
+            [],  # hidden footer
+        )
+        for lines in malformed:
+            with self.subTest(lines=lines):
+                self.assertEqual(po.codex_footer_threads(lines, current_id_only=True), set())
+                self._set_screens([lines] * 3)
+                with mock.patch.object(po, "_native_session", return_value=""):
+                    self.assertEqual(self._current(), "")
+
+    def test_process_fallback_and_same_pass_daemon_observation_are_preserved(self):
+        from fleet.collectors import codex
+
+        self._set_screens([[]])
+        with codex.daemon_identity_read_scope() as observation, \
+                mock.patch.object(po, "_native_session", return_value=self.current) as native:
+            self.assertEqual(self._current(), self.current)
+        self.assertEqual(native.call_count, 2)
+        self.assertTrue(all(call.kwargs["codex_observation"] is observation
+                            for call in native.call_args_list))
+
+    def test_clipped_or_unconfigured_footer_keeps_exact_process_native_proof(self):
+        for field in ("01a…", self.current[:-3] + "…", "100% context left"):
+            with self.subTest(field=field):
+                lines = ["› Ask Codex", "gpt-5 · " + field, "? for shortcuts"]
+                self._set_screens([lines] * 3)
+                with mock.patch.object(po, "_native_session", return_value=self.current):
+                    self.assertEqual(self._current(), self.current)
+                self._set_screens([lines] * 3)
+                with mock.patch.object(po, "_native_session", return_value=""):
+                    self.assertEqual(self._current(), "")
+
+    def test_pid_birth_group_tty_service_and_worker_mismatches_refuse(self):
+        self._set_screens([self._footer(self.current)] * 3)
+        with mock.patch.object(po, "_native_session", return_value=""):
+            self.assertEqual(po._loader_verified_pane(
+                self.pane, self.current, self.proc.pid, "wrong-start",
+                executable=str(self.herdr)), "")
+
+        self._set_screens([self._footer(self.current)] * 3, group=self.record[2] + 1)
+        with mock.patch.object(po, "_native_session", return_value=""):
+            self.assertEqual(self._current(), "")
+
+        no_tty = self._spawn_codex(tty=False)
+        no_tty_record = po._process(no_tty.pid)
+        self.assertEqual(no_tty_record[3], 0)
+        self._set_screens([self._footer(self.current)] * 3,
+                          group=no_tty_record[2], foreground_pid=no_tty.pid)
+        with mock.patch.object(po, "_native_session", return_value=""):
+            self.assertEqual(self._current(pid=no_tty.pid), "")
+
+        self._set_screens([self._footer(self.current)] * 3)
+        with mock.patch.object(po, "_runtime", return_value=("codex", True)), \
+                mock.patch.object(po, "_native_session", return_value=""):
+            self.assertEqual(self._current(), "")
+
+        worker = self._spawn_codex(extra_env={"AGENT_SESSION_ROLE": "worker"})
+        worker_record = po._process(worker.pid)
+        self._set_screens([self._footer(self.current)] * 3,
+                          group=worker_record[2], foreground_pid=worker.pid)
+        self.assertEqual(self._current(pid=worker.pid), "")
 
 
 if __name__ == "__main__":
