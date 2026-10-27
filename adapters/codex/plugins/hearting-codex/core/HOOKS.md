@@ -98,6 +98,13 @@ writer that cannot persist the field must not claim.
 
 ## Current Session and Context Evidence
 
+Native form identity uses the fields the runtime actually supplies. A form that
+has no native turn ID stays bound to its exact native session, request, current
+schema and owning connection; never manufacture a turn ID from its form ID.
+Transports that require a native turn keep that requirement. The selected private
+detail and explicit response still revalidate the current request before one
+action; neither a display alias nor a workflow prefix substitutes for that proof.
+
 Codex runtime activation (install, update, or refresh) may record the current native
 hash for Hearting's own projected hook definitions through App Server. It preserves
 disabled decisions, leaves foreign definitions to the user's `/hooks` review, and
@@ -117,6 +124,16 @@ field, or hidden footer is unknown. A late callback may report only while its
 session still matches this current proof. Registered workers and shared services
 never gain pane ownership from an inherited pane label. When current selection
 cannot be proved, leave it unknown.
+
+The native harness and full session/thread ID identify the same conversation in
+Herdr, Fleet, and peer delivery. Short display numbers are aliases allocated by
+the shared session-tag policy; a pane, PID, or temporary display alias cannot
+become another session address or grant delivery authority. Current native
+selection evidence is consumed consistently even when process startup or rollout
+evidence is missing or names an earlier selection. Keep the physical ownership
+and fresh native-selection checks above; an unproved identity stays unknown.
+A clipped or unconfigured footer supplies no identity and does not invalidate
+independent process-native proof.
 
 Context pressure is display-only. Keep raw active usage and model capacity
 separate from configured requests, the runtime's applied compaction trigger,

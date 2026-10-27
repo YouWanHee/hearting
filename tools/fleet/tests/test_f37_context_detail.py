@@ -643,7 +643,8 @@ class ClaudeStreamSessionTest(unittest.TestCase):
                               self._assistant("sid-child", "<synthetic>", 160)])
         dispatch_collector._enrich_claude_stream_session(job)
         self.assertIsNone(job.resolved_model)
-        self.assertEqual(render._job_display_model(job), "Opus")
+        with mock.patch.object(render, "_resolved_alias_models", return_value={}):
+            self.assertEqual(render._job_display_model(job), "Opus")
         self._write_log(job, [{"type": "system", "subtype": "init",
                               "session_id": "sid-child", "model": "claude-opus-5-5"},
                              self._assistant("sid-child", "<synthetic>", 160)])
