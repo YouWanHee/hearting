@@ -283,13 +283,17 @@ class GPUUnavailable(ValueError):
 def identity(pid):
     try:
         fields = Path("/proc/%s/stat" % pid).read_text().rsplit(") ", 1)[1].split()
-        return {"pid": int(pid), "starttime": fields[19],
-                "process_group": int(fields[2]),
-                "pid_namespace": os.readlink("/proc/self/ns/pid"),
-                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-                "state": fields[0]}
+        record = {"pid": int(pid), "starttime": fields[19],
+                  "process_group": int(fields[2]),
+                  "pid_namespace": os.readlink("/proc/self/ns/pid"),
+                  "state": fields[0]}
     except FileNotFoundError:
         return None
+    try:
+        record["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        pass
+    return record
 
 def living(record):
     if record.get("host") != socket.gethostname().lower().split(".")[0]:
@@ -420,12 +424,16 @@ def identity(pid):
     try:
         text = Path("/proc/%s/stat" % pid).read_text()
         fields = text.rsplit(") ", 1)[1].split()
-        return {"pid": int(pid), "starttime": fields[19],
-                "pid_namespace": os.readlink("/proc/self/ns/pid"),
-                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
-                "state": fields[0]}
+        record = {"pid": int(pid), "starttime": fields[19],
+                  "pid_namespace": os.readlink("/proc/self/ns/pid"),
+                  "state": fields[0]}
     except FileNotFoundError:
         return None
+    try:
+        record["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        pass
+    return record
 
 
 def living(record):
