@@ -406,6 +406,36 @@ def _proc_lifetime(pid):
         return "unknown", None
 
 
+def parent_successor(jobs: str | Path, parent: str, attempts, *, current_session=None) -> str:
+    """Return the same-seat successor that can actually receive these attempts, else "".
+
+    The successor must be sealed to an attempt by an exact seat handover and be
+    deliverable: ``current_session`` when the caller already knows the live
+    session, otherwise a Codex session that has a live TUI. Raises when the
+    evidence is unreadable so each caller keeps its own conservative rule.
+    """
+    import dispatch_seat_handover as handover
+    from dispatch_registry_cache import registry_view
+    view = registry_view(Path(jobs))
+    for attempt in attempts:
+        row = view.handover_attempt(attempt)
+        if row is None:
+            continue
+        successor = handover.effective_parent(row[1], jobs)
+        if not successor or successor == parent:
+            continue
+        if current_session is not None:
+            if successor == current_session:
+                return successor
+            continue
+        if handover.effective_parent_harness(row[1], jobs) != "codex":
+            continue
+        from pane_ownership import codex_tui_processes_for_session
+        if codex_tui_processes_for_session(successor):
+            return successor
+    return ""
+
+
 def _parent_duty_has_recipient(record: dict, jobs: Path) -> bool:
     """Keep a stopped duty dormant until its exact parent or bound successor returns."""
     identity = record.get("identity") or {}
@@ -415,33 +445,32 @@ def _parent_duty_has_recipient(record: dict, jobs: Path) -> bool:
     binding = record.get("parent_lifetime")
     if not isinstance(binding, dict):
         binding = (record.get("arguments") or {}).get("parent_lifetime")
-    if not isinstance(binding, dict):
-        return True
-    try:
-        from dispatch_contract import process_namespace_identity
-        namespace = binding.get("pid_namespace")
-        if not namespace or process_namespace_identity() != namespace:
-            return True
-        pid = int(binding.get("pid"))
-        start = str(binding.get("pid_start") or "")
-    except (ImportError, OSError, TypeError, ValueError):
-        return True
-    state, observed_start = _proc_lifetime(pid)
-    if state == "unknown":
-        return True
-    if state == "live" and observed_start == start:
+    if isinstance(binding, dict):
         try:
-            from pane_ownership import _native_session
-            current = _native_session(pid, "codex")
-        except Exception:
+            from dispatch_contract import process_namespace_identity
+            namespace = binding.get("pid_namespace")
+            if not namespace or process_namespace_identity() != namespace:
+                return True
+            pid = int(binding.get("pid"))
+            start = str(binding.get("pid_start") or "")
+        except (ImportError, OSError, TypeError, ValueError):
             return True
-        if not current:
+        state, observed_start = _proc_lifetime(pid)
+        if state == "unknown":
             return True
-        if current == parent:
-            return True
+        if state == "live" and observed_start == start:
+            try:
+                from pane_ownership import _native_session
+                current = _native_session(pid, "codex")
+            except Exception:
+                return True
+            if not current:
+                return True
+            if current == parent:
+                return True
 
     # A replacement TUI may carry the original native thread under a new PID,
-    # so confirm that case using the same pane ownership contract.
+    # and a duty that never recorded a TUI binding is judged the same way.
     try:
         from pane_ownership import codex_tui_processes_for_session
         bindings = codex_tui_processes_for_session(parent)
@@ -450,23 +479,68 @@ def _parent_duty_has_recipient(record: dict, jobs: Path) -> bool:
     if bindings:
         return True
 
-    # The original parent may have handed these exact attempts to a new seat.
-    # Keep the observer available for that durable recipient even if it has not
-    # started a TUI process yet.
+    # The original parent may have handed these exact attempts to a seat that
+    # can receive them; keep the observer available for that durable recipient.
     try:
-        import dispatch_seat_handover as handover
-        rows = handover.latest_rows(jobs)
         attempts = record.get("effective_attempts") or identity.get("attempt_ids") or []
-        for attempt in attempts:
-            row = rows.get(attempt)
-            if row is None:
-                continue
-            recipient = handover.effective_parent(row[1], jobs)
-            if recipient and recipient != parent:
-                return True
+        return bool(parent_successor(jobs, parent, attempts))
     except Exception:
         return True
-    return False
+
+
+_OBSERVER_CONTROL_OPTIONS = {"--obligation-lock-fd", "--service-current"}
+
+
+def _observer_argument_variants(pid, record: dict) -> tuple:
+    """Return a first-generation argv that is provably this record's own duty.
+
+    First-generation observers carry the batch identity on argv instead of a
+    ``--resume-obligation`` id. The argv only qualifies when the identity it
+    spells is exactly this record's identity, so another batch of the same
+    parent never matches.
+    """
+    try:
+        argv = Path(f"/proc/{int(pid)}/cmdline").read_bytes().decode().rstrip("\0").split("\0")
+        if len(argv) < 3 or Path(argv[1]).name != "codex-managed-completion.py":
+            return ()
+        options: dict[str, list[str]] = {}
+        duty_arguments = []
+        index = 2
+        while index < len(argv):
+            option = argv[index]
+            if not option.startswith("--"):
+                return ()
+            value = None
+            if index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                value = argv[index + 1]
+            options.setdefault(option, []).append(value)
+            if option not in _OBSERVER_CONTROL_OPTIONS:
+                duty_arguments.append(option)
+                if value is not None:
+                    duty_arguments.append(value)
+            index += 1 if value is None else 2
+        if "--resume-obligation" in options:
+            return ()
+
+        def single(name):
+            values = options.get(name, [])
+            return values[0] if len(values) == 1 and values[0] is not None else ""
+
+        identity = {
+            "jobs": str(Path(single("--jobs")).expanduser().resolve(strict=True)),
+            "sealed_batch_id": single("--sealed-batch-id"),
+            "parent_attempt_id": single("--parent-attempt-id"),
+            "parent_session_id": single("--parent-session-id"),
+            "attempt_ids": sorted({value for value in options.get("--attempt-id", [])
+                                   if value is not None}),
+        }
+        identity["delivery_parent_id"] = (
+            identity["parent_session_id"] or identity["parent_attempt_id"])
+        if single("--jobs") and identity == (record.get("identity") or {}):
+            return (tuple(duty_arguments),)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        pass
+    return ()
 
 
 def _spawn_observer(jobs: Path, duty_id: str, fd: int, launch, *, expected_observer=None):
@@ -590,6 +664,7 @@ def ensure_observers(jobs: str | Path | None = None, *, service_current=None,
                         ("--jobs", str(jobs_path), "--resume-obligation", duty_id),
                         binding, lock_fd_option="--obligation-lock-fd",
                         exact_arguments=True,
+                        argument_variants=_observer_argument_variants(observer["pid"], record),
                     )
                     if replaced != "replaced":
                         continue
@@ -1242,11 +1317,12 @@ def _pending_owner_settlements(jobs: Path, *, context=None):
             candidates = view.settlement_owner_candidates()
         else:
             floor = context.owner_candidate_floor(jobs, view)
-            selected = {record.completion_metadata().get("attempt_id", ""): record
-                        for record in (view.settlement_owner_candidates()
-                                       if floor < 0 else
-                                       view.settlement_owner_candidates_since(floor))
-                        if record.completion_metadata().get("attempt_id")}
+            selected = {}
+            for record in (view.settlement_owner_candidates()
+                           if floor < 0 else view.settlement_owner_candidates_since(floor)):
+                attempt_id = record.completion_metadata().get("attempt_id")
+                if attempt_id:
+                    selected[attempt_id] = record
             changed_rows = view.records_since(floor) if floor >= 0 else ()
             impacted = set(context.affected_settled_owner_ids(jobs, changed_rows))
             impacted.update(context.take_invalidated_owner_ids(jobs))

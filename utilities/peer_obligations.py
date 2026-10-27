@@ -328,6 +328,26 @@ def _process_holds_flock(pid: int, lock_path: Path, fd_number: str) -> bool:
     return False
 
 
+def _find_held_lock_fd(pid: int, lock_path: Path) -> str | None:
+    """Return the only fd of ``pid`` that holds ``lock_path``'s flock, else None."""
+    try:
+        info = lock_path.stat()
+        held = []
+        for entry in os.listdir(f"/proc/{pid}/fd"):
+            if not entry.isdecimal():
+                continue
+            try:
+                observed = os.stat(f"/proc/{pid}/fd/{entry}")
+            except OSError:
+                continue
+            if ((observed.st_dev, observed.st_ino) == (info.st_dev, info.st_ino)
+                    and _process_holds_flock(pid, lock_path, entry)):
+                held.append(entry)
+    except (OSError, ValueError, TypeError):
+        return None
+    return held[0] if len(held) == 1 else None
+
+
 def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | Path,
                              relative_script: str | Path, required_arguments: Iterable[str],
                              service_current: str | Path, *, lock_fd_option: str,
@@ -392,12 +412,22 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                     return None
                 script = Path(argv[1]).resolve(strict=True)
                 source_root = script.parent.parent
-                if (script != source_root / relative or _release_root(
-                        source_root, _service_layout(code_root)[2]) is None):
-                    return None
-                source_layout = _service_layout(source_root)
                 target_layout = _service_layout(code_root)
-                if (source_layout is None or target_layout is None
+                if script != source_root / relative or target_layout is None:
+                    return None
+                dev_checkout = False
+                if _release_root(source_root, target_layout[2]) is None:
+                    # A development checkout is never a managed release; it is
+                    # only ever replaced (legacy), never accepted as current.
+                    if (source_root.parent == target_layout[2]
+                            or not all((source_root / marker).is_file() for marker in (
+                                "utilities/peer_obligations.py", "core/CORE.md"))):
+                        return None
+                    dev_checkout = True
+                    source_layout = target_layout
+                else:
+                    source_layout = _service_layout(source_root)
+                if (source_layout is None
                         or source_layout[1] != target_layout[1]
                         or source_layout[2] != target_layout[2]
                         or source_layout[3] != target_layout[3]):
@@ -424,6 +454,11 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                     if duty_arguments not in expected_variants:
                         return None
                     lock_fd_number = control_values.get(lock_fd_option)
+                    if lock_fd_number is None:
+                        # Early observers open their own lease and never
+                        # advertised its descriptor; find the single fd that
+                        # holds this exact duty lock.
+                        lock_fd_number = _find_held_lock_fd(pid, lock)
                     if lock_fd_number is None or not lock_fd_number.isdecimal():
                         return None
                     observed_binding = control_values.get(service_current_option)
@@ -449,10 +484,17 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                         if not raw:
                             return None
                         env_root = Path(raw).expanduser().resolve(strict=True)
+                        if dev_checkout and env_root == source_root:
+                            continue
                         env_layout = _service_layout(env_root)
                         if env_layout is None or env_layout[1:] != source_layout[1:]:
                             return None
-                    if "HARNESS_DATA_ROOT" in env:
+                    # A checkout run (often under a fixture HOME) is bound to
+                    # this install only by the exact duty lease it holds,
+                    # which is proven below; its own data root is not.
+                    if dev_checkout:
+                        observed_data_root = None
+                    elif "HARNESS_DATA_ROOT" in env:
                         raw = env["HARNESS_DATA_ROOT"]
                         if not raw:
                             return None
@@ -468,7 +510,8 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                             return None
                         observed_data_root = (
                             Path(home).expanduser() / ".local" / "share" / "hearting")
-                    if (not observed_data_root.is_absolute()
+                    if observed_data_root is not None and (
+                            not observed_data_root.is_absolute()
                             or Path(os.path.abspath(os.fspath(observed_data_root)))
                             != source_layout[1]):
                         return None
@@ -483,7 +526,7 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                     return None
                 if held_path != lock or not _process_holds_flock(pid, lock, lock_fd_number):
                     return None
-                if source_root == target_root:
+                if source_root == target_root and not dev_checkout:
                     return ("current", None)
                 return ("legacy", None)
 

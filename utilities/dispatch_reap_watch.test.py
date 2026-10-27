@@ -1186,5 +1186,47 @@ class WorkerHomeRetentionCarrierTest(unittest.TestCase):
         sweep.assert_called_once()
 
 
+class AttemptRecordIndexTest(unittest.TestCase):
+    """attempt_record reads the one row through the shared view, with the
+    same last-match answer as the old whole-file text scan."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("dispatch_reap_watch_record", WATCH)
+        self.watcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.watcher)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.jobs = Path(self.tmp.name) / "jobs.log"
+
+    @staticmethod
+    def _line(status, aid, note):
+        return f"t\t{status}\t/repo\t/wt\towner\tattempt_id={aid},note={note}"
+
+    def _check(self, raw, aid, expect_note):
+        self.jobs.write_bytes(raw)
+        found = self.watcher.attempt_record(self.jobs, aid)
+        text = self.watcher._attempt_record_from_text(self.jobs, aid)
+        self.assertEqual(found, text)
+        if expect_note is None:
+            self.assertIsNone(found)
+        else:
+            self.assertEqual(found[1]["note"], expect_note)
+
+    def test_last_row_wins_including_a_partial_tail_row(self):
+        rows = "\n".join([self._line("open", "att-a", "first"), self._line("open", "att-b", "other"),
+                          self._line("done", "att-a", "second")])
+        self._check((rows + "\n").encode(), "att-a", "second")
+        self._check(rows.encode(), "att-a", "second")
+        self._check((rows + "\n" + self._line("done", "att-a", "tail")).encode(), "att-a", "tail")
+        self._check(rows.encode(), "att-missing", None)
+
+    def test_missing_registry_and_noncanonical_separators(self):
+        self.assertIsNone(self.watcher.attempt_record(self.jobs, "att-a"))
+        raw = (self._line("open", "att-a", "one") + "\r\n" + self._line("done", "att-a", "two")
+               + "\n").encode()
+        self._check(raw, "att-a", "two")
+
+
 if __name__ == "__main__":
     unittest.main()

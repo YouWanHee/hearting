@@ -134,14 +134,66 @@ class ParentLifetimeStopTest(unittest.TestCase):
              mock.patch.object(self.module, "process_namespace_identity", side_effect=["ns", "ns"]):
             self.assertEqual(self.module.capture_parent_lifetime(self.args), self.binding)
 
-    def test_missing_legacy_lifetime_stays_unknown_without_procfs_observation(self):
-        args = SimpleNamespace(parent_session_id=SESSION, thread_id=SESSION,
+    def _unbound_args(self):
+        return SimpleNamespace(parent_session_id=SESSION, thread_id=SESSION,
                                jobs=Path("/jobs"))
-        with mock.patch.object(self.module, "process_namespace_identity",
-                               side_effect=AssertionError("missing lifetime is unknown")), \
-             mock.patch.object(self.module, "_parent_proc_state",
-                               side_effect=AssertionError("missing lifetime is unknown")):
+
+    def test_unbound_lifetime_without_session_tui_or_successor_ends_the_observer(self):
+        args = self._unbound_args()
+        with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
+             mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]), \
+             mock.patch.object(self.module, "_confirmed_parent_successor", return_value=""):
+            self.assertEqual(self.module.parent_session_stop_reason(args, {"att-child"}),
+                             self.module.PARENT_SESSION_ENDED)
+        self.assertFalse(hasattr(args, "parent_lifetime"))
+
+    def test_unbound_lifetime_binds_the_one_session_tui_and_keeps_observing(self):
+        args = self._unbound_args()
+        tui = {"pid": 77, "pid_start": "9", "session_id": SESSION}
+        with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
+             mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[tui]):
             self.assertEqual(self.module.parent_session_stop_reason(args, {"att-child"}), "")
+        self.assertEqual(args.parent_lifetime, {**tui, "pid_namespace": "ns"})
+
+    def test_unbound_lifetime_stays_unknown_when_evidence_is_ambiguous_or_unreadable(self):
+        tuis = [{"pid": 77, "pid_start": "9", "session_id": SESSION},
+                {"pid": 78, "pid_start": "10", "session_id": SESSION}]
+        for label, patches in {
+            "two-tuis": dict(tui=mock.Mock(return_value=tuis), namespace="ns"),
+            "lookup-error": dict(tui=mock.Mock(side_effect=OSError("proc")), namespace="ns"),
+            "no-namespace": dict(tui=mock.Mock(side_effect=AssertionError("unused")),
+                                 namespace=None),
+        }.items():
+            with self.subTest(label), \
+                 mock.patch.object(self.module, "process_namespace_identity",
+                                   return_value=patches["namespace"]), \
+                 mock.patch("pane_ownership.codex_tui_processes_for_session", patches["tui"]):
+                args = self._unbound_args()
+                self.assertEqual(
+                    self.module.parent_session_stop_reason(args, {"att-child"}), "")
+
+    def test_unbound_lifetime_with_unreadable_handover_evidence_keeps_the_duty(self):
+        args = self._unbound_args()
+        with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
+             mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]), \
+             mock.patch.object(self.module, "_confirmed_parent_successor",
+                               side_effect=OSError("registry")):
+            self.assertEqual(self.module.parent_session_stop_reason(args, {"att-child"}), "")
+
+    def test_attempt_parent_without_session_never_uses_the_tui_judgement(self):
+        args = SimpleNamespace(parent_session_id=None, jobs=Path("/jobs"))
+        with mock.patch("pane_ownership.codex_tui_processes_for_session",
+                        side_effect=AssertionError("attempt parents have no session")):
+            self.assertEqual(self.module.parent_session_stop_reason(args, {"att-child"}), "")
+
+    def test_confirmed_successor_asks_for_a_deliverable_recipient(self):
+        args = self._unbound_args()
+        with mock.patch.object(self.module.batch_obligations, "parent_successor",
+                               return_value="successor") as ask:
+            self.assertEqual(
+                self.module._confirmed_parent_successor(args, {"att-child"}, current_session="x"),
+                "successor")
+        ask.assert_called_once_with(args.jobs, SESSION, {"att-child"}, current_session="x")
 
     def test_live_exact_parent_does_not_trigger_observer_exit(self):
         with mock.patch.object(self.module, "process_namespace_identity", return_value="ns"), \
@@ -281,7 +333,24 @@ raise SystemExit(3 if state == 'timeout' else 0)
         self.assertEqual(args.timeout, 600.0)
 
     def fixture_env(self):
+        """Sidecar subprocess env whose parent session has one live Codex TUI.
+
+        A duty without a recorded TUI binding is judged by the session's live
+        TUI, so subprocess fixtures that expect delivery need one to exist.
+        """
+        shim = self.base / "tui-shim"
+        shim.mkdir(exist_ok=True)
+        (shim / "sitecustomize.py").write_text(
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(ROOT / 'utilities')!r})\n"
+            "import pane_ownership\n"
+            "def _tui(session_id, **kwargs):\n"
+            "    return [{'pid': os.getppid(), 'pid_start': '1', 'session_id': session_id}]\n"
+            "pane_ownership.codex_tui_processes_for_session = _tui\n",
+            encoding="utf-8")
         env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (str(shim), env.get("PYTHONPATH", ""))))
         for key in list(env):
             if (key.startswith(("AGENT_DISPATCH_", "HERDR_"))
                     or key in {"AGENT_SESSION_ID", "AGENT_SESSION_ROLE",
@@ -890,6 +959,9 @@ class OneSidedCachedReceiptPathTest(unittest.TestCase):
                 # only its external socket/session and enqueue boundary are stubbed.
                 with mock.patch.object(module.codex_queue_delivery, "DeliverySession",
                                        side_effect=QueueSession), \
+                     mock.patch("pane_ownership.codex_tui_processes_for_session",
+                                return_value=[{"pid": os.getpid(), "pid_start": "1",
+                                               "session_id": session_id}]), \
                      mock.patch.object(module.codex_queue_delivery, "_rpc", side_effect=rpc), \
                      mock.patch.object(module.codex_queue_delivery, "send_at_least_once",
                                        return_value={"status": "queued", "queued_submission_id": "q-1",

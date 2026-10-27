@@ -646,7 +646,7 @@ def reap_terminal_descendants(jobs, fields, *, grace=0.3, kill_wait=0.5):
     resources = known_resources(route, path, jobs, {meta["attempt_id"]})
     deadline, sent = time.monotonic() + grace + kill_wait, set()
     while True:
-        current = _rows(jobs).get(meta["attempt_id"])
+        current = _rows(jobs, {meta["attempt_id"]}).get(meta["attempt_id"])
         if current is None or current[0] != fields:
             return  # A successor/result writer changed the selected row.
         if fields[1] not in {"done", "killed", "cancelled"} and not terminal_envelope_observed(meta.get("log_file")):
@@ -817,7 +817,7 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
     protected.update({(r["kind"], r["run_id"], r.get("registry")):
         {**r, "parent_close_linked": True} for r in resources})
     protected_resources = list(protected.values())
-    rows = _rows(jobs)
+    rows = _rows(jobs, set(value["attempts"]))
     pending = []
     # Reconstruct annotations after a crash between durable intent and registry.
     for aid in value["attempts"]:
@@ -832,7 +832,7 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
                 "parent_close_requested": "1", "parent_close_route_id": route["route_id"],
                 "parent_close_route_hash": route["route_hash"],
                 "parent_close_stop_resources": str(int(value["stop_resources"]))})
-            meta = _rows(jobs)[aid][1]
+            meta = _rows(jobs, {aid})[aid][1]
         deadline = time.monotonic() + grace + kill_wait
         sent = set()
         settled = False
@@ -861,7 +861,7 @@ def continue_close(value, *, jobs=None, grace=0.3, kill_wait=0.5):
                         evidence={"failure_class": "cancelled", "parent_close_settled": "1",
                                   **({"launch_outcome": "never-launched"} if never else {})})
                     if not settled:
-                        current = _rows(jobs).get(aid)
+                        current = _rows(jobs, {aid}).get(aid)
                         settled = bool(current and current[0][1] not in OPEN
                                        and current[1].get("parent_close_settled") == "1")
                 if settled or time.monotonic() >= deadline:

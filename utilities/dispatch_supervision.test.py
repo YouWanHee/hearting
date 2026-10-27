@@ -791,6 +791,99 @@ except d.DispatchContractError as e: print(json.dumps({'reason':e.reason}))
         self.assertGreaterEqual(metrics["cache_hits"], 1)
         clear_cache()
 
+    def _conflicted_child(self, attempt="att-child", **metadata):
+        """A closed child holding a pass while a later failure contradicts it."""
+        lines = self.jobs.read_text().splitlines()
+        index = next(i for i, line in enumerate(lines) if f"attempt_id={attempt}," in line + ",")
+        lines[index] = row(attempt, status="done", note="completed-marker", failure_class="pass",
+                           launch_outcome="never-launched", **metadata).strip()
+        self.jobs.write_text("\n".join(lines) + "\n")
+        self.assertEqual(contract.reconcile_attempt_terminal(self.jobs, attempt, "dead-worker-fail",
+            evidence={"failure_class": "fail", "classifier_source": "supervisor-terminal-v1"}),
+            "terminal-conflict")
+
+    def _settle(self, attempts, rounds):
+        """Run the final settlement wait; a wait still held after `rounds` joins stops the test."""
+        calls = []
+
+        def join(_monitored):
+            calls.append(1)
+            if len(calls) > rounds:
+                raise supervision.StopWaiting("still-waiting")
+            return {"state": "timeout"}
+
+        with mock.patch.object(supervision.time, "sleep"):
+            try:
+                supervision.wait_for_child_settlement(
+                    jobs=self.jobs, attempts=set(attempts), parent_attempt_id="att-owner",
+                    join=join, reconcile=lambda _monitored: None, emit=lambda _event: None)
+            except supervision.StopWaiting:
+                return False, len(calls)
+        return True, len(calls)
+
+    def test_final_settlement_ends_when_only_closed_quiescent_conflicts_remain(self):
+        self._notice_rows()
+        self._conflicted_child()
+        finished, joins = self._settle({"att-child"}, rounds=20)
+        self.assertTrue(finished)
+        self.assertEqual(joins, 1)
+        records = list(pending.record_directory(self.root, "parent-test").glob("delivery-*.json"))
+        self.assertEqual([json.loads(record.read_text())["receipt"]["reason"] for record in records],
+                         ["terminal-evidence-conflict"])
+
+    def test_final_settlement_keeps_waiting_for_open_or_live_children(self):
+        self._notice_rows()
+        finished, _joins = self._settle({"att-child"}, rounds=5)
+        self.assertFalse(finished, "an open child keeps the wait")
+        live = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: (live.kill(), live.wait()))
+        raw = Path(f"/proc/{live.pid}/stat").read_text()
+        start = raw[raw.rfind(")") + 2:].split()[19]
+        self.jobs.write_text(row("att-owner", dispatch_depth="1", parent_attempt_id="", parent_sid="parent-test",
+            parent_completion_delivery="codex-managed-gateway", route_node="__owner__",
+            managed_sealed_batch_id="batch-test", pid="99999999", pid_start="1")
+            + row("att-child", pid=str(live.pid), pid_start=start, pgid=str(live.pid)))
+        self._conflicted_child(pid=str(live.pid), pid_start=start, pgid=str(live.pid))
+        finished, _joins = self._settle({"att-child"}, rounds=5)
+        self.assertFalse(finished, "a live process keeps the wait")
+
+    def test_final_settlement_waits_while_any_child_is_still_open(self):
+        self._notice_rows()
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write(row("att-other", pid="99999997", pid_start="1"))
+        self._conflicted_child()
+        finished, _joins = self._settle({"att-child", "att-other"}, rounds=5)
+        self.assertFalse(finished)
+
+    def test_final_settlement_ends_at_once_for_a_reviewed_conflict(self):
+        self._notice_rows()
+        self._conflicted_child()
+        review = self.root / "review.md"
+        review.write_text("Compared the recorded PASS and the late failure; retain the recorded result.\n")
+        raw = self.jobs.read_text().splitlines()[1]
+        contract.resolve_terminal_conflict(self.jobs, "att-child",
+            expected_row_sha256=hashlib.sha256(raw.encode()).hexdigest(), review=review)
+        with mock.patch.object(supervision, "materialize") as materialize:
+            finished, joins = self._settle({"att-child"}, rounds=5)
+        self.assertTrue(finished)
+        self.assertEqual(joins, 0)
+        materialize.assert_not_called()
+
+    def test_owned_rows_select_owner_and_children_and_keep_the_duplicate_refusal(self):
+        self._notice_rows()
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            for index in range(20):
+                handle.write(row(f"att-unrelated-{index}", parent_attempt_id="att-other"))
+        rows = supervision._owned_rows(self.jobs, "att-owner")
+        self.assertEqual(set(rows), {"att-owner", "att-child"})
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write(row("att-unrelated-3", parent_attempt_id="att-other"))
+        with self.assertRaisesRegex(supervision.SupervisionError, "supervision-attempt-ambiguous"):
+            supervision._owned_rows(self.jobs, "att-owner")
+        with self.assertRaisesRegex(supervision.SupervisionError, "supervision-attempt-ambiguous"):
+            supervision._rows(self.jobs, {"att-owner"}, require_unique=True)
+        self.assertEqual(set(supervision._rows(self.jobs, {"att-owner"})), {"att-owner"})
+
     def test_stop_waiting_aborts_without_materializing_or_retrying(self):
         self._notice_rows()
         join = mock.Mock(return_value={"state": "timeout"})
