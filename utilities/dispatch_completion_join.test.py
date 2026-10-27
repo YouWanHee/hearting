@@ -1784,7 +1784,8 @@ class DispatchCompletionJoinTest(unittest.TestCase):
                  "route_file":str(path),"jobs":str(jobs),"successor_external":True,"successor_command":None,
                  "resource_binding":RESOURCE.resource_legacy_body_digest(row)}
         parent = SimpleNamespace(status="open",raw="time\topen\t/repo\t/wt\towner\tmeta",
-                                 metadata={"pid":"444","pid_start":"200"})
+                                 metadata={"pid":"555","pid_start":"300",
+                                           "owner_identity_lineage":"444:200"})
         sup = SimpleNamespace(load_route=lambda _: route, ledger_for=lambda *_:None,
                               resource_predecessors=lambda *_: [(armed,row)],
                               resource_watch_key=lambda record: (
@@ -1800,7 +1801,8 @@ class DispatchCompletionJoinTest(unittest.TestCase):
              mock.patch.object(RESOURCE.JOIN,"exact_attempt_row",return_value=parent):
             self.assertEqual(len(RESOURCE.context(args,control)[3]),1)
             for field,value in (("session_id","foreign-native"),("route_hash","foreign-hash"),
-                                ("jobs",str(self.root/"foreign-jobs")),("owner_start","201")):
+                                ("jobs",str(self.root/"foreign-jobs")),("owner_start","201"),
+                                ("owner_pid",222)):
                 bad = copy.deepcopy(row)
                 bad["owner_wait"][field]=value
                 write(bad)

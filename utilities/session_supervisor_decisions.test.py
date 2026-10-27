@@ -2,6 +2,7 @@
 """Both session supervisors make their continuation and stage decisions through one module."""
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,36 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import session_supervisor_decisions as D  # noqa: E402
+import dispatch_budget_record as BR  # noqa: E402
+from dispatch_continuation_budget import ContinuationBudget, ContinuationLedger  # noqa: E402
+
+
+class ContinuationLedgerInheritanceTest(unittest.TestCase):
+    def test_restores_next_ordinal_remaining_and_terminal_handoff_without_writing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            owner = "att-ledger-inherit"
+            remaining = {"gross_remaining": 3, "stall_remaining": 2,
+                         "reserved_remaining": 1}
+            self.assertTrue(BR.reserve(root, parent_attempt_id=owner, route_id="rt-test",
+                route_hash="sha256:test", ordinal=0, purpose="ordinary", klass="gross",
+                remaining=remaining)[0])
+            self.assertTrue(BR.reserve(root, parent_attempt_id=owner, route_id="rt-test",
+                route_hash="sha256:test", ordinal=1, purpose="ordinary", klass="stall",
+                remaining=remaining)[0])
+            self.assertTrue(BR.reserve(root, parent_attempt_id=owner, route_id="rt-test",
+                route_hash="sha256:test", ordinal=1, purpose="terminal-handoff", klass="reserved",
+                remaining=remaining)[0])
+            before = BR._ledger_path(root, owner).read_bytes()
+            budget = ContinuationBudget(limit=3, source="fixture", reserved=1, stall=2)
+            ledger = ContinuationLedger(budget)
+            next_ordinal, handoff = D.inherit_continuation_ledger(ledger, root, owner)
+            self.assertEqual(next_ordinal, 2)
+            self.assertTrue(handoff)
+            self.assertEqual((ledger.gross_remaining, ledger.stall_remaining,
+                              ledger.reserved_remaining),
+                             (budget.ordinary - 1, budget.stall - 1, budget.reserved - 1))
+            self.assertEqual(BR._ledger_path(root, owner).read_bytes(), before)
 
 
 def load(name):

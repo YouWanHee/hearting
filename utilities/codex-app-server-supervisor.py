@@ -1304,6 +1304,9 @@ def main(argv: list[str] | None = None) -> int:
         argument_parser.error("--jobs or AGENT_DISPATCH_JOBS is required outside --one-turn")
     if not args.parent_attempt_id or not args.lease_file:
         argument_parser.error("--parent-attempt-id and --lease-file are required outside --one-turn")
+    from dispatch_owner_input import bound_input_thread
+    restart_thread = bound_input_thread(args.jobs, args.parent_attempt_id)
+    restart = restart_thread is not None
     continuation_budget = resolve_continuation_budget(
         explicit=args.max_continuations,
         route_file=args.route_file,
@@ -1329,6 +1332,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     prompt = sys.stdin.read()
     if not prompt.strip():
+        if restart:
+            emit({"type": "dispatch.supervisor.consumer-recovery-failed",
+                  "parent_attempt_id": args.parent_attempt_id,
+                  "reason": "consumer-recovery-prompt-empty"})
+            return 75
         terminal = classify_supervisor_error("codex", "initial-prompt-empty", 64)
         if not reconcile(args, terminal):
             return 70
@@ -1362,12 +1370,22 @@ def main(argv: list[str] | None = None) -> int:
     delivery_timing = delivery_timing_fields()
     same_thread_resume_count = 0
     lease_exit: tuple[object, object, object] = (None, None, None)
+    continuations = 0
+    terminal_handoff_issued = [False]
+    recovery_prebind_failure = False
     try:
         lease.__enter__()
         lease_acquired = True
+        continuations, handoff_issued = DECISIONS.inherit_continuation_ledger(
+            ledger, budget_state_root, args.parent_attempt_id,
+        )
+        terminal_handoff_issued = [handoff_issued]
         recovered = read_supervisor_phase_state(
             state_path, args.parent_attempt_id
         )
+        if restart and (recovered is None or recovered.resource is None
+                        or recovered.resource.get("session_id") != restart_thread):
+            raise SupervisorError("owner-input-restart-state-unavailable")
         if recovered is not None:
             delivered = set(recovered.delivered_attempt_ids)
             active_outbox = recovered.outbox
@@ -1438,10 +1456,6 @@ def main(argv: list[str] | None = None) -> int:
         launch_remediated: set[tuple[str, ...]] = set()
         next_prompt = prompt
         pending_notice = ""
-        continuations = 0
-        # SD-116 (c): mirrors claude-session-supervisor.py -- spendable
-        # exactly once per owner lifetime.
-        terminal_handoff_issued = [False]
         if recovered is not None and recovered.resource is not None and active_outbox is None:
             resource_prompt = RESOURCE_WAIT.wait(args, state_path, control, delivered, emit)
             if resource_prompt is not None:
@@ -1857,6 +1871,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if terminal.failure_class == "pass" else 3
     except (DispatchContractError, JoinContractError, SupervisorError) as exc:
         lease_exit = (type(exc), exc, exc.__traceback__)
+        if restart and control is None:
+            recovery_prebind_failure = True
+            reason = exc.reason if isinstance(exc, DispatchContractError) else str(exc)
+            emit({"type": "dispatch.supervisor.consumer-recovery-failed",
+                  "parent_attempt_id": args.parent_attempt_id, "reason": reason})
+            return 75
         if isinstance(exc, TurnFailed):
             # The structured payload (and its dispatch.supervisor.turn.failed
             # log row) was already emitted where it was raised -- classify it
@@ -1875,6 +1895,12 @@ def main(argv: list[str] | None = None) -> int:
         return 70
     except Exception as exc:  # fail closed without leaking protocol/model content
         lease_exit = (type(exc), exc, exc.__traceback__)
+        if restart and control is None:
+            recovery_prebind_failure = True
+            reason = f"supervisor-internal-{type(exc).__name__}"
+            emit({"type": "dispatch.supervisor.consumer-recovery-failed",
+                  "parent_attempt_id": args.parent_attempt_id, "reason": reason})
+            return 75
         terminal = classify_supervisor_error(
             "codex", f"supervisor-internal-{type(exc).__name__}"
         )
@@ -1896,47 +1922,56 @@ def main(argv: list[str] | None = None) -> int:
                 if server is not None:
                     server.close()
         finally:
-            try:
-                from dispatch_completion_join import supervisor_guarded_attempt_ids
-                open_children = supervisor_guarded_attempt_ids(
-                    current_children(Path(args.jobs), args.parent_attempt_id), active_outbox)
-            except Exception:
-                open_children = set()
-            resource_recovery = RESOURCE_WAIT.needs_recovery(state_path, args.parent_attempt_id, lease_exit[0] is not None)
-            try:
-                if open_children or resource_recovery:
-                    write_supervisor_state(
-                        state_path,
-                        args.parent_attempt_id,
-                        delivered,
-                        phase="recovery",
-                        outbox=active_outbox,
-                    )
-                else:
-                    write_supervisor_state(
-                        state_path, args.parent_attempt_id, delivered, phase="terminal"
-                    )
-                    remove_supervisor_state(state_path)
-            except Exception as exc:
-                emit(
-                    {
-                        "type": "dispatch.supervisor.error",
-                        "reason": f"supervisor-finalize-state-{type(exc).__name__}",
-                    }
-                )
-            finally:
+            if recovery_prebind_failure:
                 if lease_acquired:
                     try:
-                        lease.__exit__(
-                            *(lease_exit if open_children or resource_recovery else (None, None, None))
-                        )
+                        lease.__exit__(None, None, None)
                     except Exception as exc:
-                        emit(
-                            {
-                                "type": "dispatch.supervisor.error",
-                                "reason": f"supervisor-finalize-lease-{type(exc).__name__}",
-                            }
+                        emit({"type": "dispatch.supervisor.error",
+                              "reason": f"supervisor-finalize-lease-{type(exc).__name__}"})
+            else:
+                try:
+                    from dispatch_completion_join import supervisor_guarded_attempt_ids
+                    open_children = supervisor_guarded_attempt_ids(
+                        current_children(Path(args.jobs), args.parent_attempt_id), active_outbox)
+                except Exception:
+                    open_children = set()
+                resource_recovery = RESOURCE_WAIT.needs_recovery(
+                    state_path, args.parent_attempt_id, lease_exit[0] is not None)
+                try:
+                    if open_children or resource_recovery:
+                        write_supervisor_state(
+                            state_path,
+                            args.parent_attempt_id,
+                            delivered,
+                            phase="recovery",
+                            outbox=active_outbox,
                         )
+                    else:
+                        write_supervisor_state(
+                            state_path, args.parent_attempt_id, delivered, phase="terminal"
+                        )
+                        remove_supervisor_state(state_path)
+                except Exception as exc:
+                    emit(
+                        {
+                            "type": "dispatch.supervisor.error",
+                            "reason": f"supervisor-finalize-state-{type(exc).__name__}",
+                        }
+                    )
+                finally:
+                    if lease_acquired:
+                        try:
+                            lease.__exit__(
+                                *(lease_exit if open_children or resource_recovery else (None, None, None))
+                            )
+                        except Exception as exc:
+                            emit(
+                                {
+                                    "type": "dispatch.supervisor.error",
+                                    "reason": f"supervisor-finalize-lease-{type(exc).__name__}",
+                                }
+                            )
 
 
 if __name__ == "__main__":

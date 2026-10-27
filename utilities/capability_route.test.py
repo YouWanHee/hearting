@@ -6411,24 +6411,25 @@ class OwnerFinishBudgetRegressionTest(unittest.TestCase):
   import dispatch_owner_input as owner_input
   import dispatch_contract
   attempt="att-parent"
-  jobs=Path(tempfile.mkdtemp())/"jobs.log"
-  lease=dispatch_contract.supervisor_lease_path(jobs,attempt)
-  jobs.parent.mkdir(parents=True,exist_ok=True)
-  jobs.write_text("2026-10-02T00:00:00Z\topen\t/repo\t/wt\towner\t"
-   +"attempt_schema_version=2,dispatch_depth=1,transport=headless,execution_surface=registered-headless,"
-   +"registered_worker=1,fallback_hop=same-harness-headless,worker_type=owner,harness=codex,"
-   +"completion_delivery=app-server-supervised,supervisor_lease=flock-v1,"
-   +f"supervisor_lease_file={lease},supervisor_lease_nonce={'d'*64},attempt_id={attempt},"
-   +"owner_route_id=rt-fixture,owner_route_hash=sha256:"+"a"*64+",route_id=rt-fixture,route_hash=sha256:"+"a"*64+",parent_sid=fixture\n")
-  with dispatch_contract.hold_supervisor_lease(jobs,attempt,lease):
-   owner_input.OwnerInput(jobs,attempt,"thread-fixture","codex-active-turn",lambda _event:None)
-   owner_input.submit(jobs,attempt,"private", "request-cli")
-   result=subprocess.run([sys.executable,str(P),"correct","--attempt-id",attempt,"--jobs",str(jobs)],
-    capture_output=True,text=True,check=False)
+  with tempfile.TemporaryDirectory(prefix="correct-cli-") as raw:
+   jobs=Path(raw)/"jobs.log"
+   lease=dispatch_contract.supervisor_lease_path(jobs,attempt)
+   jobs.write_text("2026-10-02T00:00:00Z\topen\t/repo\t/wt\towner\t"
+    +"attempt_schema_version=2,dispatch_depth=1,transport=headless,execution_surface=registered-headless,"
+    +"registered_worker=1,fallback_hop=same-harness-headless,worker_type=owner,harness=codex,"
+    +"completion_delivery=app-server-supervised,supervisor_lease=flock-v1,"
+    +f"supervisor_lease_file={lease},supervisor_lease_nonce={'d'*64},attempt_id={attempt},"
+    +"owner_route_id=rt-fixture,owner_route_hash=sha256:"+"a"*64+",route_id=rt-fixture,route_hash=sha256:"+"a"*64+",parent_sid=fixture\n")
+   with dispatch_contract.hold_supervisor_lease(jobs,attempt,lease):
+    owner_input.OwnerInput(jobs,attempt,"thread-fixture","codex-active-turn",lambda _event:None)
+    owner_input.submit(jobs,attempt,"private", "request-cli")
+    result=subprocess.run([sys.executable,str(P),"correct","--attempt-id",attempt,"--jobs",str(jobs)],
+     capture_output=True,text=True,check=False)
   self.assertEqual(0,result.returncode,result.stderr)
   value=json.loads(result.stdout)
   self.assertIn("delivery_notice",value)
-  self.assertIn("does not wake or cancel",value["delivery_notice"])
+  self.assertIn("effective parent",value["delivery_notice"])
+  self.assertIn("never replayed",value["delivery_notice"])
 
 
 class OwnerFinishCorrectionRegressionTest(OwnerFinishBudgetRegressionTest):
