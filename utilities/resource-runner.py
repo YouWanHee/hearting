@@ -7,7 +7,7 @@ import resource_run_evidence as RUN_EVIDENCE
 from resource_progress import environment as progress_environment
 import gpu_leases
 import route_authority
-from gpu_execution_sandbox import gpu_resource_nodes
+from gpu_execution_sandbox import assert_host_payload_access, gpu_resource_nodes, host_payload_nodes
 from resource_run_registry import (
     classify_identity,
     is_alive,
@@ -1947,7 +1947,16 @@ def _main(argv=None, *, controller=None):
             return
         resume = RESOURCE_RESUME.route_selected(route) and node.get("resource_policy") == "verified-resume"
         if resume and not SAFE_RUN_ID.fullmatch(args.run_id): fail("invalid --run-id")
-        if not args.smoke_attestation and not resume: fail("hash-bound smoke attestation required")
+        # A sealed GPU-free host payload carries no training attestation; it still passes
+        # the access check and every other launch guard below.
+        host_payload = args.node in host_payload_nodes(route)
+        if host_payload:
+            try:
+                assert_host_payload_access(route, args.node, jobs=getattr(args, "jobs", None))
+            except ValueError as exc:
+                fail(getattr(exc, "reason", None) or str(exc))
+        if not args.smoke_attestation and not resume and not host_payload:
+            fail("hash-bound smoke attestation required")
         if args.smoke_attestation:
             verify_launch_input([sys.executable,str(Path(__file__).parents[1]/"tools/smoke-attestation.py"),"verify","--attestation",args.smoke_attestation])
         provenance = {}

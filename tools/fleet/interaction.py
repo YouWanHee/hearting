@@ -29,9 +29,11 @@ WAIT_SOURCES = (
     "codex-appserver",
     "opencode-question",
 )
-_ALLOWED_KEYS = frozenset(
+_BASE_KEYS = frozenset(
     ("schema_version", "harness", "session_id", "kind", "source", "waiting_since")
 )
+_OPTIONAL_ID_KEYS = ("request_id", "turn_id", "item_id")
+_ALLOWED_KEYS = _BASE_KEYS | frozenset(_OPTIONAL_ID_KEYS)
 _SAFE_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _STALE_SWEEP_SEC = 24 * 3600
 _CLOCK_SKEW_SEC = 60
@@ -41,6 +43,15 @@ def _safe_key(value, label):
     value = str(value or "")
     if not value or not _SAFE_KEY_RE.fullmatch(value):
         raise ValueError("invalid %s" % label)
+    return value
+
+
+def _safe_native_ref(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    value = str(value)
+    if not value or len(value) > 200 or not _SAFE_KEY_RE.fullmatch(value):
+        return None
     return value
 
 
@@ -71,10 +82,11 @@ def _number(value):
     )
 
 
-def _encode(harness, session_id, kind, source, waiting_since):
+def _encode(harness, session_id, kind, source, waiting_since, *,
+            request_id=None, turn_id=None, item_id=None):
     if kind not in WAIT_KINDS or source not in WAIT_SOURCES or not _number(waiting_since):
         return None
-    return {
+    value = {
         "schema_version": SCHEMA_VERSION,
         "harness": _safe_key(harness, "harness"),
         "session_id": _safe_key(session_id, "session id"),
@@ -82,6 +94,14 @@ def _encode(harness, session_id, kind, source, waiting_since):
         "source": source,
         "waiting_since": float(waiting_since),
     }
+    for name, ref in (("request_id", request_id), ("turn_id", turn_id), ("item_id", item_id)):
+        if ref is None:
+            continue
+        safe_ref = _safe_native_ref(ref)
+        if safe_ref is None:
+            return None
+        value[name] = safe_ref
+    return value
 
 
 def _prepare_directory(directory):
@@ -96,8 +116,11 @@ def _prepare_directory(directory):
 
 
 def _atomic_write(path, payload):
-    if set(payload) != _ALLOWED_KEYS:
+    if not _BASE_KEYS.issubset(payload) or not set(payload).issubset(_ALLOWED_KEYS):
         raise ValueError("interaction payload key set violates the allowlist")
+    if any(_safe_native_ref(payload[name]) != payload[name]
+           for name in _OPTIONAL_ID_KEYS if name in payload):
+        raise ValueError("interaction native identity ref is invalid")
     directory = os.path.dirname(path)
     _prepare_directory(directory)
     fd, temporary = tempfile.mkstemp(dir=directory, prefix=".interaction-", suffix=".tmp")
@@ -124,11 +147,13 @@ def _atomic_write(path, payload):
         raise
 
 
-def set_wait(session_id, harness, kind, source, now=None):
+def set_wait(session_id, harness, kind, source, now=None, *,
+             request_id=None, turn_id=None, item_id=None):
     """Atomically publish one exact wait marker; every failure is observational."""
     try:
         waiting_since = time.time() if now is None else now
-        payload = _encode(harness, session_id, kind, source, waiting_since)
+        payload = _encode(harness, session_id, kind, source, waiting_since,
+                          request_id=request_id, turn_id=turn_id, item_id=item_id)
         if payload is None:
             return False
         _atomic_write(sidecar_path(session_id, harness), payload)
@@ -164,7 +189,11 @@ def read_wait(session_id, harness):
             return None
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
-        if not isinstance(payload, dict) or set(payload) != _ALLOWED_KEYS:
+        if (not isinstance(payload, dict) or not _BASE_KEYS.issubset(payload)
+                or not set(payload).issubset(_ALLOWED_KEYS)):
+            return None
+        if any(_safe_native_ref(payload[name]) != payload[name]
+               for name in _OPTIONAL_ID_KEYS if name in payload):
             return None
         if payload.get("schema_version") != SCHEMA_VERSION:
             return None
@@ -206,7 +235,7 @@ def pending_wait(session_id, harness, session_start=None, activity_since=None, n
 
 
 def sweep(now=None, max_age=_STALE_SWEEP_SEC):
-    """Remove old files only; age is never a pending-wait classification input."""
+    """Remove old temporary/malformed files; valid wait markers are not age-expired."""
     current = time.time() if now is None else now
     if not _number(current) or not _number(max_age):
         return 0
@@ -241,6 +270,8 @@ def sweep(now=None, max_age=_STALE_SWEEP_SEC):
                     and stat.S_ISREG(metadata.st_mode)
                     and float(current) - metadata.st_mtime > float(max_age)
                 ):
+                    if name.endswith(".json") and read_wait(name[:-5], harness) is not None:
+                        continue
                     os.unlink(path)
                     removed += 1
             except OSError:

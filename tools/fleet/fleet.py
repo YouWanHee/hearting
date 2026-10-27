@@ -5,7 +5,14 @@ Zero external deps (stdlib curses/sqlite3/json/subprocess/re/os/time only). Pure
 observer: reads process table + on-disk state artifacts and injects nothing (PRD §0.5).
 Summary production belongs to dispatch or the interactive runtime lifecycle; starting,
 refreshing, or closing this TUI never invokes a model provider. Git telemetry remains
-bounded background work. ``--json`` and ``--once`` are side-effect-free snapshots.
+bounded background work. Every mode — ``--once`` and ``--json`` included — is a
+snapshot in what it displays: no task is started, settled, or marked, no model
+provider is invoked, and no route, registry, or authority state changes. "Snapshot"
+still allows one bounded write: collection may create or refresh the two-hex
+session-tag display reservations in
+``~/.local/state/agent-fleet/tag-assignments.json`` (core/OPERATIONS §5.11). Existing
+live assignments keep their tag, the stable (harness, session_id) identity remains
+the authority, and display tags never settle or advance work.
 
 Modes:
   (default)  curses full-screen, background re-collect every --interval seconds
@@ -286,7 +293,11 @@ def main(argv=None):
             else:
                 from .projection import attach_projections
             ds, dj = attach_projections(ds, dj, **report_option)
-            return replace(observed, sessions=rs + ds, jobs=rj + dj)
+            answer_waits = demo.merge_answer_waits(
+                observed.answer_waits,
+                demo.answer_wait_snapshot(harness_filter=harness_filter))
+            return replace(observed, sessions=rs + ds, jobs=rj + dj,
+                           answer_waits=answer_waits)
 
     def projected_collector(harness_filter=None, usage="cache-only", fast_first=False,
                             include_report_verification=True):

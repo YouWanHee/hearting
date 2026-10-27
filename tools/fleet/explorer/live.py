@@ -324,10 +324,12 @@ def _delivery_panes(snapshot):
 def _session_records(snapshot, now, resolver):
     used, rows, by_key = set(), [], {}
     delivery_panes = _delivery_panes(snapshot)
-    for session in _records(_get(snapshot, "sessions", default=())):
-        if not _is_main(session):
-            continue
-        tag = _tag_for(session, used)
+    sessions = [session for session in _records(_get(snapshot, "sessions", default=())) if _is_main(session)]
+    # A collector tag is authoritative wherever its row sits: a tag minted for an earlier row must
+    # never take it, or the row that owns it is dropped as a duplicate below.
+    reserved = {tag for tag in (_text(_get(session, "session_tag", "tag")) for session in sessions) if tag}
+    for session in sessions:
+        tag = _tag_for(session, used | reserved)
         if tag is None or tag in used:
             continue
         used.add(tag)
@@ -603,7 +605,7 @@ def _node_detail(node, now):
     else:
         when = "after " + ", ".join(deps) if deps and state == "todo" else "·"
     rounds = _num(node.get("route_attempt_round")) or _num(node.get("attempt_round"))
-    return {
+    result = {
         "n": _text(node.get("id")) or "·", "st": state, "verdict": verdict, "who": who,
         "when": when, "rounds": [],
         "rounds_note": f"R{int(rounds)} · 앞 {int(rounds) - 1}회는 이 기록 밖" if rounds and rounds > 1 else "",
@@ -611,6 +613,73 @@ def _node_detail(node, now):
         "gate": _text(node.get("gate")),
         "out": " · ".join(str(p) for p in (node.get("write_scope") or ())) or "·", "says": "",
     }
+    if "depends_on" in node or node.get("parallel_group") is not None:
+        result["graph_known"] = True
+        result["depends_on"] = tuple(deps)
+    if node.get("parallel_group") is not None:
+        result["parallel_group"] = str(node.get("parallel_group"))
+    return result
+
+
+def _parallel_stage_details(view_nodes, now):
+    details = [_node_detail(node, now) for node in view_nodes]
+    if not any(item.get("graph_known") for item in details):
+        return details
+    index_by_id = {str(node.get("id")): index for index, node in enumerate(view_nodes)
+                   if _text(node.get("id"))}
+    levels = [None] * len(view_nodes)
+    for _ in range(len(view_nodes) + 1):
+        changed = False
+        for index, detail in enumerate(details):
+            deps = [index_by_id[dep] for dep in detail.get("depends_on", ())
+                    if dep in index_by_id]
+            if not deps:
+                level = 0
+            elif all(levels[dep] is not None for dep in deps):
+                level = 1 + max(levels[dep] for dep in deps)
+            else:
+                continue
+            if levels[index] != level:
+                levels[index] = level
+                changed = True
+        if not changed:
+            break
+    levels = [0 if level is None else level for level in levels]
+    by_level = {}
+    parallel = {}
+    for index, (node, detail, level) in enumerate(zip(view_nodes, details, levels)):
+        by_level.setdefault(level, []).append(index)
+        group = _text(node.get("parallel_group"))
+        if group:
+            parallel.setdefault((level, group), []).append(index)
+    group_at = {indices[0]: indices for indices in parallel.values() if len(indices) == 2}
+    consumed, ordered = set(), []
+    for level in sorted(by_level):
+        for index in by_level[level]:
+            if index in consumed:
+                continue
+            members = group_at.get(index)
+            if members:
+                consumed.update(members)
+                child_stages = []
+                for member in members:
+                    child = dict(details[member])
+                    child["level"] = level
+                    child["members"] = (child["n"],)
+                    child_stages.append(child)
+                deps = tuple(dict.fromkeys(dep for child in child_stages
+                                           for dep in child.get("depends_on", ())))
+                ordered.append({"group": tuple(child_stages), "members": tuple(
+                    child["n"] for child in child_stages), "depends_on": deps,
+                    "parallel_group": child_stages[0].get("parallel_group"),
+                    "graph_known": True, "level": level})
+            else:
+                consumed.add(index)
+                stage = dict(details[index])
+                stage["level"] = level
+                stage["members"] = (stage["n"],)
+                ordered.append(stage)
+    return ordered
 
 
 def _route_records(snapshot, session_rows, session_index, resolver, now):
@@ -735,6 +804,7 @@ def _route_records(snapshot, session_rows, session_index, resolver, now):
         mode = _text(view.get("capability_mode")) or _text(record.get("capability_mode"))
         route = {
             "id": rid, "repo": repo, "session_tag": owner_tag, "title": title, "state": state,
+            "outcome": _text(_get(result, "result", "status")),
             "worker": worker, "age": age, "legs": legs,
             "stages": stages, "resume": resume, "activity": "running" if active is not None or state == "working" else "ended",
             "loops": None, "worktree": worktree, "tree_label": short,
@@ -756,7 +826,7 @@ def _node_groups(view_nodes, route, rid, legs, now, done, leg_status):
     """One leg group holding the route's stages: the detail the route page prints per stage."""
     if not view_nodes:
         return []
-    detail = [_node_detail(node, now) for node in view_nodes]
+    detail = _parallel_stage_details(view_nodes, now)
     short, mode = route.get("capability"), route.get("mode")
     name = f"leg {len(legs) or 1} · {short or '·'}{' ' + mode if mode else ''}"
     owner_line = [["owner  ", "dim"]]
@@ -849,20 +919,86 @@ def _repo_records(session_rows, routes, results=None, now=None):
     return repos
 
 
-def _question_records(session_rows, session_index, now):
-    questions = []
+def _question_records(snapshot, session_rows, session_index, now):
+    """Project only current, body-free records from the shared answer-wait cache."""
+    waits = _get(snapshot, "answer_waits")
+    if not isinstance(waits, Mapping):
+        return [], {"state": "unknown", "total": None, "older": None}
+
+    complete = waits.get("complete") is True
+    health = tuple(item for item in (waits.get("health") or ()) if isinstance(item, Mapping))
+    failed = any(str(item.get("state", "")).lower() in ("failed", "error") for item in health)
+    state = "complete" if complete and not failed else "failed" if failed else "incomplete"
+    by_identity = {}
     for row in session_rows:
-        if row["state"] != "blocked":
+        row["ask"] = None
+        row["answer_wait_marker"] = None
+        info = session_index.get(row["tag"], {})
+        sid = _text(info.get("sid"))
+        harness = _text(_get(info.get("session"), "harness", "adapter", "h"))
+        if sid and harness:
+            by_identity[(harness, sid)] = row
+
+    questions, seen = [], set()
+    for index, item in enumerate(waits.get("items", ()) or ()):
+        if not isinstance(item, Mapping):
             continue
-        interaction = session_index[row["tag"]]["interaction"]
-        kind = _text(_get(interaction, "kind")) if interaction is not None else None
-        waiting = _get(interaction, "waiting_since") if interaction is not None else None
+        stale = item.get("stale")
+        older = stale == "older"
+        source = _text(item.get("source"))
+        if stale not in (False, "current") and not older:
+            continue
+        ident = _text(item.get("id"))
+        if ident and ident in seen:
+            continue
+        if ident:
+            seen.add(ident)
+        owner = item.get("owner") if isinstance(item.get("owner"), Mapping) else {}
+        harness = _text(item.get("harness")) or _text(owner.get("harness"))
+        sid = _text(item.get("session_id")) or _text(owner.get("session_id"))
+        session = by_identity.get((harness, sid)) if harness and sid else None
+        tag = ident or f"current-{index}"
+        ref = {"id": ident} if ident else {}
+        for name, value in (("harness", harness), ("session_id", sid),
+                            ("request_id", item.get("request_id")),
+                            ("turn_id", item.get("turn_id")),
+                            ("route_id", item.get("route_id")),
+                            ("question_id", item.get("question_id"))):
+            if name == "request_id" and type(value) is int:
+                ref[name] = value
+                continue
+            if name == "request_id" and not isinstance(value, str):
+                continue
+            value = _text(value)
+            if value:
+                ref[name] = value
         questions.append({
-            "tag": row["tag"], "h": row["harness"], "m": row["model"], "e": row["effort"],
-            "kind": kind, "wait": _since(waiting, now), "project": row["repo"],
-            "title": row["title"], "pane": row["pane"], "now": row["now"],
+            "id": ident, "tag": tag, "h": session["harness"] if session else harness,
+            "ref": ref,
+            "older": older,
+            "kind": _text(item.get("kind")) or source or "wait",
+            "source": source, "wait": _since(item.get("since"), now),
+            "project": session["repo"] if session else None,
+            "session_tag": session["tag"] if session else None,
+            "open_tag": session["tag"] if session else None,
+            "pane": session["pane"] if session else None,
+            "marker": "◑" if source == "S2" else "●",
         })
-    return questions
+        if session:
+            session["ask"] = "answer needed"
+            marker = "◑" if source == "S2" else "●"
+            if session.get("answer_wait_marker") != "●":
+                session["answer_wait_marker"] = marker
+
+    total = waits.get("total")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        total = None
+    older = waits.get("older")
+    if isinstance(older, bool) or not isinstance(older, int) or older < 0:
+        older = None
+    summary = {"state": state, "total": total if state == "complete" else None,
+               "older": older if state == "complete" else None}
+    return questions, summary
 
 
 _RECEIPTS = frozenset({"herdr steer received", "Claude native context received"})
@@ -1363,6 +1499,8 @@ def _memory_records(snapshot, accepted_detail):
     memory = _get(snapshot, "memory")
     if not isinstance(memory, Mapping):
         return None
+    if memory.get("journal_available") is False:
+        return None
     by_repo = memory.get("by_repo")
     if not isinstance(by_repo, Mapping):
         return None
@@ -1391,6 +1529,117 @@ def _memory_records(snapshot, accepted_detail):
                 [_parse_clock(event.get("ts")), action, _text(event.get("type")), snippet]))
     return [[repo, [row for _stamp, row in sorted(rows, key=lambda item: -item[0])]]
             for repo, rows in sorted(grouped.items()) if rows]
+
+
+def _refers_to_route(route_id, references):
+    if not route_id:
+        return False
+    for reference in references or ():
+        text = str(reference)
+        if text == route_id or re.search(r"(?<![A-Za-z0-9])" + re.escape(route_id) +
+                                         r"(?![A-Za-z0-9])", text):
+            return True
+    return False
+
+
+def _memory_backlog(snapshot, routes):
+    memory = _get(snapshot, "memory")
+    database = _get(memory, "database") if isinstance(memory, Mapping) else None
+    if not isinstance(database, Mapping):
+        return {"state": "unknown", "by_repo": {}, "limited": False}
+    state = _text(database.get("state")) or "unknown"
+    if state != "success":
+        last_good = database.get("last_good_by_repo")
+        return {"state": state,
+                "by_repo": last_good if isinstance(last_good, Mapping) else {},
+                "limited": bool(database.get("limited")),
+                "stale": bool(database.get("last_good"))}
+    source = database.get("by_repo")
+    if not isinstance(source, Mapping):
+        return {"state": "incomplete", "by_repo": {}, "limited": False}
+    grouped = {}
+    seen = set()
+    for repo, records in source.items():
+        for record in records or ():
+            if not isinstance(record, Mapping):
+                continue
+            if str(record.get("status") or "active") == "superseded":
+                continue
+            tags = tuple(str(tag).casefold() for tag in (record.get("tags") or ()))
+            rtype = str(record.get("type") or "").casefold()
+            if "backlog" not in tags and rtype not in ("backlog", "task", "todo", "obligation"):
+                continue
+            canonical = _text(record.get("canonical_id")) or _text(record.get("id"))
+            if canonical and canonical in seen:
+                continue
+            if canonical:
+                seen.add(canonical)
+            refs = tuple(record.get("links") or ()) + tuple(record.get("artifact_refs") or ())
+            linked = [route for route in routes if _refers_to_route(str(route.get("id") or ""), refs)]
+            current = next((route for route in linked
+                            if route.get("state") in ("working", "blocked") or
+                            any(stage.get("st") == "active" for stage in route.get("stages") or ())), None)
+            settled = next((route for route in linked if route.get("state") == "done"
+                            and route.get("outcome") == "success"), None)
+            progress = "DOING" if current else "DONE" if settled else "TODO"
+            item = {
+                "id": _text(record.get("id")), "canonical_id": canonical,
+                "title": _text(record.get("headline")) or _text(record.get("source")) or
+                         _text(record.get("type")) or "backlog item",
+                "progress": progress,
+                "route_id": (current or settled or {}).get("id"),
+                "updated": _text(record.get("updated")),
+            }
+            grouped.setdefault(str(repo), []).append(item)
+    for items in grouped.values():
+        items.sort(key=lambda item: (item["progress"] != "DOING", item["title"].casefold()))
+    return {"state": "success", "by_repo": grouped, "stale": False,
+            "limited": bool(database.get("limited"))}
+
+
+def _current_task_summary(accepted_detail, session_rows, session_index, routes):
+    focus, _seats, _config, _panes = _detail_parts(accepted_detail)
+    key = _get(focus, "key")
+    harness, sid = _text(_get(key, "harness")), _text(_get(key, "sid"))
+    if focus is None or not harness or not sid:
+        return {"state": "unknown", "session_tag": None, "by_route": {},
+                "todo": [], "doing": [], "done": []}
+    tag = next((tag for tag, info in session_index.items()
+                if _get(info.get("session"), "harness", "adapter", "h") == harness
+                and sid in info.get("ids", ())), None)
+    if tag is None:
+        return {"state": "unknown", "session_tag": None, "by_route": {},
+                "todo": [], "doing": [], "done": []}
+    by_route, todo, doing, done = {}, [], [], []
+    for route in routes:
+        if route.get("session_tag") != tag or route.get("state") in ("done", "dead"):
+            continue
+        route_id = str(route.get("id") or "")
+        stages = tuple(route.get("stages") or ())
+        progress = {
+            "todo": [str(stage.get("name")) for stage in stages if stage.get("st") == "todo"],
+            "doing": [str(stage.get("name")) for stage in stages if stage.get("st") == "active"],
+            "done": [str(stage.get("name")) for stage in stages if stage.get("st") == "done"],
+        }
+        if any(progress.values()):
+            by_route[route_id] = progress
+            todo.extend(progress["todo"])
+            doing.extend(progress["doing"])
+            done.extend(progress["done"])
+    obligations = _get(focus, "obligations")
+    for item in obligations or ():
+        if not isinstance(item, Mapping):
+            continue
+        state = str(item.get("state") or "").casefold()
+        label = "registered work" + (" · " + str(item.get("attempt_id"))[:8]
+                                      if item.get("attempt_id") else "")
+        if state in ("running", "claimed"):
+            doing.append(label)
+        elif state not in ("complete", "cancelled"):
+            todo.append(label)
+    health = _get(_get(focus, "health"), "state") or "success"
+    return {"state": str(health), "session_tag": tag, "by_route": by_route,
+            "todo": todo[:8], "doing": doing[:8], "done": done[:8]}
 
 
 def _system_record(snapshot, session_rows, compute, accepted_detail, usage, now=None):
@@ -1855,7 +2104,7 @@ def build_view_model(snapshot, accepted_detail=None, cached_config=None, now=Non
         repo_rank = {row["id"]: index for index, row in enumerate(repos)}
         session_rows.sort(key=lambda row: (repo_rank.get(row["repo_id"], len(repo_rank)),
                                            -mtime_by_tag.get(row["tag"], 0), row["tag"]))
-    questions = _question_records(session_rows, session_index, clock)
+    questions, answer_wait_summary = _question_records(snapshot, session_rows, session_index, clock)
     peer_nodes, peer_edges = _peer_records(session_rows, session_index, clock, snapshot)
     hosts, compute = _host_records(snapshot, session_index)
     gpu_lines = _session_gpu_lines(snapshot, session_index)
@@ -1914,6 +2163,16 @@ def build_view_model(snapshot, accepted_detail=None, cached_config=None, now=Non
     explicit = _get(focus, "source_records")
     answered = _answered_records(snapshot)
     system = _system_record(snapshot, session_rows, compute, accepted_detail, usage, clock)
+    system["answer_waits"] = answer_wait_summary
+    observations = _get(snapshot, "observations", default={}) or {}
+    peer_observation = observations.get("optional:peers") if isinstance(observations, Mapping) else None
+    system["peer_observation"] = {
+        "state": _text(_get(peer_observation, "state")) or "unknown",
+        "last_good": bool(_get(peer_observation, "last_good", default=False)),
+    }
+    system["memory_backlog"] = _memory_backlog(snapshot, routes)
+    system["task_summary"] = _current_task_summary(
+        accepted_detail, session_rows, session_index, routes)
     if answered:
         system["answered_total"] = sum(len(rows) for _repo, rows in answered)
     data = {

@@ -5019,7 +5019,7 @@ class TestValidationBasis(unittest.TestCase):
     sys.modules["hearting_gates"]._REPORTED.clear()
     with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()) as err:
      verified=R.verify_route(route,R.ROOT)
-    self.assertIn("route-registry-stale",err.getvalue())
+    self.assertEqual(err.getvalue(),"")
     self.assertIs(verified["_registry_current"],False)
  def test_route_without_capability_digest_keeps_whole_registry_comparison(self):
   route=R.compile_route(**self.args())
@@ -5067,16 +5067,24 @@ class TestValidationBasis(unittest.TestCase):
    msg=str(exc)
    self.assertIn(skewed["registry_digest"],msg)
    self.assertIn(R.TOPO.registry_digest(R.TOPO.load_registry()),msg)
-   # SD-OPEN-47 (H7-d): the operator is told which root to re-run through.
-   self.assertIn("re-run via the tooling under /tmp/b2-fixture-other-registry-root",msg)
+   # Report the two roots without prescribing an unverified old runtime.
+   self.assertNotIn("re-run via the tooling",msg)
    self.assertIn("/tmp/b2-fixture-other-registry-root",msg)
    self.assertIn(str(R.TOPO.ROOT),msg)
+  with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()) as err:
+   verified=R.verify_route(skewed,R.ROOT)
+  self.assertEqual(err.getvalue(),"")
+  self.assertIs(verified["_registry_current"],False)
   skewed=json.loads(json.dumps(route))
   skewed["validation_basis"]["unit_catalog_root"]="/tmp/b2-fixture-other-unit-root"
   skewed["unit_catalog_digest"]="sha256:"+"1"*64
   skewed=self._reseal(skewed)
   with self.assertRaisesRegex(ValueError,r"^unit-catalog-digest-skew\(compiled="):
    R.verify_route(skewed,R.ROOT)
+  with mock.patch.dict(os.environ,{"HEARTING_GATES":"off"}), contextlib.redirect_stderr(io.StringIO()) as err:
+   verified=R.verify_route(skewed,R.ROOT)
+  self.assertEqual(err.getvalue(),"")
+  self.assertIs(verified["_registry_current"],False)
  def test_validation_classifier_does_not_read_immutable_release_content(self):
   route={
    "registry_digest":"sha256:"+"1"*64,

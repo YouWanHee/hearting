@@ -30,6 +30,7 @@ the live-state root by *positive* evidence only, never by absence of it:
 from __future__ import annotations
 
 import argparse
+import atexit
 import datetime
 import hashlib
 import json
@@ -46,9 +47,9 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "utilities") not in sys.path:
@@ -315,23 +316,34 @@ def _install_child_stderr_hook(home: Path, directory: Path) -> None:
     )
 
 
-def collect_child_stderr(env: dict[str, str]) -> str:
+def collect_child_stderr(
+    env: dict[str, str], *, remove: bool = True, strict: bool = False,
+) -> str:
     """Drain the hook's per-process logs for one suite attempt, newest last."""
     directory = env.get(CHILD_STDERR_ENV)
-    if not directory or not os.path.isdir(directory):
+    if not directory:
+        return ""
+    if not os.path.isdir(directory):
+        if strict:
+            raise OSError(f"child-stderr directory is unavailable: {directory}")
         return ""
     logs = []
     for path in Path(directory).glob("*.log"):
         try:
             logs.append((path.stat().st_mtime_ns, path))
         except OSError:
+            if strict:
+                raise
             continue
     parts = []
     for _mtime, path in sorted(logs):
         try:
             parts.append(path.read_text(encoding="utf-8", errors="replace"))
-            path.unlink()
+            if remove:
+                path.unlink()
         except OSError:
+            if strict:
+                raise
             continue
     text = "".join(parts)
     if len(text) > _CHILD_STDERR_LIMIT:
@@ -588,7 +600,7 @@ def choose_suite_temp_parent() -> Path:
 
 
 _INSTALLED_LAYOUT_LOCK = threading.Lock()
-_INSTALLED_LAYOUT_CACHE: dict[str, Path] = {}
+_INSTALLED_LAYOUT_CACHE: dict[str, object] = {}
 
 
 def get_installed_layout_prefix() -> Path | None:
@@ -600,12 +612,15 @@ def get_installed_layout_prefix() -> Path | None:
     with _INSTALLED_LAYOUT_LOCK:
         cached = _INSTALLED_LAYOUT_CACHE.get("prefix")
         if cached is not None:
-            return cached
+            return cached  # type: ignore[return-value]
         tmp = Path(tempfile.mkdtemp(prefix="w1-installed-layout-", dir=str(choose_suite_temp_parent())))
-        register_fixture_root(tmp)
+        identity = register_fixture_root(tmp)
+        _INSTALLED_LAYOUT_CACHE["prefix"] = tmp
+        _INSTALLED_LAYOUT_CACHE["identity"] = identity
         env = build_isolated_env(tmp / "build-env")
         installer = ROOT / "tools" / "install" / "installer.py"
         if not installer.exists():
+            cleanup_installed_layout()
             return None
         install_home = tmp / "home"
         install_home.mkdir(parents=True, exist_ok=True)
@@ -620,15 +635,29 @@ def get_installed_layout_prefix() -> Path | None:
                 timeout=300,
             )
         except Exception:
+            cleanup_installed_layout()
             return None
         try:
             payload = json.loads(result.stdout or "{}")
         except Exception:
+            cleanup_installed_layout()
             return None
         if any(not c.get("ok", True) for c in payload.get("checks", [])):
+            cleanup_installed_layout()
             return None
-        _INSTALLED_LAYOUT_CACHE["prefix"] = tmp
         return tmp
+
+
+def cleanup_installed_layout() -> None:
+    """Retire the shared fixture after every suite and diagnostic consumer exits."""
+    with _INSTALLED_LAYOUT_LOCK:
+        prefix = _INSTALLED_LAYOUT_CACHE.pop("prefix", None)
+        identity = _INSTALLED_LAYOUT_CACHE.pop("identity", None)
+    if prefix is not None:
+        cleanup_suite_tmp_root(prefix, expected_identity=identity)
+
+
+atexit.register(cleanup_installed_layout)
 
 
 # ---------------------------------------------------------------------------
@@ -820,11 +849,97 @@ def _sample_all_live_state_fd_holders(
 # write from someone else's concurrent session.
 _FIXTURE_ROOTS: list[str] = []
 _FIXTURE_ROOTS_LOCK = threading.Lock()
+_FIXTURE_ROOT_IDENTITIES: dict[str, tuple[int, int, int] | None] = {}
+_FIXTURE_PROCESS_IDENTITIES: dict[str, dict[int, str]] = {}
+_FIXTURE_PROCESS_IDENTITIES_LOCK = threading.Lock()
 
 
-def register_fixture_root(path: Path) -> None:
+def _root_identity(path: Path) -> tuple[int, int, int] | None:
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
+
+
+def register_fixture_root(path: Path) -> tuple[int, int, int] | None:
+    identity = _root_identity(path)
+    key = str(path)
     with _FIXTURE_ROOTS_LOCK:
-        _FIXTURE_ROOTS.append(str(path))
+        _FIXTURE_ROOTS.append(key)
+        _FIXTURE_ROOT_IDENTITIES[key] = identity
+    with _FIXTURE_PROCESS_IDENTITIES_LOCK:
+        _FIXTURE_PROCESS_IDENTITIES.setdefault(key, {})
+    return identity
+
+
+def _remember_fixture_process(root: str, pid: int, start_ticks: str) -> None:
+    with _FIXTURE_PROCESS_IDENTITIES_LOCK:
+        _FIXTURE_PROCESS_IDENTITIES.setdefault(root, {})[pid] = start_ticks
+
+
+def _fixture_roots_for_environment(env: dict[str, str]) -> list[str]:
+    values = [env.get(key) for key in (CHILD_STDERR_ENV, "HOME", "TMPDIR", "AGENT_HOME",
+                                      "XDG_DATA_HOME", "XDG_STATE_HOME")]
+    candidates = [Path(os.path.abspath(value)) for value in values if value]
+    with _FIXTURE_ROOTS_LOCK:
+        roots = tuple(_FIXTURE_ROOT_IDENTITIES)
+    return [
+        root for root in roots
+        if any(Path(root) == candidate or Path(root) in candidate.parents for candidate in candidates)
+    ]
+
+
+def _remember_process_group(
+    pgid: int, roots: Iterable[str], owner_pid: int | None = None,
+) -> None:
+    roots = tuple(roots)
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return
+    records: dict[int, tuple[str, int, int, str]] = {}
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
+            state = fields[0].decode()
+            parent_pid = int(fields[1])
+            process_group = int(fields[2])
+            start_ticks = fields[19].decode()
+        except (OSError, IndexError, ValueError):
+            continue
+        records[pid] = state, parent_pid, process_group, start_ticks
+
+    with _FIXTURE_PROCESS_IDENTITIES_LOCK:
+        previous = {root: dict(_FIXTURE_PROCESS_IDENTITIES.get(root, {})) for root in roots}
+    for root in roots:
+        marker = os.fsencode(root)
+        owned = {
+            pid: ticks for pid, ticks in previous[root].items()
+            if pid in records and records[pid][0] != "Z" and records[pid][3] == ticks
+        }
+        if owner_pid in records and records[owner_pid][0] != "Z":
+            owned[owner_pid] = records[owner_pid][3]
+        changed = True
+        while changed:
+            changed = False
+            for pid, (state, parent_pid, process_group, ticks) in records.items():
+                if state == "Z" or owned.get(pid) == ticks:
+                    continue
+                parent_owned = parent_pid in owned and records.get(parent_pid, ("", 0, 0, ""))[3] == owned[parent_pid]
+                marked = False
+                if not parent_owned and process_group == pgid:
+                    marked, _readable = _process_carries_marker(
+                        Path("/proc") / str(pid), marker
+                    )
+                if parent_owned or marked:
+                    owned[pid] = ticks
+                    changed = True
+        for pid, ticks in owned.items():
+            _remember_fixture_process(root, pid, ticks)
 
 
 def _pids_in_process_group(pgid: int) -> list[int]:
@@ -846,7 +961,8 @@ def _pids_in_process_group(pgid: int) -> list[int]:
 
 
 def _sample_pgid_live_state_writes(
-    pgid: int, stop_event: threading.Event, collected: set[str], lock: threading.Lock
+    pgid: int, stop_event: threading.Event, collected: set[str], lock: threading.Lock,
+    fixture_roots: Iterable[str] = (), owner_pid: int | None = None,
 ) -> None:
     """Bounded daemon sampler: poll /proc for open-fd targets under
     LIVE_STATE_ROOT belonging to any process in ``pgid``. Runs until
@@ -855,7 +971,10 @@ def _sample_pgid_live_state_writes(
     live_prefix = str(LIVE_STATE_ROOT) + os.sep
     samples = 0
     while not stop_event.is_set() and samples < _LIVE_SAMPLER_MAX_SAMPLES:
-        for pid in _pids_in_process_group(pgid):
+        pids = _pids_in_process_group(pgid)
+        if fixture_roots:
+            _remember_process_group(pgid, fixture_roots, owner_pid)
+        for pid in pids:
             fd_dir = f"/proc/{pid}/fd"
             try:
                 fd_names = os.listdir(fd_dir)
@@ -911,15 +1030,18 @@ def run_suite(suite: Path, root: Path, env: dict[str, str], profile: str, timeou
         pgid = os.getpgid(proc.pid)
     except OSError:
         pgid = None
+    fixture_roots = _fixture_roots_for_environment(env)
     if pgid is not None:
         with _ALL_RUN_PGIDS_LOCK:
             _ALL_RUN_PGIDS.add(pgid)
             _RUN_PGID_SUITE[pgid] = relpath
             _LIVE_SUITE_PGIDS.add(pgid)
+        if fixture_roots:
+            _remember_process_group(pgid, fixture_roots, proc.pid)
     if pgid is not None and os.path.isdir("/proc"):
         sampler_thread = threading.Thread(
             target=_sample_pgid_live_state_writes,
-            args=(pgid, stop_event, collected, sample_lock),
+            args=(pgid, stop_event, collected, sample_lock, fixture_roots, proc.pid),
             daemon=True,
         )
         sampler_thread.start()
@@ -945,9 +1067,6 @@ def run_suite(suite: Path, root: Path, env: dict[str, str], profile: str, timeou
                 _OWNED_LIVE_PATHS_BY_SUITE.setdefault(relpath, set()).update(snapshot)
     duration = time.monotonic() - started_monotonic
     result = SuiteResult(relpath, rc, timed_out, out, err, duration, profile)
-    child_stderr = collect_child_stderr(env)
-    if not result.passed:
-        result.child_stderr = child_stderr
     _suite_progress(
         "suite_timeout" if timed_out else "suite_end",
         relpath,
@@ -955,6 +1074,43 @@ def run_suite(suite: Path, root: Path, env: dict[str, str], profile: str, timeou
         result="timeout" if timed_out else "pass" if result.passed else "fail",
         duration_s=round(duration, 3),
     )
+    return result
+
+
+def run_suite_with_scratch(
+    suite: Path, root: Path, env: dict[str, str], profile: str, timeout: int,
+    tmp_root: Path, identity: tuple[int, int, int] | None,
+):
+    try:
+        result = run_suite(suite, root, env, profile, timeout)
+    except BaseException:
+        def consume_child_stderr(child_stderr: str) -> None:
+            print("suite-fixture-child-stderr-after-interruption:", file=sys.stderr)
+            sys.stderr.write(child_stderr)
+            if not child_stderr.endswith("\n"):
+                sys.stderr.write("\n")
+            sys.stderr.flush()
+
+        try:
+            finalize_suite_attempt(
+                None, env, tmp_root, identity,
+                child_stderr_consumer=consume_child_stderr,
+            )
+        except BaseException as cleanup_exc:
+            # A cleanup failure must not replace the exception that interrupted
+            # the suite. The common finalizer leaves uncertain roots in place.
+            try:
+                print(
+                    f"suite-fixture-scratch-preserved: reason=interrupted-finalization-error "
+                    f"root={tmp_root} detail={cleanup_exc}",
+                    file=sys.stderr,
+                )
+            except BaseException:
+                pass
+        raise
+    if isinstance(result, SuiteResult):
+        return finalize_suite_attempt(result, env, tmp_root, identity)
+    cleanup_suite_tmp_root(tmp_root, expected_identity=identity)
     return result
 
 
@@ -992,59 +1148,273 @@ def reap_process_group(proc: subprocess.Popen) -> tuple[str, str]:
     return out or "", err or ""
 
 
-def reap_suite_tmp_processes(tmp_root: Path, *, timeout: float = 5.0) -> list[int]:
-    """Reap detached suite fixtures only when procfs positively names this temp root."""
-    marker = os.fsencode(str(tmp_root))
+def _read_proc_identity(pid: int) -> tuple[str, str] | None:
+    fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
+    return fields[0].decode(), fields[19].decode()
+
+
+def _process_carries_marker(base: Path, marker: bytes) -> tuple[bool, bool]:
+    readable = False
+    for source in ("cmdline", "environ"):
+        try:
+            data = (base / source).read_bytes()
+            readable = True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        if marker in data:
+            return True, True
+    try:
+        cwd = os.fsencode(os.readlink(base / "cwd"))
+        readable = True
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+    else:
+        if marker in cwd:
+            return True, True
+    return False, readable
+
+
+def reap_suite_tmp_processes(tmp_root: Path, *, timeout: float = 5.0) -> list[int] | None:
+    """Reap marked or previously observed processes without broad UID vetoes.
+
+    Unknown state blocks cleanup only for a PID/start identity already
+    observed in this fixture's process group, or for a process carrying its
+    private marker. ``None`` is reserved for an unreadable proc directory.
+    """
+    root_key = str(tmp_root)
+    marker = os.fsencode(root_key)
     own_pid = os.getpid()
+    with _FIXTURE_PROCESS_IDENTITIES_LOCK:
+        observed = dict(_FIXTURE_PROCESS_IDENTITIES.get(root_key, {}))
     killed: dict[int, str] = {}
+    unresolved: dict[int, str] = {}
     deadline = time.monotonic() + timeout
+
     for _ in range(2):
-        for name in os.listdir("/proc"):
-            if not name.isdigit() or int(name) == own_pid:
+        try:
+            proc_entries = os.listdir("/proc")
+        except OSError:
+            return None
+        present = {int(name) for name in proc_entries if name.isdigit()}
+        candidates = present | set(observed)
+        newly_killed: dict[int, str] = {}
+        for pid in candidates:
+            if pid == own_pid:
                 continue
-            pid = int(name)
-            base = Path("/proc") / name
+            prior_ticks = observed.get(pid)
+            base = Path("/proc") / str(pid)
             try:
-                fields = (base / "stat").read_bytes().rsplit(b")", 1)[1].split()
-                if fields[0] == b"Z":
-                    continue
-                carries_root = any(
-                    marker in (base / source).read_bytes()
-                    for source in ("cmdline", "environ")
-                )
-                if not carries_root:
-                    carries_root = marker in os.fsencode(os.readlink(base / "cwd"))
-                if not carries_root:
-                    continue
-                ticks = fields[19].decode()
-                if (base / "stat").read_bytes().rsplit(b")", 1)[1].split()[19].decode() != ticks:
-                    continue
-                # Only the process that carries the marker: a group it shares
-                # may hold processes this run never started. Descendants inherit
-                # the suite environment and are matched on their own.
-                os.kill(pid, signal.SIGKILL)
-                killed[pid] = ticks
-            except (OSError, IndexError):
+                state, ticks = _read_proc_identity(pid)
+            except FileNotFoundError:
+                unresolved.pop(pid, None)
                 continue
-        if not killed:
+            except (OSError, IndexError, UnicodeDecodeError):
+                if prior_ticks is not None:
+                    unresolved[pid] = "observed-process-state-unreadable"
+                continue
+            if state == "Z":
+                unresolved.pop(pid, None)
+                continue
+            previously_owned = prior_ticks == ticks
+            if prior_ticks is not None and not previously_owned:
+                observed.pop(pid, None)
+                unresolved.pop(pid, None)
+            if previously_owned:
+                owned = True
+            else:
+                carries_root, _readable = _process_carries_marker(base, marker)
+                owned = carries_root
+            if not owned:
+                continue
+            unresolved.pop(pid, None)
+            try:
+                current = _read_proc_identity(pid)
+                if current is None or current[1] != ticks or current[0] == "Z":
+                    unresolved.pop(pid, None)
+                    continue
+                # Kill only the process carrying this marker or its observed
+                # PID/start identity. A shared process group may have bystanders.
+                os.kill(pid, signal.SIGKILL)
+                newly_killed[pid] = ticks
+                unresolved.pop(pid, None)
+            except ProcessLookupError:
+                unresolved.pop(pid, None)
+                continue
+            except (OSError, IndexError, UnicodeDecodeError):
+                unresolved[pid] = "owned-process-signal-or-stat-unreadable"
+
+        if not newly_killed:
             break
+        killed.update(newly_killed)
+        pending: dict[int, str] = dict(killed)
         while time.monotonic() < deadline:
-            alive = []
+            pending: dict[int, str] = {}
             for pid, ticks in killed.items():
                 try:
-                    fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[1].split()
-                    if fields[19].decode() == ticks and fields[0] != b"Z":
-                        alive.append(pid)
-                except (OSError, IndexError):
-                    pass
-            if not alive:
+                    state, current_ticks = _read_proc_identity(pid)
+                except FileNotFoundError:
+                    unresolved.pop(pid, None)
+                    continue
+                except (OSError, IndexError, UnicodeDecodeError):
+                    if pid in present:
+                        unresolved[pid] = "owned-process-settlement-unreadable"
+                    pending[pid] = ticks
+                    continue
+                if current_ticks != ticks or state == "Z":
+                    unresolved.pop(pid, None)
+                    continue
+                pending[pid] = ticks
+            if not pending:
                 break
             time.sleep(.01)
         else:
-            # Cleanup runs in a `finally`: report, never replace the run's verdict.
-            print(f"suite-fixture-survived-cleanup: {sorted(alive)} root={tmp_root}", file=sys.stderr)
+            unresolved.update((pid, "owned-process-still-live") for pid in pending)
             break
-    return sorted(killed)
+        if not newly_killed:
+            break
+
+    if unresolved:
+        print(
+            f"suite-fixture-processes-unresolved: {sorted(unresolved.items())} root={tmp_root}",
+            file=sys.stderr,
+        )
+    return sorted(unresolved)
+
+
+def _remove_exact_suite_tmp_root(tmp_root: Path, identity: tuple[int, int, int] | None) -> bool:
+    try:
+        current = _root_identity(tmp_root)
+        if current is None:
+            if not tmp_root.is_symlink() and not tmp_root.exists():
+                return True
+            raise OSError("root identity could not be read")
+        if identity is None or current != identity or current[2] != stat.S_IFDIR:
+            print(
+                f"suite-fixture-scratch-preserved: root-identity-changed root={tmp_root} "
+                f"expected={identity} current={current}",
+                file=sys.stderr,
+            )
+            return False
+        shutil.rmtree(tmp_root)
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        print(f"suite-fixture-scratch-preserved: removal-failed root={tmp_root} reason={exc}", file=sys.stderr)
+        return False
+    with _FIXTURE_PROCESS_IDENTITIES_LOCK:
+        _FIXTURE_PROCESS_IDENTITIES.pop(str(tmp_root), None)
+    return True
+
+
+def cleanup_suite_tmp_root(
+    tmp_root: Path, *, expected_identity: tuple[int, int, int] | None = None,
+    timeout: float = 5.0,
+) -> bool:
+    """Remove only the created root after owned helpers reach a known boundary."""
+    root_key = str(tmp_root)
+    if expected_identity is None:
+        with _FIXTURE_ROOTS_LOCK:
+            expected_identity = _FIXTURE_ROOT_IDENTITIES.get(root_key)
+    current = _root_identity(tmp_root)
+    if current is None:
+        if not tmp_root.is_symlink() and not tmp_root.exists():
+            return True
+        print(f"suite-fixture-scratch-preserved: root-identity-unreadable root={tmp_root}", file=sys.stderr)
+        return False
+    if expected_identity is None or current != expected_identity or current[2] != stat.S_IFDIR:
+        print(
+            f"suite-fixture-scratch-preserved: root-identity-changed root={tmp_root} "
+            f"expected={expected_identity} current={current}",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        survivors = reap_suite_tmp_processes(tmp_root, timeout=timeout)
+    except Exception as exc:
+        print(
+            f"suite-fixture-scratch-preserved: reason=process-state-error "
+            f"root={tmp_root} detail={exc}",
+            file=sys.stderr,
+        )
+        return False
+    if survivors is None:
+        print(f"suite-fixture-scratch-preserved: process-state-unreadable root={tmp_root}", file=sys.stderr)
+        return False
+    if survivors:
+        print(
+            f"suite-fixture-scratch-preserved: reason=owned-process-live-or-unreadable "
+            f"pids={survivors} root={tmp_root}",
+            file=sys.stderr,
+        )
+        return False
+    return _remove_exact_suite_tmp_root(tmp_root, expected_identity)
+
+
+def finalize_suite_attempt(
+    result: SuiteResult | None, env: dict[str, str], tmp_root: Path,
+    identity: tuple[int, int, int] | None,
+    *, child_stderr_consumer: Callable[[str], None] | None = None,
+) -> SuiteResult | None:
+    """Settle owned helpers, preserve their final stderr, then retire scratch."""
+    current = _root_identity(tmp_root)
+    if identity is None or current != identity or current[2] != stat.S_IFDIR:
+        print(
+            f"suite-fixture-scratch-preserved: reason=root-identity-changed root={tmp_root} "
+            f"expected={identity} current={current}",
+            file=sys.stderr,
+        )
+        return result
+    try:
+        survivors = reap_suite_tmp_processes(tmp_root)
+    except Exception as exc:
+        survivors = None
+        print(
+            f"suite-fixture-process-state-error: root={tmp_root} detail={exc}",
+            file=sys.stderr,
+        )
+    output_error = None
+    output_error_reason = "child-stderr-unreadable"
+    try:
+        child_stderr = collect_child_stderr(env, remove=False, strict=True)
+    except OSError as exc:
+        child_stderr = ""
+        output_error = exc
+    if result is not None and not result.passed and child_stderr:
+        combined = (result.child_stderr or "") + child_stderr
+        if len(combined) > _CHILD_STDERR_LIMIT:
+            combined = "[earlier child stderr truncated]\n" + combined[-_CHILD_STDERR_LIMIT:]
+        result.child_stderr = combined
+    elif result is None and child_stderr:
+        if child_stderr_consumer is None:
+            output_error = OSError("interrupted child stderr has no diagnostic consumer")
+            output_error_reason = "child-stderr-consumer-unavailable"
+        else:
+            try:
+                child_stderr_consumer(child_stderr)
+            except BaseException as exc:
+                output_error = exc
+                output_error_reason = "child-stderr-consumer-failed"
+    if survivors is None:
+        print(f"suite-fixture-scratch-preserved: process-state-unreadable root={tmp_root}", file=sys.stderr)
+    elif survivors:
+        print(
+            f"suite-fixture-scratch-preserved: reason=owned-process-live-or-unreadable "
+            f"pids={survivors} root={tmp_root}",
+            file=sys.stderr,
+        )
+    elif output_error is not None:
+        print(
+            f"suite-fixture-scratch-preserved: reason={output_error_reason} "
+            f"root={tmp_root} detail={output_error}",
+            file=sys.stderr,
+        )
+    else:
+        _remove_exact_suite_tmp_root(tmp_root, identity)
+    return result
 
 
 def last_nonempty_line(text: str) -> str:
@@ -1906,14 +2276,14 @@ def run_profile(
     install_prefix: Path | None,
 ) -> list[SuiteResult]:
     results_by_index: dict[int, SuiteResult] = {}
-    tmp_roots: list[Path] = []
     tmp_by_index: dict[int, Path] = {}
+    tmp_identity_by_index: dict[int, tuple[int, int, int] | None] = {}
+    finalized_indices: set[int] = set()
 
     def make_env(idx: int) -> dict[str, str]:
         tmp = Path(tempfile.mkdtemp(prefix=f"w1-{profile}-{idx}-", dir=str(choose_suite_temp_parent())))
-        tmp_roots.append(tmp)
         tmp_by_index[idx] = tmp
-        register_fixture_root(tmp)
+        tmp_identity_by_index[idx] = register_fixture_root(tmp)
         if profile == "isolated":
             return build_isolated_env(tmp, root)
         if profile == "installed-layout":
@@ -1928,13 +2298,16 @@ def run_profile(
         raise ValueError(profile)
 
     def run_reaped(idx: int, suite: Path, env: dict[str, str]) -> SuiteResult:
+        # A suite's detached fixtures end with that suite, not with the whole
+        # profile. Outputs are drained after owned helpers settle and before
+        # the exact attempt root is removed.
         try:
-            return run_suite(suite, root, env, profile, timeout)
+            return run_suite_with_scratch(
+                suite, root, env, profile, timeout,
+                tmp_by_index[idx], tmp_identity_by_index[idx],
+            )
         finally:
-            # A suite's detached fixtures end with that suite, not with the whole
-            # profile: one left running would otherwise run beside every later suite.
-            if idx in tmp_by_index:
-                reap_suite_tmp_processes(tmp_by_index[idx])
+            finalized_indices.add(idx)
 
     def prepare_env(idx: int, suite: Path) -> dict[str, str]:
         relpath = suite_relpath(root, suite)
@@ -1943,6 +2316,13 @@ def run_profile(
         try:
             env = make_env(idx)
         except BaseException as exc:
+            if idx in tmp_by_index:
+                try:
+                    cleanup_suite_tmp_root(
+                        tmp_by_index[idx], expected_identity=tmp_identity_by_index[idx]
+                    )
+                finally:
+                    finalized_indices.add(idx)
             _suite_progress(
                 "suite_prepare_end", relpath, profile,
                 result="error", error_type=type(exc).__name__,
@@ -1968,14 +2348,27 @@ def run_profile(
             if suite_relpath(root, suite) in SERIAL_SUITES
         ]
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-            futures = []
-            for idx, suite in parallel:
+            pending = {}
+            remaining_suites = iter(parallel)
+
+            def submit_next() -> bool:
+                try:
+                    idx, suite = next(remaining_suites)
+                except StopIteration:
+                    return False
                 env = prepare_env(idx, suite)
-                futures.append(
-                    (idx, pool.submit(run_reaped, idx, suite, env))
-                )
-            for idx, fut in futures:
-                results_by_index[idx] = fut.result()
+                pending[pool.submit(run_reaped, idx, suite, env)] = idx
+                return True
+
+            for _ in range(max(1, jobs)):
+                if not submit_next():
+                    break
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in completed:
+                    idx = pending.pop(fut)
+                    results_by_index[idx] = fut.result()
+                    submit_next()
 
         # The pool context has joined every parallel suite before an exclusive
         # suite starts. Preserve the original corpus order in the returned
@@ -1984,13 +2377,15 @@ def run_profile(
             env = prepare_env(idx, suite)
             results_by_index[idx] = run_reaped(idx, suite, env)
     finally:
-        for tmp in tmp_roots:
-            reap_suite_tmp_processes(tmp)
-            shutil.rmtree(tmp, ignore_errors=True)
+        for idx, tmp in tmp_by_index.items():
+            if idx not in finalized_indices:
+                cleanup_suite_tmp_root(
+                    tmp, expected_identity=tmp_identity_by_index[idx],
+                )
     return [results_by_index[idx] for idx in range(len(suites))]
 
 
-def main(argv: list[str]) -> int:
+def _run_main(argv: list[str]) -> int:
     args = build_arg_parser().parse_args(argv)
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, _stop_on_signal)
@@ -2262,12 +2657,15 @@ def main(argv: list[str]) -> int:
         if install_prefix is None:
             continue
         env_tmp = Path(tempfile.mkdtemp(prefix="w1-isosense-", dir=str(choose_suite_temp_parent())))
-        register_fixture_root(env_tmp)
+        env_identity = register_fixture_root(env_tmp)
         try:
             probe_env = build_installed_layout_env(env_tmp, install_prefix)
-            probe = run_suite(root / r, root, probe_env, "installed-layout", args.timeout)
+            probe = run_suite_with_scratch(
+                root / r, root, probe_env, "installed-layout", args.timeout,
+                env_tmp, env_identity,
+            )
         finally:
-            shutil.rmtree(env_tmp, ignore_errors=True)
+            cleanup_suite_tmp_root(env_tmp, expected_identity=env_identity)
         if probe.passed:
             isolation_sensitive[r] = True
 
@@ -2582,6 +2980,14 @@ def main(argv: list[str]) -> int:
     if args.report_only:
         return 0
     return 1 if hard_failures else 0
+
+
+def main(argv: list[str]) -> int:
+    """Run one invocation and retire its shared layout on every exit path."""
+    try:
+        return _run_main(argv)
+    finally:
+        cleanup_installed_layout()
 
 
 if __name__ == "__main__":

@@ -3446,7 +3446,7 @@ def gate_release_sidecar_path(route_path):
 
 
 def record_gate_release(route, route_path, *, gate, decision, released_by, actor_kind,
-                        answers=None):
+                        answers=None, request_id=None, gate_epoch=None, receipt=None):
     """Append one gate release to the route's sidecar; `close_route` folds it into
     the outcome. Fail-soft: a release must never be lost because a sidecar could
     not be written, and the ledger already holds the authoritative transition.
@@ -3464,6 +3464,12 @@ def record_gate_release(route, route_path, *, gate, decision, released_by, actor
     }
     if answers is not None:
         row["answers"] = answers
+    if request_id is not None and gate_epoch is not None:
+        row["route_id"] = route["route_id"]
+        row["request_id"] = request_id
+        row["gate_epoch"] = gate_epoch
+        if isinstance(receipt, dict):
+            row["receipt"] = receipt
     try:
         existing = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
         rows = existing.get("gate_releases") if isinstance(existing, dict) else None
@@ -3532,6 +3538,114 @@ def owner_continuation(route, route_path, gate, jobs):
     return {**kept, "parked_attempt_id": attempt, "resume_command": resume}
 
 
+def selected_release_binding(args):
+    """The exact optional selection binding supplied by the Fleet response path."""
+    route_hash = getattr(args, "expected_route_hash", None)
+    epoch = getattr(args, "expected_gate_epoch", None)
+    request_id = getattr(args, "request_id", None)
+    supplied = (route_hash is not None, epoch is not None, request_id is not None)
+    if not any(supplied):
+        return None
+    if not all(supplied):
+        raise SupervisorError(
+            "release-binding-incomplete: --expected-route-hash, "
+            "--expected-gate-epoch, and --request-id must be supplied together"
+        )
+    if not isinstance(route_hash, str) or not route_hash.strip():
+        raise SupervisorError("release-binding-route-hash-invalid")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        raise SupervisorError("release-binding-gate-epoch-invalid")
+    if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", request_id):
+        raise SupervisorError("release-binding-request-id-invalid")
+    return {"route_hash": route_hash, "gate_epoch": epoch, "request_id": request_id}
+
+
+def selected_release_journal_evidence(route, gate, decision, node_id, binding):
+    if binding is None:
+        return {}
+    return {
+        "selected_request_id": binding["request_id"],
+        "gate_epoch": binding["gate_epoch"],
+        "route_hash": route["route_hash"],
+        "released_gate": gate,
+        "decision": decision,
+        "node": node_id,
+    }
+
+
+def selected_release_receipt(route, route_path, ledger, gate, decision, binding, resolution):
+    """Validate a selected gate identity and recover an already-applied request.
+
+    Call only while holding the route's existing workflow-ledger lock. A
+    receipt is recoverable from the normal gate-release sidecar when present;
+    the append-only workflow journal remains sufficient to refuse stale or
+    conflicting requests and to return a compact receipt if that sidecar was
+    unavailable.
+    """
+    if binding["route_hash"] != route.get("route_hash"):
+        raise SupervisorError("release-binding-route-mismatch")
+    if resolution.get("epoch") != binding["gate_epoch"]:
+        raise SupervisorError(
+            "release-binding-stale-gate-epoch: selected epoch "
+            f"{binding['gate_epoch']} is not current epoch {resolution.get('epoch')}"
+        )
+
+    journal = ledger.journal()
+    request_entries = []
+    for entry in journal:
+        evidence = entry.get("evidence") if isinstance(entry.get("evidence"), dict) else {}
+        if evidence.get("selected_request_id") == binding["request_id"]:
+            request_entries.append((entry, evidence))
+    if request_entries:
+        if any(evidence.get("route_hash") != route.get("route_hash")
+               or evidence.get("released_gate") != gate
+               or evidence.get("gate_epoch") != binding["gate_epoch"]
+               or evidence.get("decision") != decision
+               for _entry, evidence in request_entries):
+            raise SupervisorError("release-binding-request-id-reused")
+
+        sidecar_path = gate_release_sidecar_path(route_path)
+        if sidecar_path is not None:
+            try:
+                sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                if sidecar.get("route_id") == route.get("route_id"):
+                    for row in reversed(sidecar.get("gate_releases") or []):
+                        if (row.get("request_id") == binding["request_id"]
+                                and row.get("gate_epoch") == binding["gate_epoch"]
+                                and row.get("gate") == gate
+                                and row.get("decision") == decision
+                                and row.get("route_hash") == route.get("route_hash")
+                                and isinstance(row.get("receipt"), dict)):
+                            return {**row["receipt"], "recovered": True}
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+
+        first_entry, first_evidence = request_entries[0]
+        last_entry, last_evidence = request_entries[-1]
+        receipt = {
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "gate": gate, "gate_epoch": binding["gate_epoch"],
+            "request_id": binding["request_id"], "decision": decision,
+            "node": first_evidence.get("node"),
+            "workflow_state": last_entry.get("workflow_state"),
+            "released_by": first_evidence.get("released_by"),
+            "actor_kind": first_evidence.get("actor_kind"),
+            "answers_recorded": len((first_evidence.get("answers") or {}).get("answers") or {}),
+        }
+        if isinstance(last_evidence.get("successor_claims"), list):
+            receipt["successors"] = last_evidence["successor_claims"]
+        return {**receipt, "recovered": True}
+    return None
+
+
+def selected_release_public_receipt(payload):
+    """Keep the replayable result body-free and limited to normal release facts."""
+    fields = ("route_id", "route_hash", "gate", "gate_epoch", "request_id",
+              "decision", "node", "workflow_state", "retry_boundary",
+              "successors", "released_by", "actor_kind", "answers_recorded")
+    return {key: payload[key] for key in fields if key in payload}
+
+
 def cmd_release(args):
     """A50-8: `release --decision proceed|revise|stop`, semantically
     consistent with `gate --release|--block` but closing the gap `gate
@@ -3541,11 +3655,13 @@ def cmd_release(args):
     the workflow RUNNING with no successor claimed or started. `proceed`
     performs both, atomically, inside one `ledger.lock()`.
     """
+    binding = selected_release_binding(args)
     route = load_route(args.route)
     ledger = ledger_for(route, getattr(args, "jobs", None))
-    with ledger.lock():
-        if cancelled_mutation(route, ledger):
-            return 0
+    if binding is None:
+        with ledger.lock():
+            if cancelled_mutation(route, ledger):
+                return 0
     gates = {row["gate"]: row for row in (route.get("human_gate_bindings") or [])}
     if args.gate not in gates:
         raise SupervisorError(f"route declares no human gate {args.gate!r}")
@@ -3561,31 +3677,43 @@ def cmd_release(args):
     actor_kind = release_actor_kind()
     actor = resolved_released_by(actor_kind, args.actor)
     with ledger.lock():
+        if binding is not None:
+            resolution = WS.human_gate_resolution(ledger.journal(), args.gate)
+            receipt = selected_release_receipt(
+                route, args.route, ledger, args.gate, args.decision, binding, resolution)
+            if receipt is not None:
+                print(json.dumps(receipt, sort_keys=True))
+                return 0
         if cancelled_mutation(route, ledger):
+            if binding is not None:
+                raise SupervisorError("release-binding-workflow-no-longer-current")
             return 0
         state = ledger.state()["workflow_state"]
         if state != "BLOCKED_HUMAN_GATE":
             refuse_gate_not_blocked(route, args.gate, state)
+        resolution = WS.human_gate_resolution(ledger.journal(), args.gate)
+        if binding is not None and resolution.get("status") != "blocked":
+            raise SupervisorError("release-binding-gate-not-current")
         assert_release_authority(
-            actor_kind, WS.human_gate_resolution(ledger.journal(), args.gate),
-            gates[args.gate], args.gate)
+            actor_kind, resolution, gates[args.gate], args.gate)
         inline_gate = args.gate in predecessor.get("inline_human_gates", [])
         if inline_gate and args.decision == "proceed":
-            WS.require_gate_artifact_current(WS.human_gate_resolution(ledger.journal(), args.gate))
+            WS.require_gate_artifact_current(resolution)
         answers = release_answers(ledger, args.gate, args.decision, getattr(args, "answers", None))
         if answers is not None:
             actor_kind = release_actor_kind(answers)
             actor = resolved_released_by(actor_kind, args.actor)
-            assert_release_authority(actor_kind, WS.human_gate_resolution(ledger.journal(), args.gate),
-                                     gates[args.gate], args.gate)
+            assert_release_authority(actor_kind, resolution, gates[args.gate], args.gate)
             answers = {**answers, "actor_kind": actor_kind}
         answered_interview = interview_of_gate(ledger, args.gate) if answers else None
+        binding_evidence = selected_release_journal_evidence(
+            route, args.gate, args.decision, node_id, binding)
         if args.decision == "proceed":
             ledger.set_workflow_state(
                 "RUNNING",
                 evidence={"released_gate": args.gate, "released_by": actor,
                           "actor_kind": actor_kind, "decision": "proceed",
-                          "answers": answers},
+                          "answers": answers, **binding_evidence},
                 actor="release",
             )
             successors = WS.route_successors(route, node_id)
@@ -3601,7 +3729,8 @@ def cmd_release(args):
                 if WS.can_transition(current, "NEXT_REGISTERED"):
                     ledger.set_workflow_state(
                         "NEXT_REGISTERED",
-                        evidence={"node": node_id, "successors": successors},
+                        evidence={"node": node_id, "successors": successors,
+                                  "successor_claims": started, **binding_evidence},
                         actor="release",
                     )
             payload = {"gate": args.gate, "decision": "proceed", "node": node_id,
@@ -3616,14 +3745,15 @@ def cmd_release(args):
                 "RUNNING",
                 evidence={"released_gate": args.gate, "released_by": actor,
                           "actor_kind": actor_kind, "decision": "revise",
-                          "answers": answers},
+                          "answers": answers, **binding_evidence},
                 actor="release",
             )
             if not inline_gate:
                 ledger.set_workflow_state(
                     "FAILED_RETRYABLE",
                     evidence={"gate": args.gate, "released_by": actor,
-                              "retry_boundary": "frame", "next_stage": "code-refine"},
+                              "retry_boundary": "frame", "next_stage": "code-refine",
+                              **binding_evidence},
                     actor="release",
                 )
             payload = {"gate": args.gate, "decision": "revise", "node": node_id,
@@ -3634,7 +3764,7 @@ def cmd_release(args):
                 "CANCELLED",
                 evidence={"gate": args.gate, "released_gate": args.gate,
                           "released_by": actor, "actor_kind": actor_kind,
-                          "abandon_reason": "operator-decision"},
+                          "abandon_reason": "operator-decision", **binding_evidence},
                 actor="release",
             )
             payload = {"gate": args.gate, "decision": "stop", "node": node_id,
@@ -3649,8 +3779,15 @@ def cmd_release(args):
         # even when the command spelled the route through a shell variable.
         payload["route_id"] = route["route_id"]
         payload.update(ledger_metadata(getattr(args, "jobs", None), ledger))
+        if binding is not None:
+            payload.update({"route_hash": route["route_hash"],
+                            "gate_epoch": binding["gate_epoch"],
+                            "request_id": binding["request_id"]})
         record_gate_release(route, args.route, gate=args.gate, decision=args.decision,
-                            released_by=actor, actor_kind=actor_kind, answers=answers)
+                            released_by=actor, actor_kind=actor_kind, answers=answers,
+                            request_id=binding["request_id"] if binding else None,
+                            gate_epoch=binding["gate_epoch"] if binding else None,
+                            receipt=selected_release_public_receipt(payload) if binding else None)
         retire_gate_delivery(route, args.gate, args.jobs)
     record_answered_decisions(route, answered_interview, answers, actor_kind=actor_kind)
     if args.decision == "proceed" and INTERVIEW.answer_releases_gate(actor_kind, args.gate):
@@ -4550,6 +4687,12 @@ def build_parser():
     release.add_argument("--gate", required=True)
     release.add_argument("--decision", required=True, choices=("proceed", "revise", "stop"))
     release.add_argument("--actor")
+    release.add_argument("--expected-route-hash",
+                         help="require the selected route hash to match under the workflow ledger lock")
+    release.add_argument("--expected-gate-epoch", type=int,
+                         help="require the selected human-gate raise epoch to remain current")
+    release.add_argument("--request-id",
+                         help="private selected-action id for an idempotent, recoverable release receipt")
     release.add_argument("--answers",
                          help="frame interview answers file (frame_interview.py answers-template); "
                               "required for --decision proceed when the gate artifact is an interview")
