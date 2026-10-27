@@ -192,17 +192,25 @@ def legacy_resource_identity(run: dict) -> dict | None:
             owners_by_attempt = cached[1]
         else:
             owners_by_attempt: dict[str, list[dict]] = {}
-            source = (pinned_lines if pinned_view is not None
-                      else jobs_path.read_text().splitlines())
-            for line in source:
-                fields = line.split('\t')
-                if len(fields) == 6:
-                    meta = parse_registry_metadata(fields[5])
-                    attempt_id = meta.get('attempt_id')
-                    if attempt_id:
-                        owners_by_attempt.setdefault(attempt_id, []).append(meta)
+            if pinned_view is None:
+                for line in jobs_path.read_text().splitlines():
+                    fields = line.split('\t')
+                    if len(fields) == 6:
+                        meta = parse_registry_metadata(fields[5])
+                        attempt_id = meta.get('attempt_id')
+                        if attempt_id:
+                            owners_by_attempt.setdefault(attempt_id, []).append(meta)
             if signature is not None:
                 _LEGACY_RESOURCE_IDENTITY_CACHE[path] = (signature, owners_by_attempt)
+        if pinned_view is not None and aid and aid not in owners_by_attempt:
+            # The pinned pass already holds every line. Parse only rows that can
+            # name this attempt, not the whole registry's metadata on each append.
+            needle = 'attempt_id=' + aid
+            owners_by_attempt[aid] = [
+                meta for line in pinned_lines if needle in line
+                for fields in (line.split('\t'),) if len(fields) == 6
+                for meta in (parse_registry_metadata(fields[5]),)
+                if meta.get('attempt_id') == aid]
         owners = owners_by_attempt.get(aid, [])
         if len(owners) != 1:
             return None

@@ -111,6 +111,50 @@ class ResourceRegistryTest(unittest.TestCase):
                 registry.legacy_resource_identity(row)
             self.assertEqual(len(reads), 2)
 
+    def test_pinned_legacy_identity_parses_only_rows_naming_the_attempt(self):
+        import dispatch_contract
+        import dispatch_registry_cache
+        with tempfile.TemporaryDirectory() as td:
+            jobs = Path(td) / "jobs.log"
+            route = str(Path(td) / "route.json")
+            owner = ("now\tdone\tx\tx\towner\tattempt_id=att-owner,worker_type=owner,"
+                     f"owner_route_file={route},owner_route_id=rt-test,owner_route_hash=hash,"
+                     "pid=123,pid_start=456,pid_ns=pid:[fixture]\n")
+            # Near-miss rows contain the needle text but name another attempt.
+            near = ("now\tdone\tx\tx\tchild\tattempt_id=att-owner2,parent_attempt_id=att-owner\n"
+                    "now\tdone\tx\tx\tother\tnote=x,attempt_id=att-other\n")
+            filler = "".join(f"t\tdone\t/r\t/w\ts-{i}\tattempt_id=att-{i},note=row\n"
+                             for i in range(300))
+            row = {"jobs": str(jobs), "parent_attempt_id": "att-owner", "route": route,
+                   "pid_namespace": "pid:[fixture]",
+                   "owner_wait": {"parent_attempt_id": "att-owner", "jobs": str(jobs),
+                                  "owner_pid": 123, "owner_start": "456",
+                                  "route_id": "rt-test", "route_hash": "hash"}}
+
+            def identities(text):
+                jobs.write_text(text)
+                found = []
+                with mock.patch.object(registry, "recorded_governor_identity",
+                                       side_effect=lambda meta: dict(meta)):
+                    registry._LEGACY_RESOURCE_IDENTITY_CACHE.pop(str(jobs), None)
+                    found.append(registry.legacy_resource_identity(row))
+                    dispatch_contract._registry_metadata_items.cache_clear()
+                    with dispatch_registry_cache.registry_read_scope():
+                        found.append(registry.legacy_resource_identity(row))
+                        found.append(registry.legacy_resource_identity(row))
+                    parsed = dispatch_contract._registry_metadata_items.cache_info().misses
+                return found, parsed
+
+            found, parsed = identities(filler + near + owner)
+            self.assertEqual(found[0]["owner_route_id"], "rt-test")
+            self.assertEqual(found, [found[0]] * 3)
+            # Only the owner and the needle-matching near-miss row are parsed.
+            self.assertEqual(parsed, 2)
+            found, _parsed = identities(filler + owner + owner)
+            self.assertEqual(found, [None] * 3)
+            found, _parsed = identities(filler + near)
+            self.assertEqual(found, [None] * 3)
+
     def test_empty_log_has_no_output_timestamp_but_nonempty_log_does(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "resource.log"
