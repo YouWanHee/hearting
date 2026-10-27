@@ -133,6 +133,21 @@ class LeasesTest(unittest.TestCase):
         with self.assertRaises(G.GPUUnavailable):
             self.acquire(requested="0")
 
+    def test_boot_id_mismatch_proves_death_but_missing_boot_id_stays_unknown(self):
+        host = G.socket.gethostname().lower().split(".")[0]
+        namespace = os.readlink("/proc/self/ns/pid")
+        record = {"host": host, "pid_namespace": namespace,
+                  "boot_id": "previous-boot", "pid": os.getpid(),
+                  "starttime": "0", "state": "S"}
+        self.assertIs(G.living(record), False)
+        remote = {}
+        exec(compile(G._REMOTE_LEASE_CORE, "serialized-lease-core", "exec"), remote)
+        self.assertIs(remote["living"](record), False)
+        record.pop("boot_id")
+        record["pid_namespace"] = "pid:[other]"
+        self.assertIsNone(G.living(record))
+        self.assertIsNone(remote["living"](record))
+
     def test_multi_gpu_admission_is_all_or_nothing_and_uuid_is_canonicalized(self):
         self.acquire(requested="1")
         with self.assertRaises(G.GPUUnavailable):

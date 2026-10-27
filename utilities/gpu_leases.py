@@ -294,6 +294,14 @@ def identity(pid):
 def living(record):
     if record.get("host") != socket.gethostname().lower().split(".")[0]:
         return None
+    recorded_boot = record.get("boot_id")
+    if recorded_boot:
+        try:
+            current_boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        except OSError:
+            return None
+        if current_boot and current_boot != recorded_boot:
+            return False
     if record.get("pid_namespace") != os.readlink("/proc/self/ns/pid"):
         return None
     try:
@@ -413,7 +421,9 @@ def identity(pid):
         text = Path("/proc/%s/stat" % pid).read_text()
         fields = text.rsplit(") ", 1)[1].split()
         return {"pid": int(pid), "starttime": fields[19],
-                "pid_namespace": os.readlink("/proc/self/ns/pid"), "state": fields[0]}
+                "pid_namespace": os.readlink("/proc/self/ns/pid"),
+                "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+                "state": fields[0]}
     except FileNotFoundError:
         return None
 
@@ -422,6 +432,14 @@ def living(record):
     """False is proven death; unreadable/foreign namespace stays occupied."""
     if record.get("host") != socket.gethostname().lower().split(".")[0]:
         return None
+    recorded_boot = record.get("boot_id")
+    if recorded_boot:
+        try:
+            current_boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        except OSError:
+            return None
+        if current_boot and current_boot != recorded_boot:
+            return False
     if record.get("pid_namespace") != os.readlink("/proc/self/ns/pid"):
         return None
     try:
