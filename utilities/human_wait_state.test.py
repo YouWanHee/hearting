@@ -1374,10 +1374,31 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        agent_home = self.root / "agent-home"
+        (agent_home / "core").mkdir(parents=True)
+        (agent_home / "core" / "CORE.md").write_text("fixture\n", encoding="utf-8")
         self.env = mock.patch.dict(os.environ, {
             "XDG_STATE_HOME": str(self.root / "xdg"),
             "HOME": str(self.root),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "AGENT_HOME": str(agent_home),
+            "AGENT_WORKFLOW_ROOT": str(self.root / "workflow"),
+            "AGENT_ARTIFACT_CHECKPOINT": "off",
+            "AGENT_ARTIFACT_CAMPAIGN_ID": "",
+            "AGENT_ARTIFACT_CYCLE_ID": "",
+            "AGENT_ARTIFACT_PRODUCER_ID": "",
+            "AGENT_ARTIFACT_CYCLE_DIR": "",
+            "AGENT_ARTIFACT_OUTPUT_DIR": "",
+            "AGENT_DISPATCH_CALLER_HARNESS": "codex",
+            "AGENT_DISPATCH_REGISTERED_WORKER": "",
+            "AGENT_DISPATCH_CHILD": "",
+            "AGENT_DISPATCH_DEPTH": "0",
+            "AGENT_DISPATCH_ATTEMPT_ID": "",
+            "CODEX_THREAD_ID": "parent-session",
+            "CODEX_SESSION_ID": "",
+            "CLAUDE_CODE_SESSION_ID": "",
+            "CLAUDE_SESSION_ID": "",
+            "OPENCODE_SESSION_ID": "",
         }, clear=False)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -1392,6 +1413,7 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
         self.dispatch = dispatch
         self.jobs = self.root / "jobs.log"
         self.jobs.write_text("", encoding="utf-8")
+        os.environ["AGENT_DISPATCH_JOBS"] = str(self.jobs)
         registries = mock.patch.object(dispatch, "human_gate_registry_paths",
                                        return_value=(self.jobs,))
         registries.start()
@@ -1498,8 +1520,8 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
             return original(*args)
 
         with mock.patch.object(state, "_claim_selected_action", side_effect=simultaneous_claim), \
-             mock.patch.object(dispatch_owner_input, "submit",
-                               wraps=dispatch_owner_input.submit) as submit:
+             mock.patch.object(state.subprocess, "run",
+                               wraps=state.subprocess.run) as public_correct:
             results = []
             failures = []
 
@@ -1519,7 +1541,7 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
                 caller.join(timeout=20)
             self.assertTrue(all(not caller.is_alive() for caller in callers))
             self.assertEqual(failures, [])
-            self.assertEqual(submit.call_count, 1)
+            self.assertEqual(public_correct.call_count, 1)
 
         receipt = dispatch_owner_input.inspect(self.jobs, "att-workflow-owner")
         self.assertEqual(len(receipt["requests"]), 1)
@@ -1552,7 +1574,9 @@ class WorkflowSelectedResponseTest(unittest.TestCase):
         self.assertEqual(applied["state"], "applied")
         self.assertEqual(applied["result"], {
             "source": "hearting-owner-input", "status": "turn-completed",
-            "request_id": "owner-consumed", "delivery_observation": "turn-completed"})
+            "request_id": "owner-consumed", "delivery_observation": "turn-completed",
+            "target_attempt_id": item["attempt_id"],
+            "continuation": received["result"]["continuation"]})
         self.assertEqual(applied["draft"], "")
 
     def test_s3_replaced_owner_route_or_parent_cannot_receive_old_answer(self):

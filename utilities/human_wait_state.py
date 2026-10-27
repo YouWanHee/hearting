@@ -1389,6 +1389,86 @@ def _owner_binding(metadata):
     return {key: str(metadata.get(key) or "") for key in _OWNER_INPUT_BINDING_KEYS}
 
 
+def _workflow_owner_person_context(base, metadata):
+    """Require the selected route's native parent session to submit its answer."""
+    env = os.environ
+    if (env.get("AGENT_DISPATCH_REGISTERED_WORKER") == "1"
+            or env.get("AGENT_DISPATCH_CHILD") == "1"
+            or env.get("AGENT_DISPATCH_ATTEMPT_ID")):
+        return False
+    depth = env.get("AGENT_DISPATCH_DEPTH")
+    if depth not in (None, "", "0"):
+        return False
+    try:
+        import route_authority
+        harness, session_id = route_authority.caller_identity()
+    except Exception:
+        return False
+    owner = base.get("owner") if isinstance(base.get("owner"), dict) else {}
+    parent_harness = metadata.get("parent_harness")
+    parent_session = metadata.get("parent_sid")
+    return bool(harness and session_id and parent_harness and parent_session
+                and harness == parent_harness == owner.get("harness")
+                and session_id == parent_session == owner.get("session_id"))
+
+
+def _workflow_owner_lineage(jobs, native_ref):
+    """Return exact same-route owner attempts after validating the full replacement chain."""
+    if not isinstance(native_ref, dict):
+        return None
+    selected = native_ref.get("attempt_id")
+    expected = native_ref.get("owner_binding")
+    if not _safe_native_ref(selected) or not isinstance(expected, dict):
+        return None
+    try:
+        import dispatch_completion_join
+        import dispatch_replacement
+
+        effective, _mapping = dispatch_replacement.effective_attempts(jobs, {selected})
+        if len(effective) != 1:
+            return None
+        effective_attempt = next(iter(effective))
+        chain = []
+        seen = set()
+        current = selected
+        for _ in range(64):
+            if current in seen:
+                return None
+            seen.add(current)
+            row = dispatch_completion_join.exact_attempt_row(jobs, current)
+            metadata = row.metadata
+            if (metadata.get("attempt_id") != current
+                    or metadata.get("worker_type") != "owner"
+                    or str(metadata.get("dispatch_depth")) != "1"):
+                return None
+            actual = _owner_binding(metadata)
+            if current == selected:
+                if actual != expected:
+                    return None
+            elif any(actual.get(key) != expected.get(key)
+                     for key in _OWNER_INPUT_BINDING_KEYS
+                     if key not in {"attempt_id", "supervisor_lease_nonce"}):
+                return None
+            chain.append(current)
+            source = dispatch_replacement.source_binding(jobs, metadata)
+            replacement = source[1] if source else None
+            if not replacement:
+                break
+            try:
+                dispatch_completion_join.exact_attempt_row(jobs, replacement)
+            except Exception:
+                # A durable reservation without a launched registry row cannot take delivery.
+                break
+            current = replacement
+        else:
+            return None
+        if effective_attempt not in chain:
+            return None
+        return {"attempts": chain, "effective_attempt": effective_attempt}
+    except Exception:
+        return None
+
+
 def _workflow_owner_snapshot(base, *, expected_native_ref=None):
     """Resolve a current S3 owner row and its existing public input surface."""
     match, error = _workflow_current_item(base.get("id"), "S3")
@@ -1418,10 +1498,21 @@ def _workflow_owner_snapshot(base, *, expected_native_ref=None):
                       "owner_binding": binding}
         if expected_native_ref is not None and expected_native_ref != native_ref:
             return None, "workflow-owner-binding-changed"
+        if not _workflow_owner_person_context(base, metadata):
+            return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "observed": None, "support": False,
+                    "reason": "owner-correction-native-parent-context-required"}, None
+        lineage = _workflow_owner_lineage(jobs, native_ref)
+        if not lineage:
+            return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "observed": None, "support": False,
+                    "reason": "owner-correction-lineage-unverified"}, None
+        current_attempt = lineage["effective_attempt"]
         try:
-            observed = dispatch_owner_input.inspect(jobs, item["attempt_id"])
+            observed = dispatch_owner_input.inspect(jobs, current_attempt)
         except Exception as exc:
             return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "current_attempt_id": current_attempt,
                     "observed": None, "support": False,
                     "reason": "owner-correction-surface-unavailable:" + type(exc).__name__}, None
         unsettled = {"retained", "queued", "undelivered", "sending", "delivery-unknown"}
@@ -1429,9 +1520,11 @@ def _workflow_owner_snapshot(base, *, expected_native_ref=None):
                 or request.get("delivery_observation") in unsettled)
                for request in observed.get("requests", ()) if isinstance(request, dict)):
             return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                    "current_attempt_id": current_attempt,
                     "observed": observed, "support": False,
                     "reason": "owner-correction-already-pending"}, None
         return {"jobs": jobs, "item": item, "native_ref": native_ref,
+                "current_attempt_id": current_attempt,
                 "observed": observed, "support": True}, None
     except Exception as exc:
         return None, "owner-correction-target-unavailable:" + type(exc).__name__
@@ -1449,22 +1542,28 @@ def _workflow_owner_receipt(base, entry):
         jobs = Path(native_ref["jobs_path"]).resolve(strict=True)
         if jobs not in paths:
             return {"state": "unknown", "reason": "owner-correction-registry-changed"}
-        import dispatch_completion_join
         import dispatch_owner_input
-        row = dispatch_completion_join.exact_attempt_row(jobs, native_ref["attempt_id"])
-        metadata = row.metadata
-        route_id = metadata.get("owner_route_id") or metadata.get("route_id")
-        route_hash = metadata.get("owner_route_hash") or metadata.get("route_hash")
-        if (_owner_binding(metadata) != native_ref.get("owner_binding")
-                or route_id != native_ref.get("route_id")
-                or route_hash != native_ref.get("route_hash")):
+        lineage = _workflow_owner_lineage(jobs, native_ref)
+        if not lineage:
             return {"state": "unknown", "reason": "owner-correction-target-replaced"}
-        observed = dispatch_owner_input.inspect(jobs, native_ref["attempt_id"])
-        request = next((request for request in observed.get("requests", ())
-                        if isinstance(request, dict)
-                        and request.get("id") == entry.get("action_id")), None)
-        if request is None:
+        prior_result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+        target = prior_result.get("target_attempt_id")
+        lineage_attempts = lineage["attempts"]
+        targets = [target] if target is not None else lineage_attempts
+        if any(attempt not in lineage_attempts for attempt in targets):
+            return {"state": "unknown", "reason": "owner-correction-target-outside-lineage"}
+        matches = []
+        for attempt in targets:
+            try:
+                observed = dispatch_owner_input.inspect(jobs, attempt)
+            except Exception:
+                continue
+            matches.extend((attempt, request) for request in observed.get("requests", ())
+                           if isinstance(request, dict)
+                           and request.get("id") == entry.get("action_id"))
+        if len(matches) != 1:
             return {"state": "unknown", "reason": "owner-correction-receipt-unavailable"}
+        target, request = matches[0]
         request_state = request.get("state")
         if request_state == "turn-completed":
             state = "applied"
@@ -1472,9 +1571,13 @@ def _workflow_owner_receipt(base, entry):
             state = "received"
         else:
             state = "unknown"
-        result = {"status": request_state, "request_id": entry.get("action_id")}
+        result = {"status": request_state, "request_id": entry.get("action_id"),
+                  "target_attempt_id": target}
         if request.get("delivery_observation"):
             result["delivery_observation"] = request["delivery_observation"]
+        continuation = prior_result.get("continuation")
+        if isinstance(continuation, dict):
+            result["continuation"] = continuation
         return {"state": state, "result": result}
     except Exception as exc:
         return {"state": "unknown", "reason": "owner-correction-receipt-unavailable:" +
@@ -2446,7 +2549,7 @@ def _workflow_gate_submit(envelope, portable, action_id):
 
 
 def _workflow_owner_submit(envelope, portable, action_id):
-    """Use the existing durable blocked-owner correction API exactly once."""
+    """Use the public exact-owner correction command once and read its durable receipt."""
     base, error = _selected_base(envelope)
     if base is None:
         return "unknown", {"reason": error}
@@ -2462,12 +2565,62 @@ def _workflow_owner_submit(envelope, portable, action_id):
         return "unknown", {"reason": "owner-correction-answer-shape-invalid"}
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", action_id):
         return "unknown", {"reason": "owner-correction-action-id-invalid"}
+    attempt_id = envelope["native_ref"]["attempt_id"]
+    lineage = _workflow_owner_lineage(snapshot["jobs"], envelope.get("native_ref"))
+    if (not lineage or snapshot.get("current_attempt_id") != lineage["effective_attempt"]):
+        return "unknown", {"reason": "owner-correction-lineage-changed"}
+    temp_dir = None
     try:
+        temp_dir = tempfile.TemporaryDirectory(prefix="hearting-owner-correction-")
+        fd, message_path = tempfile.mkstemp(prefix="answer-", suffix=".txt", dir=temp_dir.name)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(values[0])
+            handle.flush()
+            os.fsync(handle.fileno())
+        command = [sys.executable, str(Path(__file__).resolve().with_name("capability-route.py")),
+                   "correct", "--attempt-id", attempt_id, "--jobs", str(snapshot["jobs"]),
+                   "--message-file", message_path, "--request-id", action_id]
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   timeout=30, check=False)
+        if completed.returncode != 0:
+            return "unknown", {"reason": "owner-correction-command-unconfirmed",
+                                "returncode": completed.returncode}
+        receipts = []
+        for line in (completed.stdout or "").splitlines():
+            try:
+                value = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                receipts.append(value)
+        if len(receipts) != 1:
+            return "unknown", {"reason": "owner-correction-command-receipt-ambiguous"}
+        public_receipt = receipts[0]
+        correction = public_receipt.get("correction", public_receipt)
+        if not isinstance(correction, dict):
+            return "unknown", {"reason": "owner-correction-request-receipt-missing"}
+        redirected_from = correction.get("redirected_from", public_receipt.get("redirected_from"))
+        if redirected_from is not None and redirected_from != attempt_id:
+            return "unknown", {"reason": "owner-correction-selection-redirected"}
+        if (correction.get("request_id") != action_id
+                or not isinstance(correction.get("attempt_id"), str)):
+            return "unknown", {"reason": "owner-correction-request-binding-missing"}
+        request = next((row for row in correction.get("requests", ())
+                        if isinstance(row, dict) and row.get("id") == action_id), None)
+        if request is None:
+            return "unknown", {"reason": "owner-correction-request-receipt-missing"}
+        target_attempt = correction["attempt_id"]
+        lineage = _workflow_owner_lineage(snapshot["jobs"], envelope.get("native_ref"))
+        if not lineage or target_attempt not in lineage["attempts"]:
+            return "unknown", {"reason": "owner-correction-target-outside-lineage"}
         import dispatch_owner_input
-        receipt = dispatch_owner_input.submit(
-            snapshot["jobs"], envelope["native_ref"]["attempt_id"], values[0],
-            request_id=action_id)
-        request = next((row for row in receipt.get("requests", ())
+        try:
+            observed = dispatch_owner_input.inspect(snapshot["jobs"], target_attempt)
+        except Exception as exc:
+            return "unknown", {"reason": "owner-correction-receipt-unavailable:" +
+                                type(exc).__name__}
+        request = next((row for row in observed.get("requests", ())
                         if isinstance(row, dict) and row.get("id") == action_id), None)
         if request is None:
             return "unknown", {"reason": "owner-correction-receipt-missing"}
@@ -2479,12 +2632,21 @@ def _workflow_owner_submit(envelope, portable, action_id):
         else:
             state = "unknown"
         result = {"status": request_state, "request_id": action_id,
-                  "duplicate": bool(receipt.get("duplicate"))}
+                  "target_attempt_id": target_attempt,
+                  "duplicate": bool(correction.get("duplicate"))}
+        continuation = {key: public_receipt[key] for key in
+                        ("state", "reason", "required_action", "owner_attempt_id", "parent_next")
+                        if isinstance(public_receipt.get(key), (str, int, float, bool))}
+        if continuation:
+            result["continuation"] = continuation
         if request.get("delivery_observation"):
             result["delivery_observation"] = request["delivery_observation"]
         return state, result
-    except Exception as exc:
-        return "unknown", {"reason": "owner-correction-submit-ambiguous:" + type(exc).__name__}
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
+        return "unknown", {"reason": "owner-correction-command-ambiguous:" + type(exc).__name__}
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
 
 
 def _selected_invalid_response(envelope, reason):
