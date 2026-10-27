@@ -1336,11 +1336,17 @@ def _settle_accepted_handoff(ref, row, context, successor, *, steward):
     if (getattr(successor_seat, "kind", None) != "pane"
             or successor_seat.pane != successor["pane"]):
         raise ValueError("handoff-successor-seat-mismatch")
-    handover.record_retire_handover(
-        predecessor_sid=context["predecessor"]["session_id"],
-        predecessor_harness=context["predecessor"]["harness"],
-        successor_sid=successor["session_id"], successor_harness=successor["harness"],
-        env=os.environ, successor_seat=successor_seat)
+    try:
+        handover.record_retire_handover(
+            predecessor_sid=context["predecessor"]["session_id"],
+            predecessor_harness=context["predecessor"]["harness"],
+            successor_sid=successor["session_id"], successor_harness=successor["harness"],
+            env=os.environ, successor_seat=successor_seat)
+    except handover.RegistryUnreadable as exc:
+        # The acceptance itself is already durable. Its binding handover is
+        # unknown, not empty, so leave the continuation unsettled: the existing
+        # accepted-duty replay retries it on the next observation.
+        raise ValueError("handoff-registry-unreadable") from exc
 
     acceptance["reply_ref"] = peer.schedule_acceptance_reply(ref, row["to"], row["from"])
     row["acceptance"] = acceptance

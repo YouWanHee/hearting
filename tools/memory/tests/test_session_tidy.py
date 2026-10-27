@@ -4888,6 +4888,17 @@ class SeatHandoverTest(TidyCase):
         self.assertIsNone(self.retire("sid-A", "codex", "sid-C", "claude", pane="test:pane-c"))  # A answers for nothing now
         self.assertEqual(self.effective(meta), "sid-B")
 
+    def test_an_unreadable_registry_is_not_reported_as_nothing_to_hand_over(self):
+        self.row("att-1", parent="sid-A")
+        import dispatch_registry_cache
+        with mock.patch.object(dispatch_registry_cache, "registry_view",
+                               side_effect=OSError("registry unreadable")):
+            with self.assertRaises(self.handover.RegistryUnreadable):
+                self.retire("sid-A", "claude", "sid-B", "claude")
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE_BESIDE}):
+            self.assertEqual(self.handover.handover_rows(self.seat(PANE_BESIDE)), [])
+        self.assertIsNotNone(self.retire("sid-A", "claude", "sid-B", "claude"))  # the retry binds
+
     def test_a_retire_after_a_clear_carries_the_whole_chain_across_panes(self):
         meta = self.row("att-1")
         self.snapshot(now=st.now_epoch() - 5)

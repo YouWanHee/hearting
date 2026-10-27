@@ -1524,7 +1524,11 @@ def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, 
             return "skipped:predecessor-unverified"
         row = handover.record_retire_handover(
             ident["session_id"], ident["harness"], own_sid, own_harness, env=os.environ, **booked)
-    except Exception:  # noqa: BLE001 - the retire itself already succeeded
+    except Exception as exc:  # noqa: BLE001 - the retire itself already succeeded
+        # Nothing was recorded because the registry could not be read, so this
+        # is not the verified-empty "none": keep the receipt unresolved.
+        if getattr(exc, "reason", "") == "registry-unreadable":
+            return "skipped:registry-unreadable"
         return "error"
     try:
         if row is not None and not retain_mark and _read_native_record(path) == record:
