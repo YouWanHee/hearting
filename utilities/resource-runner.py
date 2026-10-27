@@ -744,6 +744,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     if inherited_jobs and Path(inherited_jobs).resolve(strict=True) != jobs:
         raise ValueError("resource-dispatch-jobs-conflict")
     owner_wait = placeholder.get("owner_wait")
+    intent_only = (bool(owner_wait)
+                   and owner_wait.get("launch_scope") == "codex-owner-controller"
+                   and controller is None)
     placeholder.update(resource_policy="supervised-owner" if owner_wait else "verified-resume",
                        route=str(route_file), jobs=str(jobs))
     if owner_wait:
@@ -777,12 +780,43 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     for armed_row, row in initial_history_pairs:
         if row.get("run_id") in captured_compute:
             captured_compute[row["run_id"]]["armed"] = armed_row
+
+    def exact_controller_history_self(armed_row, row):
+        return (controller is not None
+                and armed_row.get("predecessor_kind") == "resource"
+                and Path(armed_row.get("resource_registry", "")).resolve()
+                    == Path(registry).resolve()
+                and armed_row.get("predecessor_id") == args.run_id
+                and row == controller.expected)
+
     def reserve(data):
         if controller is not None:
             current = data["runs"].get(args.run_id)
             if (current != controller.expected or current.get("launch_state") != "queued"
                     or any(current.get(k) != placeholder.get(k) for k in keys)):
                 raise ValueError("resource-reservation-changed")
+            if ledger and sup.resource_stage_blocked(ledger, args.node):
+                raise ValueError("resource-watch-binding-conflict")
+            others = [row for key, row in data["runs"].items()
+                      if row.get("route") == str(route_file) and row.get("node") == args.node
+                      and not (key == args.run_id and row == current)]
+            for row in others:
+                execution = row.get("execution") if isinstance(row, dict) else None
+                if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+                    captured = captured_compute.get(row.get("run_id"))
+                    if not captured or captured["row"] != row:
+                        raise ValueError("resource-reservation-changed")
+            prior_history = [row for armed_row, row in history_pairs
+                             if not exact_controller_history_self(armed_row, row)]
+            for previous in others:
+                if reboot_evidence(previous):
+                    settle(registry, previous["run_id"], previous, data=data)
+            from route_authority import require_resource_predecessors
+            if captured_compute:
+                require_resource_predecessors([*others, *prior_history], current,
+                                              observations=captured_compute)
+            else:
+                require_resource_predecessors([*others, *prior_history], current)
             claimed = {**current, "launch_state": "claimed", "launch_controller": controller.identity}
             data["runs"][args.run_id] = claimed
             return True, claimed
@@ -803,7 +837,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
             if reboot_evidence(previous):
                 settle(registry, previous['run_id'], previous, data=data)
         from route_authority import require_resource_predecessors
-        if captured_compute:
+        if intent_only:
+            sup.require_resource_intent_predecessors([*matches, *history], placeholder)
+        elif captured_compute:
             require_resource_predecessors([*matches, *history], placeholder,
                                           observations=captured_compute)
         else:
@@ -823,6 +859,8 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         history_pairs = sup.resource_predecessors(ledger, args.node) if ledger else []
         history = [row for _, row in history_pairs]
         for armed_row, row in history_pairs:
+            if exact_controller_history_self(armed_row, row):
+                continue
             execution = row.get("execution") if isinstance(row, dict) else None
             if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
                 captured = captured_compute.get(row.get("run_id"))
@@ -844,6 +882,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     proc = None
     release = None
     watch = None
+    queued = None
     payload_released = False
     lease_path, gpu_lease = None, None
     try:
@@ -852,8 +891,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         node = next((n for n in route.get("nodes", []) if n["id"] == args.node), {})
         # Native Codex tools record intent; their outer controller admits the
         # devices before arming/releasing the actual execution.
-        queued_intent = (owner_wait and owner_wait.get("launch_scope") == "codex-owner-controller"
-                         and controller is None)
+        queued_intent = intent_only
         if not queued_intent:
             lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
                 node, placeholder["command"], gpu_scoped=args.node in gpu_resource_nodes(route),
@@ -979,7 +1017,8 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                     watch.wait(timeout=2)
             def mark_failed(data):
                 current = data["runs"].get(args.run_id)
-                if current != placeholder and current != row:
+                if (current != placeholder and current != row
+                        and (queued is None or current != queued)):
                     raise ValueError("resource-reservation-changed")
                 if isinstance(error, LaunchDeferred) and controller is not None:
                     data["runs"][args.run_id] = controller.expected
