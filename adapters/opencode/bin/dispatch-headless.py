@@ -553,6 +553,25 @@ def resolve_model_settings(args: argparse.Namespace) -> dict[str, str]:
     return WRAPPER_COMMON.attach_context_window(selected, "opencode", error=ModelSelectionError)
 
 
+def provider_fallback_fields(settings: dict[str, str]) -> dict[str, str]:
+    """The provider fallback this selection took, as existing receipt fields.
+
+    `resolve_model_settings` already computes which provider/model was replaced
+    and why; the receipt otherwise keeps only the final `model` and the
+    synthesized `model_source`, so a later reader cannot tell why. These are
+    plain extra fields on the launch and attempt receipts, not a new file or
+    gate, and they stay absent when no fallback happened so the previous
+    receipt shape is unchanged.
+    """
+    source = settings.get("provider_fallback_from")
+    if not source:
+        return {}
+    return {
+        "provider_fallback_from": source,
+        "provider_fallback_reason": settings.get("provider_fallback_reason") or "primary-unavailable",
+    }
+
+
 def qa_track(capability: str) -> str:
     if capability.startswith("code-") or capability == "autopilot-code":
         return "code"
@@ -1127,6 +1146,9 @@ def attach_summary_owner(args, log_path: Path, prompt_path: Path, identity):
 def append_job(jobs: Path, args: argparse.Namespace) -> bool:
     return WRAPPER_COMMON.append_job(
         jobs, args, harness="opencode", runtime_sandbox="adapter-default", effort_key="variant",
+        adapter_fields="".join(
+            f",{key}={value}"
+            for key, value in provider_fallback_fields(args.resolved_model_settings).items()),
         claim=claim_attempt_row, marker_gate=completion_marker_gate,
     )
 
@@ -2376,6 +2398,8 @@ def main(argv: list[str]) -> int:
     print(f"agent={args.agent}")
     settings = args.resolved_model_settings
     print(f"model_source={settings['source']}")
+    for key, value in provider_fallback_fields(settings).items():
+        print(f"{key}={value}")
     print(f"model_pin_status={settings.get('pin_status', 'none')}")
     if getattr(args, 'explicit_adapter', None):
         print(f"explicit_adapter={args.explicit_adapter}")
