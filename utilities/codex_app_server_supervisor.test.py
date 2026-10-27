@@ -613,6 +613,68 @@ class CodexAppServerSupervisorTest(unittest.TestCase):
         with self.assertRaisesRegex(module.SupervisorError,"resource-sandbox-selection-unsupported"):
             module.resource_sandbox_command(args,row)
 
+    def test_host_payload_row_alone_leaves_the_owner_profile_for_its_command(self):
+        module=load_supervisor_module()
+        route={"capability":"autopilot-code","owner_dispatch_depth":1,"cwd":str(self.base),
+            "artifact_root":str(self.artifact_root),"selection":{},
+            "nodes":[{"id":"execute","kind":"pipeline-stage"},
+                {"id":"autopilot-lab-host-run","part":"autopilot-lab:host-run","kind":"resource-runner",
+                 "resource_class":"long-running","resource_transport":"detached-process",
+                 "continuation":{"kind":"supervised"}}]}
+        route_path=self.base/"host-route.json"
+        route_path.write_text(json.dumps(route))
+        profile={"default_permissions":"hearting_linked_commit","permissions":{"hearting_linked_commit":{
+            "extends":":workspace","filesystem":{str(self.base/".git/config"):"read"},"network":{"enabled":False}}}}
+        args=SimpleNamespace(sandbox="workspace-write",network_access=False,worktree=str(self.base),
+            writable_root=[],native_permission_profile=profile,owner_turn_permission_profiles=None,
+            owner_runtime_permission_state=None)
+        before=dict(vars(args))
+        payload=["systemd-run","--user","--scope","-p","MemoryMax=64M","-p","MemorySwapMax=0","true"]
+        row={"cwd":str(self.base/"payload"),"command":payload,"route":str(route_path),
+             "node":"autopilot-lab-host-run","jobs":str(self.jobs)}
+        env={k:v for k,v in os.environ.items() if k not in {
+            "CODEX_DISPATCH_SANDBOX","CODEX_DISPATCH_SANDBOX_FORCE","AGENT_DISPATCH_EXECUTION_ACCESS_FILE"}}
+        with mock.patch.dict(os.environ,env,clear=True):
+            command,selection=module.resource_sandbox_command(args,row)
+            self.assertEqual(command,["codex","sandbox","-P",":danger-full-access","--include-managed-config",
+                "-C",str(self.base),"--","/bin/sh","-c",'cd -- "$1" || exit; shift; exec "$@"',
+                "resource-payload",row["cwd"],*payload])
+            self.assertEqual((selection["mode"],selection["enforcement"],selection["scope"]),
+                ("danger-full-access","none","host-process-payload"))
+            self.assertNotIn("--inherit-pid-namespace",command)
+            self.assertEqual(vars(args),before)
+            self.assertEqual(args.sandbox,"workspace-write")
+            # The same builder keeps every other row, and a row with no route, on the owner profile.
+            for other in ({**row,"node":"execute"},{**row,"node":"missing"},
+                          {k:v for k,v in row.items() if k not in {"route","node"}},
+                          {**row,"route":str(self.base/"absent.json")}):
+                command,selection=module.resource_sandbox_command(args,other)
+                self.assertEqual(command[command.index("-P")+1],"hearting_linked_commit",other)
+                self.assertEqual(selection,{"mode":"workspace-write","enforcement":"os-sandbox","network_access":False})
+            # A caller-forced sandbox stays the owner's, so the host limit stays visible.
+            with mock.patch.dict(os.environ,{"CODEX_DISPATCH_SANDBOX_FORCE":"workspace-write"}):
+                command,selection=module.resource_sandbox_command(args,row)
+                self.assertEqual(command[command.index("-P")+1],"hearting_linked_commit")
+                self.assertEqual(selection["enforcement"],"os-sandbox")
+            # An invalid caller value stays on the owner profile; the runner start check refuses it.
+            with mock.patch.dict(os.environ,{"CODEX_DISPATCH_SANDBOX_FORCE":"bogus"}):
+                command,selection=module.resource_sandbox_command(args,row)
+                self.assertEqual(command[command.index("-P")+1],"hearting_linked_commit")
+                self.assertEqual(selection["enforcement"],"os-sandbox")
+            # The builder never raises for access; the runner start check settles a strict request.
+            request=self.base/"access-request.json"
+            request.write_text(json.dumps({"schema_version":1,"writable_roots":[],"read_roots":[],
+                "network":{"required":False,"reason":"","hosts":[]},"enforcement_required":"os-sandbox",
+                "justification":{}}))
+            with mock.patch.dict(os.environ,{"AGENT_DISPATCH_EXECUTION_ACCESS_FILE":str(request)}):
+                command,selection=module.resource_sandbox_command(args,row)
+                self.assertEqual(selection["mode"],"danger-full-access")
+                command,_=module.resource_sandbox_command(args,{**row,"node":"execute"})
+                self.assertEqual(command[command.index("-P")+1],"hearting_linked_commit")
+                request.write_text(request.read_text().replace("os-sandbox","any"))
+                command,selection=module.resource_sandbox_command(args,row)
+                self.assertEqual(selection["enforcement"],"none")
+
     def test_controller_intent_correction_scope_claim_and_exact_argv_boundaries(self):
         import dispatch_resource_wait as RESOURCE
         import dispatch_owner_input as INPUT

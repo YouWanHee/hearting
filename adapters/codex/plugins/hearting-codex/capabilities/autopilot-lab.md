@@ -295,6 +295,21 @@ applies when code borrows `full-run`. `full-run` carries
 the declared mark `start_approval: full-run`; it is data for the route card and
 the frame catalog, not a gate.
 
+`autopilot-lab:host-run` is the GPU-free counterpart: a shareable optional part
+(`setup` and `eval` graphs, also `autopilot-code`) for a long measurement, benchmark,
+browser test or memory-capped command. It is the same detached `supervised`
+resource-runner (`_kernel/resource`, `resource-exit`) but declares
+`execution_needs: host-process`, so it takes no GPU lease, no compute-hosts scope, no
+smoke or config attestation and no `start_approval`. Name it in the graph after the
+preparing stage and before the model verify/report successor, for example
+`--graph plan,plan-check,execute,autopilot-lab:host-run,impl-review,test,report`; the
+successor, never the resource exit, completes the stage. Its payload command owns the
+memory cap (`systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0 …`). On a
+Codex owner only that node's controller-built payload runs as a host process without
+OS file or network enforcement; the owner and model children stay `workspace-write`
+(see `docs/lab-execution-access.md`). It differs from `smoke`, `full-run` and
+`eval-run`, which keep the hash-bound attestation and provenance requirements.
+
 ### Eval execution topology (`standard+`)
 
 The full recipe's separable stages of a `standard+` eval are: (1) context and experiment

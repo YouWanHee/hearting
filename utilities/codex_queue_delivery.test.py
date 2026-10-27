@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import stat
 from pathlib import Path
@@ -12,6 +13,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -100,6 +102,186 @@ def native_fixture(root, *, entries=(), turn_ids=(), thread_id=THREAD,
 
 
 class QueueDeliveryTest(unittest.TestCase):
+    def test_queue_delete_uses_exact_thread_submission_and_requires_boolean_result(self):
+        with mock.patch.object(QUEUE, "_rpc", return_value={"deleted": True}) as rpc:
+            self.assertTrue(QUEUE.delete_queue_item(SOCKET, THREAD, ITEM_ID, timeout=0.4))
+        self.assertEqual(rpc.call_args.args[1], "thread/queue/delete")
+        self.assertEqual(rpc.call_args.args[2], {
+            "threadId": THREAD, "queuedSubmissionId": ITEM_ID,
+        })
+        with mock.patch.object(QUEUE, "_rpc", return_value={"deleted": 1}):
+            with self.assertRaisesRegex(QUEUE.QueueDeliveryError, "queue-delete-response-invalid"):
+                QUEUE.delete_queue_item(SOCKET, THREAD, ITEM_ID)
+
+    def test_native_completion_builder_keeps_v1_singleton_identity_and_exact_bytes(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_recipient_receipt as recipient
+
+        record = {
+            "delivery_id": "delivery-builder-test", "recipient_kind": "codex-native-queue",
+            "recipient_digest": pending.recipient_digest(THREAD), "attempt_ids": ["att-one"],
+            "receipt": {"kind": "completion", "children": []}, "receipt_digest": "0" * 64,
+            "row_revisions": {}, "session_generation": "", "session_generation_supported": "0",
+        }
+        record["receipt_digest"] = pending._canonical_receipt_digest(record["receipt"])
+        client_id = QUEUE.native_client_message_id(THREAD, [record["delivery_id"]])
+        body = QUEUE.native_completion_body(THREAD, [record], record["receipt"], "follow up")
+        self.assertEqual(client_id, "delivery-" + __import__("hashlib").sha256(
+            ("codex-native-queue-v1\0" + THREAD + "\0" + record["delivery_id"]).encode()
+        ).hexdigest()[:32])
+        self.assertEqual(body, "AGENT_HARNESS_COMPLETION_V1\n" +
+                         __import__("json").dumps(record["receipt"], sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=False) + "\nfollow up\n" +
+                         recipient.receipt_marker(record, THREAD))
+
+    def test_producer_variants_match_pre_refactor_byte_formulas(self):
+        import dispatch_pending_delivery as pending
+        import dispatch_recipient_receipt as recipient
+        import dispatch_session_sweep as sweep
+
+        records = []
+        for delivery_id, attempt_id in (("delivery-multi-b", "att-b"),
+                                        ("delivery-multi-a", "att-a")):
+            receipt = {"kind": "completion", "children": [{
+                "attempt_id": attempt_id, "status": "completed",
+                "required_action": "advance-completed",
+            }]}
+            records.append({
+                "delivery_id": delivery_id, "recipient_kind": "codex-native-queue",
+                "recipient_digest": pending.recipient_digest(THREAD), "attempt_ids": [attempt_id],
+                "receipt": receipt,
+                "receipt_digest": pending._canonical_receipt_digest(receipt),
+                "row_revisions": {}, "session_generation": "",
+                "session_generation_supported": "0", "attempts": 7,
+                sweep.STORAGE_KEY: THREAD,
+            })
+
+        own_receipt = {"kind": "completion", "children": [
+            {"attempt_id": "att-a", "status": "completed",
+             "required_action": "advance-completed"},
+            {"attempt_id": "att-b", "status": "completed",
+             "required_action": "advance-completed"},
+        ]}
+        own_records = [dict(record, receipt=own_receipt,
+                            receipt_digest=pending._canonical_receipt_digest(own_receipt))
+                       for record in records]
+        sorted_ids = sorted(row["delivery_id"] for row in own_records)
+        expected_own_id = "delivery-" + hashlib.sha256(
+            ("codex-native-queue-v1\0" + THREAD + "\0" + "\0".join(sorted_ids)).encode()
+        ).hexdigest()[:32]
+        expected_own_body = (
+            "AGENT_HARNESS_COMPLETION_V1\n" +
+            json.dumps(own_receipt, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False) + "\nfollow-up\n" +
+            "\n".join(recipient.receipt_marker(row, THREAD) for row in own_records)
+        )
+        self.assertEqual(QUEUE.native_client_message_id(
+            THREAD, [row["delivery_id"] for row in own_records]), expected_own_id)
+        self.assertEqual(QUEUE.native_completion_body(
+            THREAD, own_records, own_receipt, "follow-up"), expected_own_body)
+
+        ordered = sorted(records, key=lambda row: row["delivery_id"])
+        expected_batch_id = "delivery-" + hashlib.sha256(
+            ("codex-native-queue-batch-v1\0" + THREAD + "\0" +
+             "\0".join(row["delivery_id"] for row in ordered)).encode()
+        ).hexdigest()[:32]
+        batch_lines = []
+        for row in ordered:
+            child = row["receipt"]["children"][0]
+            batch_lines.append(
+                f"delivery_id={row['delivery_id']} route_id=- route_node=- attempts=0 "
+                f"attempt_id={child['attempt_id']} status=completed "
+                "required_action=advance-completed classification=-\n" +
+                recipient.receipt_marker(row, THREAD)
+            )
+        expected_batch_body = (
+            "Hearting runtime delivery. Follow required_action; inspect-recovery is diagnostic. "
+            "Follow route's next-action receipt; runtime-v1 owners close/finalize. "
+            "Tracked-Workflow Continuation. Keep new failures/conflicts, unfinished work, questions; "
+            "no Monitor/dispatch-wait/polling.\n" +
+            "\n".join("- " + line for line in batch_lines)
+        )
+        self.assertEqual(QUEUE.native_client_message_id(
+            THREAD, [row["delivery_id"] for row in records], batch=True), expected_batch_id)
+        self.assertEqual(QUEUE.native_batch_unit_body(Path("/tmp"), THREAD, records),
+                         expected_batch_body)
+
+        old_followup = (
+            "The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
+            "Continue and complete the original user task itself, preserving every explicit content and output-format "
+            "requirement from that request; this receipt supplements the task and does not replace it with a receipt-only response. "
+            "Read the exact result and perform the already approved parent review/follow-through in this turn, "
+            "or run its existing registered continuation. On the first user-facing close, explain what changed and why, "
+            "the observed before/after, checks actually run (including reused, skipped, and unrun checks), applicable "
+            "commit/PR/deployment/serving state, and limits or remaining work. Do not invent deployment or operating "
+            "results. Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual "
+            "finalization is required. An automatic repeat of this exact result or a cleanup-only notice after the "
+            "follow-through is handled does not call for the same action or a new user ACK; preserve a new failure, "
+            "conflict, unfinished work, or direct user question."
+        )
+        current_followup = "Original request/format apply.\nContinue with the original request."
+        prior_followup = old_followup + "\nContinue with the original request."
+        singleton = own_records[:1]
+        expected_prior_body = (
+            "AGENT_HARNESS_COMPLETION_V1\n" +
+            json.dumps(own_receipt, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False) + "\n" + prior_followup + "\n" +
+            recipient.receipt_marker(singleton[0], THREAD)
+        )
+        self.assertEqual(QUEUE.prior_followup_text(current_followup), prior_followup)
+        self.assertEqual(QUEUE.native_completion_body(
+            THREAD, singleton, own_receipt,
+            QUEUE.prior_followup_text(current_followup)), expected_prior_body)
+
+    def test_absolute_deadline_covers_connect_upgrade_and_initialize(self):
+        now = [50.0]
+        fake_socket = mock.Mock()
+
+        def connect(_path):
+            now[0] += 0.4
+
+        def recv(_size):
+            if not getattr(recv, "handshake", False):
+                recv.handshake = True
+                now[0] += 0.4
+                key = __import__("base64").b64encode(b"x" * 16).decode()
+                accept = __import__("base64").b64encode(hashlib.sha1(
+                    (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+                ).digest()).decode()
+                return ("HTTP/1.1 101 Switching Protocols\r\n"
+                        f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode()
+            now[0] += fake_socket.settimeout.call_args.args[0]
+            raise TimeoutError("stalled initialize")
+
+        fake_socket.connect.side_effect = connect
+        fake_socket.recv.side_effect = recv
+        with mock.patch.object(QUEUE.time, "monotonic", side_effect=lambda: now[0]), \
+             mock.patch.object(QUEUE, "resolve_endpoint", return_value=SOCKET), \
+             mock.patch.object(QUEUE.Path, "lstat", return_value=SimpleNamespace(
+                 st_mode=0, st_uid=QUEUE.os.geteuid())), \
+             mock.patch.object(QUEUE.stat, "S_ISSOCK", return_value=True), \
+             mock.patch.object(QUEUE.socket, "socket", return_value=fake_socket), \
+             mock.patch.object(QUEUE.secrets, "token_bytes", return_value=b"x" * 16):
+            started = now[0]
+            with self.assertRaises(QUEUE.QueueDeliveryError) as caught:
+                with QUEUE.DeliverySession(
+                        SOCKET, timeout=1.0, deadline=started + 1.0) as session:
+                    session.request(SOCKET, "thread/queue/list", {"threadId": THREAD})
+        self.assertEqual(caught.exception.reason, "queue-operation-deadline-exceeded")
+        self.assertTrue(caught.exception.ambiguous)
+        self.assertLessEqual(now[0] - started, 1.0)
+
+    def test_deadline_bounds_paginated_queue_listing_without_reading_later_pages(self):
+        clock = iter((100.0, 100.6))
+        with mock.patch.object(QUEUE.time, "monotonic", side_effect=lambda: next(clock)), \
+             mock.patch.object(QUEUE, "_rpc", return_value={
+                 "data": [], "nextCursor": "page-2"}) as rpc:
+            with self.assertRaisesRegex(QUEUE.QueueDeliveryError,
+                                        "queue-operation-deadline-exceeded"):
+                QUEUE.list_queue(SOCKET, THREAD, timeout=1.0, deadline=100.5)
+        rpc.assert_called_once()
+        self.assertEqual(rpc.call_args.kwargs["timeout"], 0.5)
+
     def test_read_exact_turn_confirms_native_turn_id_from_thread_history(self):
         items = [{"id": "item-user-exact", "type": "userMessage",
                   "content": [{"type": "text", "text": "original requested task"}]}]
