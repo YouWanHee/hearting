@@ -483,6 +483,13 @@ def _unit_frontmatter(unit):
         text = path.read_text(encoding="utf-8")
     except OSError:
         raise TopologyError(f"unknown unit: {unit} (no roles/units/{unit}.md)")
+    fields = _parse_unit_frontmatter(unit, text)
+    _UNIT_CACHE[key] = fields
+    return fields
+
+
+def _parse_unit_frontmatter(unit, text):
+    """Parse unit contract fields from the same sealed frontmatter text used on disk."""
     match = re.match(r"\A---\n(.*?\n)---\n", text, re.DOTALL)
     if not match:
         raise TopologyError(f"unit {unit}: missing frontmatter block")
@@ -507,7 +514,6 @@ def _unit_frontmatter(unit):
         if verdict
         else []
     )
-    _UNIT_CACHE[key] = fields
     return fields
 
 
