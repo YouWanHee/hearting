@@ -34,7 +34,9 @@ Two questions, two functions:
 Both answers come from one lineage judgment (:func:`_lineage_holder`), so delivery and resume
 authority never disagree.  Both answer "the registered parent" whenever there is no relation, so a call without a
 handover behaves exactly as before.  No failure here may block a caller: every public
-function returns the registered answer on any error.
+function returns the registered answer on any error, except that
+:func:`record_retire_handover` reports an unreadable registry typed so its caller can
+keep the accepted handover pending instead of treating unknown ownership as empty.
 """
 
 from __future__ import annotations
@@ -66,6 +68,17 @@ LINE_MAX_BYTES = 520
 # contribute multiple flat attempt/parent bindings.
 MAX_BINDINGS = 12
 KEEP_ROWS = 40
+
+
+class RegistryUnreadable(OSError):
+    """The jobs registry exists but its ownership rows could not be read.
+
+    Distinct from "nothing currently owned": a caller keeps its acceptance
+    continuation pending and retries the same observation instead of settling
+    a transfer that never reached the seat ledger. ``reason`` names the state
+    for callers that carry a string receipt rather than this class."""
+
+    reason = "registry-unreadable"
 
 
 def _st():
@@ -1536,9 +1549,12 @@ def record_retire_handover(predecessor_sid: str, predecessor_harness: str, succe
     rows remain untouched. ``source=retire`` keeps its exact binding-selection
     meaning for both callers. Returns the existing row on replay, or None when
     there is nothing currently owned to hand over, including attempts already
-    handed to another session. Deferred retire uses the seat proved by its
-    immutable requester and original successor mark; its observer need not own
-    that physical pane.
+    handed to another session. When the registry file exists but its rows cannot
+    be read, ownership is unknown rather than empty, so this raises
+    :class:`RegistryUnreadable` instead of returning None; callers keep their
+    existing continuation pending and observe again. Deferred retire uses the
+    seat proved by its immutable requester and original successor mark; its
+    observer need not own that physical pane.
     """
     if not predecessor_sid or not successor_sid or predecessor_sid == successor_sid:
         return None
@@ -1565,9 +1581,16 @@ def record_retire_handover(predecessor_sid: str, predecessor_harness: str, succe
                          record.handover_metadata())
                         for status, record in _handover_candidate_rows(jobs, predecessor_sid)
                         if record.handover_metadata().get("attempt_id")}
-            except OSError:
+            except FileNotFoundError:
+                # No registry file yet: nothing has been registered, so an
+                # empty ownership answer is verified rather than unknown.
                 view = None
                 rows = {}
+            except OSError as exc:
+                # The file exists but its rows could not be read. Returning an
+                # empty answer here would read as "nothing to hand over" and let
+                # an accepted handover settle without the successor binding.
+                raise RegistryUnreadable(f"jobs registry unreadable: {exc}") from exc
         possible_rows = _handover_candidates(
             predecessor_harness, predecessor_sid, jobs, rows=rows)
         if not possible_rows:
