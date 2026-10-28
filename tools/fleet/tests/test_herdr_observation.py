@@ -1,6 +1,10 @@
 """Event-revision reuse for Fleet's optional Herdr process observations."""
 import json
 import os
+import subprocess
+import tempfile
+import threading
+import time
 from collections import Counter
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -387,6 +391,163 @@ class PaneProcessReuseTest(unittest.TestCase):
                 self.assertIs(herdr.observation_view(), view_b)
         self.assertEqual(start_read.call_count, 2)
         self.assertEqual(set(herdr._OBSERVATION_VIEWS.values()), {view_a, view_b})
+
+
+_OBSERVATION_CACHE_NAMES = (
+    "_OBSERVATION_TRANSPORTS", "_OBSERVATION_FUTURES", "_OBSERVATION_VIEWS",
+    "_OBSERVATION_ERRORS", "_OBSERVATION_LAST_STARTED", "_OBSERVATION_REFRESH_PENDING",
+    "_OBSERVATION_FIRST_WAIT_SPENT")
+_CLI_AGENT = {"agent": "claude", "pane_id": "w9:p9"}
+
+
+class ListAgentsFirstReadTest(unittest.TestCase):
+    """d3: a fresh process's first ``list_agents()`` on a selected socket waits once."""
+
+    KEY = ("fleet-named", "/isolated/herdr.sock")
+
+    def setUp(self):
+        old = {name: getattr(herdr, name).copy() for name in _OBSERVATION_CACHE_NAMES}
+        for name in _OBSERVATION_CACHE_NAMES:
+            getattr(herdr, name).clear()
+        self.unfinished = []
+        self.timers = []
+
+        def restore():
+            for timer in self.timers:
+                timer.join(1.0)
+            for future in self.unfinished:
+                if not future.done():
+                    future.set_result(None)
+            herdr.close_observations()
+            for name, rows in old.items():
+                getattr(herdr, name).update(rows)
+
+        self.addCleanup(restore)
+        # The default runner path also requires ``shutil.which("herdr")``.
+        # A temporary fake keeps that hermetic; if the CLI path ever runs, it
+        # answers with an agent row the observation path never produces.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        fake = Path(temporary.name) / "herdr"
+        fake.write_text("#!/bin/sh\nprintf '%s' '" + json.dumps(
+            {"result": {"agents": [_CLI_AGENT]}}) + "'\n", encoding="utf-8")
+        fake.chmod(0o755)
+        path = mock.patch.dict(os.environ, {
+            "PATH": temporary.name + os.pathsep + os.environ.get("PATH", "")})
+        path.start()
+        self.addCleanup(path.stop)
+        # Patching subprocess.run would disable the observation path because
+        # the default runner is bound at definition time. Popen sees every
+        # subprocess.run call without changing that identity.
+        self.cli_calls = []
+        real_popen = subprocess.Popen
+
+        def popen_spy(argv, *args, **kwargs):
+            self.cli_calls.append(list(argv) if isinstance(argv, (list, tuple)) else argv)
+            return real_popen(argv, *args, **kwargs)
+
+        popen = mock.patch.object(subprocess, "Popen", popen_spy)
+        popen.start()
+        self.addCleanup(popen.stop)
+
+    def _read_answering(self, outcome, delay=0.02):
+        """``background_read`` stand-in whose Future a timer thread fills."""
+        future = Future()
+        self.unfinished.append(future)
+        if outcome is not None:
+            timer = threading.Timer(delay, future.set_result, args=(outcome,))
+            timer.daemon = True
+            self.timers.append(timer)
+            timer.start()
+        return future
+
+    def _timed_list_agents(self):
+        started = time.monotonic()
+        result = herdr.list_agents()
+        return result, time.monotonic() - started
+
+    def test_d3a_first_call_waits_for_the_initial_snapshot_without_cli(self):
+        agent = {"agent": "claude", "pane_id": "w1:p1",
+                 "agent_session": {"agent": "claude", "value": "sid-1"}}
+        view = TestView(*self.KEY, 1, 1, agents=(agent,))
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+             mock.patch.object(herdr, "background_read",
+                               side_effect=lambda _read: self._read_answering(view)) as start_read:
+            agents, elapsed = self._timed_list_agents()
+        self.assertEqual(agents, [agent])
+        self.assertLess(elapsed, herdr._OBSERVATION_WAIT_MAX_S + 0.5)
+        start_read.assert_called_once()
+        self.assertEqual(self.cli_calls, [])
+        self.assertIn(self.KEY, herdr._OBSERVATION_FIRST_WAIT_SPENT)
+        herdr.close_observations()
+        self.assertFalse(herdr._OBSERVATION_FIRST_WAIT_SPENT)
+
+    def test_d3b_unanswered_or_incomplete_first_wait_is_bounded_unknown_without_cli(self):
+        incomplete = TestView(*self.KEY, 1, 1, agents=(_CLI_AGENT,), complete=False)
+        for label, outcome in (("never-done", None), ("incomplete", incomplete)):
+            with self.subTest(label):
+                for name in _OBSERVATION_CACHE_NAMES:
+                    getattr(herdr, name).clear()
+                self.cli_calls.clear()
+                with mock.patch.object(herdr, "_observation_module",
+                                       return_value=_module_for()), \
+                     mock.patch.object(herdr, "background_read",
+                                       side_effect=lambda _read: self._read_answering(outcome)):
+                    agents, elapsed = self._timed_list_agents()
+                self.assertIsNone(agents)
+                self.assertLess(elapsed, herdr._OBSERVATION_WAIT_MAX_S + 0.5)
+                self.assertEqual(self.cli_calls, [])
+                self.assertIn(self.KEY, herdr._OBSERVATION_FIRST_WAIT_SPENT)
+
+    def test_d3c_second_call_after_unanswered_first_wait_does_not_wait(self):
+        reads = []
+
+        def start(_read):
+            reads.append(self._read_answering(None))
+            return reads[-1]
+
+        observe = herdr.observation_view
+        with mock.patch.object(herdr, "_observation_module", return_value=_module_for()), \
+             mock.patch.object(herdr, "background_read", side_effect=start), \
+             mock.patch.object(herdr, "observation_view", wraps=observe) as view_spy:
+            first, first_elapsed = self._timed_list_agents()
+            self.assertIsNone(first)
+            self.assertGreaterEqual(first_elapsed, herdr._OBSERVATION_WAIT_MAX_S - 0.05)
+            waits = [call.kwargs.get("wait_timeout", 0.0) for call in view_spy.call_args_list]
+            self.assertEqual(waits, [0.0, herdr._OBSERVATION_WAIT_MAX_S])
+
+            view_spy.reset_mock()
+            second, second_elapsed = self._timed_list_agents()
+            self.assertIsNone(second)
+            self.assertLess(second_elapsed, 0.25)
+            self.assertEqual([call.kwargs.get("wait_timeout", 0.0)
+                              for call in view_spy.call_args_list], [0.0])
+
+            # The first read ends incomplete and a later tick starts a new
+            # read: that consumer still never waits again.
+            reads[0].set_result(TestView(*self.KEY, 1, 1, complete=False))
+            self.assertIsNone(herdr.list_agents())
+            herdr._OBSERVATION_LAST_STARTED[self.KEY] -= 1.0
+            view_spy.reset_mock()
+            third, third_elapsed = self._timed_list_agents()
+            self.assertIsNone(third)
+            self.assertEqual(len(reads), 2)
+            self.assertLess(third_elapsed, 0.25)
+            self.assertEqual([call.kwargs.get("wait_timeout", 0.0)
+                              for call in view_spy.call_args_list], [0.0])
+        self.assertEqual(self.cli_calls, [])
+
+    def test_d3d_without_a_selected_socket_list_agents_keeps_the_cli_path(self):
+        with mock.patch.object(herdr, "_observation_module",
+                               return_value=_module_for(socket_path="", endpoint="default")), \
+             mock.patch.object(herdr, "background_read",
+                               side_effect=AssertionError("no socket read")) as start_read:
+            agents, elapsed = self._timed_list_agents()
+        self.assertEqual(agents, [_CLI_AGENT])
+        self.assertEqual(self.cli_calls, [["herdr", "agent", "list"]])
+        start_read.assert_not_called()
+        self.assertFalse(herdr._OBSERVATION_FIRST_WAIT_SPENT)
+        self.assertLess(elapsed, herdr._TIMEOUT_S)
 
 
 if __name__ == "__main__":
