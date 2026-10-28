@@ -21,6 +21,27 @@ import route_identity
 os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
 
 
+_STATE_TMP = None
+_STATE_OLD = None
+
+
+def setUpModule():
+    # The hard usage reader now consults Fleet's shared gauge cache; keep this
+    # module off the developer's live ~/.local/state store.
+    global _STATE_TMP, _STATE_OLD
+    _STATE_TMP = tempfile.TemporaryDirectory()
+    _STATE_OLD = os.environ.get("FLEET_USAGE_STATE_DIR")
+    os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_TMP.name
+
+
+def tearDownModule():
+    if _STATE_OLD is None:
+        os.environ.pop("FLEET_USAGE_STATE_DIR", None)
+    else:
+        os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_OLD
+    _STATE_TMP.cleanup()
+
+
 class ReplacementTest(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)

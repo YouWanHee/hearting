@@ -2424,15 +2424,15 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         resource = json.loads(registry.read_text())['runs']['fixture-run']
         armed = SUP.read_armed(ledger)['full-run']
         del resource['parent_attempt_id']
-        self.assertTrue(SUP._owner_input_is_current(armed, resource, owner_attempt, 'same-native'))
+        self.assertTrue(SUP._owner_input_is_current(route, armed, resource, owner_attempt, 'same-native'))
         for source in ('att-foreign', None, ''):
             with self.subTest(source=source):
                 resource['parent_attempt_id'] = source
                 self.assertFalse(SUP._owner_input_is_current(
-                    armed, resource, owner_attempt, 'same-native'))
+                    route, armed, resource, owner_attempt, 'same-native'))
         resource['parent_attempt_id'] = owner_attempt
         resource['owner_wait']['parent_attempt_id'] = 'att-foreign'
-        self.assertFalse(SUP._owner_input_is_current(armed, resource, owner_attempt, 'same-native'))
+        self.assertFalse(SUP._owner_input_is_current(route, armed, resource, owner_attempt, 'same-native'))
 
     def test_replacement_owner_rejects_invalid_resource_owner_pid_with_proven_lineage(self):
         for owner_pid in (True, False, 0, -1, 999999999.0, 'invalid', '0', None):

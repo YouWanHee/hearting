@@ -317,6 +317,32 @@ def _comm_of(pid):
         return None
 
 
+# The kernel-fixed inode of the initial PID namespace. A caller in any other one (a
+# container, a sandbox) sees only part of the process table, so an absence it observes
+# proves nothing.
+_INITIAL_PID_NAMESPACE = "pid:[4026531836]"
+
+
+def initial_pid_namespace():
+    """True when this process runs in the initial PID namespace; unreadable is False."""
+    try:
+        return os.readlink("/proc/self/ns/pid") == _INITIAL_PID_NAMESPACE
+    except OSError:
+        return False
+
+
+def boot_time():
+    """Kernel boot time (epoch seconds) from /proc/stat, or None."""
+    try:
+        with open("/proc/stat", encoding="ascii", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def provenance(pid, max_depth=6):
     """Best-effort launcher lineage: 'herdr' | 'terminal' | 'vscode' | 'worker' | None.
 

@@ -49,7 +49,7 @@ def _proc_start(pid):
         return None
 
 
-def _child_main(evidence_dir, explorer=False):
+def _child_main(evidence_dir, explorer=False, refresh_interval=20.0):
     from fleet import control, gitinfo, render
     from fleet.model import Session
     from fleet.refresh import LiveSnapshot, set_required_details
@@ -95,7 +95,11 @@ def _child_main(evidence_dir, explorer=False):
                             liveness="working", elapsed_min=i + 1)
                     for i, item in enumerate(fixture_vm.sessions)]
 
+    collects = [0]
+
     def collect_all(**_kwargs):
+        # Every call publishes a new snapshot object, so each refresh ages the painted hit map.
+        collects[0] += 1
         observed_at = time.time()
         snapshot = LiveSnapshot(sessions=list(sessions), observations={
             "basic": {"state": "ok", "generation_identity": "pty-fixture-generation",
@@ -177,6 +181,7 @@ def _child_main(evidence_dir, explorer=False):
         h, w = stdscr.getmaxyx()
         state = {"utc": _utc(), "monotonic": time.monotonic(),
                  "frame": frame_count[0], "size": [h, w],
+                 "collects": collects[0],
                  "hit_valid": bool(render._HIT_VALID),
                  "offset": int(render._OFFSET),
                  "body_top": int(render._CURRENT_BODY_TOP),
@@ -312,7 +317,7 @@ def _child_main(evidence_dir, explorer=False):
           synthetic_sessions=[{"pid": s.pid, "proc_start": s.proc_start,
                                "session_id": s.session_id} for s in sessions])
     try:
-        curses.wrapper(render._loop, collect_all, None, "both", 20.0)
+        curses.wrapper(render._loop, collect_all, None, "both", float(refresh_interval))
         event("fixture-exit", status="normal")
         return 0
     except BaseException as exc:
@@ -329,6 +334,8 @@ class PtyRun:
         self.mode = ("live-capture" if self.live_capture else
                      "default" if "FLEET_MOUSE" not in os.environ else "opt-out")
         self.explorer = False
+        self.click_measure = False
+        self.refresh_interval = None
         self.transcript = bytearray()
         self.inputs = []
         self.assertions = []
@@ -486,6 +493,8 @@ class PtyRun:
                        "--evidence-dir", str(self.evidence_dir)]
             if self.explorer:
                 command.append("--explorer")
+            if self.refresh_interval is not None:
+                command.extend(["--refresh-interval", str(float(self.refresh_interval))])
         self.child = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave,
                                       cwd=str(REPO_ROOT), env=child_env, close_fds=True,
                                       start_new_session=True)
@@ -813,6 +822,8 @@ class PtyRun:
         try:
             if self.live_capture:
                 self.run_live_capture()
+            elif self.explorer and self.click_measure:
+                self.run_click_measure()
             elif self.explorer:
                 self.run_explorer()
             elif self.mode == "default":
@@ -1242,6 +1253,231 @@ class PtyRun:
                    {"before": settled["explorer"]["state"], "after": after["explorer"]["state"],
                     "frames": [frames_before, after["frame"]]})
 
+    def run_click_measure(self, clicks=20, pause=0.3, press_retries=6):
+        """Click four session targets ``clicks`` times each while snapshots keep refreshing.
+
+        Targets: a tree session row (x < 32), an OVERVIEW session fold row, a repo page
+        session row (x >= 32, ``("scope", tag)``) and the unfolded row's ``(open ▸)`` link.
+        A click is a press packet and, 50 ms later, a release packet at one cell, sent after a
+        ``pause`` at human pace. Every dispatch's ``current`` flag is kept. A click whose press
+        was not adopted (``current=False``: a refresh aged the hit map) changed nothing and is
+        clicked again, up to ``press_retries`` times; those attempts are counted as press
+        losses. Each result is read from the frame painted after the loop decoded every packet
+        sent, so a slow loop cannot interleave two steps. Resets use Backspace, which the loop
+        never drops (a lone ESC can swallow the next mouse packet). The counts land in
+        ``click-measure.json``.
+        """
+        pressed_mask = getattr(curses, "BUTTON1_PRESSED", 0)
+        released_mask = getattr(curses, "BUTTON1_RELEASED", 0)
+        records, setup = [], []
+        first = self.wait_for("initial explorer frame",
+                              lambda s: s.get("hit_valid") and s.get("explorer", {}).get("hit_count"),
+                              timeout=5.0)
+        self.drain(0.3)
+
+        def nav(sample):
+            return ((sample or {}).get("explorer") or {}).get("state") or {}
+
+        def hits(sample):
+            return ((sample or {}).get("explorer") or {}).get("hits") or []
+
+        decoded_kinds = ("decoded-mouse-read", "decoded-key-read")
+        decoded_base = sum(row.get("kind") in decoded_kinds for row in self.read_events())
+        sent = [0]
+
+        def send(data, label):
+            sent[0] += 1                       # one SGR packet or one key: one decoded read
+            self.send(data, label)
+
+        def processed(timeout=3.0):
+            """The frame painted after the loop decoded (and so handled) every packet sent."""
+            end = time.monotonic() + timeout
+            while time.monotonic() < end and self.child.poll() is None:
+                decoded = [row for row in self.read_events() if row.get("kind") in decoded_kinds]
+                if len(decoded) - decoded_base >= sent[0]:
+                    sample = self.state()
+                    if sample and (not decoded or
+                                   sample.get("monotonic", 0) > decoded[-1]["monotonic"]):
+                        return sample
+                self.drain(0.02)
+            return self.state() or {}
+
+        def attempt(target, hit, dx, expect):
+            self.drain(pause)
+            x, y = hit[1] + dx, hit[0]
+            start = len(self.read_events())
+            before = nav(self.state())
+            send(b"\x1b[<0;%d;%dM" % (x + 1, y + 1), "measure-%s-press" % target)
+            self.drain(0.05)
+            send(b"\x1b[<0;%d;%dm" % (x + 1, y + 1), "measure-%s-release" % target)
+            after = processed()
+            ok = bool(expect(nav(after)))
+            rows = [row for row in self.read_events()[start:]
+                    if row.get("kind") == "explorer-mouse-dispatch"
+                    and row.get("x") == x and row.get("y") == y]
+            press = [row for row in rows if int(row.get("bstate") or 0) & pressed_mask]
+            release = [row for row in rows if int(row.get("bstate") or 0) & released_mask]
+            return {"x": x, "y": y, "action": hit[3], "success": ok,
+                    "press_dispatched": len(press), "release_dispatched": len(release),
+                    "press_not_current": sum(not row.get("current") for row in press),
+                    "release_not_current": sum(not row.get("current") for row in release),
+                    "before": {key: before.get(key) for key in ("scope", "opened")},
+                    "after": {key: nav(after).get(key) for key in ("scope", "opened")}}
+
+        def click(target, find, dx, expect, log):
+            tries = []
+            for _ in range(press_retries + 1):
+                hit = find()
+                if hit is None:
+                    break
+                tries.append(attempt(target, hit, dx, expect))
+                last = tries[-1]
+                press_lost = (not last["success"] and last["press_dispatched"]
+                              and last["press_not_current"] == last["press_dispatched"])
+                if not press_lost:
+                    break
+            row = {"target": target, "success": bool(tries and tries[-1]["success"]),
+                   "absent": not tries, "attempts": tries}
+            log.append(row)
+            return row["success"]
+
+        def key_until(label, data, predicate, tries=6):
+            for _ in range(tries):
+                sample = processed()
+                if predicate(sample):
+                    return True
+                send(data, label)
+            return bool(predicate(processed()))
+
+        def to_list():
+            return key_until("measure-reset-backspace", b"\x7f",
+                             lambda s: nav(s).get("scope") == "-"
+                             and not (s.get("explorer") or {}).get("tree_drag"))
+
+        def fold_hit(tag):
+            return next((hit for hit in hits(self.state())
+                         if hit[3] == ["fold", "sopen:OVERVIEW", tag]), None)
+
+        def ensure_open(tag):
+            for _ in range(5):
+                if nav(self.state()).get("opened") == tag:
+                    return True
+                click("fold-setup", lambda: fold_hit(tag), 4,
+                      lambda st: st.get("opened") == tag, setup)
+            return nav(self.state()).get("opened") == tag
+
+        collects_before = int(first.get("collects") or 0)
+        frames_before = int(first.get("frame") or 0)
+        started = time.monotonic()
+        self.check("measurement starts on the OVERVIEW list", to_list(), nav(self.state()))
+
+        # (B) OVERVIEW session fold row: each click toggles the in-place fold.
+        fold_tag = next(hit[3][2] for hit in hits(self.state())
+                        if hit[3][:2] == ["fold", "sopen:OVERVIEW"])
+        for _ in range(clicks):
+            want = "" if nav(self.state()).get("opened") == fold_tag else fold_tag
+            click("overview_fold", lambda: fold_hit(fold_tag), 4,
+                  lambda st, want=want: st.get("opened") == want, records)
+
+        # (D) the unfolded row's (open ▸) link goes to the session page.
+        def link_hit():
+            return next((hit for hit in hits(self.state())
+                         if hit[3] == ["page", "session", fold_tag]), None)
+
+        for _ in range(clicks):
+            to_list()
+            ensure_open(fold_tag)
+            click("open_link", link_hit, 1,
+                  lambda st: st.get("scope") == "session:" + fold_tag, records)
+
+        # (A) tree session rows (x < 32): alternate two rows so every success changes scope.
+        to_list()
+        tree = [hit for hit in hits(self.state())
+                if hit[3][:1] == ["scope"] and hit[2] <= 32 and ":" not in str(hit[3][1])]
+        tags = [tree[0][3][1], next(hit[3][1] for hit in tree if hit[3][1] != tree[0][3][1])]
+
+        def tree_hit(tag):
+            return next((hit for hit in hits(self.state())
+                         if hit[3] == ["scope", tag] and hit[2] <= 32), None)
+
+        for _ in range(clicks):
+            tag = tags[1] if nav(self.state()).get("scope") == "session:" + tags[0] else tags[0]
+            click("tree_session", lambda tag=tag: tree_hit(tag), 2,
+                  lambda st, tag=tag: st.get("scope") == "session:" + tag, records)
+
+        # (C) a repo page's session row (x >= 32, ("scope", tag)); Backspace returns to the repo.
+        to_list()
+        repo_scope = next(hit[3][1] for hit in hits(self.state())
+                          if hit[3][:1] == ["scope"] and str(hit[3][1]).startswith("repo:")
+                          and hit[2] <= 32)
+
+        def to_repo():
+            key_until("measure-repo-backspace", b"\x7f",
+                      lambda s: nav(s).get("scope") in (repo_scope, "-")
+                      and not (s.get("explorer") or {}).get("tree_drag"), tries=3)
+            for _ in range(5):
+                if nav(self.state()).get("scope") == repo_scope:
+                    return True
+                click("repo-setup", lambda: tree_hit(repo_scope), 2,
+                      lambda st: st.get("scope") == repo_scope, setup)
+            return nav(self.state()).get("scope") == repo_scope
+
+        page_tag = [None]
+
+        def page_row():
+            row = next((hit for hit in hits(self.state()) if hit[3][:1] == ["scope"]
+                        and hit[1] >= 32 and ":" not in str(hit[3][1])
+                        and page_tag[0] in (None, hit[3][1])), None)
+            if row is not None:
+                page_tag[0] = row[3][1]
+            return row
+
+        for _ in range(clicks):
+            if not to_repo():
+                records.append({"target": "repo_page_session", "success": False,
+                                "absent": True, "attempts": []})
+                continue
+            click("repo_page_session", page_row, 4,
+                  lambda st: st.get("scope") == "session:" + str(page_tag[0]), records)
+
+        last = self.state() or {}
+        summary = {}
+        for target in ("tree_session", "overview_fold", "repo_page_session", "open_link"):
+            rows = [row for row in records if row.get("target") == target]
+            tries = [item for row in rows for item in row["attempts"]]
+            finals = [row["attempts"][-1] for row in rows if row["attempts"]]
+            summary[target] = {
+                "clicks": len(rows), "success": sum(row["success"] for row in rows),
+                "first_attempt_success": sum(bool(row["attempts"] and row["attempts"][0]["success"])
+                                             for row in rows),
+                "absent": sum(bool(row["absent"]) for row in rows),
+                "attempts": len(tries),
+                "press_lost_reclicked": sum(max(0, len(row["attempts"]) - 1) for row in rows) + sum(
+                    1 for item in finals if not item["success"] and item["press_dispatched"]
+                    and item["press_not_current"] == item["press_dispatched"]),
+                "press_not_current": sum(item["press_not_current"] for item in tries),
+                "release_not_current": sum(item["release_not_current"] for item in tries),
+                "release_lost": sum(1 for item in finals if not item["success"]
+                                    and not item["press_not_current"]
+                                    and item["release_not_current"]),
+                "lost_with_all_current": sum(1 for item in finals if not item["success"]
+                                             and not item["press_not_current"]
+                                             and not item["release_not_current"])}
+        result = {"clicks_per_target": clicks, "pause_seconds": pause,
+                  "press_retries": press_retries,
+                  "refresh_interval_seconds": self.refresh_interval,
+                  "elapsed_seconds": round(time.monotonic() - started, 3),
+                  "snapshot_collects": int(last.get("collects") or 0) - collects_before,
+                  "frames": int(last.get("frame") or 0) - frames_before,
+                  "size": last.get("size"), "targets": summary,
+                  "tags": {"overview_fold": fold_tag, "tree_session": tags,
+                           "repo_page": repo_scope, "repo_page_session": page_tag[0]},
+                  "records": records, "setup_clicks": setup,
+                  "button1_pressed": pressed_mask, "button1_released": released_mask}
+        _write_json(self.evidence_dir / "click-measure.json", result)
+        self.check("click measurement covered every target",
+                   all(summary[target]["clicks"] == clicks for target in summary), summary)
+
     def read_jsonl(self, name):
         try:
             path = self.evidence_dir / name
@@ -1258,14 +1494,22 @@ def main():
     parser.add_argument("--explorer", action="store_true", help="exercise the explorer in the PTY")
     parser.add_argument("--live-capture", action="store_true",
                         help="capture the host-backed explorer in the PTY")
+    parser.add_argument("--click-measure", action="store_true",
+                        help="with --explorer: count session clicks adopted under refresh")
+    parser.add_argument("--refresh-interval", type=float, default=None,
+                        help="fixture snapshot interval in seconds (default 20)")
     parser.add_argument("--cols", type=int, default=120)
     parser.add_argument("--rows", type=int, default=40)
     args = parser.parse_args()
     if args._fixture_child:
-        return _child_main(args.evidence_dir, explorer=args.explorer)
+        return _child_main(args.evidence_dir, explorer=args.explorer,
+                           refresh_interval=(20.0 if args.refresh_interval is None
+                                             else args.refresh_interval))
     run = PtyRun(args.evidence_dir, cols=args.cols, rows=args.rows,
                  live_capture=args.live_capture)
     run.explorer = args.explorer
+    run.click_measure = args.click_measure
+    run.refresh_interval = args.refresh_interval
     result = run.execute()
     print(json.dumps({"mode": result["mode"], "passed": result["passed"],
                       "returncode": result["returncode"],

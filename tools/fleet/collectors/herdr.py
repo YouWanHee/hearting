@@ -40,6 +40,8 @@ _OBSERVATION_VIEWS = {}
 _OBSERVATION_ERRORS = {}
 _OBSERVATION_LAST_STARTED = {}
 _OBSERVATION_REFRESH_PENDING = {}
+# Endpoint/socket keys whose one bounded first ``list_agents`` wait was used.
+_OBSERVATION_FIRST_WAIT_SPENT = set()
 _OBSERVATION_MIN_REFRESH_S = 0.25
 _PANE_INFO_CACHE = OrderedDict()
 _PANE_INFO_CACHE_LIMIT = 512
@@ -178,6 +180,29 @@ def _observation_error(session=None):
     return None
 
 
+def _spend_first_observation_wait(session=None):
+    """True once per endpoint/socket that has not yet produced a complete view.
+
+    A fresh process's first read only starts the subscription; one-shot
+    consumers would otherwise always see "unknown". The wait is spent whatever
+    its outcome, so a long-running consumer never blocks after its first call.
+    """
+    try:
+        observation = _observation_module()
+        endpoint = observation.endpoint_name(session)
+        socket_path = observation.socket_path_for_endpoint(session)
+        if not socket_path:
+            return False
+        key = (endpoint, os.path.realpath(socket_path))
+        with _OBSERVATION_LOCK:
+            if key in _OBSERVATION_VIEWS or key in _OBSERVATION_FIRST_WAIT_SPENT:
+                return False
+            _OBSERVATION_FIRST_WAIT_SPENT.add(key)
+            return True
+    except Exception:
+        return False
+
+
 def close_observations():
     """Close endpoint subscriptions when their Fleet consumer exits."""
     with _OBSERVATION_LOCK:
@@ -189,6 +214,7 @@ def close_observations():
         _OBSERVATION_ERRORS.clear()
         _OBSERVATION_LAST_STARTED.clear()
         _OBSERVATION_REFRESH_PENDING.clear()
+        _OBSERVATION_FIRST_WAIT_SPENT.clear()
         _PANE_INFO_CACHE.clear()
     if futures:
         wait(futures, timeout=0.8)
@@ -227,6 +253,8 @@ def list_agents(runner=subprocess.run, which=shutil.which):
     if runner is subprocess.run and which is shutil.which:
         observation = _observation_module()
         view = observation_view()
+        if view is None and _spend_first_observation_wait():
+            view = observation_view(wait_timeout=_OBSERVATION_WAIT_MAX_S)
         if view is not None:
             return [dict(agent) for agent in view.agents]
         # An explicitly selected socket that did not produce a complete

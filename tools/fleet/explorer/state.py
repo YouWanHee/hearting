@@ -100,6 +100,19 @@ def _scroll_region(frame, name):
     return tuple(region) if isinstance(region, (list, tuple)) else ()
 
 
+def _tree_release_on_press(drag, x, y, frame):
+    """An unmoved tree press released on what it grabbed: its own cell, or a hit of that identity.
+
+    The press cell uses the motion threshold (same row, under two columns). Any other release
+    position counts only on a hit whose action is the grabbed ``("scope", identity)``.
+    """
+    if y == int(drag[5]) and abs(x - int(drag[4])) < 2:
+        return True
+    hit = next((item for item in getattr(frame, "hits", ())
+                if item.y == y and item.x0 <= x < item.x1), None)
+    return hit is not None and tuple(hit.action[:2]) == ("scope", drag[3])
+
+
 _QUESTION_REF_FIELDS = ("id", "harness", "session_id", "request_id", "turn_id",
                         "route_id", "question_id")
 _QUESTION_DRAFT_PREFIX = "hearting-question-draft:v1:"
@@ -1004,6 +1017,16 @@ def _reduce(state, event, frame=None):
             if phase == "release":
                 if state.drag and state.drag[0] == "tree":
                     drag = state.drag
+                    if not drag[8]:
+                        # An unmoved press is a click on the identity it grabbed, wherever that
+                        # row is drawn: the tree or a ("scope", …) row of the right pane. It is
+                        # confirmed before the tree-only bounds below. Only motion packets set
+                        # drag[8], so a release away from the press (motion never reported or not
+                        # adopted) is a click only on a hit with the same identity.
+                        if _tree_release_on_press(drag, x, y, frame):
+                            return reduce(replace(state, drag=()),
+                                          {"type": "click", "action": ("scope", drag[3])}, frame)
+                        return replace(state, drag=()), ()
                     if x >= 32 or y < 0 or y >= int(getattr(frame, "rows", 0)):
                         return replace(state, drag=()), ()
                     if drag[7] and drag[8]:
@@ -1018,9 +1041,6 @@ def _reduce(state, event, frame=None):
                                 getattr(ordering.get("repo_by_tag", {}), "get", lambda _key: None)(drag[2]))
                         if source and repo is not None:
                             return replace(state, drag=()), (("reorder", drag[1], repo, source, target),)
-                    if not drag[8]:
-                        return reduce(replace(state, drag=()),
-                                      {"type": "click", "action": ("scope", drag[3])}, frame)
                     return replace(state, drag=()), ()
                 return replace(state, drag=()), ()
             if event.get("motion") and state.drag:
