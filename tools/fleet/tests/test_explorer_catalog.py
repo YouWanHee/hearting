@@ -352,3 +352,7 @@ class ModelCatalogTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {**env, "OPENCODE_CONFIG": config_path}, clear=False):
                 overridden = model_catalog._opencode_configured_providers()
             self.assertEqual(overridden, {"file-provider", "inline-provider"})
+
+
+if __name__ == "__main__":
+    unittest.main()
