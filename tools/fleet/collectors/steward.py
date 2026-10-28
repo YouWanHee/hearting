@@ -29,6 +29,11 @@ def _peer_message_module():
     return peer_messages._load_peer_message()
 
 
+def _utilities_dir():
+    """The repository (or installed release) ``utilities`` directory."""
+    return Path(__file__).resolve().parents[3] / "utilities"
+
+
 def read_markers():
     """``{(harness, session_id): marker}`` over every ledger root the board reads (the
     F-98d resolver chain plus each installed runtime's own root); empty on any failure."""
@@ -50,7 +55,7 @@ def read_relations():
     """Read confirmed current holders without projecting a marker onto a successor SID."""
     try:
         import sys
-        utilities = Path(__file__).resolve().parents[2] / "utilities"
+        utilities = _utilities_dir()
         if str(utilities) not in sys.path:
             sys.path.insert(0, str(utilities))
         import dispatch_seat_handover
@@ -138,7 +143,8 @@ def _native_role_sessions(markers, rows, relations=()):
     """Exact native directory metadata for evidenced actors/targets absent from the snapshot.
 
     An OpenCode pane can omit its SID, and old process registry files can be
-    absent. Read only named actors and evidenced targets from the native metadata tables, never
+    absent. Read only named actors and evidenced targets from the native metadata tables
+    (OpenCode ``session_v2`` first, then the legacy ``session`` table), never
     conversation bodies, process state, or an inferred same-cwd identity.
     """
     from . import codex, opencode
@@ -165,9 +171,12 @@ def _native_role_sessions(markers, rows, relations=()):
             if sid:
                 wanted.add((harness, sid))
     out = []
-    for harness, db, table, column in (
-            ("codex", codex._state_db(codex._home()), "threads", "cwd"),
-            ("opencode", opencode._db(), "session", "directory")):
+    for harness, db, queries in (
+            ("codex", codex._state_db(codex._home()),
+             ("SELECT cwd FROM threads WHERE id=?",)),
+            ("opencode", opencode._db(),
+             ("SELECT directory FROM session_v2 WHERE id=?",
+              "SELECT directory FROM session WHERE id=?"))):
         ids = sorted({sid for h, sid in wanted if h == harness and sid
                       and (h, sid) not in present})
         if not ids or not db:
@@ -176,10 +185,15 @@ def _native_role_sessions(markers, rows, relations=()):
             with closing(sqlite3.connect(Path(db).absolute().as_uri() + "?mode=ro",
                                          uri=True, timeout=0.2)) as con:
                 for sid in ids:
-                    result = con.execute("SELECT %s FROM %s WHERE id=?" % (column, table),
-                                         (sid,)).fetchone()
-                    if result and isinstance(result[0], str) and result[0]:
-                        out.append(SimpleNamespace(harness=harness, session_id=sid, cwd=result[0]))
+                    for query in queries:
+                        try:
+                            result = con.execute(query, (sid,)).fetchone()
+                        except sqlite3.OperationalError:
+                            continue
+                        if result and isinstance(result[0], str) and result[0]:
+                            out.append(SimpleNamespace(harness=harness, session_id=sid,
+                                                       cwd=result[0]))
+                            break
         except (OSError, sqlite3.Error):
             continue
     return out
@@ -208,7 +222,7 @@ def _role_winners(markers, rows, evidence, relations=()):
     resolved = []
     try:
         import sys
-        utilities = Path(__file__).resolve().parents[2] / "utilities"
+        utilities = _utilities_dir()
         if str(utilities) not in sys.path:
             sys.path.insert(0, str(utilities))
         import dispatch_seat_handover as handover
@@ -423,8 +437,9 @@ def _registry_record(harness, session_id):
 
 
 class _EndObservation:
-    """One pass's reading of the live Codex/OpenCode processes, taken lazily and at most
-    once per harness, so a pass with only Claude holders reads no /proc at all."""
+    """One pass's reading of the live Claude/Codex/OpenCode session holders, taken lazily
+    and at most once per harness, so a pass whose holders all have herdr rows reads no
+    /proc."""
 
     def __init__(self):
         self._seen = {}
@@ -436,6 +451,16 @@ class _EndObservation:
             except Exception:
                 self._seen[harness] = None
         return self._seen[harness]
+
+    def claude(self):
+        def read():
+            import sys
+            utilities = str(_utilities_dir())
+            if utilities not in sys.path:
+                sys.path.insert(0, utilities)
+            import recipient_lifetime
+            return recipient_lifetime.RecipientCensus()
+        return self._once("claude", read)
 
     def codex(self):
         from . import codex
@@ -453,11 +478,19 @@ def end_observation():
 
 def _process_proof(harness, session_id, observation):
     """``"live"`` | ``"ended"`` | ``"unknown"`` from the runtime's own session-ownership
-    proof, read backwards: a Codex rollout nobody holds open, or an OpenCode session no
+    proof, read backwards: a Claude session no live Claude process claims (registry, exact
+    tap, launch argument) under a complete census while it exists in native
+    history/transcripts, a Codex rollout nobody holds open, or an OpenCode session no
     client shows and no running runtime can still be running. Only a complete observation
     can say ``ended``; an unreadable table or a PID namespace that hides processes is
     ``unknown``."""
     try:
+        if harness == "claude":
+            census = observation.claude()
+            if census is None:
+                return "unknown"
+            return {"alive": "live", "ended": "ended"}.get(
+                census.state("claude", session_id), "unknown")
         if harness == "codex":
             seen = observation.codex()
             if not seen:
@@ -490,8 +523,8 @@ def _process_proof(harness, session_id, observation):
 
 def session_liveness(harness, session_id, *, agents=None, observation=None):
     """``"live"`` | ``"ended"`` | ``"unknown"``. Only proof of exit says ``ended``:
-    a herdr row means live; Codex and OpenCode then answer from the processes that hold
-    the session (``_process_proof``); otherwise the registry record's process is checked
+    a herdr row means live; Claude, Codex and OpenCode then answer from the processes that
+    hold the session (``_process_proof``); otherwise the registry record's process is checked
     (dead pid, recycled pid, or an ``exited`` status). Anything unobserved is
     ``unknown`` and keeps counting."""
     harness = str(harness or "").lower()
@@ -508,7 +541,7 @@ def session_liveness(harness, session_id, *, agents=None, observation=None):
         if (str(agent.get("agent") or "").lower() == harness and isinstance(identity, dict)
                 and identity.get("value") == session_id):
             return "live"
-    if harness in ("codex", "opencode"):
+    if harness in ("claude", "codex", "opencode"):
         observation = end_observation() if observation is None else observation
         proof = _process_proof(harness, session_id, observation)
         if proof == "live":
@@ -565,6 +598,35 @@ def _holder_name(harness, session_id, rows):
         return None
 
 
+def _superseded_holders(relations):
+    """``{(generation, harness, sid)}`` of holders a confirmed successor already replaced.
+
+    One generation can sit under several seat keys, so a hand-over chain a -> b -> c shows
+    up as three unreleased relations. Only the chain end holds the role: a holder that
+    some lineage entry of its generation names as ``from`` is mid-chain. A fork (several
+    ends) or a lineage that leaves no end drops nothing."""
+    holders, origins = {}, {}
+    for relation in relations:
+        if relation.get("released") is True or not relation.get("generation"):
+            continue
+        holder = relation.get("holder") or {}
+        harness = str(holder.get("harness") or "").lower()
+        sid = holder.get("sid")
+        if not sid:
+            continue
+        generation = str(relation["generation"])
+        holders.setdefault(generation, set()).add((harness, sid))
+        for entry in relation.get("lineage") or ():
+            if isinstance(entry, dict) and entry.get("from"):
+                origins.setdefault(generation, set()).add((harness, entry["from"]))
+    out = set()
+    for generation, members in holders.items():
+        middle = members & origins.get(generation, set())
+        if len(members) > 1 and middle and members - middle:
+            out.update((generation, harness, sid) for harness, sid in middle)
+    return out
+
+
 def _repo_holders(repository_key, *, markers=None, relations=None, sessions=None, agents=None,
                   observation=None, _rows=None):
     """Distinct current holders attributed to ``repository_key``.
@@ -590,6 +652,7 @@ def _repo_holders(repository_key, *, markers=None, relations=None, sessions=None
         except Exception:
             agents = None
     out, seen = [], set()
+    superseded = _superseded_holders(relations)
     for relation in relations:
         if relation.get("released") is True:
             continue
@@ -597,6 +660,8 @@ def _repo_holders(repository_key, *, markers=None, relations=None, sessions=None
         harness = str(holder.get("harness") or "").lower()
         sid = holder.get("sid")
         if not sid or (harness, sid) in seen:
+            continue
+        if (str(relation.get("generation")), harness, sid) in superseded:
             continue
         row_repository = repository_for_session(harness, sid, sessions=rows)
         basis = None
@@ -645,13 +710,14 @@ def supervision_by_repository(sessions=None, *, limit=None, markers=None, relati
     rows = _context_rows(markers, relations, sessions)
     observation = end_observation() if observation is None else observation
     keys = set()
+    superseded = _superseded_holders(relations)
     for relation in relations:
         if relation.get("released") is True:
             continue
         holder = relation.get("holder") or {}
         harness = str(holder.get("harness") or "").lower()
         sid = holder.get("sid")
-        if not sid:
+        if not sid or (str(relation.get("generation")), harness, sid) in superseded:
             continue
         key = repository_for_session(harness, sid, sessions=rows)
         if key is None:

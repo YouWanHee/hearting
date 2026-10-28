@@ -614,10 +614,13 @@ class StewardCheckReactivationTest(CheckBase):
 
 
 class _StubObservation:
-    """A fixed Codex/OpenCode process observation, as ``steward.end_observation()`` returns."""
+    """A fixed Claude/Codex/OpenCode observation, as ``steward.end_observation()`` returns."""
 
-    def __init__(self, codex=None, opencode=None):
-        self._codex, self._opencode = codex, opencode
+    def __init__(self, codex=None, opencode=None, claude=None):
+        self._codex, self._opencode, self._claude = codex, opencode, claude
+
+    def claude(self):
+        return self._claude
 
     def codex(self):
         return self._codex
@@ -631,6 +634,7 @@ class StewardCheckProcessProofTest(CheckBase):
 
     CODEX_SID = "11111111-2222-3333-4444-555555555555"
     OPENCODE_SID = "ses_ended0000000000000000"
+    CLAUDE_SID = "cccccccc-2222-3333-4444-555555555555"
 
     def setUp(self):
         super().setUp()
@@ -662,6 +666,13 @@ class StewardCheckProcessProofTest(CheckBase):
     def opencode_seen(self, *, visible=(), complete=True, earliest=5_000):
         self.observation = _StubObservation(opencode={
             "complete": complete, "visible": frozenset(visible), "earliest_start_ms": earliest})
+
+    def claude_seen(self, **states):
+        """The Claude census, with each recipient's state fixed (default ``unknown``)."""
+        import recipient_lifetime
+        by_sid = {self.CLAUDE_SID if key == "main" else key: value for key, value in states.items()}
+        self.observation = _StubObservation(claude=recipient_lifetime.RecipientCensus(
+            lambda harness, sid: by_sid.get(sid, "unknown")))
 
     def duty_of(self, harness, sid):
         return self.store.get(SC.duty_id(harness, sid))
@@ -734,6 +745,47 @@ class StewardCheckProcessProofTest(CheckBase):
         self.assertEqual({t["name"]: t["liveness"] for t in seen["targets"]},
                          {"cx": "ended", "oc": "live"})
         self.assertEqual(self.factory.call_count, 1)
+
+
+    def test_s7_ended_claude_holder_retires_at_due_without_a_notice(self):
+        self.claude_seen(main="ended")
+        duty = self.due("claude", self.CLAUDE_SID)
+        self.assertEqual((duty["state"], duty["observation"]["reason"]),
+                         ("complete", "session-ended"))
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_s8_claude_holder_that_ends_after_the_notice_retires_it(self):
+        self.claude_seen(main="alive")
+        duty = self.due("claude", self.CLAUDE_SID)
+        self.assertEqual(duty["observation"]["phase"], "notified")
+        delivery_id = duty["observation"]["notice_delivery_id"]
+        self.claude_seen(main="ended")
+        SC.advance(self.duty_of("claude", self.CLAUDE_SID), self.store, now=T0 + INTERVAL + 100)
+        duty = self.duty_of("claude", self.CLAUDE_SID)
+        self.assertEqual((duty["state"], duty["observation"]["reason"]),
+                         ("complete", "session-ended"))
+        self.assertEqual(SC._notice_record(self.CLAUDE_SID, delivery_id)["state"], "rejected")
+
+    def test_s9_alive_or_unknown_claude_holder_keeps_the_duty(self):
+        self.claude_seen(main="unknown")
+        duty = self.due("claude", self.CLAUDE_SID)
+        self.assertEqual((duty["state"], duty["observation"]["phase"]), ("pending", "notified"))
+        alive = "dddddddd-2222-3333-4444-555555555555"
+        self.claude_seen(**{alive: "alive"})
+        self.assertEqual(self.due("claude", alive)["state"], "pending")
+
+    def test_s10_reconcile_all_skips_the_ended_claude_holder_with_one_observation(self):
+        gone, kept, unsure = ("ended-" + "0" * 8, "alive-" + "0" * 8, "unsure-" + "0" * 8)
+        self.claude_seen(**{gone: "ended", kept: "alive"})
+        relations = [{"released": False, "origin": {"harness": "claude", "sid": sid},
+                      "holder": {"harness": "claude", "sid": sid}, "targets": [{"name": "w"}]}
+                     for sid in (gone, kept, unsure)]
+        with mock.patch.object(SC, "_relations", return_value=relations):
+            SC.reconcile_all(self.store)
+        self.assertEqual(self.factory.call_count, 1)
+        self.assertIsNone(self.duty_of("claude", gone))
+        self.assertEqual(self.duty_of("claude", kept)["state"], "pending")
+        self.assertEqual(self.duty_of("claude", unsure)["state"], "pending")
 
 
 class StewardCheckEscTest(CheckBase):
