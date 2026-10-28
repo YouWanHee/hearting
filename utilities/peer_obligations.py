@@ -1024,10 +1024,10 @@ def _delivery_peer_module():
     return module
 
 
-def _exact_delivery_receipt(message):
+def _exact_delivery_receipt(message, roots=None):
     """Reuse the receiver's existing immutable-transfer/native-history proof."""
     try:
-        return _delivery_peer_module()._validated_pending_receiver_proof(message) is not None
+        return _delivery_peer_module()._validated_pending_receiver_proof(message, roots=roots) is not None
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return False
 
@@ -1094,7 +1094,7 @@ def _ordinary_notice_delivery(message, roots=None, *, received_only=False,
             or message.get("state") not in {"pending", "queued", "unverified", "received"}
             or (received_only and (message.get("state") != "received"
                 or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"}
-                or not _exact_delivery_receipt(message)))):
+                or not _exact_delivery_receipt(message, roots)))):
         return
     required = {"schema", "duty_id", "jobs", "carrier", "delivery_id",
                 "receipt_digest", "recipient", "route_id", "route_node"}
@@ -1211,7 +1211,7 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False,
                                   original_body=None):
     if (received_only and (message.get("state") != "received"
             or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"}
-            or not _exact_delivery_receipt(message))):
+            or not _exact_delivery_receipt(message, roots))):
         return
     if message.get("state") not in {"pending", "queued", "unverified", "received"}:
         return
@@ -1337,9 +1337,25 @@ def _registered_delivery_bindings(message, roots=None, *, received_only=False,
                 or (record.get("row_revisions") or {}).get(row.attempt_id)
                     != row.metadata.get("delivery_row_revision"))):
             return
-        record = _delivery_record_for_body(message, record, storage, original_body=original_body)
-        if record is None:
-            return
+        bound_record = _delivery_record_for_body(message, record, storage, original_body=original_body)
+        if bound_record is None:
+            # Old consumed peer envelopes discarded their body and predate the
+            # marker protocol. Verify their already-written ACK against the
+            # frozen registry identity; this branch never admits a send or ACK write.
+            from dispatch_completion_join import pending_record_identity
+            if (not received_only or require_current_recipient or record.get("state") != "acked"
+                    or record.get("acked_by") != "peer-received:" + message["ref"]
+                    or message.get("receipt") != "exact-peer-ref"
+                    or message.get("text") is not None or message.get("body_ref") is not None
+                    or producer is not None or row.metadata.get("delivery_intent") != "1"
+                    or row.metadata.get("delivery_id") != delivery_id
+                    or record.get("attempt_ids") != [row.attempt_id]
+                    or (record.get("route_id"), record.get("route_node"), record.get("parent_attempt_id"))
+                       != pending_record_identity(row.metadata, jobs)):
+                return
+            from dispatch_recipient_receipt import IDENTITY_KEY
+            bound_record = {**record, IDENTITY_KEY: pending.received_ack_identity(record, storage, delivery_id)}
+        record = bound_record
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return
     yield store, duty, row, record, root, storage, delivery_id
@@ -1398,7 +1414,7 @@ def _session_notice_delivery_bindings(message, roots=None, *, received_only=Fals
         return
     if (received_only and (message.get("state") != "received"
             or message.get("receipt") not in {"exact-peer-ref", "exact-native-history"}
-            or not _exact_delivery_receipt(message))):
+            or not _exact_delivery_receipt(message, roots))):
         return
     binding = message.get("producer_binding") or {}
     sender = message.get("from") or {}

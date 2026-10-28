@@ -597,16 +597,21 @@ class ScannerInventoryObservationTest(peer._TmpRootMixin, unittest.TestCase):
         self.edge("claude", "A", "B")
         path = pending.record_path(self.tmp_root, "A", record["delivery_id"])
         before = self.snapshot([path, self.jobs_path])
-        real_chain_end = handover.chain_end
-        calls = []
-        def chain_end(harness, sid, **kwargs):
-            calls.append(sid)
-            return real_chain_end(harness, sid, **kwargs) if len(calls) == 1 else (sid, "unresolved")
-        with mock.patch.object(handover, "chain_end", side_effect=chain_end):
+        retain = steward.peer_obligations.retain_session_notice
+        fork = tidy.state_root() / "sessions" / "retention-race.jsonl"
+        def retain_after_fork(*args, **kwargs):
+            # Discovery resolved A already; change the real ledger before the
+            # retention effect rechecks it, rather than intercepting an old reader.
+            fork.write_text(json.dumps(dict(event="succession", source="tidy-clear",
+                harness="claude", sid="C", **{"from": "A"})) + "\n")
+            return retain(*args, **kwargs)
+        with mock.patch.object(steward.peer_obligations, "retain_session_notice",
+                               side_effect=retain_after_fork) as retained:
             self.assertFalse(steward._discover_session_notice_duties(self.store()))
-        self.assertEqual(calls, ["A", "A"])
+        retained.assert_called_once()
         self.assertFalse(self.duties())
         self.assertEqual(before, self.snapshot([path, self.jobs_path]))
+        fork.unlink()  # Retire only the fixture's injected competing edge.
         self.assertTrue(steward._discover_session_notice_duties(self.store()))
         self.assertEqual(len(self.duties()), 1)
 

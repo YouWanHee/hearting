@@ -1517,7 +1517,9 @@ class LedgerTest(TidyCase):
     def test_hook_records_the_session_transcript_and_cwd(self):
         self.hook("codex", "start", "thr-1", "--transcript", "/x/rollout.jsonl", "--source", "startup")
         with self.library():
-            seat = st.resolve_seat("codex", str(self.cwd))
+            # The hook records exact native identity even when a shared service
+            # correctly refuses its inherited physical pane.
+            seat = st.resolve_seat("codex", str(self.cwd), sid="thr-1")
             row = st.session_summary(seat)[("codex", "thr-1")]
         self.assertEqual((row["transcript"], row["cwd"], row["epoch"]), ("/x/rollout.jsonl", str(self.cwd), 0))
         self.assertGreater(row["first_seen"], 0)
@@ -5790,6 +5792,68 @@ class SeatHandoverTest(TidyCase):
             self.assertTrue(any(row.get("event") == "steward-release"
                                 for _key, row in self.handover._transition_rows(seat.key)))
             self.assertEqual(st.session_summary(seat)[("claude", "sid-A")]["last_seen"], 100)
+
+
+class CardExactIdentityTest(TidyCase):
+    def test_stored_author_full_sid_and_pane_survive_a_different_current_seat(self):
+        with self.library({"HERDR_PANE_ID": "successor:pane"}):
+            sys.path.insert(0, str(ROOT / "tools"))
+            from fleet import session_tags
+            for harness in st.HARNESSES:
+                sid = "stored-" + harness + "-full-native-session-0123456789"
+                if harness == "claude":
+                    directory = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "sessions"
+                    directory.mkdir(parents=True, exist_ok=True)
+                    (directory / "99999.json").write_text(json.dumps({"sessionId": sid,
+                        "nameSource": "derived", "name": "fixture-93"}))
+                    confirmed = "93"
+                else:
+                    confirmed = session_tags.assign_observed(harness, sid)
+                card = {"author": {"harness": harness, "sid": sid},
+                        "seat": {"pane": "stored:pane"}, "authored_at_epoch": 10,
+                        "body": "원래 목표: 보존할 원문\n관련: 작업"}
+                for text in (st.render_card_text(card),
+                             st.build_card_injection(card, Path("/card.md"), 10, 2400)):
+                    self.assertIn("sid=" + sid, text)
+                    self.assertIn("pane=stored:pane", text)
+                    self.assertIn("[" + confirmed + "]", text)
+                    self.assertNotIn("successor:pane", text)
+                    self.assertIn(card["body"], text)
+                if harness != "claude":
+                    path = session_tags._path()
+                    for snapshot in (None, "{broken"):
+                        path.unlink(missing_ok=True)
+                        if snapshot:
+                            path.write_text(snapshot)
+                        text = st.render_card_text(card)
+                        self.assertNotIn("[" + confirmed + "]", text)
+                        self.assertIn("sid=" + sid, text)
+                        self.assertIn("pane=stored:pane", text)
+                    path.unlink()
+
+    def test_sparse_cards_and_tiny_caps_never_claim_a_truncated_sid(self):
+        sid = "full-native-session-" + "한" * 100
+        with self.library():
+            for card in ({}, {"author": None, "seat": None},
+                         {"author": {"harness": "codex", "sid": sid},
+                          "body": "한글 " * 2500, "seat": {}}):
+                readable = st.render_card_text(card)
+                self.assertIn("pane=-", readable)
+                for cap in (0, 1, 100, 250, 500, 1000, 1600, 2400):
+                    text = st.build_card_injection(card, Path("/card.md"), 10, cap)
+                    self.assertLessEqual(len(text.encode("utf-8")), cap)
+                    if "sid=" in text:
+                        self.assertIn("sid=" + (sid if card.get("author") else "-"), text)
+                    text.encode("utf-8").decode("utf-8")
+
+    def test_related_session_instructions_reach_compact_and_nonce_card_requests(self):
+        self.assertIn("observed pane and full exact", st.COMPACT_CARD_INSTRUCTIONS)
+        for origin in ("idle", "compact"):
+            text = clear.idle_card_request_text({"nonce": "fixture-nonce", "origin": origin})
+            self.assertIn("관측 pane·전체 native SID", text)
+            self.assertIn("관련 등 기존 칸", text)
+            self.assertIn("미확인", text)
+
 
 
 if __name__ == "__main__":

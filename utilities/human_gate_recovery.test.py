@@ -50,6 +50,7 @@ class M1Decision(unittest.TestCase):
         policy = mock.patch.object(SF.ROUTE, "gates_on", return_value=True)
         policy.start()
         self.addCleanup(policy.stop)
+        self.enterContext(mock.patch.dict(os.environ, {"HEARTING_GATES": "on"}))
         with contextlib.redirect_stdout(io.StringIO()):
             self.source, self.route_file = self.fixture._blocked()
         self.source["launch_compatibility_tuple"] = {"jobs_path": {"path": str(self.fixture.jobs)}}
@@ -113,7 +114,8 @@ class M1Decision(unittest.TestCase):
 
     def test_disabled_gate_policy_accepts_same_work_drift(self):
         proof = self.prior_proof()
-        with mock.patch.object(SF.ROUTE, "gates_on", return_value=False):
+        with mock.patch.dict(os.environ, {"HEARTING_GATES": "off"}), \
+                mock.patch.object(SF.ROUTE, "gates_on", return_value=False):
             self.assertEqual(SF.ROUTE._verify_continuation_gate_release_proofs(
                 self.suffix(proof)), [proof])
 

@@ -815,6 +815,78 @@ try {
                                     cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_v2_shell_env_carries_the_executing_session(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is unavailable for the V2 plugin module contract")
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            home.mkdir()
+            project.mkdir()
+            script = r'''
+import assert from "node:assert/strict"
+import { pathToFileURL } from "node:url"
+const plugin = (await import(pathToFileURL(process.env.PLUGIN_PATH))).default
+const hooks = new Map()
+const sessions = {
+  ses_main: { id: "ses_main", agent: "build", title: "Main work", parentID: null },
+  ses_other: { id: "ses_other", agent: "build", title: "Other work", parentID: null },
+  ses_worker: { id: "ses_worker", agent: "hearting-worker",
+                title: "hearting-worker-att-fixture", parentID: null },
+}
+const ctx = {
+  location: { directory: process.env.TEMP_ROOT, project: { id: "fixture" } },
+  app: { log: async () => {} },
+  session: {
+    get: async ({ sessionID }) => ({ data: sessions[sessionID] || null }),
+    prompt: async () => ({ data: null }),
+    context: async () => ({ data: [] }),
+    hook: async (name, fn) => hooks.set("session." + name, fn),
+  },
+  tool: { hook: async (name, fn) => hooks.set("tool." + name, fn) },
+  shell: { hook: async (name, fn) => hooks.set("shell." + name, fn) },
+  event: { subscribe: async function* ({ signal }) {
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }))
+  } },
+  permission: { hook: async (name, fn) => hooks.set("permission." + name, fn) },
+}
+const cleanup = await plugin.setup(ctx)
+const shellEnv = async (sessionID, command) => {
+  await hooks.get("tool.execute.before")({ tool: "shell", sessionID, input: { command } })
+  const event = { command, env: {} }
+  await hooks.get("shell.create.before")(event)
+  return event.env
+}
+try {
+  // 2.0.32 order: execute.before, then create.before with no OPENCODE_SESSION_ID.
+  const main = await shellEnv("ses_main", "echo main")
+  assert.equal(main.AGENT_PARENT_COMPLETION_CARRIER, "opencode-turn:ses_main")
+  const worker = await shellEnv("ses_worker", "echo worker")
+  assert.equal(worker.AGENT_PARENT_COMPLETION_CARRIER, "")
+  await hooks.get("tool.execute.before")({ tool: "shell", sessionID: "ses_main",
+                                           input: { command: "echo shared" } })
+  await hooks.get("tool.execute.before")({ tool: "shell", sessionID: "ses_other",
+                                           input: { command: "echo shared" } })
+  const shared = { command: "echo shared", env: {} }
+  await hooks.get("shell.create.before")(shared)
+  assert.equal(shared.env.AGENT_PARENT_COMPLETION_CARRIER, "",
+               "two sessions waiting on one command must stay fail-closed")
+  // An unmapped command keeps the existing env fallback.
+  const fallback = { command: "echo native", env: { OPENCODE_SESSION_ID: "ses_main" } }
+  await hooks.get("shell.create.before")(fallback)
+  assert.equal(fallback.env.AGENT_PARENT_COMPLETION_CARRIER, "opencode-turn:ses_main")
+} finally { await cleanup() }
+'''
+            env = {**BASE_ENV, "PLUGIN_PATH": str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
+                   "TEMP_ROOT": str(project), "HOME": str(home), "AGENT_HOME": str(ROOT),
+                   "PYTHONDONTWRITEBYTECODE": "1", "XDG_STATE_HOME": str(home / ".state"),
+                   "XDG_CONFIG_HOME": str(home / ".config"), "XDG_DATA_HOME": str(home / ".data"),
+                   "XDG_CACHE_HOME": str(home / ".cache")}
+            result = subprocess.run([node, "--input-type=module", "-e", script],
+                                    cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_v2_registers_guards_and_worker_hooks_are_silent(self):
         node = shutil.which("node")
         if not node:

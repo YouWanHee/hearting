@@ -1458,10 +1458,13 @@ live sessions in a small XDG state assignment file; an existing live assignment
 keeps its number and a later session takes a free one. Initial collection orders
 unassigned sessions by their known start time. Claude's runtime-derived numbers
 are fixed reservations, so a conflicting Codex or OpenCode assignment moves.
-Collection refreshes these reservations automatically; no user input or flag is
-needed. Missing, corrupt or unwritable assignment state falls back to the original
-session-id hash. Exhaustion of the 256 values and duplicate fixed Claude numbers
-leave uniqueness unavailable.
+Normal start, native reports and collection attempt these reservations without
+waiting for a writer lock; allocation failure does not fail the observed work.
+Readers consume only confirmed assignments from the existing snapshot, including
+while a writer holds its lock. Missing, unreadable or corrupt state, an unavailable
+reader or an exhausted namespace leaves the number absent. The session-id hash
+is an internal allocator candidate. Duplicate fixed Claude
+numbers retain their existing reservation policy; no user input or flag is needed.
 
 Merge with `hearting run merge-line <PR>`. Sessions and worktrees for the same
 GitHub repository share one user-state FIFO `flock`. A lone PR retains the
@@ -2555,8 +2558,11 @@ identity is gone. Prompt helpers in that shell's foreground group do not count
 as a live agent; unreadable identity remains unconfirmed. A refused start closes
 its own newly split pane only when the same shell is agent-free and its visible
 screen is unchanged from the stable snapshot recorded before native start.
-Retirement refuses busy sessions, open forms, drafts, unknown process identity
-or an unconfirmed shell return; it has no retry, forced kill or forced close.
+Retirement protects busy sessions, open forms, drafts, unknown process identity
+and unconfirmed shell return; it sends no repeated exit, forced kill or forced
+close. The same runner completes delayed Claude background-work confirmation
+on the booked foreground lifetime using exit-and-stop-tasks, without backgrounding
+the session, with live-dialog and foreground checks before input.
 An accepted retirement keeps the agent PID/start and shell PID/start observed
 when it was requested, including before a pane has a session. Reconnection
 compares that original lifetime before sending input. A proven-dead or reused

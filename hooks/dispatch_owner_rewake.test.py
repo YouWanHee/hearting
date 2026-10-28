@@ -4010,10 +4010,19 @@ class SeatHandoverRewakeTest(unittest.TestCase):
             DispatchOwnerRewakeTest.row(attempt_id=f"att-owner-{n}", status="done" if n % 2 else "open",
                                         route_id=f"rt-{n}", route_hash="digest")
             for n in range(1, 21)), encoding="utf-8")
-        with mock.patch.object(rewake.seat_handover, "_all_snapshots_uncached", return_value=[]) as snapshots:
-            rows = rewake._session_owner_rows(self.jobs, "session-1", statuses=rewake.RECEIPT_ROW_STATUSES)
+        tidy = rewake.seat_handover._st()
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.jobs.parent / "state")}):
+            tidy._append_ledger_entry(tidy.Seat("pane", "scan-fixture"),
+                                     dict(event="start", harness="claude", sid="session-1"))
+            ledgers = sorted((tidy.state_root() / "sessions").glob("*.jsonl"))
+            with mock.patch.object(tidy, "read_bytes", wraps=tidy.read_bytes) as reads, \
+                    mock.patch.object(rewake.seat_handover, "_readable_lineage_signature",
+                                      wraps=rewake.seat_handover._readable_lineage_signature) as scans:
+                rows = rewake._session_owner_rows(self.jobs, "session-1", statuses=rewake.RECEIPT_ROW_STATUSES)
         self.assertEqual(len(rows), 20)
-        self.assertEqual(snapshots.call_count, 1)
+        self.assertEqual(scans.call_count, 1)
+        self.assertEqual([call.args[0] for call in reads.call_args_list], ledgers,
+                         "one scan reads each current logical/physical ledger once")
 
     def test_the_successor_arms_the_row_the_old_window_launched_and_a_stranger_does_not(self) -> None:
         self.assertEqual(rewake._session_owner_rows(self.jobs, "session-2"), [])

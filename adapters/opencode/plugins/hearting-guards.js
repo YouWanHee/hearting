@@ -943,27 +943,83 @@ async function setupOpenCodeV2(ctx) {
     const info = await markSession(sessionID)
     return work(info)
   })
+  // OpenCode 2.0.32 runs tool.execute.before before shell.create.before and
+  // inserts OPENCODE_SESSION_ID only after the shell hooks return. Pair the
+  // exact command with its session while both are in flight; a command string
+  // two sessions are waiting on stays empty (poll-fallback) instead of guessing.
+  const shellCommands = new Map()
+  const rememberShellCommand = (command, sessionID) => {
+    if (!command || !sessionID) return
+    const sessions = shellCommands.get(command) || new Set()
+    sessions.add(sessionID)
+    shellCommands.set(command, sessions)
+  }
+  const takeShellCommandSession = (command) => {
+    if (typeof command !== "string" || !command) return null
+    const sessions = shellCommands.get(command)
+    if (!sessions) return null
+    if (sessions.size !== 1) return ""
+    const [sessionID] = sessions
+    shellCommands.delete(command)
+    return sessionID
+  }
+  const forgetShellCommand = (command, sessionID) => {
+    if (typeof command !== "string" || !command) return
+    const sessions = shellCommands.get(command)
+    if (!sessions) return
+    sessions.delete(sessionID)
+    if (!sessions.size) shellCommands.delete(command)
+  }
   const sessionPrompt = async ({ path: target, body }) => {
     const sessionID = target?.id
     const text = (body?.parts || []).map((part) => part?.text || "").filter(Boolean).join("\n")
     if (!sessionID || !text || typeof ctx.session?.prompt !== "function") return { error: true }
     try {
-      await ctx.session.prompt({ sessionID, prompt: { text }, delivery: "steer" })
+      // 2.0.32 PromptInput carries the text at the top level.
+      await ctx.session.prompt({ sessionID, text, delivery: "steer" })
       return { error: null, response: { ok: true } }
     } catch (error) {
       return { error, response: { ok: false } }
     }
+  }
+  const sessionMessages = async ({ path: target, sessionID } = {}) => {
+    const sid = sessionID || target?.id
+    if (!sid || typeof ctx.session?.context !== "function") return { error: true }
+    try {
+      const result = await ctx.session.context({ sessionID: sid })
+      const rows = result?.data ?? result
+      if (result?.error || !Array.isArray(rows)) return { error: true }
+      return { data: rows.flatMap((row) => row?.type === "user" && typeof row.text === "string"
+        ? [{ info: { id: row.id, sessionID: sid, role: "user", time: row.time },
+            parts: [{ type: "text", text: row.text }] }]
+        : []), response: { ok: true, status: 200 } }
+    } catch { return { error: true } }
   }
   const legacyContext = {
     ...ctx,
     directory: ctx.location?.directory || "",
     client: {
       session: {
-        get: ({ path: target, sessionID }) => sessionInfo(sessionID || target?.id),
-        // V2 does not expose the V1 message-list method on its plugin context.
-        // Returning an empty list keeps optional enrichment unknown instead of
-        // guessing from another session or invoking a second model.
-        messages: async () => [],
+        get: async ({ path: target, sessionID }) => {
+          // Admission uses a fresh native read, never sessionInfo's display cache.
+          const result = await ctx.session.get({ sessionID: sessionID || target?.id })
+          if (result?.error) return { error: result.error }
+          return { data: result?.data ?? result, response: { ok: true, status: 200 } }
+        },
+        wait: async ({ sessionID: sid }) => {
+          // V2 has no session.status query. Its exact session.wait resolves
+          // only after native execution is idle; the common carrier bounds it.
+          if (!sid || !pendingPeerRoot(legacyContext, sid)
+              || typeof ctx.session?.wait !== "function") throw new Error("native-idle-unavailable")
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(), 1000)
+          try {
+            const result = await ctx.session.wait({ sessionID: sid }, { signal: controller.signal })
+            if (result?.error || controller.signal.aborted) throw new Error("native-idle-unavailable")
+          } finally { clearTimeout(timer) }
+        },
+        // V2 exposes the post-compaction user messages as session.context.
+        messages: sessionMessages,
         promptAsync: sessionPrompt,
       },
       app: { log: (input) => ctx.app?.log?.(input) },
@@ -972,38 +1028,56 @@ async function setupOpenCodeV2(ctx) {
       project: ctx.project,
     },
   }
+  registerPaneContext(legacyContext)
   const hooks = await AgentHarnessGuards(legacyContext, { initialize: false })
 
-  await ctx.tool.hook("execute.before", async (event) => withSession(event.sessionID, async () => {
-    const input = { tool: event.tool, sessionID: event.sessionID }
-    const output = { args: event.input || {} }
-    await hooks["tool.execute.before"]?.(input, output)
-  }))
-  await ctx.tool.hook("execute.after", async (event) => withSession(event.sessionID, async () => {
-    const content = event.status === "completed" ? event.result?.content : []
-    const output = { output: Array.isArray(content)
-      ? content.map((part) => part?.text || "").filter(Boolean).join("\n") : "",
-      metadata: event.status === "error" ? { exit: 1 } : {} }
-    const originalText = output.output
-    if (v2WorkerSessions.has(event.sessionID)) {
-      await appendSpecSyncNudge(ctx, { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output, root)
-    } else {
-      await hooks["tool.execute.after"]?.(
-        { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output)
+  await ctx.tool.hook("execute.before", async (event) => {
+    const command = event.tool === "shell" && typeof event.input?.command === "string"
+      ? event.input.command : ""
+    if (command) rememberShellCommand(command, event.sessionID)
+    try {
+      await withSession(event.sessionID, async () => {
+        const input = { tool: event.tool, sessionID: event.sessionID }
+        const output = { args: event.input || {} }
+        await hooks["tool.execute.before"]?.(input, output)
+      })
+    } catch (error) {
+      if (command) forgetShellCommand(command, event.sessionID)
+      throw error
     }
-    if (event.status === "completed" && Array.isArray(content) &&
-        output.output.startsWith(originalText) && output.output.length > originalText.length) {
-      // V2 consumes the native result, not the legacy adapter's temporary string.
-      const text = output.output.slice(originalText.length).replace(/^\n/, "")
-      event.result = { ...event.result, content: [...content, { type: "text", text }] }
-    }
-  }))
+  })
+  await ctx.tool.hook("execute.after", async (event) => {
+    const command = event.tool === "shell" && typeof event.input?.command === "string"
+      ? event.input.command : ""
+    if (command) forgetShellCommand(command, event.sessionID)
+    await withSession(event.sessionID, async () => {
+      const content = event.status === "completed" ? event.result?.content : []
+      const output = { output: Array.isArray(content)
+        ? content.map((part) => part?.text || "").filter(Boolean).join("\n") : "",
+        metadata: event.status === "error" ? { exit: 1 } : {} }
+      const originalText = output.output
+      if (v2WorkerSessions.has(event.sessionID)) {
+        await appendSpecSyncNudge(ctx, { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output, root)
+      } else {
+        await hooks["tool.execute.after"]?.(
+          { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output)
+      }
+      if (event.status === "completed" && Array.isArray(content) &&
+          output.output.startsWith(originalText) && output.output.length > originalText.length) {
+        // V2 consumes the native result, not the legacy adapter's temporary string.
+        const text = output.output.slice(originalText.length).replace(/^\n/, "")
+        event.result = { ...event.result, content: [...content, { type: "text", text }] }
+      }
+    })
+  })
   await ctx.shell.hook("create.before", async (event) => {
     const env = event.env || {}
-    const sessionID = env.OPENCODE_SESSION_ID || ""
+    const mapped = takeShellCommandSession(event.command)
+    const sessionID = mapped === null ? (env.OPENCODE_SESSION_ID || "") : mapped
     return withSession(sessionID, async () => {
       if (v2WorkerSessions.has(sessionID)) {
         for (const key of inheritedIdentityEnv) env[key] = ""
+        env[CARRIER_ENV] = ""
         if (sessionID) env.OPENCODE_SESSION_ID = sessionID
         return
       }
@@ -1088,8 +1162,12 @@ async function setupOpenCodeV2(ctx) {
         }
         await withSession(sessionID, async (current) => {
           if (v2WorkerSessions.has(sessionID)) return
-          const event = { ...native, properties: { ...data,
+          const type = ["session.execution.succeeded", "session.execution.failed",
+            "session.execution.interrupted"].includes(native.type) ? "session.idle" : native.type
+          const event = { ...native, type, properties: { ...data,
+            ...(native.type === "session.execution.started" ? { status: { type: "busy" } } : {}),
             ...(info ? { info } : {}), sessionID } }
+          if (native.type === "session.execution.started") event.type = "session.status"
           await hooks.event?.({ event })
         })
         if (native.type === "session.deleted") v2SessionInfo.delete(sessionID)
@@ -1102,6 +1180,7 @@ async function setupOpenCodeV2(ctx) {
   return () => {
     controller.abort()
     hooks.dispose?.({ silent: true })
+    retirePaneContext(legacyContext)
     v2WorkerSessions.clear()
     v2ContractSessions.clear()
     v2SessionInfo.clear()
@@ -1588,7 +1667,8 @@ function createCompletionCarrier(ctx) {
     // Use the peer carrier's exact root and native status interpretation. An
     // empty complete status map is idle; unavailable or malformed is unknown.
     const nativeIdle = async () => {
-      if (!current() || typeof client?.get !== "function" || typeof client?.status !== "function") return false
+      if (!current() || typeof client?.get !== "function"
+          || (typeof client?.status !== "function" && typeof client?.wait !== "function")) return false
       let nativeTimeout
       const bounded = async call => {
         try {
@@ -1602,6 +1682,10 @@ function createCompletionCarrier(ctx) {
           path: { id: sid }, query: { directory: origin.directory },
         })))
         if (!current() || !pendingPeerIsNativeRoot(info, sid, origin)) return false
+        if (typeof client.wait === "function") {
+          await bounded(client.wait({ sessionID: sid }))
+          return current()
+        }
         const result = await bounded(client.status({ query: { directory: origin.directory } }))
         return current() && pendingPeerNativeStatusType(pendingPeerSdkData(result), sid) === "idle"
       } catch { return false }
@@ -1950,11 +2034,17 @@ function pendingPeerSdkNoContent(result) {
 function pendingPeerIsNativeRoot(info, sid, origin) {
   if (!info || typeof info !== "object" || Array.isArray(info)
       || info.id !== sid || typeof info.projectID !== "string"
-      || typeof info.directory !== "string" || typeof info.slug !== "string"
-      || typeof info.title !== "string"
-      || typeof info.version !== "string" || !info.time
+      || !info.time
       || !Number.isFinite(info.time.created) || !Number.isFinite(info.time.updated)
       || (info.parentID !== undefined && info.parentID !== null)) return false
+  const directory = info.location?.directory
+  if (typeof directory === "string") {
+    // V2 Session.Info uses location, with optional title and no slug/version.
+    if (info.title !== undefined && typeof info.title !== "string") return false
+    try { return realpathSync(directory) === origin.directory } catch { return false }
+  }
+  if (typeof info.directory !== "string" || typeof info.slug !== "string"
+      || typeof info.title !== "string" || typeof info.version !== "string") return false
   try { return realpathSync(info.directory) === origin.directory } catch { return false }
 }
 

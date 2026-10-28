@@ -120,7 +120,10 @@ beginning of the card; read the full file for the rest. The memory worker's
 When naming work in any of those existing fields, keep the source description
 and the comparison condition that distinguishes it, then add the original
 identifier as a reference. Preserve document/revision and checkpoint links
-when they affect meaning. Record failed, interrupted and unfinished work in
+when they affect meaning. When referencing a session in the existing related or
+other card fields, retain its confirmed Fleet number together with the observed
+pane and full exact native SID. Leave an unknown number, pane or SID unknown;
+do not fill it from a hash or another session. Record failed, interrupted and unfinished work in
 the same fields with its actual status and next action; do not guess what an
 unexplained identifier means.
 

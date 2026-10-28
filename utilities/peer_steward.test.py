@@ -1191,10 +1191,12 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         """A successful launch stays successful when shared identity is unknown."""
         import io
         import contextlib
+        from fleet import session_tags
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
                                 return_value=_herdr_json(_agent_json("codex", "herdr-claim", "peer-c"))), \
-             mock.patch.object(peer_steward, "_process_session", return_value=None) as resolve:
+             mock.patch.object(peer_steward, "_process_session", return_value=None) as resolve, \
+             mock.patch.object(session_tags, "assign_observed") as assign:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
@@ -1202,21 +1204,49 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         resolve.assert_called_once_with("w1:pM", "codex")
         self.assertIn("started=true", out.getvalue())
         self.assertIn("session_id=-", out.getvalue())
+        assign.assert_not_called()
         self.assertNotIn("session_bind=", out.getvalue())
 
     def test_the_receipt_uses_only_the_shared_resolver_identity(self):
         import io
         import contextlib
+        from fleet import session_tags
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
                                 return_value=_herdr_json(_agent_json("codex", "herdr-claim", "peer-c"))), \
-             mock.patch.object(peer_steward, "_process_session", return_value="proven-thread") as resolve:
+             mock.patch.object(peer_steward, "_process_session", return_value="proven-thread") as resolve, \
+             mock.patch.object(session_tags, "_inventory", side_effect=AssertionError("start census")):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
         self.assertEqual(rc, 0)
         resolve.assert_called_once_with("w1:pM", "codex")
         self.assertIn("session_id=proven-thread", out.getvalue())
+        self.assertIsNotNone(session_tags.assigned_tag("codex", "proven-thread"))
+        self.assertIsNone(session_tags.assigned_tag("codex", "herdr-claim"))
+
+    def test_exact_start_remains_successful_and_numberless_during_writer_contention(self):
+        import io
+        import contextlib
+        import fcntl
+        from fleet import session_tags
+        path = session_tags._path()
+        path.parent.mkdir(parents=True)
+        for harness in ("claude", "codex", "opencode"):
+            with path.with_suffix(".lock").open("a") as lock, \
+                 mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=_herdr_json(
+                     _agent_json(harness, "proven-session", "peer"))), \
+                 mock.patch.object(peer_steward, "_process_session", return_value="proven-session"), \
+                 mock.patch.object(session_tags, "_inventory", side_effect=AssertionError("start census")):
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = peer_steward.main(["start", "peer", "--kind", harness, "--pane", "w1:pM"])
+            self.assertEqual(rc, 0)
+            self.assertIn("started=true", out.getvalue())
+            self.assertIn("session_id=proven-session", out.getvalue())
+            self.assertFalse(path.exists())
 
     def test_name_is_the_positional_right_after_start(self):
         """herdr `agent start <NAME> --kind --pane`: the name is a required positional.
@@ -4822,6 +4852,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
     def test_opencode_prompt_keeps_its_native_callback_path(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        os.environ["HERDR_PANE_ID"] = "w:sender"
         harness = "opencode"
         calls = []
         payload = _agent_json(harness, "sid-" + harness, "child", status="idle")
@@ -4836,9 +4867,20 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(self._pane_io_calls(calls), [])
         row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
         self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["from"]["pane_id"], "w:sender")
+        self.assertIn(" ; pane=w:sender ; sid=sid-steward", row["text"])
         self.assertEqual(row["to"]["session_id"], "sid-opencode")
         self.assertTrue(peer_steward.peer_message.parse_peer_trailer(
             row["text"], row["to"], include_ref=True))
+
+    def test_unproven_sender_pane_is_not_borrowed_from_recipient_or_environment(self):
+        import pane_ownership
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w:inherited"}), \
+             mock.patch.object(pane_ownership, "verified_pane", return_value=""):
+            rc, _printed, row, _sent, _schedule = self._run_claude_prompt(state="busy")
+        self.assertNotIn("pane_id", row["from"])
+        self.assertIn(" ; pane=- ; sid=sid-steward", row["text"])
+        self.assertEqual(row["to"]["pane_id"], "w1:pX")
 
     def _run_claude_prompt(self, *, state="idle", screen=None,
                            consume=False, readiness=None, foregrounds=None,
@@ -9728,6 +9770,140 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_runner_finishes_delayed_claude_background_dialog_without_another_exit(self):
+        world = _RetireWorld(harness="claude", exits=False)
+        rc, line = self.retire(world)
+        self.assertEqual(rc, 0)
+        self.assertIn("reason=agent-still-running", line)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.list()[0]
+        self.assertEqual(duty["observation"]["phase"], "exit-requested")
+        world.screen = ("Background work is running\nlocal monitor\n"
+                        "❯ 1. Exit and stop tasks\n2. Move to background and exit\n"
+                        "3. Stay\nEnter to confirm · Esc to cancel\n")
+        normal_run = world.run
+        selected = []
+
+        def finish_dialog(argv, **kwargs):
+            if argv[:3] == ["herdr", "pane", "send-text"]:
+                selected.append(argv[-1])
+            if argv[:3] == ["herdr", "pane", "send-keys"] and selected == ["1"]:
+                world.exits = True
+            return normal_run(argv, **kwargs)
+
+        world.run = finish_dialog
+        self._run_retire_runner(world, once=True)
+        settled = store.get(duty["id"])
+        self.assertEqual((settled["state"], settled["result"], settled["cleanup"]),
+                         ("complete", "normal-exit", "complete"))
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-text", "w1:pOld", "/exit"],
+            ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+            ["herdr", "pane", "send-text", "w1:pOld", "1"],
+            ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
+        self.assertTrue(any(call[:4] == ["herdr", "agent", "read", "w1:pOld"]
+                            for call in world.calls))
+
+    def test_runner_does_not_confirm_ambiguous_or_foreign_retire_dialog(self):
+        dialog = ("Background work is running\n❯ 1. Exit and stop tasks\n"
+                  "2. Move to background and exit\n3. Stay\n"
+                  "Enter to confirm · Esc to cancel\n")
+        cases = [
+            ("claude", "Do you want to proceed?\nEnter to confirm\n", None),
+            ("claude", dialog + "another prompt\n", None),
+            ("claude", dialog, {"foreground_process_group_id": 999}),
+            ("codex", dialog, None),
+            ("opencode", dialog, None),
+        ]
+        for harness, screen, changed in cases:
+            with self.subTest(harness=harness, screen=screen, changed=changed):
+                world = _RetireWorld(harness=harness, exits=False)
+                self.retire(world)
+                actions = world.actions()
+                world.screen, world.bad_process = screen, changed
+                self._run_retire_runner(world, once=True)
+                self.assertEqual(world.actions(), actions)
+                duty = peer_steward.peer_obligations.ObligationStore().list()[0]
+                self.assertEqual(duty["observation"]["phase"], "exit-requested")
+
+    def test_late_background_confirmation_keeps_failed_pane_close_for_cleanup(self):
+        world = _RetireWorld(harness="claude", exits=False)
+        self.retire(world)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty_id = store.list()[0]["id"]
+        world.screen = ("Background work is running\n❯ 1. Exit and stop tasks\n"
+                        "2. Move to background and exit\n3. Stay\n"
+                        "Enter to confirm · Esc to cancel\n")
+        world.close_error = True
+        normal_run = world.run
+
+        def finish_dialog(argv, **kwargs):
+            if argv[:3] == ["herdr", "pane", "send-keys"]:
+                world.exits = True
+            return normal_run(argv, **kwargs)
+
+        world.run = finish_dialog
+        self._run_retire_runner(world, once=True)
+        pending = store.get(duty_id)
+        self.assertEqual((pending["state"], pending["observation"]["phase"]),
+                         ("cleanup-pending", "shell-returned"))
+        before_cleanup = world.actions()
+        world.close_error = False
+        self._run_retire_runner(world, once=True)
+        self.assertEqual(store.get(duty_id)["state"], "complete")
+        self.assertEqual(world.actions(), before_cleanup + [
+            ["herdr", "pane", "close", "w1:pOld"]])
+
+    def test_inline_background_confirmation_yields_to_existing_retire_runner(self):
+        world = _RetireWorld(harness="claude", exits=False)
+        store = peer_steward.peer_obligations.ObligationStore()
+        with (store.root / "runner.lock").open("w") as lock, \
+             mock.patch.object(peer_steward, "_retire_claude_background_confirm") as confirm:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            rc, line = self.retire(world)
+            self.assertEqual(rc, 0)
+            self.assertIn("reason=retire-already-pending", line)
+            confirm.assert_not_called()
+
+    def test_waiting_retire_answers_immediate_background_dialog_in_same_runner_pass(self):
+        world = _RetireWorld(harness="claude", status="working", exits=False)
+        self.retire(world)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty_id = store.list()[0]["id"]
+        self.assertEqual(store.get(duty_id)["observation"].get("phase", "waiting"), "waiting")
+        self.assertEqual(world.actions(), [])
+        dialog = ("Background work is running\n❯ 1. Exit and stop tasks\n"
+                  "2. Move to background and exit\n3. Stay\n"
+                  "Enter to confirm · Esc to cancel\n")
+        world.status = "idle"
+        normal_run = world.run
+        selected = []
+
+        def exit_and_confirm(argv, **kwargs):
+            if argv[:3] == ["herdr", "pane", "send-text"]:
+                selected.append(argv[-1])
+            if argv[:3] == ["herdr", "pane", "send-keys"]:
+                if selected == ["/exit"]:
+                    world.screen = dialog
+                elif selected == ["/exit", "1"]:
+                    world.exits = True
+            return normal_run(argv, **kwargs)
+
+        world.run = exit_and_confirm
+        self._run_retire_runner(world, once=True)
+        settled = store.get(duty_id)
+        self.assertEqual((settled["state"], settled["result"], settled["cleanup"]),
+                         ("complete", "normal-exit", "complete"))
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-text", "w1:pOld", "/exit"],
+            ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+            ["herdr", "pane", "send-text", "w1:pOld", "1"],
+            ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
+
     def test_retire_subject_treats_only_same_birth_same_namespace_zombie_as_gone(self):
         def stat_row(state, start):
             fields = [state, *(["0"] * 18), start]
@@ -9829,7 +10005,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         self._run_retire_runner(world)
         self.assertEqual(store.get(duty["id"])["state"], "complete")
 
-    def _run_retire_runner(self, world, crash_phase=None):
+    def _run_retire_runner(self, world, crash_phase=None, *, once=False):
         store = peer_steward.peer_obligations.ObligationStore()
         lock_fd = os.open(store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -9863,7 +10039,9 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                  mock.patch.object(peer_steward.time, "sleep",
                                    side_effect=InterruptedError("fixture runner stopped") if crash_phase else None), \
                  mock.patch("builtins.print"):
-                if crash_phase:
+                if once:
+                    peer_steward._reconcile_obligations(store)
+                elif crash_phase:
                     with self.assertRaises(InterruptedError):
                         peer_steward.cmd_obligation_runner(
                             SimpleNamespace(state_root=self.tmp_root, lock_fd=lock_fd))
@@ -13544,6 +13722,21 @@ class RetireBackgroundDialogTest(unittest.TestCase):
                 self.assertEqual(len(keys), 1 if switch_at == 5 else 0)
                 texts = [argv[-1] for argv in calls if argv[:3] == ["herdr", "pane", "send-text"]]
                 self.assertEqual(texts, ["1"] if switch_at == 3 else ["1", "3"])
+
+    def test_confirmation_enter_is_not_sent_to_a_changed_foreground(self):
+        dialog = peer_steward._screen_lines(
+            "Background work is running\n❯ 1. Exit and stop tasks\n"
+            "2. Move to background and exit\n3. Stay\nEnter to confirm · Esc to cancel\n")
+        with mock.patch.object(peer_steward, "_read_screen", return_value=dialog), \
+             mock.patch.object(peer_steward, "_retire_foreground",
+                               side_effect=["original", "original", "replacement"]), \
+             mock.patch.object(peer_steward.subprocess, "run") as run:
+            result = peer_steward._retire_claude_background_confirm(
+                "peer", "w1:pX", "claude", {}, "original",
+                lambda reason, **kwargs: reason, None, None)
+        self.assertEqual(result, "foreground-changed")
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ["herdr", "pane", "send-text", "w1:pX", "1"]])
 
 
 class BlockingScreenClassifierTest(unittest.TestCase):
