@@ -16,7 +16,7 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 from fleet.tests import benchmark_tick
-from fleet.collectors import codex
+from fleet.collectors import codex, collect_all
 
 
 SCRIPT = Path(benchmark_tick.__file__).resolve()
@@ -70,6 +70,146 @@ def _valid_result():
         ).hexdigest(),
         "expected": {"unique_rollouts": 6},
     }
+
+
+class _SentinelAuditRecorder:
+    """Record filesystem probes beneath one path without touching it itself."""
+
+    def __init__(self, prefix):
+        self.prefix = os.path.abspath(prefix)
+        self.active = False
+        self.accesses = []
+
+    def __call__(self, event, args):
+        if not self.active or not args or event not in {
+            "open", "os.listdir", "os.scandir",
+        }:
+            return
+        try:
+            path = os.path.abspath(os.fspath(args[0]))
+        except (TypeError, ValueError):
+            return
+        if path == self.prefix or path.startswith(self.prefix + os.sep):
+            self.accesses.append((event, path))
+
+
+class HermeticFixtureIsolationTest(unittest.TestCase):
+    """The hermetic tick may read only the fixture tree, never ambient state."""
+
+    def _write_sentinel_state(self, root):
+        dispatch = os.path.join(root, "dispatch")
+        artifacts = os.path.join(root, "artifacts")
+        state = os.path.join(root, "state")
+        for path in (
+            dispatch, artifacts, state,
+            os.path.join(root, "home"),
+            os.path.join(root, "xdg-state"),
+            os.path.join(root, "xdg-data"),
+            os.path.join(root, "xdg-cache"),
+            os.path.join(root, "tmp"),
+        ):
+            os.makedirs(path)
+        index = os.path.join(dispatch, "resource-runs.index.json")
+        registry = os.path.join(dispatch, "resource-runs.json")
+        route = os.path.join(dispatch, "route.json")
+        jobs = os.path.join(dispatch, "jobs.log")
+        attempt = "att-sentinel"
+        owner_pid = 999999999
+        starttime = 4611686018427387904
+        pid_namespace = os.readlink("/proc/self/ns/pid")
+        with open(route, "w", encoding="utf-8") as handle:
+            json.dump({"route_id": "rt-sentinel"}, handle)
+        metadata = ",".join((
+            "attempt_id=" + attempt,
+            "worker_type=owner",
+            "owner_route_file=" + route,
+            "owner_route_id=rt-sentinel",
+            "owner_route_hash=hash-sentinel",
+            "pid=" + str(owner_pid),
+            "pid_start=" + str(starttime),
+            "pid_ns=" + pid_namespace,
+        ))
+        with open(jobs, "w", encoding="utf-8") as handle:
+            handle.write("\t".join((
+                "2033-05-18T03:28:00+00:00", "open", "fixture", root,
+                "sentinel", metadata,
+            )) + "\n")
+        run = {
+            "cwd": root,
+            "pid": owner_pid,
+            "starttime": starttime,
+            "command_hash": "sentinel",
+            "pid_namespace": pid_namespace,
+            "started_at": 1000.0,
+            "resource_policy": "supervised-owner",
+            "route": route,
+            "route_id": "rt-sentinel",
+            "parent_attempt_id": attempt,
+            "jobs": jobs,
+            "owner_wait": {
+                "parent_attempt_id": attempt,
+                "jobs": jobs,
+                "owner_pid": owner_pid,
+                "owner_start": starttime,
+                "route_id": "rt-sentinel",
+                "route_hash": "hash-sentinel",
+            },
+        }
+        with open(registry, "w", encoding="utf-8") as handle:
+            json.dump({"schema_version": 1, "runs": {"run-sentinel": run}}, handle)
+        with open(index, "w", encoding="utf-8") as handle:
+            json.dump({
+                "schema_version": 1,
+                "registries": {"sentinel": {"path": registry}},
+            }, handle)
+        return {
+            "AGENT_DISPATCH_JOBS": jobs,
+            "AGENT_RESOURCE_RUN_INDEX": index,
+            "HARNESS_STATE_ROOT": state,
+            "AGENT_ARTIFACT_ROOT": artifacts,
+            "HOME": os.path.join(root, "home"),
+            "XDG_STATE_HOME": os.path.join(root, "xdg-state"),
+            "XDG_DATA_HOME": os.path.join(root, "xdg-data"),
+            "XDG_CACHE_HOME": os.path.join(root, "xdg-cache"),
+            "TMPDIR": os.path.join(root, "tmp"),
+        }
+
+    @staticmethod
+    def _snapshot(root):
+        entries = {}
+        for base, dirs, files in os.walk(root):
+            dirs.sort()
+            entries[os.path.relpath(base, root) + os.sep] = None
+            for name in sorted(files):
+                path = os.path.join(base, name)
+                entries[os.path.relpath(path, root)] = (
+                    Path(path).read_bytes(), os.stat(path).st_mtime_ns,
+                )
+        return entries
+
+    def test_hermetic_tick_never_reads_ambient_dispatch_state(self):
+        fixture, fixture_hash = benchmark_tick._load_fixture(str(FIXTURE))
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture_root = os.path.join(tmp, "fixture")
+            os.makedirs(fixture_root)
+            sentinel = os.path.join(tmp, "sentinel")
+            os.makedirs(sentinel)
+            env = self._write_sentinel_state(sentinel)
+            before = self._snapshot(sentinel)
+            recorder = _SentinelAuditRecorder(sentinel)
+            # Audit hooks cannot be removed; the recorder's active flag scopes
+            # recording to this test's hermetic call.
+            sys.addaudithook(recorder)
+            with mock.patch.dict(os.environ, env):
+                recorder.active = True
+                try:
+                    benchmark_tick._hermetic_result(
+                        fixture, fixture_hash, fixture_root, 1)
+                finally:
+                    recorder.active = False
+            self.assertEqual([], recorder.accesses)
+            self.assertEqual(before, self._snapshot(sentinel))
+            self.assertEqual([], collect_all.last_resource_jobs)
 
 
 class BenchmarkComparisonGateTest(unittest.TestCase):
