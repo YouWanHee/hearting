@@ -482,11 +482,104 @@ try {
   assert.equal(calls.length, 5, "provider observations were duplicated")
 } finally { await cleanup() }
 '''
-            env = {**os.environ,
+            env = {**os.environ, "HOME": tmp, "XDG_STATE_HOME": str(Path(tmp) / "state"),
+                   "FLEET_SESSION_REGISTRY_DIR": str(Path(tmp) / "state/agent-fleet/sessions"),
+                   "AGENT_DISPATCH_ATTEMPT_ID": "",
                    "PLUGIN_PATH": str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
                    "TEMP_ROOT": tmp, "AGENT_HOME": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1"}
             result = subprocess.run([node, "--input-type=module", "-e", script],
                                     cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_v2_form_permission_refs_and_model_limits_are_exact_body_free_observations(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = r'''
+import assert from "node:assert/strict"
+import fs from "node:fs"
+import childProcess from "node:child_process"
+import { syncBuiltinESMExports } from "node:module"
+import { pathToFileURL } from "node:url"
+const writes = []
+let releaseFirst
+childProcess.spawn = (command, args) => ({
+  on(name, callback) {
+    if (name === "close" && args[0].endsWith("fleet-interaction-state.py")) {
+      if (!releaseFirst) releaseFirst = callback
+      else queueMicrotask(() => callback(0))
+    }
+  },
+  unref() {}, kill() {}, stdin: { on() {}, end(body) { writes.push({ args, body }) } },
+})
+syncBuiltinESMExports()
+const plugin = (await import(pathToFileURL(process.env.PLUGIN_PATH))).default
+const hooks = new Map()
+let drained
+const eventsDone = new Promise(resolve => { drained = resolve })
+const nativeEvents = [
+  { type: "form.created", data: { form: { sessionID: "ses_exact", id: "form_a",
+    questions: [{ question: "PRIVATE-PROMPT", options: ["PRIVATE-CHOICE"] }] } } },
+  { type: "form.replied", data: { sessionID: "ses_exact", id: "form_a", answers: ["PRIVATE-ANSWER"] } },
+  { type: "permission.asked", data: { sessionID: "ses_exact", id: "perm_b", pattern: "PRIVATE-PATH" } },
+  { type: "permission.replied", data: { sessionID: "ses_exact", requestID: "perm_b", reply: "always" } },
+]
+const ctx = {
+  location: { directory: process.env.TEMP_ROOT },
+  session: { hook: async (name, fn) => hooks.set(name, fn),
+    get: async ({ sessionID }) => ({ id: sessionID, title: "Main work" }) },
+  tool: { hook: async () => {} }, shell: { hook: async () => {} },
+  permission: { hook: async () => {} },
+  event: { subscribe: async function* ({ signal }) {
+    for (const event of nativeEvents) yield event
+    drained()
+    await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }))
+  } },
+}
+const cleanup = await plugin.setup(ctx)
+try {
+  await eventsDone
+  assert.equal(writes.filter(call => call.args[0].endsWith("fleet-interaction-state.py")).length, 1,
+    "a reply overtook the still-running set hook")
+  releaseFirst(0)
+  for (let i = 0; i < 10; i++) await new Promise(resolve => setImmediate(resolve))
+  const calls = writes.filter(call => call.args[0].endsWith("fleet-interaction-state.py"))
+  assert.equal(calls.length, 4)
+  assert.deepEqual(calls.map(call => JSON.parse(call.body)), [
+    { session_id: "ses_exact", request_id: "form_a", source: "opencode-form" },
+    { session_id: "ses_exact", request_id: "form_a" },
+    { session_id: "ses_exact", request_id: "perm_b" },
+    { session_id: "ses_exact", request_id: "perm_b" },
+  ])
+  assert.equal(calls[2].args.at(-1), "permission")
+  assert.doesNotMatch(JSON.stringify(calls), /PRIVATE-|answers|questions|pattern/)
+  await hooks.get("http.response")({ sessionID: "ses_exact",
+    model: { providerID: "fixture", id: "model", limit: { context: 900000, output: 8192 } },
+    response: new Response("", { status: 200 }) })
+  const directory = `${process.env.XDG_STATE_HOME}/agent-fleet/context-policy/opencode`
+  let record = JSON.parse(fs.readFileSync(`${directory}/${fs.readdirSync(directory)[0]}`))
+  assert.equal(record.session_id, "ses_exact")
+  assert.equal(record.model, "fixture/model")
+  assert.equal(record.policy.effective_window_tokens, 900000)
+  assert.equal(record.policy.state, "unknown")
+  assert.equal(record.policy.applied_trigger_tokens, null)
+  await hooks.get("http.response")({ sessionID: "ses_other",
+    model: { providerID: "fixture", id: "no-limits" }, response: new Response("", { status: 200 }) })
+  record = JSON.parse(fs.readFileSync(`${directory}/${fs.readdirSync(directory)[0]}`))
+  assert.equal(record.session_id, "ses_other")
+  assert.equal(record.policy.effective_window_tokens, null)
+  assert.equal(record.policy.reason, "native-model-window-not-observed")
+} finally { cleanup() }
+'''
+            env = {**BASE_ENV, "HOME": tmp, "XDG_STATE_HOME": str(Path(tmp) / "state"),
+                   "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+                   "FLEET_SESSION_REGISTRY_DIR": str(Path(tmp) / "state/agent-fleet/sessions"),
+                   "AGENT_DISPATCH_ATTEMPT_ID": "", "OPENCODE_VERSION": "2.0.32",
+                   "PLUGIN_PATH": str(ROOT / "adapters/opencode/plugins/hearting-guards.js"),
+                   "TEMP_ROOT": tmp, "AGENT_HOME": str(ROOT), "PYTHONDONTWRITEBYTECODE": "1"}
+            result = subprocess.run([node, "--input-type=module", "-e", script],
+                                    cwd=ROOT, env=env, text=True, capture_output=True, timeout=15)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_v2_registers_guards_and_worker_hooks_are_silent(self):
