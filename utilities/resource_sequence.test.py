@@ -68,6 +68,122 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         (output / 'run.json').unlink()
         return route, path, jobs, registry, output, ledger
 
+    def failed_saved_output_fixture(self):
+        route, path, jobs, registry, output, ledger = self.fixture()
+        owner_attempt, owner_input = self.live_owner(route, jobs, registry, harness='claude')
+        config_sha = 'a' * 64
+        body = self.next_body(registry, 'saved-output-run', output)
+        body.update(parent_attempt_id=owner_attempt, config_sha256=config_sha)
+        payload = (
+            "from pathlib import Path\nimport hashlib,json,sys\n"
+            "base=Path(sys.argv[1]); route_id=sys.argv[2]; config_sha=sys.argv[3]\n"
+            "raw=base/'raw.json'; data=b'{\\\"scientific_verdict\\\":\\\"FAIL\\\",\\\"scores\\\":[1,2,3]}\\n'; raw.write_bytes(data)\n"
+            "run={'route_id':route_id,'exit':1,'config_sha256':config_sha,'outputs':["
+            "{'path':'raw.json','sha256':hashlib.sha256(data).hexdigest()}]}\n"
+            "(base/'run.json').write_text(json.dumps(run))\nraise SystemExit(1)\n"
+        )
+        body['command'] = [sys.executable, '-c', payload, str(output), route['route_id'], config_sha]
+        data = json.loads(registry.read_text())
+        data['runs'].pop('fixture-run')
+        registry.write_text(json.dumps(data))
+        (ledger.root / 'armed' / 'full-run.json').unlink()
+        self.launch(route, path, jobs, registry, output, body, exit_code=1)
+        result = SUP.poll_once(route, ledger)
+        self.assertEqual(result[0]['action'], 'halt-failed')
+        current = json.loads(registry.read_text())['runs']['saved-output-run']
+        self.assertEqual((current['status'], current['exit_code']), ('failed', 1))
+        return (route, path, jobs, registry, output, ledger, owner_attempt, owner_input,
+                output / 'raw.json', output / 'run.json')
+
+    def test_saved_nonzero_outputs_enter_verification_before_any_pass_marker(self):
+        route, path, jobs, registry, output, ledger, owner_attempt, _owner_input, raw, receipt = \
+            self.failed_saved_output_fixture()
+        completion = SUP.route_module().completion_dir(route['route_id'], jobs=jobs)
+        self.assertFalse((completion / 'full-run.json').exists())
+        self.assertFalse((completion / 'run-verify.json').exists())
+        registry_before = registry.read_bytes()
+        raw_before = raw.read_bytes()
+        receipt_before = receipt.read_bytes()
+        start_args = SimpleNamespace(route_file=str(path), route_node='run-verify',
+            attempt_id='att-saved-verifier', jobs=str(jobs), agent_home=ROOT,
+            worktree=str(self.base), dispatch_depth=2, parent_slug='fixture-owner',
+            parent_attempt_id=owner_attempt, parent_harness='claude',
+            parent_transport='headless', parent_sandbox='workspace-write', subsession_id=None)
+        with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+             mock.patch('subprocess.check_output', return_value=str(self.base)):
+            result = RA.completion_gate(start_args, 'start', ROOT, jobs,
+                                        gate=DC.completion_marker_gate)
+        self.assertIsNone(result, result)
+        verification = output / 'saved-output-verification.json'
+        verifier_code = (
+            "import hashlib,json,sys; from pathlib import Path; "
+            "raw=Path(sys.argv[1]).read_bytes(); receipt=json.loads(Path(sys.argv[2]).read_text()); "
+            "expected=receipt['outputs'][0]['sha256']; actual=hashlib.sha256(raw).hexdigest(); "
+            "assert actual==expected; Path(sys.argv[3]).write_text(json.dumps({"
+            "'verdict':'PASS','consumed_sha256':actual}))")
+        verified = subprocess.run([sys.executable, '-B', '-c', verifier_code,
+            str(raw), str(receipt), str(verification)], cwd=self.base,
+            text=True, capture_output=True, check=False)
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(json.loads(verification.read_text())['consumed_sha256'],
+                         hashlib.sha256(raw_before).hexdigest())
+        self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'FAILED_RETRYABLE')
+        self.assertEqual(ledger.state()['nodes']['full-run']['evidence']['exit_code'], 1)
+        self.assertFalse((completion / 'full-run.json').exists())
+        self.assertEqual(ledger.claims(), {})
+        self.assertEqual(registry.read_bytes(), registry_before)
+        self.assertEqual(raw.read_bytes(), raw_before)
+        self.assertEqual(receipt.read_bytes(), receipt_before)
+        journal_before = ledger.journal_path.read_bytes()
+        with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+             mock.patch('subprocess.check_output', return_value=str(self.base)):
+            preview = RA.completion_gate(start_args, 'dry-run', ROOT, jobs,
+                                          gate=DC.completion_marker_gate)
+        self.assertIsNone(preview, preview)
+        self.assertEqual(ledger.journal_path.read_bytes(), journal_before)
+        self.assertEqual(ledger.claims(), {})
+        self.assertFalse((completion / 'full-run.json').exists())
+
+    def test_saved_output_start_refuses_changed_bytes_config_and_pending_correction(self):
+        for mutation in ('changed-output', 'changed-config', 'missing-output',
+                         'cancelled', 'pending-correction'):
+            with self.subTest(mutation=mutation), self.subfixture():
+                route, path, jobs, registry, _output, ledger, owner_attempt, owner_input, raw, receipt = \
+                    self.failed_saved_output_fixture()
+                if mutation == 'changed-output':
+                    raw.write_bytes(raw.read_bytes() + b'changed')
+                elif mutation == 'changed-config':
+                    data = json.loads(receipt.read_text())
+                    data['config_sha256'] = 'b' * 64
+                    receipt.write_text(json.dumps(data))
+                elif mutation == 'missing-output':
+                    raw.unlink()
+                elif mutation == 'cancelled':
+                    data = json.loads(registry.read_text())
+                    data['runs']['saved-output-run']['cancel_requested'] = True
+                    registry.write_text(json.dumps(data))
+                else:
+                    import dispatch_owner_input as INPUT
+                    with mock.patch.object(RA, 'correction_source_session',
+                                           return_value='fixture-user-session'):
+                        INPUT.submit(jobs, owner_attempt, 'preserve the new correction',
+                                     request_id='saved-output-correction')
+                start_args = SimpleNamespace(route_file=str(path), route_node='run-verify',
+                    attempt_id='att-saved-verifier', jobs=str(jobs), agent_home=ROOT,
+                    worktree=str(self.base), dispatch_depth=2, parent_slug='fixture-owner',
+                    parent_attempt_id=owner_attempt, parent_harness='claude',
+                    parent_transport='headless', parent_sandbox='workspace-write', subsession_id=None)
+                with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
+                     mock.patch('subprocess.check_output', return_value=str(self.base)):
+                    refused = RA.completion_gate(start_args, 'start', ROOT, jobs,
+                                                 gate=DC.completion_marker_gate)
+                self.assertIsNotNone(refused)
+                self.assertEqual(refused[0], 'completion-marker-missing')
+                self.assertEqual(ledger.state()['nodes']['full-run']['state'], 'FAILED_RETRYABLE')
+                self.assertEqual(ledger.claims(), {})
+                self.assertFalse((SUP.route_module().completion_dir(route['route_id'], jobs=jobs)
+                                  / 'full-run.json').exists())
+
     def live_owner(self, route, jobs, registry, *, harness='codex'):
         import dispatch_owner_input as INPUT
         identity = SUP.RR.proc_identity(os.getpid())
