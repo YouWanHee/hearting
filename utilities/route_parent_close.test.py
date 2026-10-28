@@ -547,7 +547,7 @@ class ParentCloseTest(unittest.TestCase):
                 finally:
                     fixture.doCleanups()
 
-    def test_owner_pin_moved_by_the_handed_over_parent_is_handoff_authority(self):
+    def test_pin_change_recorded_by_the_parent_stays_authority_after_later_handover(self):
         """After a seat handover the effective parent pins; the registered parent is gone."""
         import artifact_identity
         import artifact_producer as PRODUCER
@@ -575,12 +575,119 @@ class ParentCloseTest(unittest.TestCase):
             outcome = CLOSE.close(fixture.route, fixture.path, jobs=fixture.jobs,
                                   summary=work_start.PIN_HANDOFF_SUMMARY)
             self.assertEqual(outcome["state"], "cancelled", outcome)
-            def owns(meta, session, jobs, **_):
-                return session == "seat-successor-parent"
-            with mock.patch.object(AUTH, "owns", side_effect=owns):
-                self.assertIsNotNone(CLOSE.verified_owner_pin_handoff_close(fixture.route, jobs=fixture.jobs))
-            with mock.patch.object(AUTH, "owns", return_value=False):
-                self.assertIsNone(CLOSE.verified_owner_pin_handoff_close(fixture.route, jobs=fixture.jobs))
+            # The writer proved its authority at record time; a later seat
+            # handover is not asked to re-authorize the same recorded pin.
+            for owns in (True, False):
+                with mock.patch.object(AUTH, "owns", return_value=owns):
+                    self.assertIsNotNone(CLOSE.verified_owner_pin_handoff_close(
+                        fixture.route, jobs=fixture.jobs))
+            pin_path = AUTH.pin_changes_path(fixture.route)
+            saved = pin_path.read_bytes()
+            try:
+                rows = [json.loads(line) for line in saved.splitlines() if line.strip()]
+                for row in rows:
+                    row["at"] = "2999-01-01T00:00:00Z"
+                pin_path.write_text("\n".join(json.dumps(row, sort_keys=True)
+                                              for row in rows) + "\n")
+                self.assertIsNone(CLOSE.verified_owner_pin_handoff_close(
+                    fixture.route, jobs=fixture.jobs))
+                rows = [json.loads(line) for line in saved.splitlines() if line.strip()]
+                for row in rows:
+                    if row.get("target") == "owner":
+                        row["previous"] = {"harness": "opencode"}
+                pin_path.write_text("\n".join(json.dumps(row, sort_keys=True)
+                                              for row in rows) + "\n")
+                self.assertIsNone(CLOSE.verified_owner_pin_handoff_close(
+                    fixture.route, jobs=fixture.jobs))
+            finally:
+                pin_path.write_bytes(saved)
+        finally:
+            fixture.doCleanups()
+
+    def test_pin_handoff_holder_identity_transfer_and_two_hops(self):
+        """Identity unless a proven handoff preserved the run and resumes its node."""
+        import route_authority as AUTH
+
+        fixture = ParentCloseTest()
+        fixture.setUp()
+        try:
+            initial = ROUTE.compose_route(
+                capability="autopilot-code", capability_mode="debug", shape="staged",
+                graph="execute,test,report", slug="holder-two-hops", cwd=fixture.base,
+                artifact_root=fixture.artifacts, spec_read="fixture", unassigned=True,
+                dispatch_evidence=fixture.route["dispatch_evidence"], parent_harness="codex",
+                work_request={"text": "Hold one preserved run across two handoffs",
+                              "owner_harness": "codex"})
+            path = ROUTE.canonical_route_path(fixture.artifacts, initial["route_id"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(initial))
+            fixture.route, fixture.path = initial, path
+            node = "execute"
+            run_id = "fixture-preserved-run"
+            self.assertFalse(CLOSE.pin_handoff_holder(
+                str(path), initial["route_id"], initial["route_hash"], node, run_id,
+                jobs=fixture.jobs)["inherited"])
+            self.assertFalse(CLOSE.pin_handoff_holder(
+                str(path), initial["route_id"], "sha256:" + "0" * 64, node, run_id,
+                jobs=fixture.jobs)["inherited"])
+
+            prepared = {}
+            for ordinal, (launch, target) in enumerate((("codex", "claude"), ("claude", "codex"))):
+                owner = fixture.row(f"holder-owner-{ordinal}", harness=launch,
+                                    capability_mode="debug")
+                AUTH.record_pin_change(
+                    fixture.route, target="owner",
+                    pin={"harness": target, "model": None, "effort": None},
+                    by={"harness": target, "session_id": "fixture-parent"},
+                    source="fixture", tuples=[], candidates=[])
+                outcome = CLOSE.close(fixture.route, fixture.path, jobs=fixture.jobs,
+                                      summary=work_start.PIN_HANDOFF_SUMMARY)
+                self.assertEqual(outcome["state"], "cancelled", outcome)
+                if ordinal == 0:
+                    self.assertFalse(CLOSE.pin_handoff_holder(
+                        str(fixture.path), fixture.route["route_id"],
+                        fixture.route["route_hash"], node, run_id,
+                        jobs=fixture.jobs)["inherited"],
+                        "a handoff that preserved no such run never moves it")
+                outcome_path = fixture.path.with_suffix(".outcome.json")
+                document = json.loads(outcome_path.read_text())
+                document["resources"] = [{"kind": "resource", "run_id": run_id,
+                                          "state": "working", "preserved": True}]
+                outcome_path.write_text(json.dumps(document))
+                prepared = work_start.pin_handoff_continuation(
+                    fixture.route, fixture.path, fixture.jobs, outcome)
+                self.assertTrue(prepared.get("successor_route"), prepared)
+                holder = CLOSE.pin_handoff_holder(
+                    str(fixture.path), fixture.route["route_id"], fixture.route["route_hash"],
+                    node, run_id, jobs=fixture.jobs)
+                self.assertTrue(holder["inherited"], holder)
+                self.assertEqual(holder["route_id"], Path(prepared["successor_route"]).stem)
+                self.assertEqual(holder["origin"], {
+                    "route_file": str(fixture.path),
+                    "route_id": fixture.route["route_id"],
+                    "route_hash": fixture.route["route_hash"]})
+                self.assertEqual(len(holder["chain"]), 1)
+                self.assertFalse(CLOSE.pin_handoff_holder(
+                    str(fixture.path), fixture.route["route_id"], fixture.route["route_hash"],
+                    "plan", run_id, jobs=fixture.jobs)["inherited"])
+                self.assertFalse(CLOSE.pin_handoff_holder(
+                    str(fixture.path), fixture.route["route_id"], fixture.route["route_hash"],
+                    node, "other-run", jobs=fixture.jobs)["inherited"])
+                successor_path = Path(prepared["successor_route"])
+                fixture.route = ROUTE.verify_route(json.loads(successor_path.read_text()))
+                fixture.route.pop("_registry_current", None)
+                fixture.path = successor_path
+
+            final = CLOSE.pin_handoff_holder(
+                str(path), initial["route_id"], initial["route_hash"], node, run_id,
+                jobs=fixture.jobs)
+            self.assertEqual((final["route_id"], final["route_hash"]),
+                             (fixture.route["route_id"], fixture.route["route_hash"]))
+            self.assertEqual(final["origin"]["route_id"], initial["route_id"])
+            self.assertEqual(len(final["chain"]), 2)
+            self.assertFalse(CLOSE.pin_handoff_holder(
+                str(fixture.path), fixture.route["route_id"], fixture.route["route_hash"],
+                node, run_id, jobs=fixture.jobs)["inherited"])
         finally:
             fixture.doCleanups()
 
