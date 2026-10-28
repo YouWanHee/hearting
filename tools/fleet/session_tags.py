@@ -119,7 +119,7 @@ def _inventory(sessions):
     return live, agents
 
 
-def _keep(row, panes_known):
+def _keep(row, agents):
     """Release only proven exited reservations, never uncertain live processes."""
     pid, start = row.get("pid"), row.get("proc_start")
     if pid and start:
@@ -128,14 +128,34 @@ def _keep(row, panes_known):
         if actual is not None:
             return str(actual) == str(start)
         return Path("/proc/%s" % pid).exists() and not is_terminal_state(pid)
-    return not (panes_known and row.get("pane_id"))
+    if agents is None or not row.get("pane_id"):
+        return True
+    unknown = False
+    for agent in agents:
+        identity = agent.get("agent_session") or {}
+        sid = identity.get("value") if isinstance(identity, dict) and identity.get("kind") == "id" else None
+        if not isinstance(sid, str) or not sid:
+            sid = None
+        same_harness = agent.get("agent") == row["harness"]
+        if same_harness and agent.get("pane_id") and sid is None:
+            unknown = True
+        if agent.get("pane_id") == row["pane_id"]:
+            # A present pane without native identity is not an observed exit.
+            return same_harness and (sid is None or sid == row["session_id"])
+    # An uncertain same-harness pane may be the session after a pane move.
+    # This reserves its number only; it does not attribute that pane to a SID.
+    return unknown
 
 
 def assign(sessions):
     """Collect normal inventory before attempting the nonblocking shared writer."""
     try:
+        try:
+            baseline = _read(_path())
+        except FileNotFoundError:
+            baseline = {}
         live, agents = _inventory(sessions)
-        return _assign(live, agents)
+        return _assign(live, agents, baseline=baseline)
     except (OSError, ValueError, TypeError, ImportError):
         return []
 
@@ -159,7 +179,7 @@ def assign_observed(harness, sid, *, pane_id=None, pid=None, proc_start=None):
     return assigned_tag(harness, sid)
 
 
-def _assign(live, agents, *, observed_only=False):
+def _assign(live, agents, *, observed_only=False, baseline=None):
     """Reserve against the latest snapshot and persist atomically under one lock."""
     from .session_handle import minted_tag
     path = _path()
@@ -172,8 +192,16 @@ def _assign(live, agents, *, observed_only=False):
                 old = _read(path)
             except FileNotFoundError:
                 old = {}
+            baseline = baseline or {}
+            if not observed_only:
+                # A newer full writer's deletion wins over this stale census.
+                for key in baseline.keys() - old.keys():
+                    live.pop(key, None)
             for key, row in old.items():
-                if key not in live and (observed_only or _keep(row, agents is not None)):
+                # Only unchanged rows can be retired/refreshed by this census.
+                # Newer pane/PID evidence wins even when live contains the SID.
+                if ((not observed_only and row != baseline.get(key))
+                        or (key not in live and (observed_only or _keep(row, agents)))):
                     live[key] = row.copy()
             now = time.time()
             for key, row in live.items():

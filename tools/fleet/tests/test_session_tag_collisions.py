@@ -333,15 +333,142 @@ print(json.dumps(values))
         self.assertEqual(expected, after[("codex", self.b)])
 
     def test_collection_discovers_outside_lock_then_rereads_latest_snapshot(self):
+        confirmed = []
+
         def inventory(sessions):
             # Would contend/fail if inventory ran while the writer held its lock.
-            self.assertIsNotNone(session_tags.assign_observed("opencode", self.b))
+            confirmed.append(session_tags.assign_observed("opencode", self.b, pane_id="w:new-live"))
+            self.assertIsNotNone(confirmed[0])
             return {("codex", self.a): {"harness": "codex", "session_id": self.a,
                                         "started_at": 10}}, []
         with mock.patch.object(session_tags, "_inventory", side_effect=inventory):
             session_tags.assign([])
-        self.assertIsNotNone(resolve_tag("codex", self.a))
-        self.assertNotEqual(resolve_tag("codex", self.a), resolve_tag("opencode", self.b))
+        first, second = resolve_tag("codex", self.a), resolve_tag("opencode", self.b)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
+        self.assertEqual(second, confirmed[0])
+
+    def test_stale_collection_keeps_same_sid_new_pane_and_process_evidence(self):
+        key = ("codex", self.a)
+        confirmed = session_tags.assign_observed(*key, pane_id="w:old", pid=101, proc_start="10")
+        stale = session_tags._read(session_tags._path())[key].copy()
+        latest = {}
+
+        def inventory(sessions):
+            self.assertEqual(session_tags.assign_observed(*key, pane_id="w:new", pid=202,
+                                                         proc_start="20"), confirmed)
+            latest.update(session_tags._read(session_tags._path()))
+            return {key: stale}, []
+
+        with mock.patch.object(session_tags, "_inventory", side_effect=inventory):
+            session_tags.assign([])
+        self.assertEqual(session_tags._read(session_tags._path()), latest)
+        self.assertEqual(resolve_tag(*key), confirmed)
+
+    def test_overlapping_full_collections_preserve_newer_rows_and_evidence(self):
+        key, other = ("codex", self.a), ("opencode", self.b)
+        confirmed = session_tags.assign_observed(*key, pane_id="w:old")
+        stale = session_tags._read(session_tags._path())[key].copy()
+        latest = {}
+
+        def inventory(sessions):
+            newer = {key: dict(stale, pane_id="w:moved", pid=202, proc_start="20"),
+                     other: {"harness": "opencode", "session_id": self.b,
+                             "started_at": 20, "pane_id": "w:other"}}
+            with mock.patch.object(session_tags, "_inventory", return_value=(newer, [])):
+                session_tags.assign([])
+            latest.update(session_tags._read(session_tags._path()))
+            self.assertEqual(latest[key]["pane_id"], "w:moved")
+            self.assertIn(other, latest)
+            return {key: stale}, []
+
+        with mock.patch.object(session_tags, "_inventory", side_effect=inventory):
+            session_tags.assign([])
+        self.assertEqual(session_tags._read(session_tags._path()), latest)
+        self.assertEqual(resolve_tag(*key), confirmed)
+        self.assertIsNotNone(resolve_tag(*other))
+        self.assertNotEqual(resolve_tag(*other), confirmed)
+        # The merge protects this census only; a fresh proven exit still releases.
+        with mock.patch("fleet.collectors.procscan.read_proc_start", return_value="reused"):
+            session_tags.assign([])
+        self.assertEqual(session_tags._read(session_tags._path()), {})
+
+    def test_stale_collection_does_not_resurrect_a_concurrently_deleted_row(self):
+        key, other = ("codex", self.a), ("opencode", self.b)
+        confirmed = session_tags.assign_observed(*key, pane_id="w:gone")
+        stale = session_tags._read(session_tags._path())[key].copy()
+        latest = {}
+
+        def inventory(sessions):
+            newer = {other: {"harness": "opencode", "session_id": self.b,
+                             "started_at": 20, "pane_id": "w:other"}}
+            with mock.patch.object(session_tags, "_inventory", return_value=(newer, [])):
+                session_tags.assign([])
+            latest.update(session_tags._read(session_tags._path()))
+            self.assertNotIn(key, latest)
+            self.assertEqual(latest[other]["tag"], confirmed)
+            return {key: stale}, []
+
+        with mock.patch.object(session_tags, "_inventory", side_effect=inventory):
+            session_tags.assign([])
+        self.assertEqual(session_tags._read(session_tags._path()), latest)
+        self.assertIsNone(resolve_tag(*key))
+        self.assertEqual(resolve_tag(*other), confirmed)
+        # A later verified event can legitimately reintroduce the SID.
+        returned = session_tags.assign_observed(*key, pane_id="w:returned")
+        self.assertIsNotNone(returned)
+        self.assertNotEqual(returned, confirmed)
+
+    def test_unknown_native_identity_keeps_existing_and_moved_pane_reservations(self):
+        for harness in ("codex", "opencode"):
+            for pane in ("w:original", "w:moved"):
+                with self.subTest(harness=harness, pane=pane):
+                    session_tags._path().unlink(missing_ok=True)
+                    confirmed = session_tags.assign_observed(harness, self.a, pane_id="w:original")
+                    before = session_tags._read(session_tags._path())
+                    self.agents.return_value = [{"agent": harness, "pane_id": pane,
+                                                 "agent_session": {"kind": "unknown"}}]
+                    self.assertEqual(session_tags.assign([]), [])
+                    self.assertEqual(session_tags._read(session_tags._path()), before)
+                    other = session_tags.assign_observed(harness, self.b, pane_id="w:other")
+                    self.assertIsNotNone(confirmed)
+                    self.assertIsNotNone(other)
+                    self.assertNotEqual(confirmed, other)
+                    self.agents.return_value.append({"agent": harness, "pane_id": "w:other",
+                                                     "agent_session": {"kind": "id", "value": self.b}})
+                    session_tags.assign([])
+                    self.assertEqual(resolve_tag(harness, self.a), confirmed)
+                    self.agents.return_value[0]["agent_session"] = {"kind": "id", "value": self.a}
+                    session_tags.assign([])
+                    row = session_tags._read(session_tags._path())[(harness, self.a)]
+                    self.assertEqual(row, dict(before[(harness, self.a)], pane_id=pane))
+                    self.assertEqual(resolve_tag(harness, self.b), other)
+
+    def test_missing_or_replaced_pane_still_releases_its_reservation(self):
+        replacement = {"agent": "codex", "pane_id": "w:original",
+                       "agent_session": {"kind": "id", "value": self.b}}
+        unknown = {"agent": "codex", "pane_id": "w:elsewhere", "agent_session": {"kind": "unknown"}}
+        for agents in ([], [replacement], [dict(replacement, agent="opencode")],
+                       [dict(unknown, agent="opencode")], [replacement, unknown]):
+            with self.subTest(agents=agents):
+                session_tags._path().unlink(missing_ok=True)
+                session_tags.assign_observed("codex", self.a, pane_id="w:original")
+                self.agents.return_value = agents
+                session_tags.assign([])
+                self.assertIsNone(resolve_tag("codex", self.a))
+
+    def test_failed_census_baseline_preserves_snapshot_without_discovery(self):
+        confirmed = session_tags.assign_observed("codex", self.a, pane_id="w:original")
+        before = session_tags._path().read_bytes()
+        for failure in (PermissionError(), ValueError("corrupt baseline")):
+            with self.subTest(failure=failure), \
+                 mock.patch.object(session_tags, "_read", side_effect=failure), \
+                 mock.patch.object(session_tags, "_inventory") as inventory:
+                self.assertEqual(session_tags.assign([]), [])
+                inventory.assert_not_called()
+            self.assertEqual(session_tags._path().read_bytes(), before)
+            self.assertEqual(resolve_tag("codex", self.a), confirmed)
 
     def test_failed_atomic_write_preserves_existing_assignment_and_retires_temp(self):
         confirmed = session_tags.assign_observed("codex", self.a)
