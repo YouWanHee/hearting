@@ -330,7 +330,9 @@ print(json.dumps(values))
         after = session_tags._read(session_tags._path())
         self.assertEqual(before[("codex", self.a)], after[("codex", self.a)])
         expected = dict(before[("codex", self.b)], pane_id="w:moved")
-        self.assertEqual(expected, after[("codex", self.b)])
+        self.assertEqual({k: v for k, v in expected.items() if k != "observation_revision"},
+                         {k: v for k, v in after[("codex", self.b)].items()
+                          if k != "observation_revision"})
 
     def test_collection_discovers_outside_lock_then_rereads_latest_snapshot(self):
         confirmed = []
@@ -365,6 +367,84 @@ print(json.dumps(values))
             session_tags.assign([])
         self.assertEqual(session_tags._read(session_tags._path()), latest)
         self.assertEqual(resolve_tag(*key), confirmed)
+
+    def test_identical_native_and_full_reaffirmations_survive_a_stale_census(self):
+        inventory = session_tags._inventory
+        for harness in ("codex", "opencode"):
+            for event in ("native", "full"):
+                for legacy in (False, True):
+                    with self.subTest(harness=harness, event=event, legacy=legacy):
+                        session_tags._path().unlink(missing_ok=True)
+                        key = (harness, self.a)
+                        original = session_tags.assign_observed(*key, pane_id="w:same")
+                        if legacy:
+                            data = json.loads(session_tags._path().read_text())
+                            data["assignments"][0].pop("observation_revision", None)
+                            session_tags._path().write_text(json.dumps(data))
+                            self.assertEqual(resolve_tag(*key), original)
+                        agents = [{"agent": harness, "pane_id": "w:same",
+                                   "agent_session": {"kind": "id", "value": self.a}}]
+
+                        def stale_inventory(_):
+                            if event == "native":
+                                herdr_projection._assign_observed_tag(*key, "w:same")
+                            else:
+                                self.agents.return_value = agents
+                                with mock.patch.object(session_tags, "_inventory", wraps=inventory):
+                                    self.assertEqual(session_tags.assign([]), agents)
+                            self.assertEqual(resolve_tag(*key), original)
+                            return {}, []
+
+                        with mock.patch.object(session_tags, "_inventory", side_effect=stale_inventory):
+                            session_tags.assign([])
+                        self.assertEqual(resolve_tag(*key), original)
+                        other = "opencode" if harness == "codex" else "codex"
+                        allocated = session_tags.assign_observed(other, self.b, pane_id="w:other")
+                        self.assertIsNotNone(allocated)
+                        self.assertNotEqual(allocated, original)
+                        self.assertEqual(session_tags.assign_observed(*key, pane_id="w:same"), original)
+
+    def test_identical_reaffirmation_protects_pid_and_pane_from_stale_live_evidence(self):
+        for harness in ("codex", "opencode"):
+            with self.subTest(harness=harness):
+                session_tags._path().unlink(missing_ok=True)
+                key = (harness, self.a)
+                original = session_tags.assign_observed(*key, pane_id="w:same", pid=101, proc_start="10")
+                row = session_tags._read(session_tags._path())[key].copy()
+
+                def stale_inventory(_):
+                    self.assertEqual(session_tags.assign_observed(*key, pane_id="w:same",
+                                                                pid=101, proc_start="10"), original)
+                    return {key: dict(row, pane_id="w:stale", pid=202, proc_start="20")}, []
+
+                with mock.patch.object(session_tags, "_inventory", side_effect=stale_inventory):
+                    session_tags.assign([])
+                actual = session_tags._read(session_tags._path())[key]
+                self.assertEqual((actual["pane_id"], actual["pid"], actual["proc_start"]),
+                                 ("w:same", 101, "10"))
+                self.assertEqual(actual["tag"], original)
+
+    def test_carrying_another_reservation_does_not_reaffirm_it(self):
+        for event in ("native", "full"):
+            with self.subTest(event=event):
+                session_tags._path().unlink(missing_ok=True)
+                key, other = ("codex", self.a), ("opencode", self.b)
+                session_tags.assign_observed(*key, pane_id="w:gone")
+
+                def stale_inventory(_):
+                    if event == "native":
+                        session_tags.assign_observed(*other, pane_id="w:other")
+                    else:
+                        live = {other: {"harness": other[0], "session_id": other[1],
+                                        "started_at": 20, "pane_id": "w:other"}}
+                        with mock.patch.object(session_tags, "_inventory", return_value=(live, None)):
+                            session_tags.assign([])
+                    return {}, []
+
+                with mock.patch.object(session_tags, "_inventory", side_effect=stale_inventory):
+                    session_tags.assign([])
+                self.assertIsNone(resolve_tag(*key))
+                self.assertIsNotNone(resolve_tag(*other))
 
     def test_overlapping_full_collections_preserve_newer_rows_and_evidence(self):
         key, other = ("codex", self.a), ("opencode", self.b)
@@ -442,7 +522,9 @@ print(json.dumps(values))
                     self.agents.return_value[0]["agent_session"] = {"kind": "id", "value": self.a}
                     session_tags.assign([])
                     row = session_tags._read(session_tags._path())[(harness, self.a)]
-                    self.assertEqual(row, dict(before[(harness, self.a)], pane_id=pane))
+                    expected = dict(before[(harness, self.a)], pane_id=pane)
+                    self.assertEqual({k: v for k, v in row.items() if k != "observation_revision"},
+                                     {k: v for k, v in expected.items() if k != "observation_revision"})
                     self.assertEqual(resolve_tag(harness, self.b), other)
 
     def test_missing_or_replaced_pane_still_releases_its_reservation(self):
@@ -496,6 +578,19 @@ print(json.dumps(values))
                 inventory.assert_not_called()
             self.assertEqual(session_tags._path().read_bytes(), before)
             self.assertEqual(resolve_tag("codex", self.a), confirmed)
+
+    def test_invalid_observation_revision_is_corrupt_and_preserved(self):
+        session_tags.assign_observed("codex", self.a, pane_id="w:original")
+        path = session_tags._path()
+        data = json.loads(path.read_text())
+        for invalid in (-1, True, "invalid", None):
+            with self.subTest(revision=invalid):
+                data["assignments"][0]["observation_revision"] = invalid
+                path.write_text(json.dumps(data))
+                before = path.read_bytes()
+                self.assertIsNone(resolve_tag("codex", self.a))
+                self.assertIsNone(session_tags.assign_observed("opencode", self.b))
+                self.assertEqual(path.read_bytes(), before)
 
     def test_failed_atomic_write_preserves_existing_assignment_and_retires_temp(self):
         confirmed = session_tags.assign_observed("codex", self.a)

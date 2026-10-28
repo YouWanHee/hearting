@@ -27,11 +27,13 @@ def _read(path):
         key = (row.get("harness"), row.get("session_id"))
         seen = row.get("first_seen")
         started = row.get("started_at")
+        revision = row.get("observation_revision", 0)
         if (key[0] not in {"claude", "codex", "opencode"}
                 or not isinstance(key[1], str) or not key[1]
                 or not isinstance(row.get("tag"), str) or not _HEX.fullmatch(row["tag"])
                 or not isinstance(seen, (int, float)) or isinstance(seen, bool) or not math.isfinite(seen)
                 or not isinstance(started, (int, float)) or isinstance(started, bool) or not math.isfinite(started)
+                or not isinstance(revision, int) or isinstance(revision, bool) or revision < 0
                 or key in rows):
             raise ValueError("invalid tag assignment")
         rows[key] = row
@@ -183,6 +185,7 @@ def assign_observed(harness, sid, *, pane_id=None, pid=None, proc_start=None):
 def _assign(live, agents, *, observed_only=False, baseline=None):
     """Reserve against the latest snapshot and persist atomically under one lock."""
     from .session_handle import minted_tag
+    observed = set(live)
     path = _path()
     try:
         import fcntl
@@ -198,12 +201,15 @@ def _assign(live, agents, *, observed_only=False, baseline=None):
                 # A newer full writer's deletion wins over this stale census.
                 for key in baseline.keys() - old.keys():
                     live.pop(key, None)
+                    observed.discard(key)
             for key, row in old.items():
                 # Only unchanged rows can be retired/refreshed by this census.
                 # Newer pane/PID evidence wins even when live contains the SID.
                 if ((not observed_only and row != baseline.get(key))
                         or (key not in live and (observed_only or _keep(row, agents)))):
                     live[key] = row.copy()
+                    if not observed_only:
+                        observed.discard(key)
             now = time.time()
             for key, row in live.items():
                 previous = old.get(key, {})
@@ -215,6 +221,10 @@ def _assign(live, agents, *, observed_only=False, baseline=None):
                         live[key] = row
                     row["started_at"] = previous["started_at"]
                 row["first_seen"] = previous.get("first_seen", now)
+                if key in observed:
+                    # A real reaffirmation is newer even if pane/PID data match.
+                    # Carried or superseded census rows are not new observations.
+                    row["observation_revision"] = previous.get("observation_revision", 0) + 1
                 if previous and row["harness"] != "claude":
                     row["tag"] = previous["tag"]
                 elif row["harness"] != "claude":
