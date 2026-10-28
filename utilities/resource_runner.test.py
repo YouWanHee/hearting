@@ -168,13 +168,29 @@ class ComputeRunAdoptionTest(unittest.TestCase):
                       route_closed=False, binding_conflict=False, replay=False,
                       interrupt_before_arm=False, late_conflict=None,
                       real_compute=False, mutate_outputs_before_replay=False,
-                      missing_outputs_hash=False):
+                      missing_outputs_hash=False, lineage=False, route_free=False):
         import contextlib
         import resource_run_registry as RR
         import dispatch_resource_wait as OWNER_RESOURCE
         # Current resource bindings retain the digest of the legacy reader's
         # projection. A placeholder used by the original fixture no longer
         # represents an armed row and masks the adoption/refusal paths below.
+        source_file = self.root / "source-route.json"
+        source = {"route_id": "rt-source", "route_hash": "sha256:source",
+                  "artifact_root": str(self.root), "cwd": str(self.root), "nodes": []}
+        if lineage or route_free:
+            if lineage:
+                source_file.write_text(json.dumps(source))
+                for document in (self.provenance, self.parent_contract):
+                    document.update(route_id=source["route_id"],
+                                    route_hash=source["route_hash"],
+                                    route_file=str(source_file))
+                self.original["route"] = str(source_file)
+                self.registry.write_text(json.dumps({"schema_version": 1,
+                                                     "runs": {"full-run": self.original}}))
+            else:
+                for document in (self.provenance, self.parent_contract):
+                    document.update(route_id=None, route_hash=None, route_file=None)
         self.armed["resource_binding"] = OWNER_RESOURCE.resource_legacy_body_digest(self.original)
         fake_ledger = SimpleNamespace(lock=contextlib.nullcontext,
                                       root=self.workflow,
@@ -315,6 +331,10 @@ class ComputeRunAdoptionTest(unittest.TestCase):
                                          "AGENT_DISPATCH_COMPLETION_MODE": "supervised",
                                          **({"COMPUTE_HOSTS_CONFIG": str(self.compute_config)}
                                             if real_compute else {})}, clear=False),
+            mock.patch.object(OWNER_RESOURCE, "compute_holder", side_effect=self._holder(
+                lineage, route_free, source)),
+            mock.patch.object(OWNER_RESOURCE, "resource_holder", side_effect=self._holder(
+                lineage, route_free, source)),
         ]
         entered = [patcher.start() for patcher in patches]
         self.addCleanup(lambda: [patcher.stop() for patcher in reversed(patches)])
@@ -332,6 +352,14 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         arm_runner.side_effect = run_arm
         args = SimpleNamespace(jobs=str(self.jobs), parent_attempt_id="att-owner")
         with mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+            if route_free:
+                with self.assertRaises(SystemExit) as refused:
+                    R.adopt_compute_run(self.registry, args, self.route,
+                                        self.route_file, "compute-1")
+                self.assertEqual(refused.exception.code, 65)
+                self.assertIn("resource-compute-route-mismatch",
+                              refused.exception.resource_message)
+                return json.loads(self.registry.read_text())["runs"]
             if interrupt_before_arm:
                 with self.assertRaises(SystemExit) as interrupted:
                     R.adopt_compute_run(self.registry, args, self.route, self.route_file, "compute-1")
@@ -359,6 +387,61 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         if real_compute:
             self.assertGreaterEqual(self.remote_call.call_count, 1)
         return json.loads(self.registry.read_text())["runs"]
+
+    def _holder(self, lineage, route_free, source):
+        def holder(document=None, **_kwargs):
+            if route_free:
+                return {"route_id": None, "route_hash": None, "route_file": None,
+                        "inherited": False,
+                        "origin": {"route_id": None, "route_hash": None, "route_file": None},
+                        "chain": []}
+            if lineage:
+                return {"route_id": self.route["route_id"],
+                        "route_hash": self.route["route_hash"],
+                        "route_file": str(self.route_file), "inherited": True,
+                        "origin": {"route_id": source["route_id"],
+                                   "route_hash": source["route_hash"],
+                                   "route_file": str(self.root / "source-route.json")},
+                        "chain": [{"route_id": self.route["route_id"],
+                                   "route_hash": self.route["route_hash"],
+                                   "route_file": str(self.route_file),
+                                   "owner_attempt_id": "att-original"}]}
+            # Like the real holder: a run no handoff moved has the address its
+            # own record names as its origin.
+            recorded = (document or {}).get("route") or (document or {}).get("route_file")
+            return {"route_id": self.route["route_id"],
+                    "route_hash": self.route["route_hash"],
+                    "route_file": str(self.route_file), "inherited": False,
+                    "origin": {"route_id": self.route["route_id"],
+                               "route_hash": self.route["route_hash"],
+                               "route_file": recorded or str(self.route_file)},
+                    "chain": []}
+        return holder
+
+    def test_adopt_compute_run_follows_pin_handoff_lineage(self):
+        runs = self._run_adoption(lineage=True)
+        adopted = runs["full-run__a1"]
+        self.assertEqual(adopted["execution"]["kind"], "compute-hosts")
+        self.assertEqual(adopted["execution"]["run_id"], "compute-1")
+        self.assertEqual(adopted["route"], str(self.route_file.resolve()))
+        self.assertEqual(adopted["parent_attempt_id"], "att-owner")
+
+    def test_adopt_compute_run_without_handoff_still_compares_the_current_route_file(self):
+        # A run no handoff moved is bound to this route's own file: a row that
+        # names another file under the same id/hash is not adopted.
+        self.original["route"] = str(self.root / "another-route.json")
+        self.registry.write_text(json.dumps({"schema_version": 1,
+                                             "runs": {"full-run": self.original}}))
+        with self.assertRaises(SystemExit) as refused:
+            self._run_adoption()
+        self.assertEqual(refused.exception.code, 65)
+        self.assertIn("resource-compute-binding-conflict", refused.exception.resource_message)
+        self.assertIn("resource.route", refused.exception.resource_message)
+
+    def test_adopt_compute_run_refuses_route_free_provenance(self):
+        runs = self._run_adoption(route_free=True)
+        self.assertEqual(list(runs), ["full-run"], "route-free provenance is never adopted")
+        self.assertEqual(runs["full-run"], self.original)
 
     def test_same_contract_adopts_one_retry_without_payload_spawn(self):
         runs = self._run_adoption()

@@ -1055,7 +1055,7 @@ A legacy hash collision is diagnostic
      deterministic scalar-versus-slash shape only and never overrides canonical
      fields. `worker_role` remains legacy read-only identity metadata.
    - For a route-bound job, the compiler selects and seals both portable model role and model profile; wrappers resolve the profile through adapter config and reject trailing model/effort replacement. A model or effort different from the profile default is chosen once at `compose --pin <owner|frame|worker>=<harness>[:<model>[@<effort>]]`, sealed into the route (`selection_pins`, inherited by continuations), moved later only by the route's parent with `start --pin` (recorded beside the route), and read by the wrapper from the bound route with those changes applied (`model_source=pin`, `model_pin_status=applied|harness-only|harness-mismatch|none`); a checked capacity retry may still replace a pinned model and then reports `model_source=pin+capacity` with `model_pin=`. A sealed worker or owner pin also beats an explicit `--adapter` while the pinned harness is usable (supported by the checked tuple and under no active usage limit); the replaced request is recorded as `explicit_adapter=`, and a pinned harness that cannot run keeps the request and reports `harness-mismatch`. A sealed worker pin also bounds `stage-dispatch-fallback` descent: only the pinned harness's headless candidates may take that step (native-subagent/inline only when the owner runs on that harness); other harnesses are recorded `skipped-worker-pin`, and when the pinned harness cannot take the step the chain stops with `reason=worker-pin-unavailable` and one plain detail line instead of moving the step to another tool. Top (main-session-only) models are accepted for `frame` only; an owner or worker pin naming one keeps the tool and drops the model with `warning=pin-dropped`. Within an otherwise same-harness width-two pair only, shared code may verify a sibling model and select the next declared profile whose configured model differs; the sealed `--model-profile` remains unchanged. Explicit `--profile`, `--explicit-profiles`, and harness/profile-only pins remain eligible; only a concrete model pin or capacity-retry-chosen model is preserved. Traversal skips profiles configured to the sibling's model and skips `top` and `mini`; profile order is a decision rule, not a quality ranking. Non-route direct/lifecycle surfaces retain their explicit model/inheritance contracts. Registered substantive owner/stage/review nodes reject `mini`. The orchestrator chooses harness placement subject to sealed diversity axes.
-   - **Cross-harness routing under SD-16:** before dispatch, query each harness through `utilities/usage-check.sh`, which reports `ok`, `limited(reset)`, or `unknown`. The cascade is explicit target (including an explicit pin), hard eligibility, sealed affinity/policy, the balanced usage gate, quality band, then allocation ordering (target shares scaled by the optional `allocation.harness_weights`, e.g. OpenCode `0.3`). A frame leg reads the `harness_policy` sealed on its own node; an explicit harness outside the profile's bands is followed while it is enabled. Unknown gauges pass the balanced gate optimistically and use the neutral ordering share, while account-bound native quota rejections (through their exact reset and model scope) and legacy death markers from `usage-check.sh` remain hard exclusions until the login a worker would use answers otherwise: while Claude is held, a launch decision (`usage-check.sh --recheck`, `recheck=True`) sends that login one minimal request (`dispatch_capacity_evidence.probe`) at most every 10 minutes per login (`unscoped` while no account resolves) and model family, whatever the last attempt's outcome. The probed model follows the window that holds: Haiku for an all-model window, the limited family or model for a narrower one. An answer newer than a limit decides it: one that goes through lifts a limit whose window covers the probed model (an all-model window for any model, a family or model window only for that one), as when another account is signed in or quota returns before the recorded reset, and a rejection holds the models its window covers until its own reset. Later rejections preserve successful evidence that already lifted older limits. A probe that cannot run or fails for another reason changes nothing; gauges and Fleet read the stored answers. Under `capacity-aware`, unknown/zero headroom is excluded. Allocation order is compiled and sealed into the route (`dispatch_allocation`, `dispatch_defaults_digest`); `verify` never reloads live config. A user prohibition is stronger than any signal. A policy change is complete only when the allocation ledger (`utilities/dispatch_allocation_receipt.py list|summary`) shows the new field on a real attempt, not when the file validates.
+   - **Cross-harness routing under SD-16:** before dispatch, query each harness through `utilities/usage-check.sh`, which reports `ok`, `limited(reset)`, or `unknown`. The cascade is explicit target (including an explicit pin), hard eligibility, sealed affinity/policy, the balanced usage gate, quality band, then allocation ordering (target shares scaled by the optional `allocation.harness_weights`, e.g. OpenCode `0.3`). A frame leg reads the `harness_policy` sealed on its own node; an explicit harness outside the profile's bands is followed while it is enabled. Unknown gauges pass the balanced gate optimistically and use the neutral ordering share, while account-bound native quota rejections (through their exact reset and model scope), legacy death markers from `usage-check.sh`, and, for Codex and OpenCode, a shared-gauge window at 100% used with a future reset (read through the same capacity cache judge; 99%, a past reset, or a cache older than an hour keeps today's `ok`, and Claude keeps its native evidence) remain hard exclusions until the login a worker would use answers otherwise: while Claude is held, a launch decision (`usage-check.sh --recheck`, `recheck=True`) sends that login one minimal request (`dispatch_capacity_evidence.probe`) at most every 10 minutes per login (`unscoped` while no account resolves) and model family, whatever the last attempt's outcome. The probed model follows the window that holds: Haiku for an all-model window, the limited family or model for a narrower one. An answer newer than a limit decides it: one that goes through lifts a limit whose window covers the probed model (an all-model window for any model, a family or model window only for that one), as when another account is signed in or quota returns before the recorded reset, and a rejection holds the models its window covers until its own reset. Later rejections preserve successful evidence that already lifted older limits. A probe that cannot run or fails for another reason changes nothing; gauges and Fleet read the stored answers. Under `capacity-aware`, unknown/zero headroom is excluded. Allocation order is compiled and sealed into the route (`dispatch_allocation`, `dispatch_defaults_digest`); `verify` never reloads live config. A user prohibition is stronger than any signal. A policy change is complete only when the allocation ledger (`utilities/dispatch_allocation_receipt.py list|summary`) shows the new field on a real attempt, not when the file validates.
      **Provider/model availability:** quota headroom and execution availability are separate evidence. A candidate carries `usable`, `unavailable`, or `unknown`, scoped to its provider, selected account, and model where evidence supports that precision, with its reason and observation time. A confirmed credential or entitlement rejection is a hard exclusion for only the candidates covered by that evidence and outranks older successful quota/cache data. A runtime that serves several providers through one login reports a typed authentication error (OpenCode `provider.auth`) as a confirmed rejection of that provider, account, and credential generation even without a numeric HTTP status; it stays a runtime death that automatic replacement may move to another harness, not a whole-harness login failure. Rate limits, quota, transport, internal, and unclassified errors remain unknown and cannot clear a confirmed rejection. A newer same-scope success, an observed active-account change, or a changed credential generation (re-login or token refresh) may restore eligibility. Automatic selection admits a candidate only with `usable` evidence or as an `unknown` of a provider Hearting verifies before placement (today the OpenCode Go usage/entitlement probe); another provider's `unknown` is reported as unverified and is not selected automatically, so a harness with no admissible candidate is left out without a pause. Automatic ranking and every cached ordering consume this filter before headroom, affinity, bias, and fallback; an explicit harness choice, pin, or model still runs its configured model, and an explicit model pin remains exact and reports its native error. Credential presence and model inventory are not execution or entitlement evidence.
    - **Nested child-spawn eligibility under SD-48:** root headless readiness,
      runtime-native subagent readiness, and a conductor's ability to launch a
@@ -2437,7 +2437,12 @@ repository and counts once its row appears; the process cwd is not used to guess
 however many generations it holds. A same-session re-grant, restart, resume or a
 confirmed successor takes no further slot; a session whose end Hearting proved leaves
 its slot while its mark remains and reclaims the role when it revives (a resulting
-overshoot is only displayed); an unknown session keeps counting. At the limit the
+overshoot is only displayed); an unknown session keeps counting. Proof of end follows
+each harness's declared session-ownership proof: no live Claude process in any config home claims the session (native registry, exact statusline tap or launch arguments, a nested PID namespace by its own pid) while the session exists in the native history or transcripts, or its registry process has exited,
+no live Codex process holds the session's stored rollout open, and no live OpenCode
+client shows the session while no running OpenCode runtime can be running it; an
+incomplete observation (another PID namespace, an unreadable process or connection
+table) proves nothing. At the limit the
 grant skips only the role-evidence write and reports
 `steward=limited repo=<name> holders=<current> limit=<n>`; watch, start and ordinary
 work proceed. Lowering the limit, or an install already above it, revokes no role, job
@@ -2489,8 +2494,11 @@ fill the equivalent grid by splitting right. A full or irregular tab first
 reuses an agent-free foreground shell with an empty visible prompt there, then
 checks the other tabs in the same workspace, newest first, using the same
 grid-split and empty-shell decision. Only when none has room does it create one
-unfocused tab. Existing tab names, layouts and sizes are preserved apart from
-filling an available grid cell. Openings in one workspace serialize on the
+unfocused tab. A peer start with a reference pane instead finishes inside that
+tab — free grid cell, then an agent-free empty shell, then a split of the
+reference pane itself — and does not fill another tab or create one. Existing
+tab names, layouts and sizes are preserved apart from filling an available grid
+cell. Openings in one workspace serialize on the
 peer-start claim `peer-starts/<sha256(session:workspace)>.lock`, the file pinned
 releases also take; tmux keys its claim apart in the same directory. The result
 `{surface, pane, placement, notes, view_command}` states failures as notes and
@@ -2498,11 +2506,37 @@ the pane list read once right after opening (`pane-exited`,
 `pane-list-unconfirmed`); nothing is retried or closed. A person in an
 agentless Herdr shell keeps running Fleet in the current terminal.
 
+`hearting run pane tidy` arranges the existing panes in the caller's tab once.
+It supports Herdr and tmux: two panes sit side by side, four form 2×2, six form
+3×2, and five fill two equal-height rows of three and two panes (equal widths
+within each row). The first pane marked `⚑` in screen reading order goes at
+the top left; without that mark, the caller goes first. The remaining panes
+keep their current top-to-bottom, left-to-right order. A matching grid and
+order produce no changes. Pane and terminal IDs, running processes, tab names
+and focus are preserved. A normal foreground shell can call tidy after its
+terminal and process ancestry match the live pane. Registered workers and
+callers without a live binding receive a diagnostic.
+
+Tidy uses the same workspace claim as opening. Herdr may briefly move existing
+panes through a temporary tab in the same workspace; it creates no terminal
+or process and returns those panes before finishing. A failed or interrupted
+command gathers confirmed surviving panes from its temporary tab when the
+server still answers, and reports partial or unconfirmed changes. Existing
+panes and their input stay intact. Zoomed tabs, insufficient space and unconfirmed
+caller or layout state return a diagnostic without starting rearrangement.
+The JSON result is `{surface, tab, panes, changed, notes}`; `panes` is the last
+observed screen order. Success, including an unchanged grid, exits 0; refusal,
+failure or an unconfirmed result exits 1. Hearting pane tidy is not supported
+on cmux. If desired, register the command in the terminal's key settings;
+detached key commands may lack the caller's terminal context. Hearting does
+not register keys or change user configuration.
+
 Same-seat succession uses `peer-steward.py start <name> --kind <harness>`,
 which with no `--pane` or `--beside` uses the calling pane (`HERDR_PANE_ID`)
 as its placement reference, in the Git primary checkout (the calling cwd outside
-Git) unless `--cwd` names another. `--beside` selects the reference tab/pane,
-not the direction; `--pane` retains explicit reuse. Placement follows the window
+Git) unless `--cwd` names another. `--beside` fixes the reference tab and
+placement stays inside it; it does not select the split direction; `--pane`
+retains explicit reuse. Placement follows the window
 contract above, and `start` holds the workspace claim through launch so
 concurrent starts cannot claim the same shell or subdivide a stale layout.
 Names longer than Herdr's 32-character limit are explained before any placement

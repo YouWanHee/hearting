@@ -17,6 +17,27 @@ import dispatch_capacity_evidence as Q
 ROOT = Path(__file__).resolve().parents[1]
 
 
+_STATE_TMP = None
+_STATE_OLD = None
+
+
+def setUpModule():
+    # The shared-gauge reader consults Fleet's live usage cache; keep these
+    # tests off the developer's real ~/.local/state store.
+    global _STATE_TMP, _STATE_OLD
+    _STATE_TMP = tempfile.TemporaryDirectory()
+    _STATE_OLD = os.environ.get("FLEET_USAGE_STATE_DIR")
+    os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_TMP.name
+
+
+def tearDownModule():
+    if _STATE_OLD is None:
+        os.environ.pop("FLEET_USAGE_STATE_DIR", None)
+    else:
+        os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_OLD
+    _STATE_TMP.cleanup()
+
+
 def load(name, file):
     spec = importlib.util.spec_from_file_location(name, ROOT / "utilities" / file)
     module = importlib.util.module_from_spec(spec)
@@ -1198,6 +1219,119 @@ class ClaudeLimitRecheckTests(unittest.TestCase):
         self.assertEqual(self.probes(), [])
         self.assertEqual(states("--recheck")["claude"], "ok")
         self.assertEqual(len(self.probes()), 1)
+
+
+class SharedGaugeHoldTests(unittest.TestCase):
+    """Backlog E: a cached 100% window is a hard hold, read by the one capacity judge."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.jobs = self.home / "jobs.log"
+        self.jobs.write_text("")
+        self.usage = self.home / "usage"
+        self.now = int(time.time())
+        self.env = mock.patch.dict(os.environ, {
+            "HOME": str(self.home), "AGENT_HOME": str(ROOT),
+            "AGENT_DISPATCH_JOBS": str(self.jobs),
+            "FLEET_USAGE_STATE_DIR": str(self.usage),
+            "HARNESS_CAPACITY_SCORES": "",
+            "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        if str(ROOT / "tools") not in sys.path:
+            sys.path.insert(0, str(ROOT / "tools"))
+
+    def record(self, harness, payload, age=5):
+        from fleet.collectors import usage_cache
+        usage_cache.record(harness, payload, now=self.now - age)
+
+    def readers(self):
+        states = Q.usage_states(self.jobs, now=self.now)
+        hold = Q.harness_hold(self.jobs, "codex", now=self.now)
+        limits = Q.active_limits(self.jobs, now=self.now)
+        return states, hold, limits
+
+    def test_codex_full_weekly_window_holds_all_three_readers(self):
+        reset = self.now + 86400
+        self.record("codex", {"windows": [["7d", 100, reset]]})
+        states, hold, limits = self.readers()
+        self.assertEqual(states["codex"], f"limited({Q._iso(reset)})")
+        self.assertEqual(hold, {"until_epoch": reset, "label": Q._iso(reset)})
+        self.assertEqual(limits["codex"]["reset_epoch"], reset)
+        self.assertEqual(limits["codex"]["scope_authority"], "gauge")
+        self.assertEqual(limits["codex"]["model_scope"], "all")
+
+    def test_ninety_nine_past_reset_and_stale_cache_stay_ok(self):
+        future = self.now + 86400
+        self.record("codex", {"windows": [["7d", 99, future]]})
+        states, hold, limits = self.readers()
+        self.assertEqual(states["codex"], "ok")
+        self.assertIsNone(hold)
+        self.assertNotIn("codex", limits)
+        self.record("codex", {"windows": [["7d", 100, self.now - 60]]})
+        states, hold, limits = self.readers()
+        self.assertEqual((states["codex"], hold, limits.get("codex")), ("ok", None, None))
+        self.record("codex", {"windows": [["7d", 100, future]]}, age=4000)
+        states, hold, limits = self.readers()
+        self.assertEqual((states["codex"], hold, limits.get("codex")), ("ok", None, None))
+
+    def test_opencode_full_rl_window_holds_all_three_readers(self):
+        reset = self.now + 86400
+        self.record("opencode", {"rl_windows": [["mo", 100, reset]]})
+        states = Q.usage_states(self.jobs, now=self.now)
+        hold = Q.harness_hold(self.jobs, "opencode", now=self.now)
+        limits = Q.active_limits(self.jobs, now=self.now)
+        self.assertEqual(states["opencode"], f"limited({Q._iso(reset)})")
+        self.assertEqual(hold, {"until_epoch": reset, "label": Q._iso(reset)})
+        self.assertEqual(limits["opencode"]["reset_epoch"], reset)
+
+    def test_claude_cache_windows_stay_native_only(self):
+        self.record("claude", {"windows": [["7d", 100, self.now + 86400]]})
+        states = Q.usage_states(self.jobs, now=self.now)
+        self.assertEqual(states["claude"], "ok")
+        self.assertIsNone(Q.harness_hold(self.jobs, "claude", now=self.now))
+        self.assertNotIn("claude", Q.active_limits(self.jobs, now=self.now))
+
+    def test_manual_score_replaces_the_gauge(self):
+        self.record("codex", {"windows": [["7d", 100, self.now + 86400]]})
+        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_SCORES": "codex:0"}):
+            states = Q.usage_states(self.jobs, now=self.now)
+            self.assertEqual(states["codex"], "ok")
+            self.assertIsNone(Q.harness_hold(self.jobs, "codex", now=self.now))
+
+    def test_later_legacy_marker_reset_wins_over_the_gauge(self):
+        stamp = datetime.fromtimestamp(self.now, timezone.utc).isoformat().replace("+00:00", "Z")
+        self.jobs.write_text(
+            f"{stamp}\tdone\t/r\t/w\tjob\tattempt_id=att-gauge,harness=codex,"
+            "note=dead-session-limit,reset=2099-01-01T00:00:00Z\n")
+        self.record("codex", {"windows": [["7d", 100, self.now + 86400]]})
+        self.assertEqual(Q.usage_states(self.jobs, now=self.now)["codex"],
+                         "limited(2099-01-01T00:00:00Z)")
+        self.assertEqual(Q.harness_hold(self.jobs, "codex", now=self.now)["until_epoch"],
+                         Q._text_reset_epoch("2099-01-01T00:00:00Z", self.now, os.environ))
+
+    def test_later_gauge_reset_wins_over_the_legacy_marker(self):
+        stamp = datetime.fromtimestamp(self.now, timezone.utc).isoformat().replace("+00:00", "Z")
+        marker_reset = Q._iso(self.now + 3600)
+        self.jobs.write_text(
+            f"{stamp}\tdone\t/r\t/w\tjob\tattempt_id=att-gauge,harness=codex,"
+            f"note=dead-session-limit,reset={marker_reset}\n")
+        gauge_reset = self.now + 86400
+        self.record("codex", {"windows": [["7d", 100, gauge_reset]]})
+        self.assertEqual(Q.usage_states(self.jobs, now=self.now)["codex"],
+                         f"limited({Q._iso(gauge_reset)})")
+        self.assertEqual(Q.harness_hold(self.jobs, "codex", now=self.now)["until_epoch"], gauge_reset)
+
+    def test_broken_capacity_reader_keeps_todays_answer(self):
+        self.record("codex", {"windows": [["7d", 100, self.now + 86400]]})
+        with mock.patch.object(Q, "_capacity_reader", side_effect=RuntimeError("missing")):
+            states = Q.usage_states(self.jobs, now=self.now)
+            self.assertEqual(states["codex"], "ok")
+            self.assertIsNone(Q.harness_hold(self.jobs, "codex", now=self.now))
+            self.assertNotIn("codex", Q.active_limits(self.jobs, now=self.now))
 
 
 if __name__ == "__main__":

@@ -73,6 +73,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable, Iterator, Optional
 
@@ -268,8 +269,30 @@ def _digest(*parts: str, size: int = 20) -> str:
 
 
 def _endpoint_scope(env=None) -> str:
-    """A pane id is local to its Herdr endpoint; keep named sockets in separate seats."""
-    env = os.environ if env is None else env
+    """A pane id is local to its Herdr endpoint; keep named sockets in separate seats.
+
+    The default path (no ``env``) asks herdr for that endpoint's socket identity, so a reader
+    outside herdr keys a pane as the pane's own hooks do; an explicit env (``{}``, a dict or the
+    ``os.environ`` object) is computed as-is, so writer and lock keys never change."""
+    if env is None:
+        return _default_endpoint()[0]
+    return _env_endpoint_scope(env)
+
+
+def _default_endpoint() -> tuple[str, str]:
+    """``(endpoint, socket herdr reported)`` of this process; the socket is "" unless discovered.
+
+    Only a process outside any herdr pane asks: a pane process keys from its env exactly as
+    that pane's own hooks do (herdr exports the socket together with the pane id)."""
+    if not (str(os.environ.get("HERDR_SOCKET_PATH") or "").strip()
+            or str(os.environ.get("HERDR_PANE_ID") or "").strip()):
+        socket_path = _herdr_endpoint_socket(str(os.environ.get("AGENT_HERDR_SESSION") or "").strip())
+        if socket_path:
+            return _digest("herdr-endpoint", "socket", os.path.realpath(socket_path)), socket_path
+    return _env_endpoint_scope(os.environ), ""
+
+
+def _env_endpoint_scope(env) -> str:
     server = str(env.get("AGENT_HERDR_SESSION") or "").strip()
     socket_path = str(env.get("HERDR_SOCKET_PATH") or "").strip()
     if socket_path:
@@ -521,6 +544,66 @@ def _herdr_codex_agents() -> Optional[list[dict]]:
     return [a for a in agents if isinstance(a, dict) and a.get("agent") == "codex" and a.get("pane_id")]
 
 
+HERDR_ENDPOINT_RETRY_SEC = 60.0     # an unanswered endpoint question is asked again after this
+_HERDR_ENDPOINT_SOCKETS: dict[str, tuple[str, float]] = {}   # server -> (socket or "", monotonic)
+_HERDR_ENDPOINT_LOCK = threading.Lock()
+
+
+def _herdr_endpoint_socket(server: str) -> str:
+    """The socket herdr itself reports for its running ``server`` ("" is the default one), else "".
+
+    Only herdr's answer counts: ``running`` is true, ``socket`` is a non-empty string and
+    ``session`` names the asked server (null, "" or "default" for the default one); a stopped
+    session still names a socket. A found socket is kept for the process lifetime: herdr derives
+    it from its config directory, so a server restart keeps the path (a moved socket needs the
+    reading process restarted). A miss is asked again only after HERDR_ENDPOINT_RETRY_SEC."""
+    server = str(server or "").strip()
+    with _HERDR_ENDPOINT_LOCK:
+        cached = _HERDR_ENDPOINT_SOCKETS.get(server)
+        if cached is not None and (cached[0] or time.monotonic() - cached[1] < HERDR_ENDPOINT_RETRY_SEC):
+            return cached[0]
+        found = _ask_herdr_endpoint_socket(server)
+        _HERDR_ENDPOINT_SOCKETS[server] = (found, time.monotonic())
+        return found
+
+
+def _ask_herdr_endpoint_socket(server: str) -> str:
+    exe = _herdr_executable()
+    if not exe:
+        return ""
+    command = [exe] + (["--session", server] if server else []) + ["status", "server", "--json"]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=HERDR_LOOKUP_TIMEOUT_SEC)
+        status = json.loads(done.stdout or "")
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError, TypeError):
+        return ""
+    if not isinstance(status, dict) or status.get("running") is not True:
+        return ""
+    socket_path = status.get("socket")
+    if not isinstance(socket_path, str) or not socket_path.strip():
+        return ""
+    named = status.get("session")
+    default = (None, "", "default")
+    if not (named in default if server in ("", "default") else named == server):
+        return ""
+    return socket_path.strip()
+
+
+def _legacy_pane_seat(seat: Seat) -> Optional[Seat]:
+    """The endpoint-free key of an endpoint-keyed pane seat (read-only fallback), else None."""
+    if seat.kind != "pane" or not seat.endpoint or not seat.pane:
+        return None
+    return Seat("pane", _digest("pane", seat.pane), seat.pane, seat.harness)
+
+
+def _pane_seat_candidates(pane: str) -> list[Seat]:
+    """``pane``'s normalized seat, then its legacy endpoint-free seat when the two differ."""
+    seat = _pane_seat_of(pane)
+    legacy = _legacy_pane_seat(seat)
+    return [seat] + ([legacy] if legacy is not None else [])
+
+
 def _agent_session(agent: dict) -> str:
     session = agent.get("agent_session")
     return str(session.get("value") or "") if isinstance(session, dict) else ""
@@ -534,10 +617,11 @@ def _real(path) -> str:
 
 def _pane_seat_of(pane: str, *, endpoint: Optional[str] = None,
                   socket_path: Optional[str] = None) -> Seat:
+    discovered = ""
     if endpoint is None:
-        endpoint = _endpoint_scope()
+        endpoint, discovered = _default_endpoint()
     if socket_path is None:
-        socket_path = str(os.environ.get("HERDR_SOCKET_PATH") or "")
+        socket_path = str(os.environ.get("HERDR_SOCKET_PATH") or "") or discovered
     key = _digest("pane", endpoint, pane) if endpoint else _digest("pane", pane)
     return Seat("pane", key, pane, "codex", "", endpoint=endpoint, socket_path=socket_path)
 
@@ -576,10 +660,14 @@ def _successor_pane(sid: str, agents: list[dict], cwd: str) -> list[str]:
     if len(here) != 1:
         return []
     pane = str(here[0]["pane_id"])
-    seat = _pane_seat_of(pane)
+    booking, seat = None, None
     try:
         import session_tidy_clear
-        booking = session_tidy_clear.read_reservation(seat.key)
+        for seat in _pane_seat_candidates(pane):
+            # The legacy key is read only when the normalized key holds no booking.
+            booking = session_tidy_clear.read_reservation(seat.key)
+            if booking:
+                break
     except BaseException:  # noqa: BLE001
         return []
     ok = bool(booking) and booking.get("harness") == "codex" and booking.get("status") in ("reserved", "unverified") \
@@ -631,7 +719,8 @@ def codex_pane_for_session(sid: str, cwd: str = "", source: str = "") -> str:
         panes = [str(a["pane_id"]) for a in agents if _agent_session(a) == sid]
         if not panes:
             panes = [str(a["pane_id"]) for a in agents
-                     if ("codex", sid) in session_summary(_pane_seat_of(str(a["pane_id"])))]
+                     if any(("codex", sid) in session_summary(seat)
+                            for seat in _pane_seat_candidates(str(a["pane_id"])))]
     if not panes:
         panes = _cleared_into(sid)
     if not panes and agents and source == "clear" and cwd:
@@ -1078,10 +1167,19 @@ def _lineage_transcript(harness: str, sid: str, hint: str) -> dict:
 
 
 def seat_lineage(seat: Seat, *, harness=None, sid=None) -> list[dict]:
-    """Read the seat's bounded existing lineage without updating any state."""
+    """Read the seat's bounded existing lineage without updating any state.
+
+    A pane seat's endpoint-free legacy ledger replaces (never joins) the endpoint ledger only when
+    the endpoint ledger lacks the asked session and the legacy one holds exactly that session."""
     physical = physical_seat(seat)
-    rows = _read_ledger_lines(physical)
     sessions = session_summary(physical)
+    wanted = (str(harness or session_identity(seat)[0] or ""), str(sid or session_identity(seat)[1] or ""))
+    legacy = _legacy_pane_seat(physical) if all(wanted) and wanted not in sessions else None
+    if legacy is not None:
+        legacy_sessions = session_summary(legacy)
+        if wanted in legacy_sessions:
+            physical, sessions = legacy, legacy_sessions
+    rows = _read_ledger_lines(physical)
     cards, locations = {}, {}
     for key, summary in sessions.items():
         name, session = key

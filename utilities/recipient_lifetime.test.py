@@ -421,5 +421,118 @@ class RecipientLifetimeTest(unittest.TestCase):
             self.assertIn("session-identity-unresolved", reasons)
 
 
+    def _nest(self, proc, *, nspid="NSpid:\t{pid}\t114", pid=123):
+        """Move a fake process into a nested PID namespace with an NSpid vector."""
+        (proc / "ns" / "pid").unlink()
+        os.symlink("pid:[4026534296]", proc / "ns" / "pid")
+        if nspid is not None:
+            (proc / "status").write_text("Name:\tclaude\n" + nspid.format(pid=pid) + "\n")
+
+    def test_fake_proc_bfs_helper_of_claude_binary_is_skipped_beside_a_real_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "proc"
+            self._fake_proc_root(root)
+            self._fake_runtime(root, 122, argv=("bfs", "/", "-maxdepth", "6"))
+            _proc, home = self._fake_runtime(root, 123)
+            (home / "sessions" / "123.json").write_text(json.dumps({
+                "pid": 123, "procStart": "123", "sessionId": "real-sid"}))
+            complete, holders, reasons = claude_session_census(proc_root=root)
+            self.assertTrue(complete, reasons)
+            self.assertEqual(holders, {"real-sid"})
+            self.assertNotIn("process-inventory-changed", reasons)
+
+    def test_fake_proc_nested_namespace_process_binds_by_its_innermost_pid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "proc"
+            self._fake_proc_root(root)
+            proc, home = self._fake_runtime(root, 123)
+            self._nest(proc)
+            (home / "sessions" / "114.json").write_text(json.dumps({
+                "pid": 114, "procStart": "123", "sessionId": "nested-sid"}))
+            complete, holders, reasons = claude_session_census(proc_root=root)
+            self.assertTrue(complete, reasons)
+            self.assertEqual(holders, {"nested-sid"})
+
+    def test_fake_proc_nested_namespace_process_binds_by_exact_statusline_tap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "proc"
+            self._fake_proc_root(root)
+            proc, home = self._fake_runtime(root, 123)
+            self._nest(proc)
+            (home / ".statusline").mkdir()
+            (home / ".statusline" / "tap-sid.json").write_text(json.dumps({
+                "pid": 114, "proc_start": "123", "session_id": "tap-sid"}))
+            complete, holders, reasons = claude_session_census(proc_root=root)
+            self.assertTrue(complete, reasons)
+            self.assertEqual(holders, {"tap-sid"})
+
+    def test_fake_proc_nested_namespace_process_that_does_not_bind_stays_incomplete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "proc"
+            self._fake_proc_root(root)
+            proc, home = self._fake_runtime(root, 123)
+            self._nest(proc)
+            complete, _holders, reasons = claude_session_census(proc_root=root)
+            self.assertFalse(complete)
+            self.assertIn("session-identity-unresolved", reasons)
+
+            (home / "sessions" / "114.json").write_text(json.dumps({
+                "pid": 114, "procStart": "999", "sessionId": "stale-sid"}))
+            complete, _holders, reasons = claude_session_census(proc_root=root)
+            self.assertFalse(complete)
+            self.assertIn("native-session-claim-unusable", reasons)
+
+        for label, nspid in (("missing", None), ("single", "NSpid:\t{pid}"),
+                             ("outer-mismatch", "NSpid:\t999\t114"),
+                             ("non-numeric", "NSpid:\t{pid}\tx")):
+            with self.subTest(label), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "proc"
+                self._fake_proc_root(root)
+                proc, home = self._fake_runtime(root, 123)
+                self._nest(proc, nspid=nspid)
+                (home / "sessions" / "114.json").write_text(json.dumps({
+                    "pid": 114, "procStart": "123", "sessionId": "nested-sid"}))
+                complete, holders, reasons = claude_session_census(proc_root=root)
+                self.assertFalse(complete)
+                self.assertIn("pid-namespace-mismatch", reasons)
+                self.assertEqual(holders, set())
+
+    def test_fake_proc_host_namespace_process_still_binds_only_by_host_pid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "proc"
+            self._fake_proc_root(root)
+            proc, home = self._fake_runtime(root, 123)
+            (proc / "status").write_text("Name:\tclaude\nNSpid:\t123\t114\n")
+            (home / "sessions" / "114.json").write_text(json.dumps({
+                "pid": 114, "procStart": "123", "sessionId": "inner-sid"}))
+            complete, holders, reasons = claude_session_census(proc_root=root)
+            self.assertFalse(complete)
+            self.assertIn("session-identity-unresolved", reasons)
+            self.assertNotIn("inner-sid", holders)
+
+            (home / "sessions" / "123.json").write_text(json.dumps({
+                "pid": 123, "procStart": "123", "sessionId": "host-sid"}))
+            (home / "sessions" / "114.json").unlink()
+            complete, holders, reasons = claude_session_census(proc_root=root)
+            self.assertTrue(complete, reasons)
+            self.assertEqual(holders, {"host-sid"})
+
+    def test_recipient_census_over_nested_fake_proc_keeps_holder_alive_and_ends_unclaimed_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "proc"
+            self._fake_proc_root(root)
+            proc, home = self._fake_runtime(root, 123)
+            self._nest(proc)
+            (home / "sessions" / "114.json").write_text(json.dumps({
+                "pid": 114, "procStart": "123", "sessionId": "nested-sid"}))
+            (home / "history.jsonl").write_text(
+                json.dumps({"sessionId": "nested-sid"}) + "\n"
+                + json.dumps({"sessionId": "gone-sid"}) + "\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}), self._real_census_at(root):
+                census = RecipientCensus()
+                self.assertEqual(census.state("claude", "nested-sid"), "alive")
+                self.assertEqual(census.state("claude", "gone-sid"), "ended")
+
+
 if __name__ == "__main__":
     unittest.main()

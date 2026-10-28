@@ -14,8 +14,16 @@ from fleet.collectors import usage_cache
 class F51UsageCacheTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.dispatch_tmp = tempfile.TemporaryDirectory()
         self.old = os.environ.get("FLEET_USAGE_STATE_DIR")
+        self.old_dispatch = os.environ.get("AGENT_DISPATCH_JOBS")
+        self.old_resource_index = os.environ.get("AGENT_RESOURCE_RUN_INDEX")
         os.environ["FLEET_USAGE_STATE_DIR"] = self.tmp.name
+        jobs = os.path.join(self.dispatch_tmp.name, "jobs.log")
+        open(jobs, "w").close()
+        os.environ["AGENT_DISPATCH_JOBS"] = jobs
+        os.environ["AGENT_RESOURCE_RUN_INDEX"] = os.path.join(
+            self.dispatch_tmp.name, "resource-runs.index.json")
         self.old_fetchers = dict(usage_cache.FETCHERS)
         # A prior test/cycle must not retain a worker keyed to a real state directory.
         for thread in list(usage_cache._THREADS.values()):
@@ -32,7 +40,16 @@ class F51UsageCacheTest(unittest.TestCase):
             os.environ.pop("FLEET_USAGE_STATE_DIR", None)
         else:
             os.environ["FLEET_USAGE_STATE_DIR"] = self.old
+        for key, value in (
+            ("AGENT_DISPATCH_JOBS", self.old_dispatch),
+            ("AGENT_RESOURCE_RUN_INDEX", self.old_resource_index),
+        ):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         self.tmp.cleanup()
+        self.dispatch_tmp.cleanup()
 
     def test_record_and_widened_read_serve_ad_hoc_probes(self):
         # 2026-09-16: dispatch placement writes its own live reading through and

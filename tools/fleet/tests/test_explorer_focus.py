@@ -240,6 +240,51 @@ class AuxReads(unittest.TestCase):
         self.assertEqual(models.source_records["models"], {"profiles": ["balanced"]})
 
 
+class SessionPageDialogue(unittest.TestCase):
+    """e8: the session page's pick of a generation before the clear reads that generation's talk."""
+
+    def test_a_picked_earlier_generation_reads_that_generations_dialogue(self):
+        from unittest import mock
+        from tools.fleet.explorer import focus
+        from tools.fleet.explorer.types import FocusRequest
+        current = "5ed20fe8-499b-4490-a87f-f492612948cf"
+        compacted = "7dcee068-0000-4000-8000-000000000001"
+        cleared = "bbf14dfc-0000-4000-8000-000000000002"
+
+        def entry(sid, source, generation=None):
+            return {"harness": "claude", "sid": sid, "source": source, "relation": "confirmed",
+                    "started_at": 1.0, "current": generation is None,
+                    "cards": [] if generation is None else [{"generation": generation,
+                                                             "status": "available"}],
+                    "transcript": {"path": "/transcripts/%s.jsonl" % sid[:8], "status": "available"}}
+        entries = (entry(compacted, "startup", 1), entry(cleared, "compact", 2), entry(current, "clear"))
+        seen, read = [], []
+
+        def seat(_session, harness, sid, *, cards=False, pane=None):
+            seen.append((harness, sid, cards, pane))
+            return entries, pane or "", Health("success", 1.0)
+
+        def dialogue(item):
+            read.append(item["sid"])
+            return ["user: " + item["sid"][:8]]
+        snapshot = {"sessions": [{"harness": "claude", "session_id": current, "cwd": "/x"}]}
+        request = FocusRequest(FocusKey("claude", current), 1, 0, ("claude:" + current,),
+                               ("seat", "cards", "pane", "dialogue:1"))
+        with mock.patch.object(focus, "read_seat_history", side_effect=seat), \
+                mock.patch.object(focus, "read_dialogue", side_effect=dialogue), \
+                mock.patch.object(focus, "read_pane_map", return_value={current: "w18:p7"}), \
+                mock.patch.object(focus, "read_pane_visible", return_value=None), \
+                mock.patch.object(focus, "session_entries", return_value=[]), \
+                mock.patch.object(focus, "read_attempts", return_value=[]):
+            result = focus.collect_focus(request, snapshot=snapshot, state_roots=[],
+                                         route_loader=lambda *_args, **_kwargs: None)
+        self.assertEqual(seen, [("claude", current, True, "w18:p7")])
+        self.assertEqual(read, [cleared])
+        spoken = result.source_records["dialogue"]
+        self.assertEqual((spoken["index"], spoken["sid"], spoken["lines"]),
+                         (1, cleared, ["user: bbf14dfc"]))
+
+
 class ExplorerFeedRequests(unittest.TestCase):
     """What the open screen asks the pumps for: only what is open."""
 

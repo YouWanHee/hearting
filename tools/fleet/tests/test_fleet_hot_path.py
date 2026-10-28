@@ -528,11 +528,18 @@ class ManagedCodexTagTest(unittest.TestCase):
                 sess.session_tag = "9c"
 
         from fleet.collectors import procscan
-        with mock.patch.object(procscan, "scan", return_value=[server, client]), \
-             mock.patch.object(codex, "prepare_tick", return_value=SimpleNamespace()), \
-             mock.patch.object(codex, "enrich", side_effect=enrich), \
-             mock.patch.object(dispatch_collector, "collect", return_value=[]):
-            sessions, _jobs = collect_all(harness_filter=["codex"])
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = os.path.join(tmp, "jobs.log")
+            open(jobs, "w").close()
+            with mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_JOBS": jobs,
+                "AGENT_RESOURCE_RUN_INDEX": os.path.join(
+                    tmp, "resource-runs.index.json"),
+            }), mock.patch.object(procscan, "scan", return_value=[server, client]), \
+                 mock.patch.object(codex, "prepare_tick", return_value=SimpleNamespace()), \
+                 mock.patch.object(codex, "enrich", side_effect=enrich), \
+                 mock.patch.object(dispatch_collector, "collect", return_value=[]):
+                sessions, _jobs = collect_all(harness_filter=["codex"])
         by_pid = {s.pid: s for s in sessions}
         self.assertEqual(by_pid[100].session_tag, "9c")
         self.assertNotIn("_session_tag_unpaired", by_pid[100].to_dict())
