@@ -522,10 +522,10 @@ GATE_DELIVERY_HEADER = (
     "Do not start a separate harness-scheduled re-invocation, Monitor, dispatch-wait, or a polling loop."
 )
 COMPLETION_DELIVERY_HEADER = (
-    "Follow required_action/route next-action receipt; inspect-recovery: diagnostic. "
-    "runtime-v1 owns close/finalize. Tracked-Workflow Continuation. "
-    "Keep new failures/conflicts, unfinished work, questions; no separate "
-    "harness-scheduled re-invocation/Monitor/dispatch-wait/polling."
+    "Hearting runtime delivery. Follow required_action/next-action receipt; "
+    "inspect-recovery: diagnostic. runtime-v1 finalizes. Tracked-Workflow Continuation. "
+    "Keep new failures/conflicts, unfinished work, questions; no extra "
+    "harness-scheduled calls/Monitor/dispatch-wait/polling."
 )
 # Frozen headers from the previous short rendering; receipt recovery only.
 _PREVIOUS_NOTICE_DELIVERY_HEADER = (
