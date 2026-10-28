@@ -252,6 +252,97 @@ with hold_supervisor_lease(jobs,attempt,supervisor_lease_path(jobs,attempt)):
             if child.poll() is None: child.kill(); child.wait(timeout=5)
             child.stdin.close(); child.stdout.close()
 
+    def test_parked_consumer_of_an_earlier_release_moves_and_keeps_its_resource(self):
+        import dispatch_contract as contract
+        import dispatch_completion_join as join
+        import route_authority
+        import route_parent_close
+        child_root = self.root/'release-move'; (child_root/'old/utilities').mkdir(parents=True)
+        jobs = child_root/'jobs.log'
+        lease = supervisor_lease_path(jobs, self.attempt)
+        jobs.write_text(FIXTURE.owner_row(lease))
+        I.initialize_owner_input(jobs, self.attempt, 'codex-active-turn')
+        governor = child_root/'old/utilities/model-worker-governor.py'
+        governor.write_text("""import subprocess,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+import dispatch_owner_input as I
+from dispatch_contract import hold_supervisor_lease,supervisor_lease_path
+jobs=Path(sys.argv[2]); attempt=sys.argv[3]
+with hold_supervisor_lease(jobs,attempt,supervisor_lease_path(jobs,attempt)):
+ I.OwnerInput(jobs,attempt,'thread-1','codex-active-turn',lambda v:None)
+ server=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])
+ print(server.pid,flush=True)
+ time.sleep(60)
+""")
+        tagged = {**os.environ, 'AGENT_DISPATCH_ATTEMPT_ID': self.attempt}
+        payload = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],
+                                   start_new_session=True, env=tagged)
+        consumer = subprocess.Popen([sys.executable, str(governor), str(ROOT/'utilities'), str(jobs),
+                                     self.attempt], start_new_session=True, env=tagged,
+                                    stdout=subprocess.PIPE, text=True)
+        def stop(process):
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+        self.addCleanup(stop, payload)
+        self.addCleanup(stop, consumer)
+        server = int(consumer.stdout.readline())
+        self.addCleanup(consumer.stdout.close)
+        _, start, _ = contract.process_observation(consumer.pid)
+        _, payload_start, _ = contract.process_observation(payload.pid)
+        namespace = os.readlink('/proc/self/ns/pid')
+        jobs.write_text(jobs.read_text().replace('attempt_id=' + self.attempt,
+            f'launch_claimed=1,launch_started=1,pid={consumer.pid},pid_start={start},'
+            f'pgid={consumer.pid},pid_ns={namespace},pid_observer_ns={namespace},'
+            f'attempt_id={self.attempt}'))
+        join.write_supervisor_state(lease.with_suffix('.json'), self.attempt, set(), phase='parked')
+        state = json.loads(lease.with_suffix('.json').read_text())
+        state['resource'] = {'session_id': 'thread-1', 'delivered': [], 'outbox': None}
+        lease.with_suffix('.json').write_text(json.dumps(state))
+        resources = [{'kind': 'resource', 'run_id': 'var', 'registry': str(child_root/'runs.json'),
+                      'row': {'run_id': 'var', 'pid': payload.pid, 'starttime': payload_start,
+                              'launch_state': 'started'}}]
+        calls = []
+        def respawn(jobs_path, attempt, *, expected_identity, check_only=False):
+            calls.append((expected_identity, check_only))
+            return {'state': 'ready'} if check_only else {
+                'state': 'respawned', 'pid': '1', 'pid_start': '1',
+                'respawn_release': str(ROOT)}
+        with mock.patch.object(I, '_installed_release', return_value=ROOT.resolve()), \
+             mock.patch.object(I, '_respawn_adapter', return_value=respawn), \
+             mock.patch.object(route_authority, 'owns', return_value=True), \
+             mock.patch.object(route_parent_close, 'row_requested', return_value=False), \
+             mock.patch.object(route_parent_close, 'owner_resources', return_value=resources):
+            # An input being sent, or a turn running, keeps the consumer as it is.
+            channel = I._path(jobs, self.attempt)
+            idle = channel.read_bytes()
+            busy = json.loads(idle)
+            busy['requests'] = [{'id': 'in-flight', 'digest': '0', 'state': 'sending', 'events': []}]
+            channel.write_text(json.dumps(busy))
+            self.assertEqual(I.move_parked_consumer(jobs, *I._target(jobs, self.attempt), 'resume'), {})
+            channel.write_bytes(idle)
+            join.write_supervisor_state(lease.with_suffix('.json'), self.attempt, set(),
+                                        phase='running-turn')
+            self.assertEqual(I.move_parked_consumer(jobs, *I._target(jobs, self.attempt), 'resume'), {})
+            lease.with_suffix('.json').write_text(json.dumps(state))
+            self.assertIsNone(consumer.poll())
+            receipt = I.submit(jobs, self.attempt, 'resume the fixed run on the installed release', 'resume')
+        self.assertEqual(receipt['consumer_release_moved_from'], str((child_root/'old').resolve()))
+        self.assertEqual(receipt['consumer_recovery'], 'respawned', receipt)
+        expected = (str(consumer.pid), start)
+        self.assertEqual(calls[-2:], [(expected, True), (expected, False)])
+        self.assertEqual(consumer.wait(timeout=5), -15)
+        deadline = time.monotonic() + 5
+        while contract.process_observation(server)[0] == 'present' and time.monotonic() < deadline:
+            if contract.process_observation(server)[2] == 'Z':
+                break
+            time.sleep(.02)
+        self.assertNotEqual(contract.process_observation(server)[0:3:2], ('present', 'S'))
+        self.assertIsNone(payload.poll())
+        self.assertEqual([item['state'] for item in I.inspect(jobs, self.attempt)['requests']], ['queued'])
+        self.assertIn('\topen\t', jobs.read_text())
+
     def test_cli_supervisor_delivers_correction_before_terminal_for_both_transports(self):
         fixture = load('owner_input_cli_fixture', ROOT/'utilities/claude_session_supervisor.test.py')
         for harness in ('claude', 'opencode'):

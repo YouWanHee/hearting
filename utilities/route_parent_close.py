@@ -560,6 +560,75 @@ def _agent_processes(meta, resources, *, terminal=False):
     return agents, observed
 
 
+def owner_resources(meta, jobs):
+    """Registered resources linked to one owner attempt, or None when unreadable."""
+    import owner_route_binding as OWNER
+    try:
+        binding, _ = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=meta["attempt_id"])
+        if binding is None:
+            return None
+        _, route = OWNER._verified_binding(binding)
+        return linked_resources(route, Path(binding.route_file), Path(jobs), {meta["attempt_id"]})
+    except (OWNER.OwnerRouteBindingError, OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _session_of(pid):
+    try:
+        return os.getsid(pid)
+    except OSError:
+        return None
+
+
+def owner_consumer_session(meta, resources):
+    """The governed process's session when it holds every unregistered owner process.
+
+    Registered payloads run in sessions of their own. When they are running and
+    nothing else of the owner is outside this session, stopping it leaves
+    exactly the state consumer recovery restores.
+    """
+    identities = DC.authoritative_process_identities(meta)
+    if not identities or not DC.attempt_scan_namespace_authority(meta):
+        return None
+    visibility, actual, state = DC.process_observation(identities[0].pid)
+    if visibility != "present" or actual != identities[0].expected_start or state == "Z":
+        return None
+    session = _session_of(identities[0].pid)
+    agents, observed, preserved = _classify_agent_processes(meta, resources)
+    if (session is None or not observed or not preserved
+            or any(_session_of(pid) != session for pid, _ in agents)):
+        return None
+    return session
+
+
+def stop_owner_consumer(meta, resources, session, *, grace=2.0, kill_wait=1.0):
+    """Stop one open owner's consumer session; nothing is cancelled or settled.
+
+    The same attempt continues through consumer recovery, and only members of
+    that session are signalled, so registered payloads keep running.
+    """
+    deadline = time.monotonic() + grace + kill_wait
+    sent = set()
+    while True:
+        agents, _, _ = _classify_agent_processes(meta, resources)
+        targets = [(pid, start) for pid, start in agents if _session_of(pid) == session]
+        if not targets:
+            # Its summary observer follows the stopped identity; the restored
+            # consumer attaches its own.
+            pid, start = meta.get("summary_owner_pid", ""), meta.get("summary_owner_pid_start", "")
+            if pid.isdigit() and start:
+                _signal(int(pid), start, signal.SIGTERM)
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        escalated = time.monotonic() >= deadline - kill_wait
+        for pid, start in targets:
+            if (pid, start, escalated) not in sent:
+                _signal(pid, start, signal.SIGKILL if escalated else signal.SIGTERM)
+                sent.add((pid, start, escalated))
+        time.sleep(0.05)
+
+
 def owner_continuation_processes(meta, jobs):
     """Owner execution may end while its registered payloads keep running.
 
@@ -577,14 +646,8 @@ def owner_continuation_processes(meta, jobs):
         return DC.ProcessQuiescence("unverifiable", "observer-namespace-mismatch"), []
     if DC.terminal_receipt_incomplete(meta):
         return DC.ProcessQuiescence("unverifiable", "post-exit-receipt-incomplete"), []
-    import owner_route_binding as OWNER
-    try:
-        binding, _ = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=meta["attempt_id"])
-        if binding is None:
-            return proof, []
-        _, route = OWNER._verified_binding(binding)
-        resources = linked_resources(route, Path(binding.route_file), Path(jobs), {meta["attempt_id"]})
-    except (OWNER.OwnerRouteBindingError, OSError, ValueError, KeyError, TypeError):
+    resources = owner_resources(meta, jobs)
+    if resources is None:
         # Without resource evidence, retain the already observed live residue.
         # Failed classification cannot grant continuation or erase that positive.
         return proof, []
