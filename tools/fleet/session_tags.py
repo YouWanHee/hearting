@@ -45,24 +45,9 @@ def _read(path):
 
 
 def assigned_tag(harness, sid):
-    """Read the shared assignment, seeding a first-use live inventory automatically.
-
-    An existing lock with no snapshot means record loss, rather than first use;
-    that call stays on the hash fallback until ordinary collection recovers it.
-    """
-    path = _path()
+    """Read a confirmed snapshot row without allocation, discovery or locking."""
     try:
-        row = _read(path).get((harness, sid))
-        if row:
-            return row["tag"]
-    except FileNotFoundError:
-        if (path.parent / "tag-assignments.lock").exists():
-            return None
-    except (OSError, ValueError, TypeError):
-        return None
-    assign([])
-    try:
-        row = _read(path).get((harness, sid))
+        row = _read(_path()).get((harness, sid))
         return row["tag"] if row else None
     except (OSError, ValueError, TypeError):
         return None
@@ -147,30 +132,58 @@ def _keep(row, panes_known):
 
 
 def assign(sessions):
-    """Seed/refresh assignments under one lock without waiting for pane writes.
+    """Collect normal inventory before attempting the nonblocking shared writer."""
+    try:
+        live, agents = _inventory(sessions)
+        return _assign(live, agents)
+    except (OSError, ValueError, TypeError, ImportError):
+        return []
 
-    Unknown consumers only read the resulting snapshot. A corrupt file is left
-    untouched; a later normal collection can seed a missing file automatically.
+
+def assign_observed(harness, sid, *, pane_id=None, pid=None, proc_start=None):
+    """Attempt one already-proven native observation, without a native census.
+
+    A narrow event proves no other session's absence. Keep every reservation and
+    its evidence until the normal full inventory can establish an exit.
     """
+    if harness not in {"claude", "codex", "opencode"} or not isinstance(sid, str) or not sid.strip():
+        return None
+    row = {"harness": harness, "session_id": sid, "started_at": _started(harness, sid)}
+    row.update({key: value for key, value in
+                (("pane_id", pane_id), ("pid", pid), ("proc_start", proc_start))
+                if value is not None})
+    if harness == "claude":
+        from .session_handle import resolve_tag
+        row["tag"] = resolve_tag(harness, sid)
+    _assign({(harness, sid): row}, None, observed_only=True)
+    return assigned_tag(harness, sid)
+
+
+def _assign(live, agents, *, observed_only=False):
+    """Reserve against the latest snapshot and persist atomically under one lock."""
     from .session_handle import minted_tag
     path = _path()
     try:
         import fcntl
         path.parent.mkdir(parents=True, exist_ok=True)
         with (path.parent / "tag-assignments.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            live, agents = _inventory(sessions)
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 old = _read(path)
             except FileNotFoundError:
                 old = {}
             for key, row in old.items():
-                if key not in live and _keep(row, agents is not None):
+                if key not in live and (observed_only or _keep(row, agents is not None)):
                     live[key] = row.copy()
             now = time.time()
             for key, row in live.items():
                 previous = old.get(key, {})
                 if previous:
+                    # Missing fields in a narrow observation cannot erase prior
+                    # PID/start/pane evidence or a Claude fixed reservation.
+                    if observed_only:
+                        row = {**previous, **{k: v for k, v in row.items() if v is not None}}
+                        live[key] = row
                     row["started_at"] = previous["started_at"]
                 row["first_seen"] = previous.get("first_seen", now)
                 if previous and row["harness"] != "claude":
@@ -199,7 +212,7 @@ def assign(sessions):
                 tag = next((f"{(base + step) % 256:02x}" for step in range(256)
                             if f"{(base + step) % 256:02x}" not in taken), None)
                 if tag is None:
-                    row.pop("tag", None)  # namespace exhausted: honest hash fallback
+                    row.pop("tag", None)  # namespace exhausted: leave the number absent
                 else:
                     row["tag"] = tag
                     taken.add(tag)

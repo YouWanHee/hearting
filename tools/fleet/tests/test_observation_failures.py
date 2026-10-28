@@ -1,5 +1,6 @@
 """Fleet audit P3: failed observations never establish negative facts."""
 from contextlib import ExitStack
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -280,6 +281,46 @@ class JobFailures(unittest.TestCase):
 
 
 class PaneMetadata(unittest.TestCase):
+    def test_first_collection_assigns_and_failure_still_reads_confirmed_snapshot(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, {"XDG_STATE_HOME": td}))
+            sessions = [Session(harness=h, pid=os.getpid(), session_id="native-" + h, session_tag="ff")
+                        for h in ("codex", "opencode")]
+            live = {(s.harness, s.session_id): {"harness": s.harness,
+                    "session_id": s.session_id, "started_at": 10} for s in sessions}
+            for target, result in (
+                ("fleet.collectors.procscan.scan", sessions),
+                ("fleet.collectors.codex.prepare_tick", None),
+                ("fleet.collectors.codex.enrich", None),
+                ("fleet.collectors.opencode.enrich", None),
+                ("fleet.collectors.herdr.enrich", None),
+                ("fleet.collectors.usage_cache.account_usage", {}),
+                ("fleet.collectors.resource_runs.collect", []),
+                ("fleet.projection.attach_projections", None),
+                ("fleet.route_chain.enrich", None),
+                ("fleet.collectors.peer_messages.collect", None),
+                ("fleet.session_tags._inventory", (live, [])),
+                ("fleet.collectors.dispatch.collect", []),
+            ):
+                stack.enter_context(mock.patch(target, return_value=result))
+            path = session_tags._path()
+            path.parent.mkdir(parents=True)
+            with path.with_suffix(".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                pending = collectors.collect_all(jobs_path=td + "/jobs", fast_first=True)
+            self.assertEqual([s.session_tag for s in pending.sessions], [None, None])
+            self.assertFalse(path.exists())
+            confirmed = collectors.collect_all(jobs_path=td + "/jobs", fast_first=True)
+            tags = [s.session_tag for s in confirmed.sessions]
+            self.assertTrue(all(tags))
+            for s in sessions:
+                s.session_tag = "ff"  # stale enrichment may not survive a missing row
+            sessions.append(Session(harness="codex", pid=os.getpid(), session_id="new-native", session_tag="ff"))
+            with mock.patch.object(session_tags, "assign", side_effect=OSError("optional writer")):
+                failed = collectors.collect_all(jobs_path=td + "/jobs", fast_first=True)
+            self.assertEqual([s.session_tag for s in failed.sessions], tags + [None])
+
+
     def test_pane_metadata_wait_cannot_delay_basic_publication(self):
         with tempfile.TemporaryDirectory() as state:
             agents = [{"agent": "codex", "pane_id": str(i),

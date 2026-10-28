@@ -1,5 +1,6 @@
 """Live number allocation, fixed Claude reservations and consumer agreement."""
 import importlib.util
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -102,29 +103,29 @@ class SessionTagCollisionTest(unittest.TestCase):
         self.assertEqual(resolve_tag("codex", self.b), b_tag)
         self.assertNotIn(resolve_tag("codex", self.a), {a_tag, b_tag})
 
-    def test_record_loss_and_corruption_return_original_hash(self):
+    def test_record_loss_and_corruption_leave_number_absent(self):
         self.tags([self.session(self.a), self.session(self.b, started=20)])
         path = session_tags._path()
         path.unlink()
-        self.assertEqual(resolve_tag("codex", self.b), minted_tag(self.b))
+        self.assertIsNone(resolve_tag("codex", self.b))
         path.write_text("{broken")
-        self.assertEqual(resolve_tag("codex", self.b), minted_tag(self.b))
+        self.assertIsNone(resolve_tag("codex", self.b))
         self.tags([self.session(self.a), self.session(self.b)])
         self.assertEqual(path.read_text(), "{broken")
 
-    def test_duplicate_mutable_assignments_are_corrupt_and_use_hash(self):
+    def test_duplicate_mutable_assignments_are_corrupt_and_numberless(self):
         self.tags([self.session(self.a), self.session(self.b, started=20)])
         data = json.loads(session_tags._path().read_text())
         for row in data["assignments"]:
             row["tag"] = "00"
         session_tags._path().write_text(json.dumps(data))
-        self.assertEqual(resolve_tag("codex", self.a), minted_tag(self.a))
-        self.assertEqual(resolve_tag("codex", self.b), minted_tag(self.b))
+        self.assertIsNone(resolve_tag("codex", self.a))
+        self.assertIsNone(resolve_tag("codex", self.b))
 
     def test_unwritable_state_does_not_break_consumer(self):
         with mock.patch("fleet.session_tags.tempfile.mkstemp", side_effect=PermissionError):
             self.tags([self.session(self.a), self.session(self.b)])
-        self.assertEqual(resolve_tag("codex", self.b), minted_tag(self.b))
+        self.assertIsNone(resolve_tag("codex", self.b))
 
     def test_live_process_survives_partial_collection_and_pid_reuse_releases(self):
         self.tags([self.session(self.a)])
@@ -133,6 +134,13 @@ class SessionTagCollisionTest(unittest.TestCase):
         with mock.patch("fleet.collectors.procscan.read_proc_start", return_value="reused"):
             session_tags.refresh([])
         self.assertEqual(session_tags._read(session_tags._path()), {})
+
+    def test_unreadable_live_process_identity_keeps_its_reservation(self):
+        confirmed = self.tags([self.session(self.a)])[0]
+        with mock.patch("fleet.collectors.procscan.read_proc_start", return_value=None), \
+             mock.patch("fleet.collectors.procscan.is_terminal_state", return_value=False):
+            self.tags([])
+        self.assertEqual(resolve_tag("codex", self.a), confirmed)
 
     def test_zombie_process_releases_its_number(self):
         self.tags([self.session(self.a)])
@@ -147,12 +155,18 @@ class SessionTagCollisionTest(unittest.TestCase):
         self.agents.return_value = [{"agent": "claude", "pane_id": "w:p", "agent_session": {"kind": "id", "value": "cl"}}]
         self.assertNotEqual(self.tags([self.session(self.a)])[0], minted_tag(self.a))
 
-    def test_first_standalone_consumers_allocate_without_fleet(self):
+    def test_first_consumers_are_read_only_until_observed_producer(self):
         self.agents.return_value = [{"agent": harness, "pane_id": "w:" + sid,
                                     "agent_session": {"kind": "id", "value": sid}}
                                    for harness, sid in (("codex", self.a), ("opencode", self.b))]
-        first = resolve_tag("codex", self.a)
-        second = resolve_tag("opencode", self.b)
+        with mock.patch.object(session_tags, "assign", side_effect=AssertionError("reader allocated")):
+            self.assertIsNone(resolve_tag("codex", self.a))
+            self.assertIsNone(resolve_tag("opencode", self.b))
+            self.assertFalse(session_tags._path().parent.exists())
+        self.agents.assert_not_called()
+        first = session_tags.assign_observed("codex", self.a, pane_id="w:a")
+        second = session_tags.assign_observed("opencode", self.b, pane_id="w:b")
+        self.agents.assert_not_called()
         self.assertNotEqual(first, second)
         self.assertEqual(resolve_tag("codex", self.a), first)
 
@@ -160,16 +174,17 @@ class SessionTagCollisionTest(unittest.TestCase):
         before = self.tags([self.session(self.a)])[0]
         self.agents.return_value = [{"agent": "codex", "pane_id": "w:new",
                                     "agent_session": {"kind": "id", "value": self.b}}]
-        self.assertNotEqual(resolve_tag("codex", self.b), before)
+        self.assertIsNone(resolve_tag("codex", self.b))
+        self.assertNotEqual(session_tags.assign_observed("codex", self.b, pane_id="w:new"), before)
 
     def test_sequential_native_first_reports_allocate_before_metadata(self):
         agents, reported = [], []
-        self.agents.side_effect = lambda: agents
+        self.agents.side_effect = AssertionError("native producer started a census")
 
         def run(command, **kwargs):
             if command[2] == "report-agent-session":
                 sid = command[command.index("--agent-session-id") + 1]
-                agents.append({"agent": "codex", "pane_id": command[3],
+                agents.append({"agent": command[command.index("--agent") + 1], "pane_id": command[3],
                                "agent_session": {"kind": "id", "value": sid}})
             elif command[2] == "report-metadata":
                 shown = command[command.index("--display-agent") + 1]
@@ -181,11 +196,12 @@ class SessionTagCollisionTest(unittest.TestCase):
                 mock.patch("fleet.herdr_projection.shutil.which", return_value="herdr"), \
                 mock.patch("fleet.herdr_projection.session_title", return_value=""), \
                 mock.patch("fleet.herdr_projection._formatter_overrides", return_value=(None, None)):
-            for sid in (self.a, self.b):
-                REPORT("codex", sid, "w:" + sid, True, session_seq=1, session_start_source="startup")
+            for harness, sid in (("codex", self.a), ("opencode", self.b)):
+                REPORT(harness, sid, "w:" + sid, True, session_seq=1, session_start_source="startup")
         self.assertEqual(len(reported), 2)
         self.assertNotEqual(reported[0], reported[1])
-        self.assertEqual(reported, ["[%s] codex" % resolve_tag("codex", sid) for sid in (self.a, self.b)])
+        self.assertEqual(reported, ["[%s] %s" % (resolve_tag(harness, sid), harness)
+                                    for harness, sid in (("codex", self.a), ("opencode", self.b))])
 
     def test_idle_colliding_herdr_pane_updates_metadata_without_identity_or_prompt(self):
         self.agents.return_value = [{"agent": "codex", "pane_id": "w:" + sid,
@@ -219,14 +235,17 @@ class SessionTagCollisionTest(unittest.TestCase):
         self.assertIsNone(resolve_tag("codex", ""))
         self.assertEqual(session_tags._read(session_tags._path()), {})
 
-    def test_empty_first_inventory_does_not_disable_later_standalone_allocation(self):
-        self.assertEqual(resolve_tag("codex", self.a), minted_tag(self.a))
+    def test_empty_first_inventory_recovers_on_next_normal_collection(self):
+        self.assertIsNone(resolve_tag("codex", self.a))
+        session_tags.assign([])
         self.agents.return_value = [{"agent": "codex", "pane_id": "w:" + sid,
                                     "agent_session": {"kind": "id", "value": sid}}
                                    for sid in (self.a, self.b)]
+        self.assertIsNone(resolve_tag("codex", self.b))
+        session_tags.assign([])
         self.assertNotEqual(resolve_tag("codex", self.a), resolve_tag("codex", self.b))
 
-    def test_herdr_capacity_exhaustion_uses_hash_without_recursive_refresh(self):
+    def test_herdr_capacity_exhaustion_is_numberless_without_recursive_refresh(self):
         self.agents.return_value = [{"agent": "codex", "pane_id": "w:" + str(n),
                                     "agent_session": {"kind": "id", "value": "live-%d" % n}}
                                    for n in range(257)]
@@ -234,7 +253,7 @@ class SessionTagCollisionTest(unittest.TestCase):
         rows = session_tags._read(session_tags._path())
         self.assertEqual(len(rows), 256)
         missing = next("live-%d" % n for n in range(257) if ("codex", "live-%d" % n) not in rows)
-        self.assertEqual(resolve_tag("codex", missing), minted_tag(missing))
+        self.assertIsNone(resolve_tag("codex", missing))
 
     def test_uuid_creation_order_for_pre_install_herdr_pair(self):
         older = "01a1223d-621b-7908-8399-1f234f623c79"
@@ -247,7 +266,136 @@ class SessionTagCollisionTest(unittest.TestCase):
         self.assertEqual(len(set(before)), 256)
         self.tags(sessions + [self.session("extra", started=300)])
         self.assertEqual([resolve_tag(s.harness, s.session_id) for s in sessions], before)
-        self.assertEqual(resolve_tag("codex", "extra"), minted_tag("extra"))
+        self.assertIsNone(resolve_tag("codex", "extra"))
+
+    def test_failures_never_display_an_unconfirmed_hash_for_either_harness(self):
+        for harness in ("codex", "opencode"):
+            with self.subTest(harness=harness):
+                path = session_tags._path()
+                path.unlink(missing_ok=True)
+                self.assertIsNone(resolve_tag(harness, self.b))
+                session_tags.assign_observed(harness, self.a)
+                confirmed = session_tags.assign_observed(harness, self.b)
+                self.assertNotEqual(confirmed, minted_tag(self.b))
+                self.assertEqual(resolve_tag(harness, self.b), confirmed)
+                for failure in (PermissionError(), ValueError()):
+                    with mock.patch.object(session_tags, "_read", side_effect=failure):
+                        self.assertIsNone(resolve_tag(harness, self.b))
+                with mock.patch.dict(sys.modules, {"fleet.session_tags": None}):
+                    self.assertIsNone(resolve_tag(harness, self.b))
+                path.unlink()
+                self.assertIsNone(resolve_tag(harness, self.b))
+                path.write_text("{broken")
+                self.assertIsNone(resolve_tag(harness, self.b))
+                session_tags.assign_observed(harness, self.b)
+                self.assertEqual(path.read_text(), "{broken")
+
+    def test_real_writer_lock_readers_and_producers_return_without_waiting(self):
+        sessions = [self.session(self.a), self.session(self.b, started=20)]
+        confirmed = self.tags(sessions)[1]
+        path = session_tags._path()
+        snapshot = path.read_bytes()
+        # The child reads and attempts production against a genuinely held lock.
+        script = """
+import json
+from unittest import mock
+from fleet import session_tags
+from fleet.session_handle import resolve_tag
+with mock.patch.object(session_tags, '_inventory', side_effect=AssertionError('reader census')):
+    values = [resolve_tag('codex', %r), resolve_tag('codex', 'missing')]
+    assert session_tags.assign_observed('codex', 'missing') is None
+with mock.patch.object(session_tags, '_inventory', return_value=({}, [])):
+    assert session_tags.assign([]) == []
+print(json.dumps(values))
+""" % self.b
+        with path.with_suffix(".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            proc = subprocess.run([sys.executable, "-c", script], timeout=3, capture_output=True,
+                                  text=True, env=dict(os.environ, PYTHONPATH=str(ROOT / "tools")))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout), [confirmed, None])
+            self.assertEqual(path.read_bytes(), snapshot)
+        # A leftover lock file is not a lock; the next normal event fills the miss.
+        self.assertIsNone(resolve_tag("codex", "missing"))
+        self.assertIsNotNone(session_tags.assign_observed("codex", "missing"))
+        self.assertEqual(resolve_tag("codex", self.b), confirmed)
+
+    def test_narrow_observation_preserves_other_rows_and_absent_evidence(self):
+        self.tags([self.session(self.a), self.session(self.b, started=20)])
+        before = session_tags._read(session_tags._path())
+        with mock.patch.object(session_tags, "_inventory", side_effect=AssertionError("census")), \
+             mock.patch.object(session_tags, "_keep", side_effect=AssertionError("absence")):
+            session_tags.assign_observed("opencode", "new", pane_id="w:new")
+            session_tags.assign_observed("codex", self.b, pane_id="w:moved")
+        after = session_tags._read(session_tags._path())
+        self.assertEqual(before[("codex", self.a)], after[("codex", self.a)])
+        expected = dict(before[("codex", self.b)], pane_id="w:moved")
+        self.assertEqual(expected, after[("codex", self.b)])
+
+    def test_collection_discovers_outside_lock_then_rereads_latest_snapshot(self):
+        def inventory(sessions):
+            # Would contend/fail if inventory ran while the writer held its lock.
+            self.assertIsNotNone(session_tags.assign_observed("opencode", self.b))
+            return {("codex", self.a): {"harness": "codex", "session_id": self.a,
+                                        "started_at": 10}}, []
+        with mock.patch.object(session_tags, "_inventory", side_effect=inventory):
+            session_tags.assign([])
+        self.assertIsNotNone(resolve_tag("codex", self.a))
+        self.assertNotEqual(resolve_tag("codex", self.a), resolve_tag("opencode", self.b))
+
+    def test_failed_atomic_write_preserves_existing_assignment_and_retires_temp(self):
+        confirmed = session_tags.assign_observed("codex", self.a)
+        path = session_tags._path()
+        before = path.read_bytes()
+        for target in ("tempfile.mkstemp", "os.fsync", "os.replace"):
+            with self.subTest(target=target), \
+                 mock.patch("fleet.session_tags." + target, side_effect=OSError("fixture")):
+                self.assertIsNone(session_tags.assign_observed("opencode", self.b))
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(resolve_tag("codex", self.a), confirmed)
+                self.assertEqual(list(path.parent.glob(".tag-assignments-*")), [])
+
+    def test_native_owned_identity_allocates_before_metadata_without_a_census(self):
+        with mock.patch.object(herdr_projection.shutil, "which", return_value="herdr"), \
+             mock.patch.object(herdr_projection, "may_report", return_value=True), \
+             mock.patch.object(session_tags, "_inventory", side_effect=AssertionError("census")):
+            for harness, sid in (("codex", self.a), ("opencode", self.b)):
+                self.assertTrue(herdr_projection.project(harness, sid, pane_id="w:" + sid,
+                                                        report_session=False))
+                self.assertIsNotNone(resolve_tag(harness, sid))
+        self.assertNotEqual(resolve_tag("codex", self.a), resolve_tag("opencode", self.b))
+
+    def test_display_refresh_and_refused_or_stale_native_proof_never_allocate(self):
+        with mock.patch.object(session_tags, "assign_observed") as assign, \
+             mock.patch.object(herdr_projection.shutil, "which", return_value="herdr"), \
+             mock.patch.object(herdr_projection, "may_report", return_value=False):
+            herdr_projection.compose("codex", self.a, steward=False, title="")
+            herdr_projection.project("opencode", self.a, pane_id="w:a", report_session=False)
+            assign.assert_not_called()
+        with mock.patch.object(session_tags, "assign_observed") as assign, \
+             mock.patch.object(herdr_projection.shutil, "which", return_value="herdr"), \
+             mock.patch.object(herdr_projection, "_send_projection") as send:
+            REPORT("codex", self.a, "w:a", True, _proof=mock.Mock(side_effect=[True, False]))
+            assign.assert_not_called()
+            self.assertEqual(send.call_count, 1)
+        self.assertFalse(session_tags._path().exists())
+
+    def test_native_report_remains_successful_and_numberless_under_writer_lock(self):
+        path = session_tags._path()
+        path.parent.mkdir(parents=True)
+        commands = []
+        with path.with_suffix(".lock").open("a") as lock, \
+             mock.patch.object(herdr_projection.shutil, "which", return_value="herdr"), \
+             mock.patch.object(herdr_projection, "_send_projection", side_effect=lambda c, o: commands.append(c)), \
+             mock.patch.object(herdr_projection, "session_title", return_value=""), \
+             mock.patch.object(herdr_projection, "_formatter_overrides", return_value=(None, None)), \
+             mock.patch.object(session_tags, "_inventory", side_effect=AssertionError("census")):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            REPORT("opencode", self.a, "w:a", True)
+        self.assertEqual([c[2] for c in commands], ["report-agent-session", "report-metadata"])
+        self.assertEqual(commands[-1][commands[-1].index("--display-agent") + 1], "opencode")
+        self.assertIsNone(resolve_tag("opencode", self.a))
+        self.assertIsNotNone(session_tags.assign_observed("opencode", self.a, pane_id="w:a"))
 
     def test_process_concurrent_refreshes_share_the_same_assignments(self):
         script = '''
@@ -262,8 +410,14 @@ refresh([Session(harness='codex', session_id=sid, pid=os.getpid(),
 ''' % ([self.a, self.b],)
         env = dict(os.environ, PYTHONPATH=str(ROOT / "tools"))
         processes = [subprocess.Popen([sys.executable, "-c", script], env=env) for _ in range(4)]
-        for process in processes:
-            self.assertEqual(process.wait(timeout=10), 0)
+        try:
+            for process in processes:
+                self.assertEqual(process.wait(timeout=10), 0)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
         self.assertNotEqual(resolve_tag("codex", self.a), resolve_tag("codex", self.b))
 
 
