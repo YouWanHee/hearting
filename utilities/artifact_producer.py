@@ -1177,18 +1177,24 @@ def _indexed_route_children(root: Path, route_id: str, route_hash_value: str):
 
 
 def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> bool:
-    """A closed, unused candidate cannot take an executed predecessor's cycle.
+    """A closed, unused candidate cannot take an executed predecessor's cycle."""
+    outcome = _read_json(route_lineage.canonical_route_path(root, route["route_id"]).with_suffix(".outcome.json"))
+    if (not isinstance(outcome, dict)
+            or outcome.get("route_id") != route["route_id"]
+            or outcome.get("route_hash") != route["route_hash"]
+            or outcome.get("terminal_gate_proven") is not False):
+        return False
+    return _unexecuted_continuation(root, route)
+
+
+def _unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> bool:
+    """No attempt of this continuation ever started, and nothing continues it.
 
     Audit bindings and unconsumed registrations are history, not execution.
     Read the exact route registry and markers afresh; missing or unreadable
     evidence stays unknown. Started or unresolved launches stay attached.
     """
-    outcome = _read_json(route_lineage.canonical_route_path(root, route["route_id"]).with_suffix(".outcome.json"))
-    if (not isinstance(outcome, dict)
-            or outcome.get("route_id") != route["route_id"]
-            or outcome.get("route_hash") != route["route_hash"]
-            or outcome.get("terminal_gate_proven") is not False
-            or _indexed_route_children(root, route["route_id"], route["route_hash"])):
+    if _indexed_route_children(root, route["route_id"], route["route_hash"]):
         return False
     try:
         module = artifact_lifecycle._load_capability_route()
@@ -1354,6 +1360,10 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
                     handed_over = _handed_over_routes(root, record)
                 if sibling["route_id"] in handed_over:
                     continue  # closed lineage: that branch belongs to another cycle
+                if _unexecuted_continuation(root, sibling):
+                    # A continuation that never ran is not a second branch of work;
+                    # if it starts later, this executed branch refuses it instead.
+                    continue
                 reason = "cycle-route-binding-mismatch:lineage-fork"
                 return Admission(False, reason, f"branch={node['route_id']} siblings={sibling['route_id']},{path[path.index(node)+1]['route_id']}",
                                  path, _d120_next_action(reason))
