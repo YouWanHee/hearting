@@ -1262,7 +1262,9 @@ delivery share the notice claim; forms and busy turns use the courier's
 existing retained-message path. Codex and OpenCode keep their existing
 retained completion controllers.
 Confirmed session handover changes the recipient, while the signed notice stays
-under the registered parent's storage key. If an older outer observer cannot
+under the registered parent's storage key. A run notice that names only the
+session that launched the run follows that session's seat the same way: the
+session that took the seat over receives it, across harnesses. If an older outer observer cannot
 process this retained duty, its exact PID and existing lock identify a safe
 observer replacement: accepted records remain intact and the replacement takes
 the same lock. A supported observer and the native carrier stay alive.
@@ -1913,7 +1915,9 @@ related join-recovery; unrelated pending deliveries stay with the
 selector-less bulk `reconcile --apply` maintenance path.
 
 Progress is observed by the runtime from exact native tool identifiers and
-completion states, scoped file changes, and bounded verification leases. This
+completion states, scoped file changes, and bounded verification leases. A
+supervised owner's attempt log is a receipt log; its tool identifiers are read
+from the child session transcript that log announces. This
 strict observer progress supports supervision notices. Separately, the launcher
 uses a more permissive activity sample (attempt log/transcript changes, exact
 runtime tool CPU or new process identities, and an exact live verification
