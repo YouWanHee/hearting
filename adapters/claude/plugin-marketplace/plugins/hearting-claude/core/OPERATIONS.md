@@ -1904,7 +1904,9 @@ related join-recovery; unrelated pending deliveries stay with the
 selector-less bulk `reconcile --apply` maintenance path.
 
 Progress is observed by the runtime from exact native tool identifiers and
-completion states, scoped file changes, and bounded verification leases. This
+completion states, scoped file changes, and bounded verification leases. A
+supervised owner's attempt log is a receipt log; its tool identifiers are read
+from the child session transcript that log announces. This
 strict observer progress supports supervision notices. Separately, the launcher
 uses a more permissive activity sample (attempt log/transcript changes, exact
 runtime tool CPU or new process identities, and an exact live verification
