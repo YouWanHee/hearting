@@ -472,9 +472,11 @@ Fleet `--window`. Peer start and recovery stay on the checked Herdr reference;
 It fills the calling tab's 2×2 grid without focus: right, right-column down,
 then remaining-column down, each at ratio 0.5. A full or irregular tab reuses
 an agent-free, idle shell with an empty prompt, then the newest other tab with
-room, then opens one unfocused tab. `--beside` selects the reference tab;
-`--pane` keeps explicit pane reuse. No pane move or extra flag is needed. The
-shared contract is `core/OPERATIONS.md §5.14`.
+room, then opens one unfocused tab, except that a peer start with a reference
+pane finishes inside that tab — grid cell, empty shell, then a split of the
+reference pane — and does not fill another tab or create one. `--beside` fixes
+the reference tab; `--pane` keeps explicit pane reuse. No pane move or extra flag
+is needed. The shared contract is `core/OPERATIONS.md §5.14`.
 
 ## Fleet background shell rows
 

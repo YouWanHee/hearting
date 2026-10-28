@@ -64,8 +64,25 @@ def _proc_start(stat_text: str) -> str:
     return fields[19] if close >= 0 and len(fields) > 19 else ""
 
 
-_EMBEDDED_HELPERS = {"rg", "ugrep"}
+_EMBEDDED_HELPERS = {"rg", "ugrep", "bfs"}
 _INITIAL_PID_NAMESPACE = "pid:[4026531836]"
+
+
+def _namespace_pid(proc: Path, pid: str) -> str | None:
+    """Return the innermost pid of a nested-namespace process, or None if not exact."""
+    try:
+        lines = (proc / "status").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if not line.startswith("NSpid:"):
+            continue
+        values = line.split()[1:]
+        if (len(values) < 2 or not all(item.isdecimal() for item in values)
+                or values[0] != pid):
+            return None
+        return values[-1]
+    return None
 
 
 def _native_claude_executable(executable: str) -> bool:
@@ -261,6 +278,8 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
 
     Unreadable process identity, unbound Claude processes, namespace mismatch,
     malformed native claims, and process churn make the result incomplete.
+    A process in a nested PID namespace binds by its own innermost pid; otherwise
+    namespace mismatch keeps the census incomplete.
     """
     root = Path(proc_root)
     started = time.monotonic()
@@ -313,9 +332,12 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
         except OSError:
             reasons.add("process-context-unreadable")
             continue
+        claim_pid = pid
         if namespace != host_namespace:
-            reasons.add("pid-namespace-mismatch")
-            continue
+            claim_pid = _namespace_pid(proc, pid)
+            if claim_pid is None:
+                reasons.add("pid-namespace-mismatch")
+                continue
         env = {}
         for item in environ:
             if b"=" in item:
@@ -336,7 +358,7 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
         holders.update(argv_sids)
         if len(argv_sids) > 1:
             reasons.add("conflicting-session-arguments")
-        native_sid, valid = _native_session_claim(Path(home_value), pid, start)
+        native_sid, valid = _native_session_claim(Path(home_value), claim_pid, start)
         if not valid:
             reasons.add("native-session-claim-unusable")
             continue
@@ -357,7 +379,7 @@ def claude_session_census(*, proc_root: str | os.PathLike = "/proc",
         if tap_indexes[home_key] is None:
             reasons.add("statusline-tap-index-incomplete")
             continue
-        taps = tap_sids_by_pid(home, pid, start, index=tap_indexes[home_key])
+        taps = tap_sids_by_pid(home, claim_pid, start, index=tap_indexes[home_key])
         claims = {native_sid} if native_sid else set()
         claims.update(taps)
         holders.update(claims)
