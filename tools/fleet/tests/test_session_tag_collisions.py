@@ -450,13 +450,40 @@ print(json.dumps(values))
                        "agent_session": {"kind": "id", "value": self.b}}
         unknown = {"agent": "codex", "pane_id": "w:elsewhere", "agent_session": {"kind": "unknown"}}
         for agents in ([], [replacement], [dict(replacement, agent="opencode")],
-                       [dict(unknown, agent="opencode")], [replacement, unknown]):
+                       [dict(unknown, agent="opencode")]):
             with self.subTest(agents=agents):
                 session_tags._path().unlink(missing_ok=True)
                 session_tags.assign_observed("codex", self.a, pane_id="w:original")
                 self.agents.return_value = agents
                 session_tags.assign([])
                 self.assertIsNone(resolve_tag("codex", self.a))
+
+    def test_reused_original_seat_does_not_discard_an_unknown_moved_session(self):
+        for harness in ("codex", "opencode"):
+            for replacement_harness in ("codex", "opencode"):
+                for reverse in (False, True):
+                    with self.subTest(harness=harness, replacement=replacement_harness, reverse=reverse):
+                        session_tags._path().unlink(missing_ok=True)
+                        confirmed = session_tags.assign_observed(harness, self.a, pane_id="w:original")
+                        replacement = {"agent": replacement_harness, "pane_id": "w:original",
+                                       "agent_session": {"kind": "id", "value": self.b}}
+                        moved = {"agent": harness, "pane_id": "w:moved",
+                                 "agent_session": {"kind": "unknown"}}
+                        self.agents.return_value = [moved, replacement] if reverse else [replacement, moved]
+                        session_tags.assign([])
+                        self.assertEqual(resolve_tag(harness, self.a), confirmed)
+                        other = resolve_tag(replacement_harness, self.b)
+                        self.assertIsNotNone(other)
+                        self.assertNotEqual(other, confirmed)
+                        moved["agent_session"] = {"kind": "id", "value": self.a}
+                        session_tags.assign([])
+                        row = session_tags._read(session_tags._path())[(harness, self.a)]
+                        self.assertEqual(row["pane_id"], "w:moved")
+                        self.assertEqual(row["tag"], confirmed)
+                        # A fresh census with no uncertain pane still permits cleanup.
+                        self.agents.return_value = [replacement]
+                        session_tags.assign([])
+                        self.assertIsNone(resolve_tag(harness, self.a))
 
     def test_failed_census_baseline_preserves_snapshot_without_discovery(self):
         confirmed = session_tags.assign_observed("codex", self.a, pane_id="w:original")

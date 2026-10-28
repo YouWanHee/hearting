@@ -141,7 +141,8 @@ def _keep(row, agents):
             unknown = True
         if agent.get("pane_id") == row["pane_id"]:
             # A present pane without native identity is not an observed exit.
-            return same_harness and (sid is None or sid == row["session_id"])
+            if same_harness and (sid is None or sid == row["session_id"]):
+                return True
     # An uncertain same-harness pane may be the session after a pane move.
     # This reserves its number only; it does not attribute that pane to a SID.
     return unknown
