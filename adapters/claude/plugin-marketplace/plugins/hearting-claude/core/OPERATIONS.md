@@ -1262,7 +1262,9 @@ delivery share the notice claim; forms and busy turns use the courier's
 existing retained-message path. Codex and OpenCode keep their existing
 retained completion controllers.
 Confirmed session handover changes the recipient, while the signed notice stays
-under the registered parent's storage key. If an older outer observer cannot
+under the registered parent's storage key. A run notice that names only the
+session that launched the run follows that session's seat the same way: the
+session that took the seat over receives it, across harnesses. If an older outer observer cannot
 process this retained duty, its exact PID and existing lock identify a safe
 observer replacement: accepted records remain intact and the replacement takes
 the same lock. A supported observer and the native carrier stay alive.
@@ -1332,13 +1334,22 @@ resource payloads. A live or unknown consumer, held lease, changed target or thr
 or uncertain execution does not start another consumer. A `sending` or
 `delivery-unknown` correction is not retransmitted; a non-parent sender leaves the
 existing undelivered notice for the route parent to handle through normal `start`.
+A live consumer keeps the release code it started with, resource launch included.
+When the effective parent's `correct` reaches a parked consumer of an earlier
+release (no turn running, no correction being sent, no resource launch pending),
+the runtime first stops only that consumer's own session, keeps registered payloads
+running, and restores it on the installed release through this same recovery
+(`consumer_release_moved_from`). It moves only after the recorded launch passes the
+same respawn checks; otherwise the consumer stays as it is.
 
 Registered resource/compute payloads stay under their existing run records across
 same-attempt consumer recovery; their survival is not surviving owner execution. The
 shared parent-close classification separates them, with exact route/attempt binding
 and complete observation of the remaining process set. Recovery context recognizes
 the recorded owner identity lineage and passes existing resource record locations to
-the restored supervisor without relaunching or editing the records. A valid terminal
+the restored supervisor without relaunching or editing the records. A positively
+unstarted run that `start` re-prepares under its same ID follows the same lineage:
+an earlier PID/start of the same owner attempt is not a different owner. A valid terminal
 result, cancellation or unknown execution retains its existing path.
 Resource registration settles a positively observed previous-boot execution as
 retryable failure even when power loss left no exit sentinel. The same observation
@@ -1904,7 +1915,9 @@ related join-recovery; unrelated pending deliveries stay with the
 selector-less bulk `reconcile --apply` maintenance path.
 
 Progress is observed by the runtime from exact native tool identifiers and
-completion states, scoped file changes, and bounded verification leases. This
+completion states, scoped file changes, and bounded verification leases. A
+supervised owner's attempt log is a receipt log; its tool identifiers are read
+from the child session transcript that log announces. This
 strict observer progress supports supervision notices. Separately, the launcher
 uses a more permissive activity sample (attempt log/transcript changes, exact
 runtime tool CPU or new process identities, and an exact live verification
@@ -2476,8 +2489,11 @@ fill the equivalent grid by splitting right. A full or irregular tab first
 reuses an agent-free foreground shell with an empty visible prompt there, then
 checks the other tabs in the same workspace, newest first, using the same
 grid-split and empty-shell decision. Only when none has room does it create one
-unfocused tab. Existing tab names, layouts and sizes are preserved apart from
-filling an available grid cell. Openings in one workspace serialize on the
+unfocused tab. A peer start with a reference pane instead finishes inside that
+tab — free grid cell, then an agent-free empty shell, then a split of the
+reference pane itself — and does not fill another tab or create one. Existing
+tab names, layouts and sizes are preserved apart from filling an available grid
+cell. Openings in one workspace serialize on the
 peer-start claim `peer-starts/<sha256(session:workspace)>.lock`, the file pinned
 releases also take; tmux keys its claim apart in the same directory. The result
 `{surface, pane, placement, notes, view_command}` states failures as notes and
@@ -2488,8 +2504,9 @@ agentless Herdr shell keeps running Fleet in the current terminal.
 Same-seat succession uses `peer-steward.py start <name> --kind <harness>`,
 which with no `--pane` or `--beside` uses the calling pane (`HERDR_PANE_ID`)
 as its placement reference, in the Git primary checkout (the calling cwd outside
-Git) unless `--cwd` names another. `--beside` selects the reference tab/pane,
-not the direction; `--pane` retains explicit reuse. Placement follows the window
+Git) unless `--cwd` names another. `--beside` fixes the reference tab and
+placement stays inside it; it does not select the split direction; `--pane`
+retains explicit reuse. Placement follows the window
 contract above, and `start` holds the workspace claim through launch so
 concurrent starts cannot claim the same shell or subdivide a stale layout.
 Names longer than Herdr's 32-character limit are explained before any placement

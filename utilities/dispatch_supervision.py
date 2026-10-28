@@ -113,6 +113,25 @@ def _inside_root(path, root):
         return False
 
 
+def _tool_event_source(metadata, log_path):
+    """The file that carries the owner's tool rows.
+
+    A supervised Claude owner's attempt log is a receipt log with control rows
+    only; it announces the child session whose own transcript has the tool
+    rows. The summary follower already resolves that transcript the same way.
+    """
+    try:
+        from dispatch_summary import announced_session, session_transcript
+        decided, announced = announced_session(log_path)
+        if (not decided or not isinstance(announced, dict) or announced.get("invalid")
+                or announced.get("runtime")):
+            return log_path
+        runtime_home = metadata.get("runtime_home") or None
+        return session_transcript(announced, runtime_home=runtime_home) or log_path
+    except (ImportError, OSError, ValueError, TypeError):
+        return log_path
+
+
 def runtime_tool_progress(metadata, previous=None):
     """Read only the latest bounded native tool identity, never transcript prose."""
     latest = previous or None
@@ -120,7 +139,7 @@ def runtime_tool_progress(metadata, previous=None):
     if not raw_path or not Path(raw_path).is_absolute():
         return latest
     try:
-        with Path(raw_path).open("rb") as handle:
+        with _tool_event_source(metadata, Path(raw_path)).open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             start = max(0, handle.tell() - 262144)
             handle.seek(start)

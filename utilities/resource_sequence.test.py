@@ -749,6 +749,12 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         failed['session'] = ({'harness': launcher.harness, 'id': launcher.session_id}
                              if launcher.known and launcher.session_id else None)
         failed.pop('resource_operation')
+        # The owner's consumer was restored after this failure: same attempt, new PID/start.
+        registry_text = jobs.read_text()
+        self.assertEqual(registry_text.count(',attempt_id=' + owner_attempt), 1)
+        jobs.write_text(registry_text.replace(',attempt_id=' + owner_attempt,
+            ',owner_identity_lineage=4000000001:7,attempt_id=' + owner_attempt))
+        failed['owner_wait'] = {**owner_wait, 'owner_pid': 4000000001, 'owner_start': '7'}
         registry.write_text(json.dumps({'schema_version': 1,
             'runs': {var['run_id']: var, run_id: failed}}))
         self.assertTrue(RR.resource_never_started(failed))
@@ -810,6 +816,8 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                         'pid': 4_000_000_000, 'starttime': '1'}}),
                     ('unknown-process', {'pid': 4_000_000_000, 'starttime': '1',
                                          'command_hash': 'c' * 64}),
+                    ('foreign-owner', {'owner_wait': {
+                        **owner_wait, 'owner_pid': 4000000002, 'owner_start': '7'}}),
                     ('sentinel', {}), ('already-armed', {})):
                 with self.subTest(restore_refusal=invalid):
                     unsafe = {**failed, **changes}
@@ -837,6 +845,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             self.assertEqual(queued['run_id'], run_id)
             self.assertEqual(queued['launch_state'], 'queued')
             self.assertEqual(queued['resource_operation'], operation)
+            self.assertEqual(queued['owner_wait'], owner_wait)
             self.assertFalse(queued['payload_spawned'])
             self.assertEqual(payloads, [])
             self.assertEqual(json.loads(registry.read_text())['runs'][var['run_id']], var_snapshot)
