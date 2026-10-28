@@ -147,6 +147,20 @@ def run_wrapper(args: argparse.Namespace, command: list[str]):
     (``run_forwarding_termination``). Every other launch returns quickly and
     keeps the plain ``subprocess.run``.
     """
+    if len(command) > 1 and Path(command[1]).name == "dispatch-headless.py":
+        # This surface calls adapters directly, including SD-59 retries; it
+        # does not pass through dispatch-node's final launch boundary.
+        harness = Path(command[1]).parents[1].name
+        reason, detail = None, ""
+        try:
+            if harness not in DISPATCH_NODE.current_launch_harnesses():
+                reason = "explicit-adapter-disabled-by-user-policy"
+                detail = harness
+        except DISPATCH_NODE.DispatchNodeError as exc:
+            reason, detail = exc.reason, compact_diagnostic(str(exc.fields))
+        if reason:
+            return subprocess.CompletedProcess(command, 65,
+                f"check=failed\nreason={reason}\ndetail={detail}\nregistered=0\nstarted=0\nchild_spawned=0\n", "")
     lifecycle = getattr(args, "launch_lifecycle", DETACHED)
     timeout = outer_subprocess_timeout(
         getattr(args, "foreground_timeout", FOREGROUND_TIMEOUT_DEFAULT),
@@ -392,7 +406,9 @@ def _record_leg_failure(route: dict, node: dict, hop: dict, reason: str,
 
 def _typed_stop_code(reason: str, *, direct: bool = False) -> int | None:
     """Classify an actual wrapper refusal by its typed reason, not exit code."""
-    if reason in ROUTE_STATE_REFUSAL_REASONS:
+    if reason in ROUTE_STATE_REFUSAL_REASONS or reason in {
+        "explicit-adapter-disabled-by-user-policy", "defaults-invalid",
+    }:
         return 65
     if reason in PRELAUNCH_PROCESS_BLOCK_REASONS or (direct and reason.startswith("retry-")):
         return 78
@@ -549,7 +565,28 @@ def ordered_fallback_hops(
     another tool.
     """
 
+    config = DISPATCH_NODE.current_launch_defaults()
+    enabled = DISPATCH_NODE.ROUTE.DEFAULTS.current_enabled_harnesses(config)
     allocation = route.get("dispatch_allocation")
+    allowed = set(enabled)
+    if (config.get("schema_version") in {3, 4} and isinstance(allocation, dict)
+            and isinstance(allocation.get("harness_order"), list)):
+        allowed.intersection_update(allocation["harness_order"])
+    worker_pin = sealed_pin_harness(route, worker_type="stage")
+    if worker_pin in enabled:
+        allowed.add(worker_pin)  # only its existing checked rows, not other automatic candidates
+    hops = []
+    for hop in node["fallback_hops"]:
+        if hop.get("fallback_hop") in HEADLESS_HOPS:
+            hops.append({**hop, "candidates": [
+                dict(row) if row.get("child_harness") in allowed else
+                {**row, "_allocation_skip": "disabled-by-user-policy"}
+                for row in hop.get("candidates", [])]})
+        elif hop.get("fallback_hop") == "native-subagent":
+            hops.append({**hop, "candidates": [row for row in hop.get("candidates", [])
+                                               if row.get("harness") in enabled]})
+        else:
+            hops.append(dict(hop))  # inline is work on an existing owner
     if not isinstance(allocation, dict) or allocation.get("strategy") not in {
         ALLOCATION_STRATEGY, "capacity-aware", "balanced"
     }:
@@ -559,7 +596,7 @@ def ordered_fallback_hops(
         # Only the allocation path collapses the chain to one row per
         # harness (via headless.setdefault below) and therefore needs the
         # parent filter.
-        return apply_worker_pin(route, list(node["fallback_hops"]), parent_identity), None
+        return apply_worker_pin(route, hops, parent_identity), None
     counts = attempt_counts(jobs, window=int(allocation["window"]))
     states = _usage_states(jobs, node.get("model_profile"), recheck=recheck)
     worker_pin = sealed_pin_harness(route, worker_type="stage")
@@ -571,7 +608,7 @@ def ordered_fallback_hops(
     headless: dict[str, tuple[dict, dict]] = {}
     trailing_rows: list[tuple[dict, dict]] = []
     tail_hops = []
-    for hop in node["fallback_hops"]:
+    for hop in hops:
         if hop["fallback_hop"] not in {"same-harness-headless", "cross-harness-headless"}:
             tail_hops.append(hop)
             continue
@@ -585,7 +622,8 @@ def ordered_fallback_hops(
                 # as today.
                 trailing_rows.append((hop, row))
                 continue
-            if row.get("status") == "supported" and harness in ALLOCATION_HARNESSES:
+            if (row.get("status") == "supported" and harness in ALLOCATION_HARNESSES
+                    and not row.get("_allocation_skip")):
                 # After parent filtering a child adapter appears at exactly
                 # one ordinal, so setdefault's first-wins is a no-op here
                 # rather than the silent deletion it used to be.
@@ -608,6 +646,9 @@ def ordered_fallback_hops(
                 for band in ("primary", "relief", "last_resort")
             },
         }
+        if worker_pin in available and worker_pin not in {
+                h for band in ("primary", "relief", "last_resort") for h in policy[band]}:
+            policy["primary"] = [worker_pin, *policy["primary"]]
         _selected, quality_band, ranks, relief_promoted = CAPACITY.select(
             policy,
             states,
@@ -2306,9 +2347,12 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
     attempts: list[str] = []
     direct_failures: list[dict[str, str]] = []
     candidate_outcomes = CandidateOutcomes()
-    fallback_hops, allocation_context = ordered_fallback_hops(
-        route, node, args.jobs, parent_identity=parent_identity, recheck=args.action != "dry-run"
-    )
+    try:
+        fallback_hops, allocation_context = ordered_fallback_hops(
+            route, node, args.jobs, parent_identity=parent_identity, recheck=args.action != "dry-run"
+        )
+    except DISPATCH_NODE.DispatchNodeError as exc:
+        return fail(exc.reason, 65, child_spawned="0", **exc.fields)
     if allocation_context is not None:
         os.environ["AGENT_DISPATCH_PARENT_CROSS"] = str(
             allocation_context.get("parent_cross") or "not-applicable"
@@ -2755,6 +2799,13 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
         elif hop["fallback_hop"] == "native-subagent":
             candidate = next((row for row in hop.get("candidates", []) if row.get("status") == "supported"), None)
             if candidate:
+                try:
+                    enabled = DISPATCH_NODE.current_launch_harnesses()
+                except DISPATCH_NODE.DispatchNodeError as exc:
+                    return fail(exc.reason, 65, child_spawned="0", **exc.fields)
+                if candidate.get("harness") not in enabled:
+                    attempts.append(f"{ordinal}:native-subagent:skipped-disabled-by-user-policy")
+                    continue
                 proof = native_child_proof(args, route, node)
                 if proof:
                     print("check=degraded")

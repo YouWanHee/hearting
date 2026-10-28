@@ -85,7 +85,10 @@ def fixture_state_environ(tmpdir):
     nothing ambient leaks in, no real user home is touched -- while giving the
     registry/completion derivation a resolvable root inside the test's tempdir.
     """
-    return {"HARNESS_STATE_ROOT": str(Path(tmpdir) / "state")}
+    defaults = Path(tmpdir) / "fixture-defaults.yaml"
+    defaults.write_text((ROOT / "profiles/dispatch-defaults.yaml").read_text())
+    return {"HARNESS_STATE_ROOT": str(Path(tmpdir) / "state"),
+            "DISPATCH_DEFAULTS_CONFIG": str(defaults)}
 
 
 def make_node(depth=2, dispatch_fallback=None):
@@ -776,6 +779,40 @@ class MainMaterializationTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 65)
         self.assertEqual(run.call_count, 1)
 
+
+    def test_d5_new_direct_replay_and_equal_pin_cannot_launch_disabled_adapter(self):
+        with tempfile.TemporaryDirectory() as td:
+            policy = Path(td) / "defaults.yaml"
+            policy.write_text((ROOT / "profiles/dispatch-defaults.yaml").read_text().replace(
+                "  enabled: [claude, codex, opencode]", "  enabled: [claude, opencode]"))
+            for adapter in ("claude", "codex", "opencode"):
+                for pin, replay in ((False, False), (True, False), (True, True)):
+                    node = make_node()
+                    route = make_route(node)
+                    if pin:
+                        route["selection_pins"] = {"contract_version": 1, "worker": {"harness": adapter}}
+                    with self.subTest(adapter=adapter, pin=pin, replay=replay), mock.patch.object(N, "replacement_task", return_value=None):
+                        got = self._run_main(["--node", "execute", "--adapter", adapter, "--slug", "d5", "--parent", "owner",
+                            *(["--", "--automatic-retry-of", "att-original"] if replay else [])], route,
+                            environ={"DISPATCH_DEFAULTS_CONFIG": str(policy)})
+                    self.assertEqual(got is None, adapter == "codex")
+            # Historical successful tuples remain valid even with no readable defaults.
+            parent = {"parent_harness": "claude", "parent_transport": "headless", "parent_sandbox": "default", "launch_authority": "conductor"}
+            with mock.patch.dict(N.os.environ, {"DISPATCH_DEFAULTS_CONFIG": str(Path(td)/"absent")}):
+                selected = N.resolve_checked_tuple(make_route(make_node()), make_node(), "codex", parent)
+                self.assertEqual(selected.candidate["child_harness"], "codex")
+                bad = {**parent, "parent_harness": "opencode"}
+                with self.assertRaises(N.DispatchNodeError):
+                    N.resolve_checked_tuple(make_route(make_node()), make_node(), "codex", bad)
+
+    def test_d5_final_launch_rechecks_policy_after_pin_availability(self):
+        route = make_route(make_node())
+        route["selection_pins"]={"contract_version":1,"worker":{"harness":"codex"}}
+        with mock.patch.object(N, "current_launch_harnesses", side_effect=[("claude", "codex", "opencode"),("claude", "opencode")]) as policy, \
+             mock.patch("dispatch_capacity_evidence.active_limits",return_value={}):
+            got = self._run_main(["--node", "execute", "--adapter", "claude", "--slug", "d5-final", "--parent", "owner"], route)
+        self.assertIsNone(got)
+        self.assertEqual(policy.call_count,2)
 
 class RoundProtocolTest(unittest.TestCase):
     """Verdict-less history gets full-scope first-pass guidance; real verdicts

@@ -653,6 +653,8 @@ class WorkStartTest(unittest.TestCase):
 
     def test_automatic_frames_use_real_selector_usage_gate_before_wrapper_launch(self):
         owner = load("work_start_capacity_owner", W.ROOT / "utilities/dispatch-owner.py")
+        policy = Path(self.tmp.name)/"dispatch-defaults.yaml"
+        policy.write_text((W.ROOT/"profiles/dispatch-defaults.yaml").read_text())
         self.route.update(cwd=self.tmp.name, capability="autopilot-code", capability_mode="debug",
                           owner_model_profile="deep")
         for node in self.route["nodes"][:2]:
@@ -686,7 +688,7 @@ class WorkStartTest(unittest.TestCase):
         for headroom in (30, 60):
             with self.subTest(headroom=headroom), contextlib.ExitStack() as stack:
                 self.jobs.unlink(missing_ok=True); self.calls.clear(); launched.clear()
-                stack.enter_context(mock.patch.dict(os.environ, {}, clear=True))
+                stack.enter_context(mock.patch.dict(os.environ, {"DISPATCH_DEFAULTS_CONFIG":str(policy)}, clear=True))
                 stack.enter_context(mock.patch.object(owner, "_authoritative_jobs", return_value=str(self.jobs)))
                 stack.enter_context(mock.patch.object(owner, "_sealed_owner_context", return_value=context))
                 # This case tests selector choice, while subprocess.run is the
@@ -4836,6 +4838,48 @@ class BlockedOwnerAutoHarvestTest(unittest.TestCase):
     def test_normal_start_harvest_preserves_a_stored_answer(self):
         self._start(stored_answer=True)
 
+
+
+class D5PublicOwnerStartTest(unittest.TestCase):
+    def test_public_start_real_selector_binding_and_fake_wrapper_preserve_B(self):
+        fixture=load('d5_public_owner_fixture',Path(__file__).with_name('dispatch_owner.test.py'))
+        O=fixture.OWNER
+        for requested in (None,'codex'):
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as td:
+                config=fixture.d5_defaults(td,enabled=('claude','codex','opencode'))
+                env=fixture._isolated_env({'DISPATCH_DEFAULTS_CONFIG':str(config),'HARNESS_STATE_ROOT':str(Path(td)/'state'),
+                    'AGENT_DISPATCH_JOBS':str(Path(td)/'jobs.log'),'AGENT_DISPATCH_CALLER_HARNESS':'claude'})
+                for key in list(env):
+                    if key.startswith('AGENT_ARTIFACT_'):env.pop(key)
+                (Path(td)/'jobs.log').touch()
+                with mock.patch.dict(os.environ,env,clear=True):
+                    path,route=fixture.d5_public_route(td,text='codex 시켜' if requested else 'Continue approved work',owner=requested)
+                    before=path.read_bytes()
+                    fixture.d5_defaults(td)  # stale sealed policy includes Codex; now disabled
+                    launched=[];commands=[]
+                    def run(command,**kwargs):
+                        commands.append(command)
+                        self.assertEqual(Path(command[1]).name,'dispatch-owner.py')
+                        self.assertIn('--start',command)
+                        out=io.StringIO()
+                        with contextlib.redirect_stdout(out):code=O.main(command[2:])
+                        return subprocess.CompletedProcess(command,code,out.getvalue(),'')
+                    with mock.patch.object(O,'_usage',return_value={h:'ok' for h in ('claude','codex','opencode')}) as usage, \
+                         mock.patch.object(O._capacity,'capacity_report',return_value={'scores':{'claude':80,'codex':99,'opencode':70},'sources':{}}), \
+                         mock.patch.object(O,'run_owner_wrapper',side_effect=lambda argv,env:launched.append(argv) or 0), \
+                         mock.patch('artifact_producer.prepare_route_artifact_env',return_value={}), \
+                         mock.patch.object(W,'prepare_task_request',return_value=None):
+                        result=W.start_work(route,path,Path(td)/'jobs.log',run=run)
+                    self.assertEqual(len(commands),1,result)
+                    self.assertEqual(path.read_bytes(),before)
+                    if requested:
+                        self.assertEqual(launched,[])
+                        self.assertIn('explicit-adapter-disabled-by-user-policy',result['launches'][0]['receipt'])
+                    else:
+                        self.assertEqual(len(launched),1,result)
+                        self.assertEqual(Path(launched[0][0]).parts[-3],'claude')
+                        self.assertEqual(usage.call_args.args[1],'deep')
+                        self.assertNotIn('headless-main-session-only-model',result['launches'][0]['receipt'])
 
 if __name__ == "__main__":
     unittest.main()

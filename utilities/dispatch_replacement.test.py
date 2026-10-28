@@ -3063,6 +3063,71 @@ class ReplacementTest(unittest.TestCase):
                 else:
                     self.assertIn('no-eligible-route-evidence-candidate', selected.out)
 
+
+    def test_d5_automatic_owner_replacement_public_start_never_launches_disabled_codex(self):
+        spec=importlib.util.spec_from_file_location('d5_replacement_owner_fixture',Path(__file__).with_name('dispatch_owner.test.py'))
+        suite=importlib.util.module_from_spec(spec);spec.loader.exec_module(suite)
+        self._blocked_owner();self._answer()
+        config=suite.d5_defaults(self.root,enabled=('claude','codex','opencode'))
+        env=suite._isolated_env({'DISPATCH_DEFAULTS_CONFIG':str(config),'HARNESS_STATE_ROOT':str(self.root/'state'),
+             'AGENT_DISPATCH_JOBS':str(self.jobs),'AGENT_DISPATCH_CALLER_HARNESS':'claude'})
+        for key in list(env):
+            if key.startswith('AGENT_ARTIFACT_'):env.pop(key)
+        with mock.patch.dict(os.environ,env,clear=True):
+            for command in (["git","init","-q",str(self.root)],
+                            ["git","-C",str(self.root),"-c","user.name=Fixture","-c","user.email=fixture@example.com","commit","--allow-empty","-qm","fixture"]):
+                subprocess.run(command,check=True,capture_output=True)
+            path,route=suite.d5_public_route(self.root,cwd=self.root)
+            # Keep the existing replacement family/claim and original task. The
+            # selector consumes this real verified stale route at its public seam.
+            self.route.update(route);self.path.write_text(json.dumps(self.route))
+            source_before=self.jobs.read_bytes();route_before=self.path.read_bytes()
+            suite.d5_defaults(self.root)
+            launched=[];commands=[]
+            def run(command,**kwargs):
+                commands.append(command)
+                self.assertEqual(Path(command[1]).name,'dispatch-owner.py')
+                self.assertIn('--start',command)
+                self.assertNotIn('--adapter',command)
+                out=io.StringIO()
+                with contextlib.redirect_stdout(out):code=suite.OWNER.main(command[2:])
+                return SimpleNamespace(returncode=code,stdout=out.getvalue(),stderr='')
+            with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None), \
+                 mock.patch.object(suite.OWNER,'_usage',return_value={h:'ok' for h in ('claude','codex','opencode')}) as usage, \
+                 mock.patch.object(suite.OWNER._capacity,'capacity_report',return_value={'scores':{'claude':80,'codex':99,'opencode':70},'sources':{}}), \
+                 mock.patch.object(suite.OWNER,'run_owner_wrapper',side_effect=lambda argv,env:launched.append(argv) or 0), \
+                 mock.patch('artifact_producer.prepare_route_artifact_env',return_value={}):
+                result=R.advance(self.jobs,'att-source',run=run,authority_check=lambda *_:True,resume_capacity=True)
+            self.assertEqual(len(commands),1,result)
+            self.assertEqual(len(launched),1,result)
+            self.assertEqual(Path(launched[0][0]).parts[-3],'claude')
+            self.assertEqual(usage.call_args.args[1],'deep')
+            self.assertIn('--automatic-retry-of',launched[0])
+            self.assertIn('att-source',launched[0])
+            self.assertEqual(self.path.read_bytes(),route_before)
+            # A fake wrapper registers nothing; e0 owns its status classification.
+            self.assertNotIn('headless-main-session-only-model',result.get('launcher_diagnostic',''))
+            # The existing claim binds the source row once; all historical
+            # values survive and no successor row is fabricated by the fake.
+            original=R._rows(source_before.decode().splitlines())
+            current=R._rows(self.jobs.read_text().splitlines())
+            self.assertEqual(set(current),set(original))
+            for aid, (fields, meta) in original.items():
+                self.assertEqual(current[aid][0][:5],fields[:5])
+                for key,value in meta.items():self.assertEqual(current[aid][1][key],value)
+
+    def test_d5_disabled_fixed_replay_returns_policy_attention_before_claim_and_spawn(self):
+        spec=importlib.util.spec_from_file_location('d5_fixed_replay_fixture',Path(__file__).with_name('dispatch_owner.test.py'))
+        suite=importlib.util.module_from_spec(spec);spec.loader.exec_module(suite)
+        config=suite.d5_defaults(self.root)
+        before=self.jobs.read_bytes()
+        with mock.patch.dict(os.environ,{'DISPATCH_DEFAULTS_CONFIG':str(config)}), \
+             mock.patch.object(R,'claim',side_effect=AssertionError('policy refusal must precede a new claim')), \
+             mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None):
+            result=R.advance(self.jobs,'att-source',run=lambda *a,**k:self.fail('no wrapper may run'),authority_check=lambda *_:True)
+        self.assertEqual((result['state'],result['reason']),('needs-attention','explicit-adapter-disabled-by-user-policy'),result)
+        self.assertEqual(self.jobs.read_bytes(),before)
+
     def test_gpu_lab_correction_prepares_compute_defaults_instead_of_replaying_old_access(self):
         import execution_access as EA
         inventory = self.root / 'config/hearting/compute-hosts.yaml'
@@ -4448,6 +4513,24 @@ class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
             self.assertEqual(select_call.call_args.args[1]["claude"], "limited(limited)")
             self.assertEqual(selected_rows[0][0], "codex")
             self.assertIsNotNone(R._capacity_hold(self.jobs, self.meta, allow_frame_peer=False))
+
+
+    def test_d5_disabled_successful_frame_peer_cannot_release_a_new_capacity_choice(self):
+        config=self.root/'d5-frame-policy.yaml'
+        config.write_text((R.ROOT/'profiles/dispatch-defaults.yaml').read_text().replace(
+            '  enabled: [claude, codex, opencode]','  enabled: [claude, opencode]'))
+        capacity=R._capacity_reader()
+        before=self.jobs.read_bytes()
+        with mock.patch.dict(os.environ,{'DISPATCH_DEFAULTS_CONFIG':str(config)}), \
+             mock.patch('dispatch_capacity_evidence.harness_hold',return_value={'label':'limited'}), \
+             mock.patch('dispatch_capacity_evidence.usage_states',return_value={'claude':'limited(now)','codex':'ok','opencode':'limited'}), \
+             mock.patch('model_config.resolve_config',return_value=({},'fixture')), \
+             mock.patch('model_profile.resolve_profile_values',side_effect=lambda h,c,p:{'model':h+'-'+p}), \
+             mock.patch.object(R,'_capacity_reader',return_value=capacity), \
+             mock.patch.object(capacity,'capacity_report',return_value={'scores':{'claude':0,'codex':99,'opencode':0},'sources':{}}), \
+             mock.patch('dispatch_allocation.attempt_counts',return_value={'claude':0,'codex':0,'opencode':0}):
+            self.assertIsNotNone(R._capacity_hold(self.jobs,self.meta,allow_frame_peer=True))
+        self.assertEqual(self.jobs.read_bytes(),before)
 
     def test_wrong_raw_identity_auth_runtime_and_non_capacity_results_are_refused(self):
         self.assertIsNone(self.kind(reconcile_reason="terminal-invalid:claude-result-auth"))

@@ -831,50 +831,43 @@ def main(argv):
                                   route_node=values.get("--route-node"))
             if route_evidence else None
         )
+        config = _load_defaults()
+        enabled = _defaults.current_enabled_harnesses(config)
+        config_version = config.get("schema_version")
         if sealed_context and isinstance(sealed_context.get("policy"), dict):
             policy = dict(sealed_context["policy"])
-            config = None
-            config_version = 3
+            if config_version not in {3, 4}:
+                config_version = 3  # retain the sealed quality selector for old config
         else:
-            config = _load_defaults()
             policy = _defaults.query_profile_policy(config, profile)
-            config_version = config.get("schema_version")
-        configured = [
-            harness for band in _defaults.QUALITY_BANDS for harness in policy[band]
-        ]
-        # Legacy schema-v1 still admits an explicit OpenCode relief request;
-        # schema-v3 authorization comes from the enabled set and quality bands.
+        auto_pool = enabled
+        if (config.get("schema_version") in {3, 4} and sealed_context
+                and isinstance(sealed_context.get("allocation"), dict)):
+            pool = sealed_context["allocation"].get("harness_order")
+            if isinstance(pool, list):
+                auto_pool = [h for h in enabled if h in pool]
+        policy = _defaults.restrict_harness_policy(policy, auto_pool)
+        configured = [h for band in _defaults.QUALITY_BANDS for h in policy[band]]
         if explicit is not None and explicit not in _defaults.DISPATCHABLE_HARNESSES:
             raise OwnerError("explicit-adapter-unauthorized")
         explicit_policy = None
-        if (
-            explicit is not None
-            and config_version == 3
-            and explicit not in configured
-        ):
-            # The profile's bands are a recommendation for automatic selection.
-            # A harness the user explicitly named is honoured while it is
-            # enabled at all (the allocation pool); only a disabled harness is
-            # refused.
-            pool = None
-            if sealed_context and isinstance(sealed_context.get("allocation"), dict):
-                pool = sealed_context["allocation"].get("harness_order")
-            if pool is None and config is not None:
-                pool = _defaults.query_allocation(config)["harness_order"]
-            if explicit not in (pool or ()):
-                raise OwnerError("explicit-adapter-disabled-by-user-policy")
-            explicit_policy = "outside-profile-bands"
         sealed = sealed_context["harnesses"] if sealed_context else None
         # A sealed owner pin (`compose --pin owner=<harness>`) beats the request while its harness is
         # available (CONVENTIONS §2.1). The swap is made here, before the sealed-candidate check, so a
         # request outside the route evidence is replaced rather than refused; the usage state is known
         # only below, where a limited pin gives the request back to the checks it always had.
-        requested, pin_doc = explicit, None
-        if route_evidence and values["--worker-type"] == "owner":
+        requested, pin_doc, pinned = explicit, None, None
+        if route_evidence and values["--worker-type"] in {"owner", "frame"}:
             pin_doc = route_in_force(json.loads(Path(route_evidence).read_text(encoding="utf-8")))
-            pinned = sealed_pin_harness(pin_doc, worker_type="owner")
+            pinned = sealed_pin_harness(pin_doc, worker_type=values["--worker-type"])
             if pinned and pinned != explicit and (sealed is None or pinned in sealed):
                 explicit = pinned
+        if pinned and pinned not in enabled:
+            raise OwnerError("explicit-adapter-disabled-by-user-policy")
+        if explicit is not None and explicit not in enabled:
+            raise OwnerError("explicit-adapter-disabled-by-user-policy")
+        if explicit is not None and explicit not in configured:
+            explicit_policy = "outside-profile-bands"
         policy_harnesses = list(configured)
         if sealed is not None:
             if explicit is not None and explicit not in sealed:
@@ -903,19 +896,22 @@ def main(argv):
         # A sealed/explicit target stays exact and reports its native provider
         # error. Automatic placement applies provider/model eligibility through
         # the shared usage state before allocation and all fallback bands.
-        states = _usage(jobs, None if explicit or pin_doc else profile,
+        states = _usage(jobs, None if explicit or pinned else profile,
                         recheck="--dry-run" not in forwarded)
         overridden = None
         pin_chosen = False
         if pin_doc is not None:
             choice, overridden = pinned_launch_harness(
-                pin_doc, worker_type="owner", requested=requested,
-                available=lambda h: (sealed is None or h in sealed) and _eligible(states.get(h, "unknown")))
+                pin_doc, worker_type=values["--worker-type"], requested=requested,
+                available=lambda h: h in enabled and (sealed is None or h in sealed) and _eligible(states.get(h, "unknown")))
             pin_chosen = choice is not None and choice != requested
             if choice != explicit:  # the pinned harness is limited: the request, with today's checks
                 explicit = choice
                 if explicit is not None and sealed is not None and explicit not in sealed:
                     raise OwnerError("explicit-adapter-outside-route-evidence")
+        if explicit is not None and explicit not in enabled:
+            raise OwnerError("explicit-adapter-disabled-by-user-policy")
+        explicit_policy = "outside-profile-bands" if explicit is not None and explicit not in configured else None
         allocation = (
             sealed_context.get("allocation")
             if sealed_context and isinstance(sealed_context.get("allocation"), dict)
@@ -945,7 +941,7 @@ def main(argv):
 
         def automatically_available(harness):
             score = capacity.get(harness)
-            return (harness not in top_excluded and _eligible(states[harness])
+            return (harness in enabled and harness not in top_excluded and _eligible(states[harness])
                     and score is not None and score > 0)
 
         selected = None
@@ -984,7 +980,7 @@ def main(argv):
             # A sealed route constrains this last resort too: silently starting
             # an owner whose harness the checked tuples never probed only moves
             # the failure to every dispatch-depth-2 launch.
-            if config_version == 3:
+            if config_version in {3, 4}:
                 fallback_pool = ()
             elif sealed is not None:
                 fallback_pool = sealed
@@ -1203,6 +1199,11 @@ def main(argv):
                     raise OwnerError(f"{exc.code}:{exc.detail}") from exc
         if overridden:
             forwarded += ["--explicit-adapter", overridden]
+        # Selection and launch are separate boundaries: policy may change while
+        # binding artifacts or waiting for the first frame leg.
+        launch_enabled = _defaults.current_enabled_harnesses()
+        if selected not in launch_enabled or (pinned and pinned not in launch_enabled):
+            raise OwnerError("explicit-adapter-disabled-by-user-policy")
         result = run_owner_wrapper([str(wrapper), *forwarded], child_env)
         if result == 0 and frame_degradation and "--start" in forwarded:
             route, first_attempt_id, first_harness, degradation_reason, detail = frame_degradation
@@ -1214,7 +1215,7 @@ def main(argv):
                 except Exception:
                     pass
         return result
-    except (OwnerError, OwnerRouteBindingError, OSError) as exc:
+    except (OwnerError, OwnerRouteBindingError, OSError, _defaults.DefaultsConfigError) as exc:
         return _error(str(exc))
 
 

@@ -4310,4 +4310,108 @@ class LaunchTupleReportOnlyTest(unittest.TestCase):
   self.assertEqual({r["rejection_class"] for r in rows}, {"candidate-unsupported"})
 
 
+
+class D5FallbackSelectionTest(unittest.TestCase):
+ def test_all_strategies_trailing_and_native_candidates_use_live_enabled(self):
+  with tempfile.TemporaryDirectory() as td:
+   config=Path(td)/"defaults.yaml"
+   config.write_text((ROOT/"profiles/dispatch-defaults.yaml").read_text().replace(
+    "  enabled: [claude, codex, opencode]","  enabled: [claude, opencode]"))
+   parent={"parent_harness":"claude","parent_transport":"headless","parent_sandbox":"adapter-default","launch_authority":"conductor"}
+   rows=[{**parent,"child_harness":h,"status":"supported"} for h in ("codex","claude","opencode")]
+   hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":rows},
+         {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":[{**rows[0],"parent_harness":"opencode"}]},
+         {"ordinal":3,"fallback_hop":"native-subagent","candidates":[{"harness":"codex","status":"supported"}]},
+         {"ordinal":4,"fallback_hop":"inline"}]
+   node={"id":"execute","dispatch_depth":2,"model_profile":"deep","fallback_hops":hops,
+         "harness_policy":{"primary":["codex","claude"],"relief":["opencode"],"last_resort":[],"promote_relief_below":0}}
+   with mock.patch.dict(os.environ,{"DISPATCH_DEFAULTS_CONFIG":str(config)}), \
+        mock.patch.object(F,"attempt_counts",return_value={h:0 for h in ("claude","codex","opencode")}), \
+        mock.patch.object(F,"_usage_states",return_value={h:"ok" for h in ("claude","codex","opencode")}), \
+        mock.patch.object(F.CAPACITY,"capacity_scores",return_value={"codex":99,"claude":80,"opencode":70}):
+    for strategy in (None,"config-order","balanced","capacity-aware","least-recent-attempts"):
+     route={} if strategy is None else {"dispatch_allocation":{"strategy":strategy,"window":30,"harness_order":["codex","claude","opencode"]}}
+     before=json.dumps((route,node),sort_keys=True)
+     ordered,context=F.ordered_fallback_hops(route,node,Path(td)/"jobs.log",parent_identity=parent)
+     candidates=[r for hop in ordered if hop["fallback_hop"] in F.HEADLESS_HOPS for r in hop.get("candidates",[])]
+     self.assertTrue(all(r.get("_allocation_skip")=="disabled-by-user-policy" for r in candidates if r["child_harness"]=="codex"))
+     self.assertEqual(next(r["child_harness"] for r in candidates if not r.get("_allocation_skip")),"claude")
+     self.assertFalse(next(h for h in ordered if h["fallback_hop"]=="native-subagent")["candidates"])
+     self.assertEqual(json.dumps((route,node),sort_keys=True),before)
+     if context:self.assertNotIn("codex",context["rank"])
+
+ def test_enabled_checked_worker_pin_outside_original_bands_and_pool_stays_exact(self):
+  with tempfile.TemporaryDirectory() as td:
+   config=Path(td)/"defaults.yaml"
+   config.write_text((ROOT/"profiles/dispatch-defaults.yaml").read_text().replace("  enabled: [claude, codex, opencode]","  enabled: [claude, opencode]"))
+   parent={"parent_harness":"claude","parent_transport":"headless","parent_sandbox":"adapter-default","launch_authority":"conductor"}
+   node={"id":"execute","dispatch_depth":2,"model_profile":"deep",
+    "harness_policy":{"primary":["claude"],"relief":[],"last_resort":[],"promote_relief_below":0},
+    "fallback_hops":[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[{**parent,"child_harness":"claude","status":"supported"}]},
+                     {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":[{**parent,"child_harness":"opencode","status":"supported"}]}]}
+   before=json.dumps(node,sort_keys=True)
+   with mock.patch.dict(os.environ,{"DISPATCH_DEFAULTS_CONFIG":str(config)}), \
+        mock.patch.object(F,"attempt_counts",return_value={"claude":0,"codex":0,"opencode":0}), \
+        mock.patch.object(F,"_usage_states",return_value={"claude":"ok","codex":"ok","opencode":"ok"}), \
+        mock.patch.object(F.CAPACITY,"capacity_scores",return_value={"claude":5,"codex":99,"opencode":80}):
+    for strategy in ("balanced","capacity-aware","least-recent-attempts"):
+     route={"dispatch_allocation":{"strategy":strategy,"window":30,"harness_order":["claude"]},
+            "selection_pins":{"contract_version":1,"worker":{"harness":"opencode"}}}
+     hops,_=F.ordered_fallback_hops(route,node,Path(td)/"jobs",parent_identity=parent)
+     self.assertEqual(hops[0]["candidates"][0]["child_harness"],"opencode")
+     self.assertFalse(hops[0]["candidates"][0].get("_worker_pin_skip"))
+     del route["selection_pins"]
+     hops,_=F.ordered_fallback_hops(route,node,Path(td)/"jobs",parent_identity=parent)
+     self.assertTrue(all(row.get("_allocation_skip") for hop in hops for row in hop.get("candidates",[]) if row["child_harness"]=="opencode"))
+   self.assertEqual(json.dumps(node,sort_keys=True),before)
+
+ def test_legacy_owner_order_is_not_a_new_worker_prohibition(self):
+  with tempfile.TemporaryDirectory() as td:
+   config=Path(td)/"defaults.yaml"
+   parent={"parent_harness":"claude","parent_transport":"headless","parent_sandbox":"adapter-default","launch_authority":"conductor"}
+   node={"id":"execute","model_profile":"deep","fallback_hops":[{"ordinal":1,"fallback_hop":"same-harness-headless",
+    "candidates":[{**parent,"child_harness":h,"status":"supported"} for h in ("codex","claude")]}]}
+   with mock.patch.dict(os.environ,{"DISPATCH_DEFAULTS_CONFIG":str(config)}), \
+        mock.patch.object(F,"attempt_counts",return_value={"claude":0,"codex":0,"opencode":0}), \
+        mock.patch.object(F,"_usage_states",return_value={"claude":"ok","codex":"ok","opencode":"ok"}):
+    for version,strategy in ((1,"config-order"),(2,"least-recent-attempts")):
+     config.write_text(f"schema_version: {version}\ndepth1_owner: [claude]\nopencode:\n  relief_only: {str(version == 1).lower()}\n"+
+      ("allocation:\n  strategy: least-recent-attempts\n  window: 30\n" if version==2 else "")+"capabilities:\n")
+     route={"dispatch_allocation":{"strategy":strategy,"window":30,"harness_order":["claude"]}}
+     hops,context=F.ordered_fallback_hops(route,node,Path(td)/"jobs",parent_identity=parent)
+     self.assertFalse(any(row.get("_allocation_skip") for hop in hops for row in hop.get("candidates",[])))
+     if context:self.assertEqual(set(context["rank"]),{"claude","codex"})
+
+ def test_real_wrapper_boundary_rechecks_policy_for_all_adapters_and_capacity_commands(self):
+  with tempfile.TemporaryDirectory() as td:
+   config=Path(td)/"defaults.yaml"
+   baseline=(ROOT/"profiles/dispatch-defaults.yaml").read_text()
+   args=SimpleNamespace(action="dry-run",launch_lifecycle=F.DETACHED,direct_timeout=1,foreground_timeout=1)
+   parent={"parent_harness":"claude","parent_transport":"headless","parent_sandbox":"adapter-default","launch_authority":"conductor"}
+   node={"id":"execute","fallback_hops":[{"ordinal":1,"fallback_hop":"cross-harness-headless",
+    "candidates":[{**parent,"child_harness":"codex","status":"supported"}]}]}
+   config.write_text(baseline)
+   with mock.patch.dict(os.environ,{"DISPATCH_DEFAULTS_CONFIG":str(config)}):
+    hops,_=F.ordered_fallback_hops({},node,Path(td)/"jobs",parent_identity=parent)
+    self.assertEqual(hops[0]["candidates"][0]["child_harness"],"codex")
+    config.write_text(baseline.replace("  enabled: [claude, codex, opencode]","  enabled: [claude, opencode]"))
+    for harness in ("claude","codex","opencode"):
+     # Both ordinary and SD-59 model-alternative commands share run_wrapper.
+     command=[sys.executable,str(ROOT/f"adapters/{harness}/bin/dispatch-headless.py"),"--dry-run","--capacity-retry","1"]
+     with mock.patch.object(F.subprocess,"run",return_value=SimpleNamespace(returncode=0,stdout="",stderr="")) as spawn, \
+          mock.patch.object(F,"run_forwarding_termination") as foreground:
+      result=F.run_wrapper(args,command)
+     self.assertEqual(spawn.call_count,0 if harness=="codex" else 1)
+     foreground.assert_not_called()
+     if harness=="codex":
+      self.assertEqual(result.returncode,65)
+      self.assertIn("explicit-adapter-disabled-by-user-policy",result.stdout)
+      self.assertEqual(F._typed_stop_code("explicit-adapter-disabled-by-user-policy",direct=True),65)
+    config.unlink()
+    with mock.patch.object(F.subprocess,"run") as spawn:
+     result=F.run_wrapper(args,[sys.executable,str(ROOT/"adapters/claude/bin/dispatch-headless.py"),"--dry-run"])
+    spawn.assert_not_called()
+    self.assertIn("reason=defaults-invalid",result.stdout)
+    self.assertEqual(F._typed_stop_code("defaults-invalid",direct=True),65)
+
 if __name__=="__main__": unittest.main()
