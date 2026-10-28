@@ -45,6 +45,8 @@ HOOK = _load("dispatch_session_sweep_hook", ROOT / "hooks/dispatch-session-sweep
 REQUEST_RECONNECT = SWEEP.request_obligation_reconciliation
 import dispatch_batch_obligations as OBLIGATIONS  # noqa: E402
 import peer_obligations  # noqa: E402
+sys.path.insert(0, str(ROOT / "tools"))
+import fixture_processes  # noqa: E402
 
 FIXTURE_ENV_LOG = os.environ.get("SD111_FIXTURE_ENV_LOG")
 
@@ -324,6 +326,9 @@ class IsolatedRootMixin:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        # A real `__ensure-obligations` child starts the shared obligation runner
+        # outside the in-process patch; it keeps writing obligations/ until reaped.
+        fixture_processes.reap(self._tmp.name)
         self._tmp.cleanup()
         super().tearDown()
 
@@ -2318,7 +2323,9 @@ console.log(JSON.stringify({prompts, logs}));
 await hooks.event({event: {type: "session.created", properties: {info: {id: "ses-oc-parent"}}}});
 if (prompts.length) throw new Error("activation itself started a turn");
 await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses-oc-parent"}}});
-await new Promise(r => setTimeout(r, 1500));
+// The delivery chain spawns Python children; wait for its settle record, not a fixed 1.5 s.
+for (let i = 0; i < 200 && !logs.some(row => row.extra?.stage === "settle"); i++)
+  await new Promise(r => setTimeout(r, 50));
 ''')
         self.assertEqual(len(result["prompts"]), 1)
         self.assertEqual(result["prompts"][0]["path"], {"id": self.SID})
@@ -2329,7 +2336,9 @@ await new Promise(r => setTimeout(r, 1500));
         result = self.run_plugin('''
 if (prompts.length) throw new Error("startup context was treated as receipt");
 await hooks.event({event: {type: "session.idle", properties: {sessionID: "ses-oc-parent"}}});
-await new Promise(r => setTimeout(r, 1500));
+// The delivery chain spawns Python children; wait for its settle record, not a fixed 1.5 s.
+for (let i = 0; i < 200 && !logs.some(row => row.extra?.stage === "settle"); i++)
+  await new Promise(r => setTimeout(r, 50));
 ''', restored_selector=True)
         self.assertEqual(len(result["prompts"]), 1)
         self.assertEqual(result["prompts"][0]["path"], {"id": self.SID})

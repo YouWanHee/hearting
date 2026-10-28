@@ -15,8 +15,16 @@ from fleet.collectors import usage_cache
 class F51OptOutTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.dispatch_tmp = tempfile.TemporaryDirectory()
         self.old_state_dir = os.environ.get("FLEET_USAGE_STATE_DIR")
+        self.old_dispatch = os.environ.get("AGENT_DISPATCH_JOBS")
+        self.old_resource_index = os.environ.get("AGENT_RESOURCE_RUN_INDEX")
         os.environ["FLEET_USAGE_STATE_DIR"] = self.tmp.name
+        jobs = os.path.join(self.dispatch_tmp.name, "jobs.log")
+        open(jobs, "w").close()
+        os.environ["AGENT_DISPATCH_JOBS"] = jobs
+        os.environ["AGENT_RESOURCE_RUN_INDEX"] = os.path.join(
+            self.dispatch_tmp.name, "resource-runs.index.json")
         self.old_disable = os.environ.get("FLEET_DISABLE")
 
     def tearDown(self):
@@ -28,7 +36,16 @@ class F51OptOutTest(unittest.TestCase):
             os.environ.pop("FLEET_DISABLE", None)
         else:
             os.environ["FLEET_DISABLE"] = self.old_disable
+        for key, value in (
+            ("AGENT_DISPATCH_JOBS", self.old_dispatch),
+            ("AGENT_RESOURCE_RUN_INDEX", self.old_resource_index),
+        ):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         self.tmp.cleanup()
+        self.dispatch_tmp.cleanup()
 
     def _run(self, argv):
         buf = io.StringIO()

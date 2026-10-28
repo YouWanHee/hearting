@@ -7305,9 +7305,15 @@ def _explorer_hit_geometry(frame, snapshot, size):
 
 
 def _explorer_click_current(size, snapshot):
-    """A click is adopted only for the paint it was aimed at: same size, same snapshot."""
-    return bool(_HIT_VALID and _HIT_SIZE == tuple(size)
-                and _HIT_SNAPSHOT_ID == (id(snapshot) if snapshot is not None else None))
+    """A click is adopted for the paint it was aimed at: the frame still on screen, same size.
+
+    A snapshot, detail or focus result that lands after that paint does not age it. Explorer
+    hits carry identities and the reducer resolves them against `_EXPLORER_FRAME`, the frame
+    the person saw and clicked, so dropping the click there only loses it.
+    """
+    frame = _EXPLORER_FRAME
+    return bool(frame is not None and _HIT_SIZE == tuple(size)
+                and (getattr(frame, "rows", None), getattr(frame, "cols", None)) == tuple(size))
 
 
 def _explorer_apply_effects(effects, vm):
@@ -11902,6 +11908,20 @@ def _explorer_text_input():
     return _explorer_question_editing() or models_finding(_EXPLORER_STATE)
 
 
+def _explorer_unmoved_tree_release(bstate, state):
+    """The release of an unmoved tree press is adopted even after a refresh aged the hit map.
+
+    The reducer confirms it from the identity the press grabbed (its own cell or a hit of that
+    identity), so a snapshot tick between press and release cannot drop the click.
+    """
+    release = getattr(curses, "BUTTON1_RELEASED", 0)
+    other = (getattr(curses, "BUTTON4_PRESSED", 0) | getattr(curses, "BUTTON5_PRESSED", 0)
+             | _EXPLORER_MOUSE_MOTION)
+    drag = tuple(getattr(state, "drag", ()) or ())
+    return bool(release and bstate & release and not bstate & other
+                and len(drag) > 8 and drag[0] == "tree" and not drag[8])
+
+
 def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     """Apply one decoded event to the explorer's view-local reducer."""
     global _EXPLORER_STATE, _EXPLORER_TEXT
@@ -11909,7 +11929,9 @@ def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     state = _explorer_state_for(_EXPLORER_STATE, (size or (0, 100))[1])
     if ch == curses.KEY_MOUSE:
         mx, my, bstate = mouse_event if mouse_event is not None else _getmouse_event()
-        if mx is not None and size is not None and _explorer_click_current(size, snapshot):
+        if mx is not None and size is not None and (
+                _explorer_click_current(size, snapshot)
+                or _explorer_unmoved_tree_release(bstate, state)):
             if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
                 events = [{"type": "wheel", "direction": 1, "x": mx, "y": my}]
             elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):

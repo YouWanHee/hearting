@@ -96,6 +96,30 @@ class ProgressTest(unittest.TestCase):
         self.assertEqual(tool["sequence"],test["sequence"]+1)
         self.assertEqual(P.heartbeat(self.args(phase="tool",kind="tool",evidence="inspect-failure"),3),tool)
 
+    def test_supervised_claude_owner_progress_follows_its_announced_transcript(self):
+        from claude_project_dir import encode_project_dir
+        cwd = self.base / "owner-worktree"; cwd.mkdir()
+        runtime_home = self.base / "worker-home"
+        session = "085a89c5-3951-4b87-a9c2-c98cd6e97616"
+        receipt = self.base / "owner.claude.jsonl"
+        receipt.write_text("".join(json.dumps(row) + "\n" for row in (
+            {"type": "dispatch.supervisor.session", "parent_attempt_id": self.attempt,
+             "session_id": session, "cwd": str(cwd)},
+            {"type": "dispatch.supervisor.turn-started"})))
+        transcript = runtime_home / "projects" / encode_project_dir(str(cwd)) / f"{session}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "call-1", "input": {"secret": "x"}}]}}) + "\n")
+        metadata = {"log_file": str(receipt), "runtime_home": str(runtime_home)}
+        first = P.runtime_tool_progress(metadata)
+        self.assertEqual(first, ["claude", "call-1", "tool_use"])
+        with transcript.open("a") as out:
+            out.write(json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "call-1", "content": "private"}]}}) + "\n")
+        self.assertEqual(P.runtime_tool_progress(metadata, first), ["claude", "call-1", "tool_result"])
+        # Without the transcript the receipt log stays the source: no progress is invented.
+        self.assertEqual(P.runtime_tool_progress({"log_file": str(receipt)}, first), first)
+
     def test_native_tool_progress_replaces_per_tool_model_heartbeat(self):
         log=self.base/"worker.jsonl"
         # This exact log path is registered before observing the runtime.

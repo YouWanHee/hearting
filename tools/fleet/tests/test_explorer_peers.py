@@ -88,6 +88,33 @@ def _lane_region(vm, boxes):
     return cells
 
 
+def _history_recede_delta(expected_cells):
+    """The approved backlog-B delta: a finished owner line recedes to the dim rung.
+
+    The frozen PEERS reference keeps every glyph and hit. A line that shows an ended
+    owner (`✕ lab`, `✓ session-tidy`) may differ only by `style.recede_key` on the cells
+    inside that card; every other frozen cell stays as captured.
+    """
+    from tools.fleet.explorer.style import recede_key
+
+    normalized = [list(row) for row in expected_cells]
+    for row in normalized:
+        text = "".join(str(cell[0] or "") for cell in row)
+        for marker in ("✕ lab", "✓ session-tidy"):
+            start = 0
+            while True:
+                x = text.find(marker, start)
+                if x < 0:
+                    break
+                left, right = text.rfind("│", 0, x), text.find("│", x)
+                if left >= 0 and right > left:
+                    for xx in range(left + 1, right):
+                        cell = row[xx]
+                        row[xx] = [cell[0], recede_key(cell[1]), *cell[2:]]
+                start = x + len(marker)
+    return normalized
+
+
 class PeerPaneReference(unittest.TestCase):
     def test_peers_and_selected_links_match_reference_pane(self):
         vm = load_fixture(FIXTURES / "view_model.json")
@@ -110,6 +137,7 @@ class PeerPaneReference(unittest.TestCase):
                     expected_cells = [row[SEPARATOR:] for row in expected_cells[5:]]
                     expected_cells = _lane_gutter_delta(frame, vm, expected_cells)
                     expected_cells = _arrow_glyph_delta(expected_cells)
+                    expected_cells = _history_recede_delta(expected_cells)
                     expected_hits = [[hit[0] - 5, hit[1] - SEPARATOR, hit[2] - SEPARATOR, hit[3]]
                                      for hit in expected_full_hits
                                      if hit[0] >= 5 and hit[1] >= SEPARATOR]

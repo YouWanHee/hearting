@@ -860,6 +860,171 @@ def session_id_of_process(pid, environ=None):
     return session_of_process(pid, environ)[0]
 
 
+# Commands that start no session of their own and open none: a process running one proves
+# nothing about any session, either way.
+_UTILITY_COMMANDS = frozenset(("agent", "auth", "bench", "completion", "debug", "export", "github",
+                               "import", "mcp", "models", "session", "stats", "upgrade", "uninstall"))
+
+
+def _command_of(argv):
+    """``(command, index)`` an `opencode` argv selects, or None when it cannot be read.
+
+    ``command`` is "" when the process is the default TUI (no command word, or a positional
+    project/prompt). Same word walk as ``procscan.invocation_mode``."""
+    from . import procscan
+    if not argv or os.path.basename(argv[0]) != "opencode":
+        return None
+    i = 1
+    while i < len(argv):
+        word = argv[i]
+        if word == "--":
+            return "", i
+        if word in procscan._VALUE_OPTIONS:
+            if i + 1 >= len(argv):
+                return None
+            i += 2
+            continue
+        if word in procscan._FLAG_OPTIONS or (word.startswith("--") and "=" in word):
+            i += 1
+            continue
+        if word.startswith("-"):
+            return None
+        return (word, i) if word in procscan._COMMANDS["opencode"] else ("", i)
+    return "", len(argv)
+
+
+def _run_session(tail):
+    """For the words after `opencode run`: ``(session_id, unresolved)``.
+
+    `--session/-s` names the session it works on; `--continue/-c` and `--fork` pick one the
+    command line does not name (unresolved); anything else starts a session of its own."""
+    found, unresolved = None, False
+    for index, arg in enumerate(tail):
+        key, equal, value = arg.partition("=")
+        if key in ("--continue", "-c", "--fork"):
+            unresolved = True
+        elif key in ("--session", "-s"):
+            if not equal:
+                value = tail[index + 1] if index + 1 < len(tail) else ""
+            if SESSION_ID_RE.match(value or ""):
+                found = value
+            else:
+                unresolved = True
+    return found, unresolved
+
+
+def _unseen_clients(servers, clients):
+    """True when every connection into a `serve`/`web` listener comes from a known opencode
+    client. ``servers``/``clients`` are pid sets; anything unreadable or unmatched is False."""
+    from . import codex
+    connections = codex._tcp_connections()
+    owners = codex._socket_owners_by_inode()
+    if connections is None or owners is None:
+        return False
+    port_of = lambda address: address.rsplit(":", 1)[1]  # noqa: E731 - "hexaddr:hexport"
+    for pid in servers:
+        mine = {inode for inode, pids in owners.items() if pid in pids}
+        ports = {port_of(local) for state, local, _remote, inode in connections
+                 if state == "0A" and inode in mine}
+        if not ports:
+            return False  # a listener this walk cannot see may have clients it cannot see
+        for state, local, remote, _inode in connections:
+            if state != "01" or port_of(local) not in ports:
+                continue
+            peers = [row for row in connections
+                     if row[0] == "01" and row[1] == remote and row[2] == local]
+            who = owners.get(peers[0][3]) if len(peers) == 1 else None
+            if not who or not who <= clients:
+                return False
+    return True
+
+
+def session_visibility(pids=None):
+    """``{"complete", "visible", "earliest_start_ms"}`` for the live OpenCode processes, or
+    None when the process table cannot be listed.
+
+    ``visible`` holds every session a running OpenCode client shows (its TUI selection
+    record, `--session`, or `run --session`). ``complete`` is False when some process
+    could not be classified, a `serve`/`web` runtime has a connection that is not a known
+    client, a table was unreadable, or the caller is outside the initial PID namespace:
+    then a session missing from ``visible`` is not proven unshown. ``earliest_start_ms``
+    is the oldest running OpenCode process's start (epoch ms), None when none runs."""
+    from . import procscan
+    if pids is None:
+        try:
+            pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+        except OSError:
+            return None
+    boot = procscan.boot_time()
+    ticks_per_second = os.sysconf("SC_CLK_TCK")
+    complete = procscan.initial_pid_namespace() and boot is not None
+    uid = os.geteuid()
+    visible, servers, clients, earliest = set(), set(), set(), None
+    for pid in pids:
+        try:
+            if os.stat("/proc/%s" % pid).st_uid != uid:
+                continue
+        except OSError:
+            continue
+        if procscan._comm_of(pid) != "opencode" or procscan.is_terminal_state(pid):
+            continue
+        start = _proc_start_ticks(pid)
+        if start is None:
+            continue
+        if boot is not None:
+            began = int((boot + int(start) / ticks_per_second) * 1000)
+            earliest = began if earliest is None else min(earliest, began)
+        selected, _source = session_of_process(pid)
+        if selected:
+            visible.add(selected)
+            clients.add(pid)
+            continue
+        argv = _cmdline(pid)
+        command = _command_of(argv)
+        if command is None:
+            complete = False
+        elif command[0] in ("serve", "web"):
+            servers.add(pid)
+        elif command[0] in _UTILITY_COMMANDS:
+            continue
+        elif command[0] == "run":
+            found, unresolved = _run_session(argv[command[1] + 1:])
+            clients.add(pid)
+            if found:
+                visible.add(found)
+            complete = complete and not unresolved
+        else:
+            clients.add(pid)
+            complete = False  # a TUI/attach that has not chosen a session yet
+    if servers and complete:
+        complete = _unseen_clients(servers, clients)
+    return {"complete": complete, "visible": frozenset(visible), "earliest_start_ms": earliest}
+
+
+def session_activity(session_id):
+    """``(time_updated_ms, time_idle_ms | None)`` of one session, or None when OpenCode's
+    database does not hold it (or cannot be read). ``session_v2`` wins; the older
+    ``session`` table has no idle mark. Message content is never read."""
+    import contextlib
+    if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+        return None
+    try:
+        with contextlib.closing(sqlite3.connect("file:%s?mode=ro" % _db(), uri=True,
+                                                timeout=0.2)) as con:
+            for query in ("SELECT time_updated, time_idle FROM session_v2 WHERE id = ?",
+                          "SELECT time_updated, NULL FROM session WHERE id = ?"):
+                try:
+                    row = con.execute(query, (session_id,)).fetchone()
+                except sqlite3.OperationalError:
+                    continue
+                if row and isinstance(row[0], (int, float)) and not isinstance(row[0], bool):
+                    idle = row[1] if isinstance(row[1], (int, float)) else None
+                    return row[0], idle
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    return None
+
+
 def _keeper_key(sess):
     """Prefer an exact TUI selection, then earliest process start and lowest PID."""
     kind = getattr(sess, "_opencode_bind_kind", None)
