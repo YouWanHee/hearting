@@ -943,16 +943,57 @@ async function setupOpenCodeV2(ctx) {
     const info = await markSession(sessionID)
     return work(info)
   })
+  // OpenCode 2.0.32 runs tool.execute.before before shell.create.before and
+  // inserts OPENCODE_SESSION_ID only after the shell hooks return. Pair the
+  // exact command with its session while both are in flight; a command string
+  // two sessions are waiting on stays empty (poll-fallback) instead of guessing.
+  const shellCommands = new Map()
+  const rememberShellCommand = (command, sessionID) => {
+    if (!command || !sessionID) return
+    const sessions = shellCommands.get(command) || new Set()
+    sessions.add(sessionID)
+    shellCommands.set(command, sessions)
+  }
+  const takeShellCommandSession = (command) => {
+    if (typeof command !== "string" || !command) return null
+    const sessions = shellCommands.get(command)
+    if (!sessions) return null
+    if (sessions.size !== 1) return ""
+    const [sessionID] = sessions
+    shellCommands.delete(command)
+    return sessionID
+  }
+  const forgetShellCommand = (command, sessionID) => {
+    if (typeof command !== "string" || !command) return
+    const sessions = shellCommands.get(command)
+    if (!sessions) return
+    sessions.delete(sessionID)
+    if (!sessions.size) shellCommands.delete(command)
+  }
   const sessionPrompt = async ({ path: target, body }) => {
     const sessionID = target?.id
     const text = (body?.parts || []).map((part) => part?.text || "").filter(Boolean).join("\n")
     if (!sessionID || !text || typeof ctx.session?.prompt !== "function") return { error: true }
     try {
-      await ctx.session.prompt({ sessionID, prompt: { text }, delivery: "steer" })
+      // 2.0.32 PromptInput carries the text at the top level.
+      await ctx.session.prompt({ sessionID, text, delivery: "steer" })
       return { error: null, response: { ok: true } }
     } catch (error) {
       return { error, response: { ok: false } }
     }
+  }
+  const sessionMessages = async ({ path: target, sessionID } = {}) => {
+    const sid = sessionID || target?.id
+    if (!sid || typeof ctx.session?.context !== "function") return []
+    try {
+      const result = await ctx.session.context({ sessionID: sid })
+      const rows = result?.data ?? result
+      if (!Array.isArray(rows)) return []
+      return rows.flatMap((row) => row?.type === "user" && typeof row.text === "string"
+        ? [{ info: { id: row.id, sessionID: sid, role: "user", time: row.time },
+            parts: [{ type: "text", text: row.text }] }]
+        : [])
+    } catch { return [] }
   }
   const legacyContext = {
     ...ctx,
@@ -960,10 +1001,8 @@ async function setupOpenCodeV2(ctx) {
     client: {
       session: {
         get: ({ path: target, sessionID }) => sessionInfo(sessionID || target?.id),
-        // V2 does not expose the V1 message-list method on its plugin context.
-        // Returning an empty list keeps optional enrichment unknown instead of
-        // guessing from another session or invoking a second model.
-        messages: async () => [],
+        // V2 exposes the post-compaction user messages as session.context.
+        messages: sessionMessages,
         promptAsync: sessionPrompt,
       },
       app: { log: (input) => ctx.app?.log?.(input) },
@@ -974,36 +1013,53 @@ async function setupOpenCodeV2(ctx) {
   }
   const hooks = await AgentHarnessGuards(legacyContext, { initialize: false })
 
-  await ctx.tool.hook("execute.before", async (event) => withSession(event.sessionID, async () => {
-    const input = { tool: event.tool, sessionID: event.sessionID }
-    const output = { args: event.input || {} }
-    await hooks["tool.execute.before"]?.(input, output)
-  }))
-  await ctx.tool.hook("execute.after", async (event) => withSession(event.sessionID, async () => {
-    const content = event.status === "completed" ? event.result?.content : []
-    const output = { output: Array.isArray(content)
-      ? content.map((part) => part?.text || "").filter(Boolean).join("\n") : "",
-      metadata: event.status === "error" ? { exit: 1 } : {} }
-    const originalText = output.output
-    if (v2WorkerSessions.has(event.sessionID)) {
-      await appendSpecSyncNudge(ctx, { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output, root)
-    } else {
-      await hooks["tool.execute.after"]?.(
-        { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output)
+  await ctx.tool.hook("execute.before", async (event) => {
+    const command = event.tool === "shell" && typeof event.input?.command === "string"
+      ? event.input.command : ""
+    if (command) rememberShellCommand(command, event.sessionID)
+    try {
+      await withSession(event.sessionID, async () => {
+        const input = { tool: event.tool, sessionID: event.sessionID }
+        const output = { args: event.input || {} }
+        await hooks["tool.execute.before"]?.(input, output)
+      })
+    } catch (error) {
+      if (command) forgetShellCommand(command, event.sessionID)
+      throw error
     }
-    if (event.status === "completed" && Array.isArray(content) &&
-        output.output.startsWith(originalText) && output.output.length > originalText.length) {
-      // V2 consumes the native result, not the legacy adapter's temporary string.
-      const text = output.output.slice(originalText.length).replace(/^\n/, "")
-      event.result = { ...event.result, content: [...content, { type: "text", text }] }
-    }
-  }))
+  })
+  await ctx.tool.hook("execute.after", async (event) => {
+    const command = event.tool === "shell" && typeof event.input?.command === "string"
+      ? event.input.command : ""
+    if (command) forgetShellCommand(command, event.sessionID)
+    await withSession(event.sessionID, async () => {
+      const content = event.status === "completed" ? event.result?.content : []
+      const output = { output: Array.isArray(content)
+        ? content.map((part) => part?.text || "").filter(Boolean).join("\n") : "",
+        metadata: event.status === "error" ? { exit: 1 } : {} }
+      const originalText = output.output
+      if (v2WorkerSessions.has(event.sessionID)) {
+        await appendSpecSyncNudge(ctx, { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output, root)
+      } else {
+        await hooks["tool.execute.after"]?.(
+          { tool: event.tool, sessionID: event.sessionID, args: event.input || {} }, output)
+      }
+      if (event.status === "completed" && Array.isArray(content) &&
+          output.output.startsWith(originalText) && output.output.length > originalText.length) {
+        // V2 consumes the native result, not the legacy adapter's temporary string.
+        const text = output.output.slice(originalText.length).replace(/^\n/, "")
+        event.result = { ...event.result, content: [...content, { type: "text", text }] }
+      }
+    })
+  })
   await ctx.shell.hook("create.before", async (event) => {
     const env = event.env || {}
-    const sessionID = env.OPENCODE_SESSION_ID || ""
+    const mapped = takeShellCommandSession(event.command)
+    const sessionID = mapped === null ? (env.OPENCODE_SESSION_ID || "") : mapped
     return withSession(sessionID, async () => {
       if (v2WorkerSessions.has(sessionID)) {
         for (const key of inheritedIdentityEnv) env[key] = ""
+        env[CARRIER_ENV] = ""
         if (sessionID) env.OPENCODE_SESSION_ID = sessionID
         return
       }

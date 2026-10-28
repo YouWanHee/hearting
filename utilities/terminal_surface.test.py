@@ -8,10 +8,13 @@ and setUp removes the inherited pane and socket variables even for a single-file
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -24,7 +27,7 @@ sys.path.insert(0, str(_HERE))
 import terminal_surface as ts  # noqa: E402
 
 _SURFACE_ENV = ("HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID",
-                "TMUX", "TMUX_PANE", "AGENT_HERDR_SESSION")
+                "TMUX", "TMUX_PANE", "AGENT_HERDR_SESSION", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID")
 
 FULL = [(10, 2, 200, 100)]
 TWO = [(10, 2, 100, 100), (110, 2, 100, 100)]
@@ -136,6 +139,184 @@ class FakeHerdr:
         if focused:
             self.focused_pane, self.focused_tab = pane_id, tab["tab_id"]
         return _done({"result": {"tab": tab, "root_pane": {"pane_id": pane_id, "focused": focused}}})
+
+
+class FakeTidyHerdr(FakeHerdr):
+    """Existing PTYs in split trees, with Herdr 0.9.5's mutation semantics."""
+
+    def __init__(self, n=6, area=(10, 2, 200, 100)):
+        super().__init__([FULL], area=area)
+        self.panes = {f"w1:p{i}": {"tab_id": "w1:t1", "terminal_id": f"terminal-{i}",
+                                  "title": "", "display_agent": "", "shell_pid": os.getpid()}
+                      for i in range(n)}
+        self.trees = {"w1:t1": self.chain(list(self.panes), "down", .25)}
+        self.focused_pane = f"w1:p{n - 1}"
+        self.zoomed, self.fail_at, self.failure, self.mutation_count = False, None, None, 0
+
+    @classmethod
+    def chain(cls, ids, direction, ratio=None):
+        return ids[0] if len(ids) == 1 else {
+            "direction": direction, "ratio": ratio or 1 / len(ids), "first": ids[0],
+            "second": cls.chain(ids[1:], direction, ratio)}
+
+    @staticmethod
+    def ids(tree):
+        return [tree] if isinstance(tree, str) else FakeTidyHerdr.ids(tree["first"]) + FakeTidyHerdr.ids(tree["second"])
+
+    @classmethod
+    def remove(cls, tree, pane):
+        if tree == pane:
+            return None
+        if isinstance(tree, str):
+            return tree
+        a, b = cls.remove(tree["first"], pane), cls.remove(tree["second"], pane)
+        return b if a is None else a if b is None else {**tree, "first": a, "second": b}
+
+    @classmethod
+    def insert(cls, tree, target, pane, direction, ratio):
+        if tree == target:
+            return {"first": target, "second": pane, "direction": direction, "ratio": max(.1, min(.9, ratio))}
+        if isinstance(tree, str):
+            return tree
+        return {**tree, "first": cls.insert(tree["first"], target, pane, direction, ratio),
+                "second": cls.insert(tree["second"], target, pane, direction, ratio)}
+
+    def canonical(self):
+        ids, counts = list(self.panes), ts._grid_rows(len(self.panes))
+        rows, index = [], 0
+        for count in counts:
+            rows.append(self.chain(ids[index:index + count], "right"))
+            index += count
+        def join(parts):
+            return parts[0] if len(parts) == 1 else {"first": parts[0], "second": join(parts[1:]),
+                                                    "direction": "down", "ratio": 1 / len(parts)}
+        self.trees["w1:t1"] = join(rows)
+
+    def layout_snapshot(self, tab):
+        panes, splits = [], []
+        def walk(tree, rect, path="s"):
+            if isinstance(tree, str):
+                panes.append({"pane_id": tree, "rect": rect, "focused": tree == self.focused_pane})
+                return
+            splits.append({"id": path, "direction": tree["direction"], "ratio": tree["ratio"], "rect": rect})
+            axis, length = ("x", "width") if tree["direction"] == "right" else ("y", "height")
+            first = int(rect[length] * tree["ratio"] + .5)
+            walk(tree["first"], {**rect, length: first}, path + "0")
+            walk(tree["second"], {**rect, axis: rect[axis] + first, length: rect[length] - first}, path + "1")
+        walk(self.trees[tab], dict(self.area))
+        return {"workspace_id": "w1", "tab_id": tab, "zoomed": self.zoomed, "area": dict(self.area),
+                "focused_pane_id": self.focused_pane if self.focused_pane in self.ids(self.trees[tab]) else panes[0]["pane_id"],
+                "panes": panes, "splits": splits}
+
+    def metadata(self, pane):
+        return {**self.panes[pane], "pane_id": pane, "workspace_id": "w1", "focused": pane == self.focused_pane}
+
+    def __call__(self, argv):
+        args = list(argv[1:])
+        if args[:1] == ["--session"]:
+            args = args[2:]
+        self.calls.append(args)
+        verb = args[:2]
+        if verb in (["pane", "move"], ["pane", "resize"], ["pane", "swap"]):
+            self.mutation_count += 1
+            if self.mutation_count == self.fail_at:
+                if callable(self.failure):
+                    return self.failure(args)
+                if isinstance(self.failure, BaseException):
+                    raise self.failure
+                return _done({"result": {"move_result": {"changed": False, "reason": "same_tab"}}})
+        def arg(key):
+            return args[args.index(key) + 1]
+        if verb == ["workspace", "get"]:
+            return _done({"result": {"workspace": {"workspace_id": "w1", "focused": True,
+                "active_tab_id": self.focused_tab, "label": "my workspace"}}})
+        if verb == ["tab", "list"]:
+            return _done({"result": {"tabs": copy.deepcopy(self.tabs)}})
+        if verb == ["pane", "list"]:
+            return _done({"result": {"panes": [self.metadata(p) for p in self.panes]}})
+        if verb == ["pane", "get"]:
+            return _done({"result": {"pane": self.metadata(args[2])}})
+        if verb == ["pane", "process-info"]:
+            pane = arg("--pane")
+            return _done({"result": {"process_info": {"pane_id": pane, "shell_pid": self.panes[pane]["shell_pid"]}}})
+        if verb == ["pane", "layout"]:
+            pane = arg("--pane")
+            return _done({"result": {"layout": self.layout_snapshot(self.panes[pane]["tab_id"])}})
+        if verb == ["pane", "move"]:
+            pane, previous = args[2], self.panes[args[2]]["tab_id"]
+            self.assert_no_focus(args)
+            created, closed = None, None
+            if "--new-tab" in args:
+                assert arg("--workspace") == "w1"
+                tab = "w1:t-stage"
+                created = {"tab_id": tab, "workspace_id": "w1", "number": 2, "label": "", "focused": False}
+            else:
+                tab = arg("--tab")
+                if previous == tab:
+                    return _done({"result": {"move_result": {"changed": False, "reason": "same_tab"}}})
+                assert self.panes[arg("--target-pane")]["tab_id"] == tab
+            tree = self.remove(self.trees[previous], pane)
+            if tree is None:
+                closed = previous
+                del self.trees[previous]
+                self.tabs = [t for t in self.tabs if t["tab_id"] != previous]
+            else:
+                self.trees[previous] = tree
+            if created:
+                self.tabs.append(created)
+                self.trees[tab] = pane
+            else:
+                self.trees[tab] = self.insert(self.trees[tab], arg("--target-pane"), pane,
+                                               arg("--split"), float(arg("--ratio")))
+            self.panes[pane]["tab_id"] = tab
+            return _done({"result": {"move_result": {"changed": True, "previous_pane_id": pane,
+                "previous_tab_id": previous, "previous_workspace_id": "w1", "pane": self.metadata(pane),
+                "source_layout": self.layout_snapshot(previous) if not closed else None,
+                "target_layout": self.layout_snapshot(tab), "created_tab": created,
+                "closed_tab_id": closed, "focused_pane_id": self.layout_snapshot(tab)["focused_pane_id"]}}})
+        if verb == ["pane", "swap"]:
+            source, target = arg("--source-pane"), arg("--target-pane")
+            tab = self.panes[source]["tab_id"]
+            assert self.panes[target]["tab_id"] == tab
+            def swap(tree):
+                if isinstance(tree, str):
+                    return target if tree == source else source if tree == target else tree
+                return {**tree, "first": swap(tree["first"]), "second": swap(tree["second"])}
+            self.trees[tab] = swap(self.trees[tab])
+            self.focused_pane, self.focused_tab = source, tab
+            return _done({"result": {"swap": {"changed": True, "source_pane_id": source,
+                "target_pane_id": target, "focused_pane_id": source, "layout": self.layout_snapshot(tab)}}})
+        if verb == ["pane", "resize"]:
+            pane, direction = arg("--pane"), arg("--direction")
+            tab = self.panes[pane]["tab_id"]
+            snapshot = self.layout_snapshot(tab)
+            rect = next(p["rect"] for p in snapshot["panes"] if p["pane_id"] == pane)
+            axis, size, cross, cross_size = ("x", "width", "y", "height") if direction in ("left", "right") else ("y", "height", "x", "width")
+            def candidates(grow):
+                edge = rect[axis] + (rect[size] if grow else 0)
+                return [s for s in snapshot["splits"] if s["direction"] == ("right" if axis == "x" else "down")
+                        and abs(s["rect"][axis] + int(s["rect"][size] * s["ratio"] + .5) - edge) <= 1
+                        and max(s["rect"][cross], rect[cross]) < min(s["rect"][cross] + s["rect"][cross_size], rect[cross] + rect[cross_size])]
+            grow = direction in ("right", "down")
+            found = candidates(grow) or candidates(not grow)
+            if not found:
+                return _done({"result": {"resize": {"changed": False}}})
+            boundary = found[0]
+            node = self.trees[tab]
+            for bit in boundary["id"][1:]:
+                node = node["first" if bit == "0" else "second"]
+            old = node["ratio"]
+            node["ratio"] = max(.1, min(.9, old + min(.5, abs(float(arg("--amount")))) * (1 if grow else -1)))
+            return _done({"result": {"resize": {"changed": old != node["ratio"], "pane_id": pane,
+                "focused_pane_id": self.focused_pane, "layout": self.layout_snapshot(tab)}}})
+        raise AssertionError(f"unexpected tidy command: {args}")
+
+    @staticmethod
+    def assert_no_focus(args):
+        assert "--no-focus" in args and "--focus" not in args
+
+    def mutations(self):
+        return [a for a in self.calls if a[:2] in (["pane", "move"], ["pane", "resize"], ["pane", "swap"])]
 
 
 class _IsolatedMixin:
@@ -501,6 +682,348 @@ class LockTest(_IsolatedMixin, unittest.TestCase):
         self.assertEqual(ts._HELD, set())
 
 
+class TidyGeometryTest(unittest.TestCase):
+    def test_required_shapes_and_full_width_odd_cells(self):
+        area = dict(zip(ts._RECT, (3, 7, 201, 101)))
+        for n, counts in ((1, [1]), (2, [2]), (4, [2, 2]), (5, [3, 2]), (6, [3, 3])):
+            for border in (0, 1):
+                cells = ts._grid_cells(area, n, border)
+                ys = sorted({r["y"] for r in cells})
+                rows = [[r for r in cells if r["y"] == y] for y in ys]
+                self.assertEqual([len(row) for row in rows], counts)
+                self.assertEqual(sum(row[0]["height"] for row in rows) + border * (len(rows) - 1), 101)
+                for row in rows:
+                    self.assertEqual(sum(r["width"] for r in row) + border * (len(row) - 1), 201)
+                    self.assertLessEqual(max(r["width"] for r in row) - min(r["width"] for r in row), 1)
+
+    def test_reading_order_supervisors_and_bad_rects(self):
+        fake = FakeTidyHerdr()
+        fake.canonical()
+        layout = fake.layout_snapshot("w1:t1")
+        for pane in layout["panes"]:
+            pane["title"] = "[50] ⚑ codex" if pane["pane_id"] in {"w1:p2", "w1:p4"} else ""
+        layout["panes"].reverse()
+        self.assertEqual(ts._tidy_order(layout, "w1:p1"), ["w1:p2", "w1:p0", "w1:p1", "w1:p3", "w1:p4", "w1:p5"])
+        cells = ts._grid_cells(layout["area"], 6)
+        layout["panes"][0]["rect"]["width"] += 20
+        with self.assertRaises(ts._TidyError):
+            ts._grid_matches(layout, cells)
+        for mutate in (lambda l: l["panes"].append(copy.deepcopy(l["panes"][0])),
+                       lambda l: l["panes"][0]["rect"].update(width=0),
+                       lambda l: l["area"].update(height=True)):
+            invalid = fake.layout_snapshot("w1:t1")
+            mutate(invalid)
+            with self.assertRaises(ts._TidyError):
+                ts._reading(invalid)
+
+    def test_large_ratio_difference_is_not_a_grid_and_small_area_is_refused(self):
+        fake = FakeTidyHerdr(2)
+        fake.canonical()
+        fake.trees["w1:t1"]["ratio"] = .8
+        self.assertFalse(ts._grid_matches(fake.layout_snapshot("w1:t1"), ts._grid_cells(fake.area, 2)))
+        with self.assertRaisesRegex(ts._TidyError, "too-small"):
+            ts._grid_cells(dict(zip(ts._RECT, (0, 0, 8, 5))), 6)
+
+
+class TidyHerdrTest(_IsolatedMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch("session_tidy.is_worker", return_value=False)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def tidy(self, fake, caller="w1:p1", runner=None):
+        return ts.tidy_panes(near=ts.Near(ts.HerdrSurface(runner or fake), pane=caller))
+
+    def test_different_supervisor_caller_focus_then_idempotent_for_each_shape(self):
+        for n, counts in ((2, [2]), (4, [2, 2]), (5, [3, 2]), (6, [3, 3])):
+            with self.subTest(n=n):
+                fake = FakeTidyHerdr(n)
+                marked = f"w1:p{n - 2}"
+                fake.panes[marked]["display_agent"] = "[50] ⚑ codex"
+                identity = {p: (v["terminal_id"], v["shell_pid"]) for p, v in fake.panes.items()}
+                focus = (fake.focused_pane, fake.focused_tab)
+                result = self.tidy(fake)
+                self.assertEqual(result.notes, [], result)
+                self.assertTrue(result.changed)
+                self.assertEqual(result.panes, [marked] + [f"w1:p{i}" for i in range(n) if f"w1:p{i}" != marked])
+                layout = fake.layout_snapshot("w1:t1")
+                self.assertEqual([sum(p["rect"]["y"] == y for p in layout["panes"])
+                                  for y in sorted({p["rect"]["y"] for p in layout["panes"]})], counts)
+                self.assertEqual((fake.focused_pane, fake.focused_tab), focus)
+                self.assertEqual(identity, {p: (v["terminal_id"], v["shell_pid"]) for p, v in fake.panes.items()})
+                self.assertEqual([t["tab_id"] for t in fake.tabs], ["w1:t1"])
+                mutations = fake.mutations()
+                moves = [a for a in mutations if a[1] == "move"]
+                self.assertEqual(len(moves), 2 * (n - 1))
+                for args in moves:
+                    self.assertIn("--no-focus", args)
+                    self.assertTrue("--new-tab" in args or "--tab" in args and "--target-pane" in args)
+                self.assertTrue(all(a[a.index("--source-pane") + 1] == focus[0]
+                                    for a in mutations if a[1] == "swap"))
+                fake.calls.clear()
+                again = self.tidy(fake)
+                self.assertEqual(again.notes, [], again)
+                self.assertFalse(again.changed)
+                self.assertEqual(fake.mutations(), [])
+
+    def test_return_command_order_and_thirds_are_fixed(self):
+        for n, expected in ((2, [("w1:p0", "w1:p1", "right", .5)]),
+                             (4, [("w1:p1", "w1:p3", "down", .5), ("w1:p0", "w1:p3", "right", .5), ("w1:p2", "w1:p1", "right", .5)]),
+                             (5, [("w1:p2", "w1:p4", "down", .5), ("w1:p0", "w1:p4", "right", 1/3), ("w1:p1", "w1:p0", "right", .5), ("w1:p3", "w1:p2", "right", .5)]),
+                             (6, [("w1:p2", "w1:p5", "down", .5), ("w1:p0", "w1:p5", "right", 1/3), ("w1:p1", "w1:p0", "right", .5), ("w1:p3", "w1:p2", "right", 1/3), ("w1:p4", "w1:p3", "right", .5)])):
+            fake = FakeTidyHerdr(n)
+            result = self.tidy(fake)
+            self.assertEqual(result.notes, [], result)
+            moves = [a for a in fake.mutations() if a[1] == "move" and "--tab" in a and a[a.index("--tab") + 1] == "w1:t1"]
+            actual = [(a[2], a[a.index("--target-pane") + 1], a[a.index("--split") + 1], float(a[a.index("--ratio") + 1])) for a in moves]
+            for got, want in zip(actual, expected):
+                self.assertEqual(got[:3], want[:3])
+                self.assertAlmostEqual(got[3], want[3])
+            self.assertEqual(len(actual), len(expected))
+
+    def test_matching_grid_reads_only_and_order_only_uses_swaps(self):
+        fake = FakeTidyHerdr()
+        fake.canonical()
+        self.assertFalse(self.tidy(fake, "w1:p0").changed)
+        self.assertEqual(fake.mutations(), [])
+        result = self.tidy(fake, "w1:p3")
+        self.assertEqual(result.notes, [], result)
+        self.assertEqual(result.panes, ["w1:p3", "w1:p0", "w1:p1", "w1:p2", "w1:p4", "w1:p5"])
+        self.assertTrue(all(a[1] == "swap" for a in fake.mutations()))
+
+    def test_canonical_tree_uses_resize_before_swaps_without_staging(self):
+        fake = FakeTidyHerdr()
+        fake.canonical()
+        fake.trees["w1:t1"]["ratio"] = .8
+        fake.trees["w1:t1"]["first"]["ratio"] = .15
+        fake.trees["w1:t1"]["second"]["ratio"] = .7
+        result = self.tidy(fake, "w1:p3")
+        self.assertEqual(result.notes, [], result)
+        actions = [a[1] for a in fake.mutations()]
+        self.assertNotIn("move", actions)
+        self.assertEqual(actions[:3], ["resize"] * 3)
+        resizes = [a for a in fake.mutations() if a[1] == "resize"]
+        self.assertEqual([a[a.index("--direction") + 1] for a in resizes], ["up", "right", "left"])
+        self.assertTrue(all(0 < float(a[a.index("--amount") + 1]) <= .5 for a in resizes))
+
+    def test_move_refusal_timeout_and_interrupt_gather_only_owned_staging(self):
+        for fail_at in (1, 3, 10):
+            for error in (None, subprocess.TimeoutExpired("fake-herdr", 1), KeyboardInterrupt()):
+                with self.subTest(fail_at=fail_at, error=type(error).__name__):
+                    fake = FakeTidyHerdr()
+                    fake.fail_at, fake.failure = fail_at, error
+                    result = self.tidy(fake)
+                    self.assertTrue(result.notes, result)
+                    self.assertEqual(set(fake.panes), {f"w1:p{i}" for i in range(6)})
+                    self.assertEqual({p["tab_id"] for p in fake.panes.values()}, {"w1:t1"})
+                    self.assertEqual(fake.focused_pane, "w1:p5")
+                    self.assertFalse(any(a[:2] in (["pane", "close"], ["tab", "create"], ["pane", "run"], ["pane", "send-text"], ["layout", "apply"]) for a in fake.calls))
+
+    def test_ambiguous_first_move_after_server_applied_it_is_observed_and_gathered(self):
+        for mode in ("timeout", "json", "wrong-id"):
+            fake = FakeTidyHerdr()
+            fake.fail_at = 1
+            def applied(args):
+                fake.fail_at = None
+                response = fake(["herdr", *args])
+                if mode == "timeout":
+                    raise subprocess.TimeoutExpired("herdr", 1)
+                if mode == "json":
+                    return subprocess.CompletedProcess([], 0, stdout="{bad json", stderr="")
+                block = json.loads(response.stdout)
+                block["result"]["move_result"]["pane"]["pane_id"] = "foreign:p0"
+                return _done(block)
+            fake.failure = applied
+            result = self.tidy(fake)
+            self.assertTrue(result.notes)
+            self.assertEqual({p["tab_id"] for p in fake.panes.values()}, {"w1:t1"})
+            self.assertEqual(len(fake.tabs), 1)
+
+    def test_cleanup_failure_is_partial_and_preserves_live_panes(self):
+        fake = FakeTidyHerdr()
+        calls = {"moves": 0}
+        def run(argv):
+            if argv[1:3] == ["pane", "move"]:
+                calls["moves"] += 1
+                if calls["moves"] >= 3:
+                    return _done(None, 1)
+            return fake(argv)
+        result = self.tidy(fake, runner=run)
+        self.assertTrue(result.changed)
+        self.assertTrue(any("staging-retained" in n for n in result.notes), result)
+        self.assertEqual(len(fake.panes), 6)
+
+    def test_sigint_sigterm_restore_handlers_and_gather_staging(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            fake = FakeTidyHerdr()
+            fake.fail_at = 3
+            def terminate(_args):
+                os.kill(os.getpid(), sig)
+            fake.failure = terminate
+            before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+            result = self.tidy(fake)
+            self.assertTrue(any(sig.name in note for note in result.notes), result)
+            self.assertEqual({p["tab_id"] for p in fake.panes.values()}, {"w1:t1"})
+            self.assertEqual(before, {s: signal.getsignal(s) for s in before})
+
+    def test_resize_and_swap_noop_are_failure(self):
+        for resize in (True, False):
+            fake = FakeTidyHerdr()
+            fake.canonical()
+            if resize:
+                fake.trees["w1:t1"]["ratio"] = .7
+            fake.fail_at = 1
+            result = self.tidy(fake, "w1:p3")
+            self.assertTrue(result.notes)
+            self.assertEqual(len(fake.panes), 6)
+
+    def test_concurrent_focus_change_stops_before_next_mutation(self):
+        fake = FakeTidyHerdr()
+        def run(argv):
+            response = fake(argv)
+            if fake.mutation_count == 1:
+                fake.focused_pane = "w1:p4"
+            return response
+        result = self.tidy(fake, runner=run)
+        self.assertTrue(result.notes)
+        self.assertEqual(fake.focused_pane, "w1:p4")
+        self.assertFalse(any(a[1] == "swap" for a in fake.mutations()))
+        self.assertFalse(any("staging-retained" in n for n in result.notes), result)
+        self.assertEqual({p["tab_id"] for p in fake.panes.values()}, {"w1:t1"})
+
+    def test_one_pane_and_foreign_or_duplicate_layout_refuse_without_mutations(self):
+        fake = FakeTidyHerdr(1)
+        self.assertEqual(self.tidy(fake, "w1:p0").notes, [])
+        self.assertEqual(fake.mutations(), [])
+        for foreign in (True, False):
+            fake = FakeTidyHerdr()
+            def corrupt(argv):
+                response = fake(argv)
+                if argv[1:3] == ["pane", "layout"]:
+                    block = json.loads(response.stdout)
+                    panes = block["result"]["layout"]["panes"]
+                    panes[0]["pane_id"] = "other:p0" if foreign else panes[-1]["pane_id"]
+                    return _done(block)
+                return response
+            self.assertTrue(self.tidy(fake, runner=corrupt).notes)
+            self.assertEqual(fake.mutations(), [])
+
+    def test_resize_swap_result_failure_matrix_and_confirmed_no_change(self):
+        for verb in ("resize", "swap"):
+            for mode in ("false", "json", "timeout", "wrong-id", "interrupt"):
+                with self.subTest(verb=verb, mode=mode):
+                    fake = FakeTidyHerdr()
+                    fake.canonical()
+                    if verb == "resize":
+                        fake.trees["w1:t1"]["ratio"] = .7
+                    def fail(argv):
+                        if argv[1:3] != ["pane", verb]:
+                            return fake(argv)
+                        if mode == "timeout":
+                            raise subprocess.TimeoutExpired("herdr", 1)
+                        if mode == "interrupt":
+                            raise KeyboardInterrupt()
+                        if mode == "json":
+                            return subprocess.CompletedProcess(argv, 0, stdout="invalid", stderr="")
+                        if mode == "false":
+                            return _done({"result": {verb: {"changed": False}}})
+                        block = json.loads(fake(argv).stdout)
+                        block["result"][verb]["pane_id" if verb == "resize" else "source_pane_id"] = "other:p0"
+                        return _done(block)
+                    result = self.tidy(fake, "w1:p3", runner=fail)
+                    self.assertTrue(result.notes, result)
+                    if mode == "false":
+                        self.assertFalse(result.changed)
+                    self.assertEqual(fake.focused_pane, "w1:p5")
+                    self.assertEqual(len(fake.panes), 6)
+
+    def test_pane_natural_exit_during_staging_preserves_all_survivors(self):
+        fake = FakeTidyHerdr()
+        fake.fail_at = 4
+        def exited(_args):
+            tab = fake.panes["w1:p0"]["tab_id"]
+            fake.trees[tab] = fake.remove(fake.trees[tab], "w1:p0")
+            del fake.panes["w1:p0"]
+            return _done(None, 1)
+        fake.failure = exited
+        result = self.tidy(fake)
+        self.assertTrue(result.notes, result)
+        self.assertEqual(set(fake.panes), {f"w1:p{i}" for i in range(1, 6)})
+        self.assertEqual({p["tab_id"] for p in fake.panes.values()}, {"w1:t1"})
+        self.assertEqual(fake.focused_pane, "w1:p5")
+
+    def test_an_existing_other_tab_and_its_processes_are_untouched(self):
+        fake = FakeTidyHerdr()
+        fake.tabs.append({"tab_id": "w1:tOther", "workspace_id": "w1", "number": 9, "label": "keep me"})
+        fake.trees["w1:tOther"] = "w1:pOther"
+        fake.panes["w1:pOther"] = {"tab_id": "w1:tOther", "terminal_id": "other-terminal", "shell_pid": os.getpid()}
+        before = copy.deepcopy(fake.panes["w1:pOther"])
+        result = self.tidy(fake)
+        self.assertEqual(result.notes, [], result)
+        self.assertEqual(fake.panes["w1:pOther"], before)
+        self.assertEqual({t["tab_id"] for t in fake.tabs}, {"w1:t1", "w1:tOther"})
+
+    def test_final_identity_or_inventory_uncertainty_is_never_success(self):
+        for mode in ("identity", "inventory"):
+            fake = FakeTidyHerdr()
+            def run(argv):
+                response = fake(argv)
+                if fake.mutation_count and argv[1:3] == ["pane", "get"] and mode == "identity":
+                    block = json.loads(response.stdout)
+                    block["result"]["pane"]["terminal_id"] = "replaced-terminal"
+                    return _done(block)
+                if fake.mutation_count and argv[1:3] == ["pane", "list"] and mode == "inventory":
+                    return _done(None, 1)
+                return response
+            result = self.tidy(fake, runner=run)
+            self.assertTrue(result.notes, result)
+            self.assertEqual(len(fake.panes), 6)
+
+
+class TidyCallerTest(_IsolatedMixin, unittest.TestCase):
+    def test_worker_rejected_before_any_runner_even_with_near(self):
+        with mock.patch("session_tidy.is_worker", return_value=True), \
+             mock.patch.object(ts, "_run", side_effect=AssertionError("terminal touched")):
+            self.assertEqual(ts.tidy_panes().notes, ["worker-refused"])
+            fake = FakeTidyHerdr()
+            self.assertEqual(ts.tidy_panes(near=ts.Near(ts.HerdrSurface(fake), pane="w1:p0")).notes, ["worker-refused"])
+            self.assertEqual(fake.calls, [])
+
+    def test_plain_shell_proof_rechecked_under_lock_and_endpoint_bound(self):
+        os.environ.update(HERDR_PANE_ID="w1:p1", HERDR_TAB_ID="foreign:t9", AGENT_HERDR_SESSION="private")
+        fake = FakeTidyHerdr()
+        with mock.patch("session_tidy.is_worker", return_value=False), \
+             mock.patch.object(ts, "_caller_herdr_pane", return_value=""), \
+             mock.patch("pane_ownership.verified_terminal_caller", return_value=True) as proof, \
+             mock.patch.object(ts, "_run", side_effect=fake):
+            result = ts.tidy_panes()
+        self.assertEqual(result.notes, [], result)
+        self.assertGreaterEqual(proof.call_count, 2)
+        self.assertEqual(result.tab, "w1:t1")
+
+    def test_stale_pane_wrong_endpoint_and_missing_proof_do_not_mutate(self):
+        os.environ.update(HERDR_PANE_ID="w1:p0", TMUX="/private/tmux.sock,1,0", TMUX_PANE="%0")
+        fake = FakeTidyHerdr()
+        with mock.patch("session_tidy.is_worker", return_value=False), \
+             mock.patch.object(ts, "_caller_herdr_pane", return_value=""), \
+             mock.patch("pane_ownership.verified_terminal_caller", return_value=False), \
+             mock.patch.object(ts, "_run", return_value=_done(None, 1)):
+            self.assertTrue(ts.tidy_panes().notes)
+        self.assertEqual(fake.mutations(), [])
+
+    def test_zoom_small_and_inactive_are_no_mutation_diagnostics(self):
+        for mode in ("zoom", "small", "inactive"):
+            fake = FakeTidyHerdr(4, area=(0, 0, 200, 100) if mode != "small" else (0, 0, 4, 4))
+            fake.zoomed = mode == "zoom"
+            if mode == "inactive":
+                fake.focused_tab = "w1:tOther"
+            with mock.patch("session_tidy.is_worker", return_value=False):
+                result = ts.tidy_panes(near=ts.Near(ts.HerdrSurface(fake), pane="w1:p0"))
+            self.assertTrue(result.notes, result)
+            self.assertEqual(fake.mutations(), [])
+
+
 @unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
 class OpenPaneTmuxTest(_IsolatedMixin, unittest.TestCase):
     """A private tmux server per test: its socket is in the test directory, never $TMUX."""
@@ -510,7 +1033,7 @@ class OpenPaneTmuxTest(_IsolatedMixin, unittest.TestCase):
                               env=self.env, timeout=10, check=False)
 
     def start_server(self, border=None):
-        self.socket = self.root / f"tmux-{border or 'default'}.sock"
+        self.socket = self.root / f"tmux-{border or 'default'}-{time.monotonic_ns()}.sock"
         self.env = {key: value for key, value in os.environ.items() if key not in _SURFACE_ENV}
         self.env["SHELL"] = "/bin/sh"
         started = self.tmux("-f", "/dev/null", "new-session", "-d", "-s", "d1", "-x", "200", "-y", "60",
@@ -586,6 +1109,126 @@ class OpenPaneTmuxTest(_IsolatedMixin, unittest.TestCase):
         self.assertEqual(reused.placement, "reuse")
         self.assertIn(reused.pane, panes)
         self.assertEqual(self.windows(), [4])
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux is not installed")
+class TidyTmuxTest(_IsolatedMixin, unittest.TestCase):
+    tmux = OpenPaneTmuxTest.tmux
+    start_server = OpenPaneTmuxTest.start_server
+    focus = OpenPaneTmuxTest.focus
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch("session_tidy.is_worker", return_value=False)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def make_panes(self, n, border=None):
+        near = self.start_server(border)
+        for i in range(n - 1):
+            split = self.tmux("split-window", "-d", "-t", self.reference, "-h" if i % 2 == 0 else "-v",
+                              "-P", "-F", "#{pane_id}", "sleep 600")
+            self.assertEqual(split.returncode, 0, split.stderr)
+        ids = self.tmux("list-panes", "-t", self.reference, "-F", "#{pane_id}").stdout.split()
+        self.tmux("select-pane", "-t", ids[-1])
+        return near, ids
+
+    def test_required_shapes_ids_process_focus_borders_and_idempotence(self):
+        for n, counts in ((2, [2]), (4, [2, 2]), (5, [3, 2]), (6, [3, 3])):
+            for border in (None, "top", "bottom"):
+                with self.subTest(n=n, border=border):
+                    near, ids = self.make_panes(n, border)
+                    caller = ids[1]
+                    marked = ids[-2]
+                    self.tmux("select-pane", "-t", marked, "-T", "[50] ⚑ supervisor")
+                    base = near.surface.tidy_snapshot(caller)
+                    desired = [marked] + [p["pane_id"] for p in ts._reading(base) if p["pane_id"] != marked]
+                    focus = self.focus()
+                    calls = []
+                    run = near.surface.runner
+                    def record(argv):
+                        calls.append(argv)
+                        return run(argv)
+                    near = ts.Near(ts.TmuxSurface(record, str(self.socket)), pane=caller)
+                    result = ts.tidy_panes(near=near)
+                    self.assertEqual(result.notes, [], result)
+                    self.assertEqual(result.panes, desired)
+                    final = near.surface.tidy_snapshot(caller)
+                    self.assertEqual(final["identity"], base["identity"])
+                    self.assertEqual(self.focus(), focus)
+                    rows = sorted({p["rect"]["y"] for p in final["panes"]})
+                    self.assertEqual([sum(p["rect"]["y"] == y for p in final["panes"]) for y in rows], counts)
+                    self.assertTrue(all(a[1:3] == ["-S", str(self.socket)] for a in calls))
+                    for a in calls:
+                        if "swap-pane" in a:
+                            source, target = a[a.index("-s") + 1], a[a.index("-t") + 1]
+                            if final["focused_pane_id"] in (source, target):
+                                self.assertEqual(target, final["focused_pane_id"])
+                                self.assertNotIn("-d", a)
+                            else:
+                                self.assertIn("-d", a)
+                    calls.clear()
+                    again = ts.tidy_panes(near=near)
+                    self.assertEqual(again.notes, [], again)
+                    self.assertFalse(again.changed)
+                    self.assertFalse(any("select-layout" in a or "swap-pane" in a for a in calls))
+
+    def test_zoom_is_unchanged_and_operation_failure_restores_only_known_cells(self):
+        near, ids = self.make_panes(6)
+        self.tmux("resize-pane", "-Z", "-t", self.reference)
+        before = self.tmux("display-message", "-p", "-t", self.reference, "#{window_layout}").stdout
+        result = ts.tidy_panes(near=near)
+        self.assertIn("pane-tab-zoomed", result.notes)
+        self.assertFalse(result.changed)
+        self.assertEqual(self.tmux("display-message", "-p", "-t", self.reference, "#{window_layout}").stdout, before)
+        self.tmux("resize-pane", "-Z", "-t", self.reference)
+        base = near.surface.tidy_snapshot(self.reference)
+        run = near.surface.runner
+        def refuse(argv):
+            if "swap-pane" in argv:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="refused")
+            return run(argv)
+        result = ts.tidy_panes(near=ts.Near(ts.TmuxSurface(refuse, str(self.socket)), pane=ids[1]))
+        self.assertTrue(result.notes)
+        final = near.surface.tidy_snapshot(self.reference)
+        self.assertEqual(final["identity"], base["identity"])
+        self.assertEqual(final["original_layout"], base["original_layout"])
+        self.assertEqual(final["focused_pane_id"], base["focused_pane_id"])
+
+    def test_plain_shell_cli_finds_its_tab_with_another_pane_focused(self):
+        # Only this private server's environment loses worker markers. Production
+        # still refuses this test runner's inherited registered-worker context.
+        near = self.start_server()
+        for key in ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
+                    "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH", "MEM_DISTILL"):
+            self.env.pop(key, None)
+            self.tmux("set-environment", "-gu", key)
+        created = self.tmux("new-window", "-d", "-P", "-F", "#{pane_id}", "/bin/sh")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        caller = created.stdout.strip()
+        for _ in range(5):
+            self.assertEqual(self.tmux("split-window", "-d", "-h", "-t", caller, "sleep 600").returncode, 0)
+        window = self.tmux("display-message", "-p", "-t", caller, "#{window_id}").stdout.strip()
+        self.tmux("rename-window", "-t", window, "shell tidy fixture")
+        self.tmux("select-window", "-t", window)
+        ids = self.tmux("list-panes", "-t", window, "-F", "#{pane_id}").stdout.split()
+        self.tmux("select-pane", "-t", ids[-1])
+        surface = ts.TmuxSurface(socket=str(self.socket))
+        before = surface.tidy_snapshot(caller)
+        target = self.root / "cli-result.json"
+        line = (shlex.join([sys.executable, str(_HERE / "pane.py"), "tidy"]) + " > " + shlex.quote(str(target))
+                + "; " + shlex.join(["tmux", "-S", str(self.socket), "wait-for", "-S", "tidy-finished"]))
+        self.tmux("send-keys", "-t", caller, "-l", line)
+        self.tmux("send-keys", "-t", caller, "Enter")
+        waited = self.tmux("wait-for", "tidy-finished")
+        self.assertEqual(waited.returncode, 0, waited.stderr)
+        result = json.loads(target.read_text())
+        self.assertEqual(result["notes"], [], result)
+        self.assertEqual(result["tab"], window)
+        self.assertEqual(result["panes"][0], caller)
+        final = surface.tidy_snapshot(caller)
+        self.assertEqual(final["identity"], before["identity"])
+        self.assertEqual(final["focused_pane_id"], ids[-1])
 
 
 if __name__ == "__main__":

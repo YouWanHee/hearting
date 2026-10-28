@@ -15,7 +15,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from terminal_surface import open_pane  # noqa: E402
+from terminal_surface import open_pane, tidy_panes  # noqa: E402
 
 
 def parser():
@@ -24,11 +24,21 @@ def parser():
     opening = actions.add_parser("open", help="open one command pane beside the caller")
     opening.add_argument("--title", help="pane name; defaults to the command's name")
     opening.add_argument("command", nargs=argparse.REMAINDER)
+    actions.add_parser(
+        "tidy", help="arrange existing panes in the caller's tab",
+        description="Arrange existing panes in a grid, preserving processes, IDs and focus. "
+        "Supports Herdr and tmux. Hearting pane tidy is not supported on cmux.",
+        epilog="Optionally register this command in your terminal's key settings; "
+        "detached commands may lack terminal context. No keys are registered automatically.")
     return value
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.action == "tidy":
+        result = tidy_panes()
+        print(json.dumps(result.json(), ensure_ascii=False, separators=(",", ":")))
+        return 1 if result.notes else 0
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser().error("a command is required after --")
