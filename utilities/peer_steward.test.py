@@ -8680,7 +8680,7 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                     (self.TWO, None, "split", "w1:p1", "down"),
                     (self.THREE, None, "split", "w1:p0", "down"),
                     (self.FOUR, "w1:p3", "reuse", "w1:p3", None),
-                    (self.FOUR, None, "tab", "w1", None)):
+                    (self.FOUR, None, "split", "w1:p0", "right")):
                 with self.subTest(kind=kind, action=action, target=target):
                     calls = []
                     def run(argv, **kwargs):
@@ -8737,6 +8737,78 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                             self.assertEqual(create[create.index("--ratio") + 1], "0.5")
                         else:
                             self.assertEqual(create[create.index("--workspace") + 1], "w1")
+
+    def test_beside_a_full_reference_tab_splits_that_pane_instead_of_spilling(self):
+        """The reference tab wins over a newer tab with room: split it, never fill another."""
+        reference = self.layout(self.FOUR)
+        reference["tab_id"] = "w1:t1"
+        newer = self.layout(self.TWO)
+        newer["tab_id"] = "w1:t2"
+        newer["panes"] = [{"pane_id": f"w1:p2-{i}", "rect": pane["rect"]}
+                          for i, pane in enumerate(newer["panes"])]
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            action = argv[1:3]
+            if action == ["pane", "layout"]:
+                target = argv[argv.index("--pane") + 1]
+                return _herdr_json({"result": {"layout":
+                                               newer if target.startswith("w1:p2-") else reference}})
+            if action == ["tab", "list"]:
+                return _herdr_json({"result": {"tabs": [
+                    {"tab_id": "w1:t1", "workspace_id": "w1", "number": 1},
+                    {"tab_id": "w1:t2", "workspace_id": "w1", "number": 2}]}})
+            if action == ["pane", "list"]:
+                return _herdr_json({"result": {"panes": [
+                    {"pane_id": pane["pane_id"], "workspace_id": "w1", "tab_id": layout["tab_id"]}
+                    for layout in (reference, newer) for pane in layout["panes"]
+                ] + [{"pane_id": "w1:pNew", "workspace_id": "w1", "tab_id": "w1:t1"}]}})
+            if action == ["pane", "split"]:
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pNew", "focused": False}}})
+            if action == ["tab", "create"]:
+                return _herdr_json({"result": {"root_pane": {"pane_id": "w1:pTab", "focused": False}}})
+            if action == ["agent", "start"]:
+                return _herdr_json({"result": {"agent": {"agent": "codex", "name": "grid"}}})
+            if action == ["pane", "get"]:
+                return _herdr_json({"result": {"pane": {"pane_id": argv[3], "agent": "codex"}}})
+            if action == ["pane", "process-info"]:
+                return _herdr_json({"result": {"process_info": {
+                    "pane_id": argv[-1], "shell_pid": 7, "foreground_process_group_id": 7,
+                    "foreground_processes": [{"pid": 7}]}}})
+            if action == ["pane", "wait-output"]:
+                return _herdr_json({"result": {}})
+            raise AssertionError(argv)
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_pane_has_agent", return_value="pane-occupied"), \
+             mock.patch.object(peer_steward, "_pane_foreground_shell", return_value=None), \
+             mock.patch.object(peer_steward, "_wait_for_shell_prompt", return_value=True), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
+             mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value=None), \
+             mock.patch.object(peer_steward, "_process_session", return_value=None), \
+             mock.patch.object(peer_steward, "_read_screen", return_value=None), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["start", "grid", "--kind", "codex",
+                                    "--beside", "w1:p0", "--cwd", str(self.tmp_root)])
+        self.assertEqual(rc, 0, printed.call_args_list)
+        splits = [a for a in calls if a[1:3] == ["pane", "split"]]
+        self.assertEqual(len(splits), 1, calls)
+        split = splits[0]
+        self.assertEqual(split[split.index("--pane") + 1], "w1:p0")
+        self.assertIn("--no-focus", split)
+        self.assertEqual(split[split.index("--direction") + 1], "right")
+        self.assertFalse(any(a[1:3] == ["tab", "create"] for a in calls))
+        self.assertFalse(any(a[1:3] == ["tab", "list"] for a in calls))
+        self.assertFalse(any(a[1:3] == ["pane", "layout"]
+                             and a[a.index("--pane") + 1].startswith("w1:p2-") for a in calls))
+        start = next(a for a in calls if a[1:3] == ["agent", "start"])
+        self.assertEqual(start[start.index("--pane") + 1], "w1:pNew")
 
 
 class ProjectStartTest(_TmpRootMixin, unittest.TestCase):
@@ -8847,7 +8919,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
         super().setUp()
         # These tests own startup/readiness; terminal_surface.test.py owns layout selection.
         placement = mock.patch.object(terminal_surface, "place",
-                                      side_effect=lambda surface, pane=None, workspace=None:
+                                      side_effect=lambda surface, pane=None, workspace=None, **kwargs:
                                       ("split", pane, "right"))
         placement.start()
         self.addCleanup(placement.stop)
