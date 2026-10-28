@@ -771,6 +771,28 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
             "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
             "resource_policy", "owner_wait", "launch_request", "resource_operation", "share")
+    # A restored input consumer is the same owner with a new PID/start; its
+    # earlier identity stays in the attempt lineage, read before any lock.
+    owner_lineage = set()
+    if owner_wait and owner_wait.get("parent_attempt_id"):
+        import dispatch_completion_join as JOIN
+        from dispatch_contract import attempt_identity_lineage
+        try:
+            owner_lineage = attempt_identity_lineage(
+                JOIN.exact_attempt_row(jobs, owner_wait["parent_attempt_id"]).metadata)
+        except JOIN.JoinContractError:
+            owner_lineage = set()
+
+    def same_owner_wait(recorded):
+        requested = placeholder.get("owner_wait")
+        if recorded == requested:
+            return True
+        identity = ("owner_pid", "owner_start")
+        if (not isinstance(recorded, dict) or not isinstance(requested, dict)
+                or {k: v for k, v in recorded.items() if k not in identity}
+                != {k: v for k, v in requested.items() if k not in identity}):
+            return False
+        return (str(recorded.get("owner_pid")), str(recorded.get("owner_start"))) in owner_lineage
     import dispatch_resource_wait as OWNER_RESOURCE
     import resource_run_registry as RR
     sup = OWNER_RESOURCE.supervisor()
@@ -844,8 +866,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                     raise ValueError("resource-reservation-changed")
         current = data["runs"].get(args.run_id)
         if current is not None:
-            immutable_keys = tuple(k for k in keys if k != "resource_operation")
-            if any(current.get(k) != placeholder.get(k) for k in immutable_keys):
+            immutable_keys = tuple(k for k in keys if k not in ("resource_operation", "owner_wait"))
+            if (any(current.get(k) != placeholder.get(k) for k in immutable_keys)
+                    or not same_owner_wait(current.get("owner_wait"))):
                 raise ValueError("resource-route-body-conflict")
             operation = placeholder.get("resource_operation")
             reprepare = (ledger is not None and owner_wait
