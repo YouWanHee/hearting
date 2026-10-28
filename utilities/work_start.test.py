@@ -4841,12 +4841,13 @@ class BlockedOwnerAutoHarvestTest(unittest.TestCase):
 
 
 class D5PublicOwnerStartTest(unittest.TestCase):
-    def test_public_start_real_selector_binding_and_fake_wrapper_preserve_B(self):
+    def test_public_start_continues_admitted_target_and_refuses_target_disabled_at_admission(self):
         fixture=load('d5_public_owner_fixture',Path(__file__).with_name('dispatch_owner.test.py'))
         O=fixture.OWNER
-        for requested in (None,'codex'):
-            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as td:
-                config=fixture.d5_defaults(td,enabled=('claude','codex','opencode'))
+        for requested,admitted in ((None,True),('codex',True),('codex',False)):
+            with self.subTest(requested=requested,admitted=admitted), tempfile.TemporaryDirectory() as td:
+                enabled=('claude','codex','opencode') if admitted else ('claude','opencode')
+                config=fixture.d5_defaults(td,enabled=enabled)
                 env=fixture._isolated_env({'DISPATCH_DEFAULTS_CONFIG':str(config),'HARNESS_STATE_ROOT':str(Path(td)/'state'),
                     'AGENT_DISPATCH_JOBS':str(Path(td)/'jobs.log'),'AGENT_DISPATCH_CALLER_HARNESS':'claude'})
                 for key in list(env):
@@ -4855,7 +4856,7 @@ class D5PublicOwnerStartTest(unittest.TestCase):
                 with mock.patch.dict(os.environ,env,clear=True):
                     path,route=fixture.d5_public_route(td,text='codex 시켜' if requested else 'Continue approved work',owner=requested)
                     before=path.read_bytes()
-                    fixture.d5_defaults(td)  # stale sealed policy includes Codex; now disabled
+                    fixture.d5_defaults(td)  # Codex is off at launch in all three cases.
                     launched=[];commands=[]
                     def run(command,**kwargs):
                         commands.append(command)
@@ -4872,9 +4873,14 @@ class D5PublicOwnerStartTest(unittest.TestCase):
                         result=W.start_work(route,path,Path(td)/'jobs.log',run=run)
                     self.assertEqual(len(commands),1,result)
                     self.assertEqual(path.read_bytes(),before)
-                    if requested:
+                    if requested and admitted:
+                        self.assertEqual(len(launched),1,result)
+                        self.assertEqual(Path(launched[0][0]).parts[-3],'codex')
+                        self.assertEqual(result['launches'][0]['receipt'].count('policy_note=disabled-since-admission'),1)
+                    elif requested:
                         self.assertEqual(launched,[])
                         self.assertIn('explicit-adapter-disabled-by-user-policy',result['launches'][0]['receipt'])
+                        usage.assert_not_called()
                     else:
                         self.assertEqual(len(launched),1,result)
                         self.assertEqual(Path(launched[0][0]).parts[-3],'claude')
