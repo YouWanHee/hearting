@@ -211,7 +211,9 @@ def submit(jobs, attempt, text, request_id=None):
     request_id = request_id or "input-" + _digest([attempt, digest])[:32]
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
         raise InputError("correction-id-invalid")
-    if row.status in {"open", "running"} and not supervisor_lease_is_held(jobs, row.metadata):
+    moved = move_parked_consumer(jobs, row, target, request_id)
+    if (row.status in {"open", "running"} and not supervisor_lease_is_held(jobs, row.metadata)
+            and "consumer_release_moved_from" not in moved):
         # Settlement takes the jobs lock before input admission takes its own
         # lock. Storage failures leave the same open row available for retry.
         from dispatch_completion_join import settle_finished_attempt
@@ -272,6 +274,7 @@ def submit(jobs, attempt, text, request_id=None):
 
     # The input lock is deliberately released before any registry, process or
     # adapter work. The adapter transaction rechecks identity under jobs.lock.
+    result.update(moved)
     if pending_recovery:
         result.update(recover_consumer(jobs, attempt))
     if (unresolved_pending and result.get("consumer_recovery") not in {"live", "respawned"}
@@ -283,6 +286,129 @@ def submit(jobs, attempt, text, request_id=None):
             "to restore this same owner's consumer; do not start a replacement."
         )
     return result
+
+
+def _respawn_adapter():
+    adapter_path = ROOT / "adapters" / "codex" / "bin" / "dispatch-headless.py"
+    if adapter_path.is_symlink() or not adapter_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "hearting_codex_dispatch_headless_recovery", adapter_path)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.respawn_supervised_owner
+
+
+def _installed_release():
+    current = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "hearting/current"
+    try:
+        return current.resolve(strict=True)
+    except OSError:
+        return None
+
+
+def _consumer_release(metadata):
+    """Release root of the exact governed consumer process, from its own argv."""
+    from dispatch_contract import process_observation
+    pid, start = metadata.get("pid", ""), metadata.get("pid_start", "")
+    if not pid.isdigit() or not start:
+        return None
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    visibility, actual, state = process_observation(int(pid))
+    if visibility != "present" or actual != start or state == "Z":
+        return None
+    for raw in argv[1:3]:
+        script = Path(os.fsdecode(raw))
+        if (script.is_absolute() and script.name == "model-worker-governor.py"
+                and script.parent.name == "utilities"):
+            return script.parent.parent.resolve()
+    return None
+
+
+def move_parked_consumer(jobs, row, target, request_id, *, session=None, spawn=None, settle=2.0):
+    """Stop a parked consumer of an earlier release so recovery restores it on this one.
+
+    A consumer keeps the code it started with, including the resource launcher.
+    After an install, the effective parent's next correction moves a parked
+    consumer (no turn running, no input being sent, no launch pending) to the
+    installed release: only its own session stops, registered payloads keep
+    running, and the existing same-attempt recovery restores it. Anything that
+    recovery could not restore leaves the consumer as it is.
+    """
+    from dispatch_completion_join import read_supervisor_phase_state
+    from dispatch_contract import DispatchContractError
+    import route_parent_close
+
+    attempt = row.attempt_id
+    try:
+        metadata = dict(row.metadata)
+        if (row.status not in {"open", "running"} or metadata.get("harness") != "codex"
+                or metadata.get("launch_claimed") != "1" or metadata.get("launch_started") != "1"
+                or metadata.get("parent_close_requested") == "1"
+                or route_parent_close.row_requested(metadata, jobs)
+                or not supervisor_lease_is_held(jobs, metadata)):
+            return {}
+        installed = _installed_release()
+        previous = _consumer_release(metadata)
+        if (installed is None or previous is None or previous == installed
+                or ROOT.resolve() != installed):
+            return {}
+        caller = session
+        if caller is None:
+            try:
+                caller = route_authority.caller_identity()[1]
+            except (DispatchContractError, OSError, ValueError, TypeError):
+                caller = ""
+        if not route_authority.owns(metadata, caller, jobs):
+            return {}
+        lease_path = supervisor_lease_path(jobs, attempt)
+        if metadata.get("supervisor_lease_file") != str(lease_path):
+            return {}
+
+        def parked(value):
+            state = read_supervisor_phase_state(lease_path.with_suffix(".json"), attempt)
+            return (state is not None and state.phase == "parked"
+                    and _bound(value, target)
+                    and (state.resource or {}).get("session_id") == value["thread_id"]
+                    and not any(item.get("state") == "sending" or item.get("id") == request_id
+                                for item in value["requests"]))
+
+        resources = route_parent_close.owner_resources(metadata, jobs)
+        if resources is None or any(
+                (resource.get("row") or {}).get("launch_state") in {"queued", "claimed"}
+                for resource in resources if resource.get("kind") == "resource"):
+            return {}
+        consumer_session = route_parent_close.owner_consumer_session(metadata, resources)
+        if consumer_session is None:
+            return {}
+        spawn = spawn or _respawn_adapter()
+        if spawn is None:
+            return {}
+        expected = (metadata.get("pid", ""), metadata.get("pid_start", ""))
+        if spawn(jobs, attempt, expected_identity=expected,
+                 check_only=True).get("state") != "ready":
+            return {}
+        with _locked(jobs, attempt) as (_, value):
+            current, _ = _target(jobs, attempt)
+            if (value is None or value.get("target") != target or not parked(value)
+                    or (current.metadata.get("pid"), current.metadata.get("pid_start")) != expected):
+                return {}
+            # Holding the input lock keeps the old consumer from taking new input.
+            stopped = route_parent_close.stop_owner_consumer(metadata, resources, consumer_session)
+        deadline = time.monotonic() + settle
+        while stopped and supervisor_lease_is_held(jobs, metadata) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not stopped or supervisor_lease_is_held(jobs, metadata):
+            return {"consumer_release_move": "stop-incomplete", "consumer_release": str(previous)}
+        return {"consumer_release_moved_from": str(previous)}
+    except (InputError, JoinContractError, OSError, ValueError, KeyError, TypeError):
+        return {}
 
 
 def recover_consumer(jobs, attempt, *, session=None, spawn=None):
@@ -365,18 +491,9 @@ def recover_consumer(jobs, attempt, *, session=None, spawn=None):
             return _recovery_result("not-started", decision.reason or decision.detail or
                                     "owner-input-recovery-not-authorized")
 
+        spawn = spawn or _respawn_adapter()
         if spawn is None:
-            adapter_path = ROOT / "adapters" / "codex" / "bin" / "dispatch-headless.py"
-            if adapter_path.is_symlink() or not adapter_path.is_file():
-                return _recovery_result("not-started", "codex-respawn-adapter-unavailable")
-            spec = importlib.util.spec_from_file_location(
-                "hearting_codex_dispatch_headless_recovery", adapter_path)
-            if spec is None or spec.loader is None:
-                return _recovery_result("not-started", "codex-respawn-adapter-unavailable")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            spec.loader.exec_module(module)
-            spawn = module.respawn_supervised_owner
+            return _recovery_result("not-started", "codex-respawn-adapter-unavailable")
         try:
             outcome = spawn(jobs, attempt,
                             expected_identity=(metadata.get("pid", ""), metadata.get("pid_start", "")))

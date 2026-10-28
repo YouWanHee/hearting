@@ -1332,13 +1332,22 @@ resource payloads. A live or unknown consumer, held lease, changed target or thr
 or uncertain execution does not start another consumer. A `sending` or
 `delivery-unknown` correction is not retransmitted; a non-parent sender leaves the
 existing undelivered notice for the route parent to handle through normal `start`.
+A live consumer keeps the release code it started with, resource launch included.
+When the effective parent's `correct` reaches a parked consumer of an earlier
+release (no turn running, no correction being sent, no resource launch pending),
+the runtime first stops only that consumer's own session, keeps registered payloads
+running, and restores it on the installed release through this same recovery
+(`consumer_release_moved_from`). It moves only after the recorded launch passes the
+same respawn checks; otherwise the consumer stays as it is.
 
 Registered resource/compute payloads stay under their existing run records across
 same-attempt consumer recovery; their survival is not surviving owner execution. The
 shared parent-close classification separates them, with exact route/attempt binding
 and complete observation of the remaining process set. Recovery context recognizes
 the recorded owner identity lineage and passes existing resource record locations to
-the restored supervisor without relaunching or editing the records. A valid terminal
+the restored supervisor without relaunching or editing the records. A positively
+unstarted run that `start` re-prepares under its same ID follows the same lineage:
+an earlier PID/start of the same owner attempt is not a different owner. A valid terminal
 result, cancellation or unknown execution retains its existing path.
 Resource registration settles a positively observed previous-boot execution as
 retryable failure even when power loss left no exit sentinel. The same observation

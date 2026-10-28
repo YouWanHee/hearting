@@ -1561,8 +1561,11 @@ def recorded_supervisor_command(record: dict, fields: list[str], metadata: dict[
     return _writer_shell_command(command, metadata["attempt_id"], None, log_path)
 
 
-def respawn_supervised_owner(jobs, attempt_id, *, expected_identity):
-    """Restore a Codex consumer on the exact launched owner row, from its record."""
+def respawn_supervised_owner(jobs, attempt_id, *, expected_identity, check_only=False):
+    """Restore a Codex consumer on the exact launched owner row, from its record.
+
+    `check_only` runs the same record checks and stops before any reservation or
+    spawn, so a live consumer is only moved when it can be restored."""
     from types import SimpleNamespace
     import dispatch_replacement
     import dispatch_completion_join as JOIN
@@ -1772,6 +1775,9 @@ def respawn_supervised_owner(jobs, attempt_id, *, expected_identity):
         attempt_id=attempt_id,
     )
     dispatch_env.update(commit_policy.runtime_permission_context_env(permission_args))
+    if check_only:
+        return {"state": "ready", "launch_home": launch_home, "respawn_release": str(ROOT),
+                "runtime_dir": runtime_dir}
     governor = ROOT / "utilities" / "model-worker-governor.py"
     try:
         governor_root = resolve_model_governor_root(artifact_root, environ=dispatch_env)
