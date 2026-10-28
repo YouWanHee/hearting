@@ -2432,7 +2432,12 @@ repository and counts once its row appears; the process cwd is not used to guess
 however many generations it holds. A same-session re-grant, restart, resume or a
 confirmed successor takes no further slot; a session whose end Hearting proved leaves
 its slot while its mark remains and reclaims the role when it revives (a resulting
-overshoot is only displayed); an unknown session keeps counting. At the limit the
+overshoot is only displayed); an unknown session keeps counting. Proof of end follows
+each harness's declared session-ownership proof: Claude's registry process has exited,
+no live Codex process holds the session's stored rollout open, and no live OpenCode
+client shows the session while no running OpenCode runtime can be running it; an
+incomplete observation (another PID namespace, an unreadable process or connection
+table) proves nothing. At the limit the
 grant skips only the role-evidence write and reports
 `steward=limited repo=<name> holders=<current> limit=<n>`; watch, start and ordinary
 work proceed. Lowering the limit, or an install already above it, revokes no role, job

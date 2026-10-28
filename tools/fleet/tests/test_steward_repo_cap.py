@@ -6,9 +6,12 @@ Linked worktrees fold into their primary through ``resolve_gitdir``.
 """
 import json
 import os
+import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +21,7 @@ _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
-from fleet.collectors import steward                                   # noqa: E402
+from fleet.collectors import codex, opencode, procscan, steward       # noqa: E402
 
 EXPLICIT = {"harness": "unknown", "session_id": None, "name": "-", "kind": "explicit",
             "source": "explicit"}
@@ -176,7 +179,297 @@ class SessionLivenessTest(_RepoFixture, unittest.TestCase):
 
     def test_missing_registry_is_unknown(self):
         self.assertEqual(steward.session_liveness("claude", "s1", agents=[]), "unknown")
-        self.assertEqual(steward.session_liveness("opencode", "s1", agents=[]), "unknown")
+        observation = mock.Mock(codex=lambda: None, opencode=lambda: None)
+        self.assertEqual(steward.session_liveness("opencode", "s1", agents=[],
+                                                  observation=observation), "unknown")
+
+
+CODEX_X = "aaaaaaaa-1111-2222-3333-444444444444"
+CODEX_Y = "bbbbbbbb-1111-2222-3333-444444444444"
+OPENCODE_X = "ses_endedxxxxxxxxxxxxxxxxxx"
+OPENCODE_Y = "ses_shownyyyyyyyyyyyyyyyyyy"
+_HOLD = "import sys, time; print('ready', flush=True); time.sleep(600)"
+_SERVE = ("import socket, time; s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(16); "
+          "print(s.getsockname()[1], flush=True); time.sleep(600)")
+_CLIENT = ("import socket, sys, time; c = socket.create_connection(('127.0.0.1', int(sys.argv[-1]))); "
+           "print('ready', flush=True); time.sleep(600)")
+
+
+class _ProcessFixture(_RepoFixture):
+    """Fixture ``codex``/``opencode`` processes (the interpreter under that name), a private
+    Codex home, TUI-selection dir and OpenCode database. The observation functions are
+    handed only the fixture pids, so the developer host's real sessions never leak in."""
+
+    def setUp(self):
+        super().setUp()
+        base = Path(self.temp.name).resolve()
+        self.bin, self.codex_home = base / "bin", base / "codex-home"
+        self.bin.mkdir()
+        self.codex_pids, self.opencode_pids = [], []
+        self.db = base / "opencode.db"
+        con = sqlite3.connect(self.db)
+        con.execute("CREATE TABLE session_v2 (id TEXT, time_updated INTEGER, time_idle INTEGER)")
+        con.execute("CREATE TABLE session (id TEXT, time_updated INTEGER)")
+        con.commit()
+        con.close()
+        patcher = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.codex_home),
+                                               "XDG_STATE_HOME": str(base / "state")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.namespace = mock.patch.object(procscan, "initial_pid_namespace", return_value=True)
+        self.namespace.start()
+        self.addCleanup(self.namespace.stop)
+        self.open_rollouts = mock.Mock(side_effect=lambda: codex_read(pids=self.codex_pids))
+        self.visibility = mock.Mock(side_effect=lambda: opencode_read(pids=self.opencode_pids))
+        for target, name, replacement in ((codex, "open_rollout_sessions", self.open_rollouts),
+                                          (opencode, "session_visibility", self.visibility),
+                                          (opencode, "_db", lambda: str(self.db))):
+            patch = mock.patch.object(target, name, replacement)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def spawn(self, name, code, *args):
+        link = self.bin / name
+        if not link.exists():
+            os.symlink(sys.executable, link)
+        proc = subprocess.Popen([str(link), "-c", code, *args], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(self.reap, proc)
+        return proc, proc.stdout.readline().strip()
+
+    @staticmethod
+    def reap(proc):
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+
+    def rollout(self, sid, day="28"):
+        path = self.codex_home / "sessions" / "2026" / "10" / day / f"rollout-2026-10-{day}T00-00-00-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"type": "session_meta", "payload": {"id": sid}}) + "\n")
+        return path
+
+    def codex_holding(self, sid):
+        path = self.rollout(sid)
+        proc, _ = self.spawn("codex", "import time; f = open(%r); print('ready', flush=True); "
+                             "time.sleep(600)" % str(path))
+        self.codex_pids.append(proc.pid)
+        return proc
+
+    def opencode_proc(self, code, *args):
+        proc, line = self.spawn("opencode", code, *args)
+        self.opencode_pids.append(proc.pid)
+        return proc, line
+
+    def select(self, proc, sid):
+        directory = Path(os.environ["XDG_STATE_HOME"]) / "hearting" / "tui-identity"
+        directory.mkdir(parents=True, exist_ok=True)
+        start = opencode._proc_start_ticks(proc.pid)
+        (directory / f"{proc.pid}-{start}.json").write_text(json.dumps({
+            "schema": opencode.TUI_SELECTION_SCHEMA, "pid": proc.pid, "start": start,
+            "sessionID": sid}))
+
+    def put(self, sid, updated, idle=None, table="session_v2"):
+        con = sqlite3.connect(self.db)
+        if table == "session_v2":
+            con.execute("INSERT INTO session_v2 VALUES (?, ?, ?)", (sid, updated, idle))
+        else:
+            con.execute("INSERT INTO session VALUES (?, ?)", (sid, updated))
+        con.commit()
+        con.close()
+
+    def state(self, harness, sid):
+        return steward.session_liveness(harness, sid, agents=[])
+
+    def holders(self, harness, *sids):
+        rows = [self.row(sid, self.primary, harness) for sid in sids]
+        return rows, [_relation(sid, harness=harness) for sid in sids]
+
+
+codex_read = codex.open_rollout_sessions
+opencode_read = opencode.session_visibility
+
+
+class SessionLivenessCodexTest(_ProcessFixture, unittest.TestCase):
+    def test_c1_rollout_held_open_is_live(self):
+        self.codex_holding(CODEX_X)
+        self.assertEqual(self.state("codex", CODEX_X), "live")
+
+    def test_c2_open_rollout_beats_an_exited_registry_record(self):
+        self.codex_holding(CODEX_X)
+        self.write_codex_record(CODEX_X, status="exited")
+        self.assertEqual(self.state("codex", CODEX_X), "live")
+
+    def write_codex_record(self, sid, **fields):
+        directory = self.registry / "codex"
+        directory.mkdir(parents=True, exist_ok=True)
+        record = {"pid": 999999, "sessionId": sid, **fields}
+        (directory / f"{record['pid']}.json").write_text(json.dumps(record))
+
+    def test_c2b_a_registry_record_still_decides_when_one_exists(self):
+        self.rollout(CODEX_X)
+        self.write_codex_record(CODEX_X, pid=os.getpid())  # a running process: registry says live
+        self.assertEqual(self.state("codex", CODEX_X), "live")
+        self.write_codex_record(CODEX_X, pid=os.getpid(), status="exited")
+        self.assertEqual(self.state("codex", CODEX_X), "ended")
+
+    def test_c3_rollout_nobody_holds_is_ended_and_frees_the_slot(self):
+        proc = self.codex_holding(CODEX_X)
+        self.codex_holding(CODEX_Y)
+        self.reap_now(proc)
+        rows, relations = self.holders("codex", CODEX_X, CODEX_Y, "no-rollout-sid")
+        result = self.census(rows, relations)
+        by_sid = {h["session_id"]: (h["liveness"], h["counted"]) for h in result["holders"]}
+        self.assertEqual(by_sid, {CODEX_X: ("ended", False), CODEX_Y: ("live", True),
+                                  "no-rollout-sid": ("unknown", True)})
+        self.assertEqual(result["counted"], 2)
+
+    def reap_now(self, proc):
+        proc.kill()
+        proc.wait()
+
+    def test_c4_no_rollout_file_or_two_of_them_is_unknown(self):
+        self.assertEqual(self.state("codex", CODEX_X), "unknown")
+        self.rollout(CODEX_X, day="27")
+        self.assertEqual(self.state("codex", CODEX_X), "ended")
+        self.rollout(CODEX_X, day="28")
+        self.assertEqual(self.state("codex", CODEX_X), "unknown")
+
+    def test_c5_unreadable_fd_table_or_process_list_is_unknown(self):
+        self.codex_holding(CODEX_Y)
+        self.rollout(CODEX_X)
+        self.assertEqual(self.state("codex", CODEX_X), "ended")
+        with mock.patch.object(codex, "_rollout_fd_paths", side_effect=PermissionError("fd")):
+            self.assertEqual(self.state("codex", CODEX_X), "unknown")
+        with mock.patch.object(codex, "_rollout_fd_paths", return_value=([], True)):
+            self.assertEqual(self.state("codex", CODEX_X), "unknown")
+        self.open_rollouts.side_effect = lambda: None
+        self.assertEqual(self.state("codex", CODEX_X), "unknown")
+
+    def test_c6_outside_the_initial_pid_namespace_proves_no_end(self):
+        self.codex_holding(CODEX_Y)
+        self.rollout(CODEX_X)
+        self.namespace.stop()
+        self.addCleanup(self.namespace.start)
+        with mock.patch.object(procscan, "initial_pid_namespace", return_value=False):
+            self.assertEqual(self.state("codex", CODEX_X), "unknown")
+            self.assertEqual(self.state("codex", CODEX_Y), "live")
+
+    def test_c7_fd_helper_reads_the_open_rollout(self):
+        proc = self.codex_holding(CODEX_X)
+        paths, partial = codex._rollout_fd_paths(proc.pid)
+        self.assertEqual(([codex._sid(path) for path in paths], partial), ([CODEX_X], False))
+        proc.kill()
+        proc.wait()
+        with self.assertRaises(OSError):
+            codex._rollout_fd_paths(proc.pid)
+        self.assertIsNone(codex._proc_rollout(proc.pid, str(self.primary), str(self.codex_home)))
+
+    def test_c8_claude_holders_read_no_process_table(self):
+        rows, relations = self.holders("claude", "c1", "c2")
+        result = self.census(rows, relations)
+        self.assertEqual({h["liveness"] for h in result["holders"]}, {"unknown"})
+        self.open_rollouts.assert_not_called()
+        self.visibility.assert_not_called()
+
+    def test_c9_one_observation_per_pass_and_only_for_the_harness_in_use(self):
+        sids = ("cx-1", "cx-2", "cx-3")
+        rows = [self.row(sid, cwd, "codex") for sid, cwd in zip(sids, (self.primary, self.primary, self.other))]
+        relations = [_relation(sid, harness="codex") for sid in sids]
+        steward.supervision_by_repository(rows, limit=2, markers={}, relations=relations, agents=[])
+        self.assertEqual((self.open_rollouts.call_count, self.visibility.call_count), (1, 0))
+        self.open_rollouts.reset_mock()
+        with mock.patch.object(steward, "_last_supervision", None), \
+                mock.patch.object(steward, "read_relations", return_value=relations), \
+                mock.patch.object(steward, "_registry_sessions", return_value=[]), \
+                mock.patch.object(steward, "_steward_limit", return_value=2), \
+                mock.patch("fleet.collectors.herdr.list_agents", return_value=[]):
+            steward.enrich(rows, markers={})
+        self.assertEqual((self.open_rollouts.call_count, self.visibility.call_count), (1, 0))
+
+
+class SessionLivenessOpenCodeTest(_ProcessFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.now_ms = int(time.time() * 1000)
+
+    def test_o1_argv_session_or_tui_selection_is_live(self):
+        self.opencode_proc(_HOLD, "-s", OPENCODE_X)
+        self.assertEqual(self.state("opencode", OPENCODE_X), "live")
+        proc, _ = self.opencode_proc(_HOLD)
+        self.select(proc, OPENCODE_Y)
+        self.assertEqual(self.state("opencode", OPENCODE_Y), "live")
+
+    def test_o2_older_than_every_running_opencode_is_ended(self):
+        self.put(OPENCODE_X, 1_000)
+        self.assertEqual(self.state("opencode", OPENCODE_X), "ended")  # nothing runs at all
+        self.opencode_proc(_HOLD, "-s", OPENCODE_Y)
+        rows, relations = self.holders("opencode", OPENCODE_X, OPENCODE_Y)
+        by_sid = {h["session_id"]: (h["liveness"], h["counted"])
+                  for h in self.census(rows, relations)["holders"]}
+        self.assertEqual(by_sid, {OPENCODE_X: ("ended", False), OPENCODE_Y: ("live", True)})
+
+    def test_o3_runtime_idle_mark_ends_a_session_updated_after_start(self):
+        self.opencode_proc(_HOLD, "-s", OPENCODE_Y)
+        later = self.now_ms + 60_000
+        self.put(OPENCODE_X, later, idle=later)
+        self.assertEqual(self.state("opencode", OPENCODE_X), "ended")
+
+    def test_o4_recent_update_without_idle_mark_is_unknown(self):
+        self.opencode_proc(_HOLD, "-s", OPENCODE_Y)
+        later = self.now_ms + 60_000
+        self.put(OPENCODE_X, later)
+        self.assertEqual(self.state("opencode", OPENCODE_X), "unknown")
+        self.put("ses_otherzzzzzzzzzzzzzzzz", later, idle=later - 1)
+        self.assertEqual(self.state("opencode", "ses_otherzzzzzzzzzzzzzzzz"), "unknown")
+
+    def test_o5_tui_that_has_not_chosen_a_session_is_unknown(self):
+        self.opencode_proc(_HOLD)
+        self.put(OPENCODE_X, 1_000)
+        self.assertEqual(self.state("opencode", OPENCODE_X), "unknown")
+
+    def test_o6_a_client_the_walk_cannot_classify_is_unknown(self):
+        self.put(OPENCODE_X, 1_000)
+        _server, port = self.opencode_proc(_SERVE, "serve")
+        self.opencode_proc(_CLIENT, "-s", OPENCODE_Y, port)
+        self.assertEqual(self.state("opencode", OPENCODE_X), "ended")  # only opencode clients
+        stranger = socket.create_connection(("127.0.0.1", int(port)))
+        self.addCleanup(stranger.close)
+        self.assertEqual(self.state("opencode", OPENCODE_X), "unknown")
+        self.assertEqual(self.state("opencode", OPENCODE_Y), "live")
+
+    def test_o6b_a_runtime_without_a_visible_listener_is_unknown(self):
+        self.put(OPENCODE_X, 1_000)
+        self.opencode_proc(_HOLD, "serve")
+        self.assertEqual(self.state("opencode", OPENCODE_X), "unknown")
+
+    def test_o7_run_continue_and_fork_are_unresolved_but_run_session_is_live(self):
+        self.put(OPENCODE_X, 1_000)
+        self.opencode_proc(_HOLD, "run", "-s", OPENCODE_Y)
+        self.assertEqual(self.state("opencode", OPENCODE_Y), "live")
+        self.assertEqual(self.state("opencode", OPENCODE_X), "ended")
+        for flag in ("-c", "--continue", "--fork"):
+            proc, _ = self.opencode_proc(_HOLD, "run", flag)
+            self.assertEqual(self.state("opencode", OPENCODE_X), "unknown", flag)
+            self.opencode_pids.remove(proc.pid)
+
+    def test_o8_missing_from_the_database_or_hidden_processes_is_unknown(self):
+        self.assertEqual(self.state("opencode", OPENCODE_X), "unknown")
+        self.put(OPENCODE_X, 1_000)
+        with mock.patch.object(procscan, "initial_pid_namespace", return_value=False):
+            self.assertEqual(self.state("opencode", OPENCODE_X), "unknown")
+        self.assertEqual(self.state("opencode", OPENCODE_X), "ended")
+
+    def test_o9_legacy_session_table_is_enough(self):
+        self.opencode_proc(_HOLD, "-s", OPENCODE_Y)
+        self.put(OPENCODE_X, 1_000, table="session")
+        self.assertEqual(self.state("opencode", OPENCODE_X), "ended")
+        self.put("ses_recentzzzzzzzzzzzzzzz", self.now_ms + 60_000, table="session")
+        self.assertEqual(self.state("opencode", "ses_recentzzzzzzzzzzzzzzz"), "unknown")
+
+    def test_utility_commands_neither_show_a_session_nor_block_the_proof(self):
+        self.put(OPENCODE_X, 1_000)
+        self.opencode_proc(_HOLD, "models")
+        self.assertEqual(self.state("opencode", OPENCODE_X), "ended")
 
 
 class RepositoryForSessionTest(_RepoFixture, unittest.TestCase):
