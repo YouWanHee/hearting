@@ -127,12 +127,12 @@ class ClaudeNativeIdentityHelperTest(unittest.TestCase):
                 self.assertIsNone(claude_identity.observe_process(71, proc_root=f.root))
             f.process()
             f.registry()
-            original_claim = claude_identity._native_session_claim
+            original_claim = claude_identity._native_session_observation
             def exit_after_claim(*args):
                 result = original_claim(*args)
                 (proc / "cmdline").unlink()
                 return result
-            with unittest.mock.patch.object(claude_identity, "_native_session_claim", side_effect=exit_after_claim):
+            with unittest.mock.patch.object(claude_identity, "_native_session_observation", side_effect=exit_after_claim):
                 self.assertIsNone(claude_identity.statusline_identity(71, "current", f.home, proc_root=f.root))
             with unittest.mock.patch.object(claude_identity.Path, "open", side_effect=PermissionError()):
                 self.assertIsNone(claude_identity.observe_process(71, proc_root=f.root))
@@ -247,7 +247,8 @@ class ClaudeNativeIdentityHelperTest(unittest.TestCase):
 
     def test_retained_claim_requires_fresh_owner_runtime_and_readable_exact_prior(self):
         for case in ("conflict", "incomplete", "unreadable-inventory", "foreign-runtime",
-                     "foreign-tap", "unreadable-prior", "replaced-prior", "reuse", "exit"):
+                     "foreign-tap", "unreadable-prior", "oversize-prior", "denied-prior",
+                     "replaced-prior", "reuse", "exit"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
                 f = FakeClaudeProc(tmp)
                 f.process()
@@ -265,6 +266,18 @@ class ClaudeNativeIdentityHelperTest(unittest.TestCase):
                                                                    return_value=os.getuid() + 1))
                 elif case == "unreadable-prior":
                     (f.home / ".statusline/current.json").write_text("{")
+                elif case == "oversize-prior":
+                    path = f.home / ".statusline/current.json"
+                    row = json.loads(path.read_text())
+                    path.write_text(json.dumps({**row, "padding": "x" * 65536}))
+                elif case == "denied-prior":
+                    real_claim = claude_identity._focused_tap_claim
+                    def denied_claim(path, pid, start):
+                        if path.name == "current.json":
+                            raise PermissionError("private exact-prior read denied")
+                        return real_claim(path, pid, start)
+                    stack.enter_context(unittest.mock.patch.object(claude_identity, "_focused_tap_claim",
+                                                                   side_effect=denied_claim))
                 else:
                     real_claim = claude_identity._focused_tap_claim
                     def changed_claim(path, pid, start):
@@ -295,7 +308,56 @@ class ClaudeNativeIdentityHelperTest(unittest.TestCase):
                 self.assertIsNone(current)
                 self.assertEqual(tap["pid"] if tap else None,
                                  71 if case in {"conflict", "incomplete", "unreadable-inventory"} else None)
-                self.assertEqual(policy, "unobserved" if case in {"reuse", "exit"} else "replace")
+                self.assertEqual(policy, "unobserved" if case in {
+                    "unreadable-prior", "oversize-prior", "denied-prior", "replaced-prior",
+                    "reuse", "exit"} else "replace")
+
+    def test_native_read_failures_are_unknown_but_raw_reader_stays_unusable(self):
+        for kind in ("runtime", "unknown"):
+            for fault in ("denied", "oversize", "replaced", "short-read"):
+                with self.subTest(kind=kind, fault=fault), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+                    f = FakeClaudeProc(tmp)
+                    f.process(argv=["claude"] if kind == "runtime" else ["unrecognized-runtime-title"])
+                    path = f.registry()
+                    f.tap()
+                    f.tap(sid="old")
+                    if fault == "oversize":
+                        row = json.loads(path.read_text())
+                        path.write_text(json.dumps({**row, "padding": "x" * 65536}))
+                    elif fault == "denied":
+                        real_open = os.open
+                        def denied_open(candidate, *args, **kwargs):
+                            if Path(candidate) == path:
+                                raise PermissionError("private native read denied")
+                            return real_open(candidate, *args, **kwargs)
+                        stack.enter_context(unittest.mock.patch.object(claude_identity.os, "open",
+                                                                       side_effect=denied_open))
+                    else:
+                        real_read = os.read
+                        def interrupted_read(fd, size):
+                            native = os.fstat(fd).st_ino == path.stat().st_ino
+                            raw = real_read(fd, size)
+                            if native:
+                                if fault == "short-read":
+                                    return raw[:len(raw) // 2]
+                                replacement = path.with_suffix(".new")
+                                replacement.write_bytes(raw)
+                                os.replace(replacement, path)
+                            return raw
+                        stack.enter_context(unittest.mock.patch.object(claude_identity.os, "read",
+                                                                       side_effect=interrupted_read))
+                    self.assertEqual(claude_identity._native_session_claim(f.home, "71", "101"), (None, False))
+                    self.assertEqual(claude_identity.statusline_bindings(
+                        71, "current", f.home, proc_root=f.root), (None, None, "unobserved"))
+
+    def test_foreign_prior_cannot_enable_launch_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = FakeClaudeProc(tmp)
+            f.process(argv=["claude", "--session-id=current"])
+            f.tap()
+            with unittest.mock.patch.object(claude_identity.os, "getuid", return_value=os.getuid() + 1):
+                self.assertEqual(claude_identity.statusline_bindings(
+                    71, "current", f.home, proc_root=f.root), (None, None, "replace"))
 
 
 class OpenCodeProcessTest(unittest.TestCase):

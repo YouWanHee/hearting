@@ -193,35 +193,44 @@ def invocation_kind(argv: list[str]) -> str:
     return "session"
 
 
-def _native_session_claim(home: Path, pid: str, start: str):
+def _native_session_observation(home: Path, pid: str, start: str) -> tuple[str | None, bool | None]:
+    """Return a claim and validity: True observed, False invalid, None unreadable.
+
+    Selection and invalidation need different evidence. The raw census reader
+    below still reports both invalid and unreadable native records as unusable.
+    """
     path = home / "sessions" / (pid + ".json")
     try:
         info = path.lstat()
     except FileNotFoundError:
         return None, True
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-            or info.st_size > 65536):
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
         return None, False
+    if info.st_size > 65536:
+        return None, None
     fd = None
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         opened = os.fstat(fd)
         if (opened.st_dev, opened.st_ino, opened.st_size) != (info.st_dev, info.st_ino, info.st_size):
-            return None, False
+            return None, None
         raw = os.read(fd, 65537)
         after = os.fstat(fd)
         current = path.lstat()
-        if (len(raw) > 65536 or (after.st_dev, after.st_ino, after.st_size) !=
+        if (len(raw) != info.st_size or len(raw) > 65536 or (after.st_dev, after.st_ino, after.st_size) !=
                 (info.st_dev, info.st_ino, info.st_size)
                 or (current.st_dev, current.st_ino, current.st_size) !=
                 (info.st_dev, info.st_ino, info.st_size)):
-            return None, False
-        row = json.loads(raw.decode("utf-8"))
-    except (OSError, ValueError, UnicodeError):
-        return None, False
+            return None, None
+    except OSError:
+        return None, None
     finally:
         if fd is not None:
             os.close(fd)
+    try:
+        row = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return None, False
     if not isinstance(row, dict):
         return None, False
     recorded_pid = row.get("pid")
@@ -231,6 +240,11 @@ def _native_session_claim(home: Path, pid: str, start: str):
             or not isinstance(sid, str) or not sid):
         return None, False
     return sid, True
+
+
+def _native_session_claim(home: Path, pid: str, start: str):
+    sid, valid = _native_session_observation(home, pid, start)
+    return sid, valid is True
 
 
 def _conversation_tokens(argv: list[str]) -> list[str] | None:
@@ -338,19 +352,24 @@ def observe_process(pid, *, proc_root: str | os.PathLike = "/proc"):
             "argv": argv, "executable": executable, "kind": kind, "invocation": mode}
 
 
+class _InvalidTapClaimError(OSError):
+    """Positive file ownership/type rejection, rather than a failed read."""
+
+
 def _focused_tap_claim(path: Path, pid, start: str):
     """Read one bounded owner claim, never stdin-supplied PID evidence."""
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
                  | getattr(os, "O_NONBLOCK", 0))
     try:
         before = os.fstat(fd)
-        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
-                or before.st_size > 65536):
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid():
+            raise _InvalidTapClaimError("statusline fallback is not an owner regular file")
+        if before.st_size > 65536:
             raise OSError("statusline fallback file unusable")
         raw = os.read(fd, 65537)
         stamp = lambda info: (info.st_dev, info.st_ino, info.st_size,
                               info.st_mtime_ns, info.st_ctime_ns)
-        if (len(raw) > 65536 or stamp(os.fstat(fd)) != stamp(before)
+        if (len(raw) != before.st_size or len(raw) > 65536 or stamp(os.fstat(fd)) != stamp(before)
                 or stamp(path.lstat()) != stamp(before)):
             raise OSError("statusline fallback file changed")
         row = json.loads(raw)
@@ -422,8 +441,10 @@ def statusline_bindings(parent_pid, sid: str, home: str | os.PathLike, *,
             continue
         start = observed["proc_start"]
         try:
-            current, valid = _native_session_claim(Path(home), str(pid), start)
+            current, valid = _native_session_observation(Path(home), str(pid), start)
         except OSError:
+            return None, None, "unobserved"
+        if valid is None:
             return None, None, "unobserved"
         if not valid:
             return None, None, "replace"
@@ -434,8 +455,8 @@ def statusline_bindings(parent_pid, sid: str, home: str | os.PathLike, *,
                 return None, None, "replace"
             try:
                 prior = _focused_tap_claim(Path(home) / ".statusline" / (sid + ".json"), pid, start)
-            except FileNotFoundError:
-                prior = None
+            except _InvalidTapClaimError:
+                return None, None, "replace"
             except (OSError, ValueError):
                 return None, None, "unobserved"
             if observe_process(pid, proc_root=proc_root) != observed:
@@ -474,8 +495,10 @@ def statusline_bindings(parent_pid, sid: str, home: str | os.PathLike, *,
             if not selected:
                 try:
                     retained = _focused_tap_claim(Path(home) / ".statusline" / (sid + ".json"), pid, start) == sid
+                except _InvalidTapClaimError:
+                    retained = False
                 except (OSError, ValueError):
-                    pass
+                    return None, None, "unobserved"
         if observe_process(pid, proc_root=proc_root) != observed:
             return None, None, "unobserved"
         return (observed if selected else None, observed if selected or retained else None,

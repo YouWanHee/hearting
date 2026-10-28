@@ -243,6 +243,7 @@ class StatuslinePriorClaimTest(unittest.TestCase):
                  "CLAUDE_CONFIG_DIR": str(self.f.home), "FLEET_TITLE_DISABLE": "1",
                  "HARNESS_CAPACITY_REFRESH_DISABLE": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.strip(), "statusline must still render")
         latest = json.loads((self.f.home / ".statusline-last.json").read_text())
         self.assertEqual(latest["cost"]["total_cost_usd"], 2.25)
         tap = json.loads((self.f.home / ".statusline/current.json").read_text())
@@ -311,6 +312,132 @@ class StatuslinePriorClaimTest(unittest.TestCase):
         self.assertIsNone(self.reader())
         self.assertIsNone(json.loads(self.display.read_text()))
 
+    def test_unreadable_current_prior_preserves_raw_conflict(self):
+        proxy = self.agent / "utilities/claude_process_identity.py"
+        original = proxy.read_text()
+        for argv in (["claude"], ["unrecognized-runtime-title"]):
+            for fault in ("oversize", "denied", "replaced"):
+                with self.subTest(argv=argv, fault=fault):
+                    self.f.process(argv=argv)
+                    self.f.tap(sid="old")
+                    self.f.tap()
+                    path = self.f.home / ".statusline/current.json"
+                    if fault == "oversize":
+                        row = json.loads(path.read_text())
+                        path.write_text(json.dumps({**row, "padding": "x" * 65536}))
+                    elif fault == "denied":
+                        proxy.write_text(original +
+                            "\n_real_claim = m._focused_tap_claim\n"
+                            "def denied_claim(path, pid, start):\n"
+                            "    if path.name == 'current.json':\n"
+                            "        raise PermissionError('private exact-prior read denied')\n"
+                            "    return _real_claim(path, pid, start)\n"
+                            "m._focused_tap_claim = denied_claim\n")
+                    else:
+                        proxy.write_text(original +
+                            f"\n_prior = m.Path({str(path)!r})\n"
+                            "_real_read = m.os.read\n"
+                            "def replaced_read(fd, size):\n"
+                            "    prior = m.os.fstat(fd).st_ino == _prior.stat().st_ino\n"
+                            "    raw = _real_read(fd, size)\n"
+                            "    if prior:\n"
+                            "        info = _prior.stat()\n"
+                            "        replacement = _prior.with_suffix('.new')\n"
+                            "        replacement.write_bytes(raw)\n"
+                            "        m.os.utime(replacement, ns=(info.st_atime_ns, info.st_mtime_ns))\n"
+                            "        m.os.replace(replacement, _prior)\n"
+                            "    return raw\n"
+                            "m.os.read = replaced_read\n")
+                    paths = [path, path.with_name("old.json")]
+                    before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
+                    self.assertIsNone(self.reader())
+                    try:
+                        self.event(expect_tap_update=False)
+                    finally:
+                        proxy.write_text(original)
+                    self.assertIsNone(self.reader())
+                    self.assertEqual([(p.read_bytes(), p.stat().st_mtime_ns) for p in paths], before)
+                    self.assertIsNone(json.loads(self.display.read_text()))
+                    self.assertEqual(list((self.f.home / "sessions").iterdir()), [])
+
+    def test_native_read_denied_does_not_discard_prior_claims(self):
+        proxy = self.agent / "utilities/claude_process_identity.py"
+        original = proxy.read_text()
+        for argv in (["claude"], ["unrecognized-runtime-title"]):
+            with self.subTest(argv=argv):
+                self.f.process(argv=argv)
+                native = self.f.registry()
+                self.f.tap(sid="old")
+                self.f.tap()
+                paths = [self.f.home / ".statusline" / (sid + ".json") for sid in ("old", "current")]
+                before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
+                native_raw = native.read_bytes()
+                # The actual reader can independently read the valid native
+                # record. Only this callback's bounded observation is denied.
+                self.assertEqual(self.reader(), "current")
+                proxy.write_text(original +
+                    f"\n_native = m.Path({str(native)!r})\n"
+                    "_real_open = m.os.open\n"
+                    "def denied_open(path, *args, **kwargs):\n"
+                    "    if m.Path(path) == _native:\n"
+                    "        raise PermissionError('private native read denied')\n"
+                    "    return _real_open(path, *args, **kwargs)\n"
+                    "m.os.open = denied_open\n")
+                try:
+                    self.event(expect_tap_update=False)
+                finally:
+                    proxy.write_text(original)
+                self.assertEqual(self.reader(), "current")
+                self.assertEqual([(p.read_bytes(), p.stat().st_mtime_ns) for p in paths], before)
+                self.assertEqual(native.read_bytes(), native_raw)
+                self.assertIsNone(json.loads(self.display.read_text()))
+
+    def test_retained_current_claim_cannot_expire_aged_conflicting_claim(self):
+        self.f.tap(sid="old")
+        self.f.tap()
+        old = self.f.home / ".statusline/old.json"
+        os.utime(old, (1000, 1000))
+        before = old.read_bytes(), old.stat().st_mtime_ns
+        self.assertIsNone(self.reader())
+        tap = self.event()
+        self.assertEqual((tap["pid"], tap["proc_start"]), (71, "101"))
+        self.assertEqual((old.read_bytes(), old.stat().st_mtime_ns), before)
+        self.assertIsNone(self.reader())
+        self.assertIsNone(json.loads(self.display.read_text()))
+        self.assertEqual(list((self.f.home / "sessions").iterdir()), [])
+
+    def test_priorless_unknown_telemetry_cannot_expire_unrelated_conflict(self):
+        self.f.process(argv=["unrecognized-runtime-title"])
+        self.f.tap(sid="old")
+        self.f.tap(sid="other")
+        paths = [self.f.home / ".statusline" / (sid + ".json") for sid in ("old", "other")]
+        os.utime(paths[0], (1000, 1000))
+        before = [(p.read_bytes(), p.stat().st_mtime_ns) for p in paths]
+        self.assertIsNone(self.reader())
+        tap = self.event()
+        self.assertNotIn("pid", tap)
+        self.assertNotIn("proc_start", tap)
+        self.assertEqual([(p.read_bytes(), p.stat().st_mtime_ns) for p in paths], before)
+        self.assertIsNone(self.reader())
+        self.assertIsNone(json.loads(self.display.read_text()))
+        self.assertEqual(list((self.f.home / "sessions").iterdir()), [])
+
+    def test_verified_current_callback_keeps_normal_cleanup_and_telemetry(self):
+        self.f.registry()
+        self.f.tap(sid="old", start="100")
+        old = self.f.home / ".statusline/old.json"
+        os.utime(old, (1000, 1000))
+        leftover = old.with_name(".old.json.tmp")
+        leftover.write_text("partial old write")
+        os.utime(leftover, (1000, 1000))
+        self.assertEqual(self.reader(), "current")
+        tap = self.event()
+        self.assertEqual((tap["pid"], tap["proc_start"]), (71, "101"))
+        self.assertEqual(json.loads(self.display.read_text()), 71)
+        self.assertFalse(old.exists())
+        self.assertFalse(leftover.exists())
+        self.assertEqual(self.reader(), "current")
+
     def test_current_prior_tap_survives_historical_selector(self):
         self.f.process(argv=["claude", "--session-id=old"])
         self.f.tap()
@@ -329,10 +456,14 @@ class StatuslinePriorClaimTest(unittest.TestCase):
         self.assertNotIn("proc_start", tap)
 
     def test_invalid_prior_claims_are_not_copied(self):
+        proxy = self.agent / "utilities/claude_process_identity.py"
+        original = proxy.read_text()
         for case in ("reused", "other-pid", "nearer", "service", "foreign-current",
                      "malformed-current", "unknown-reused", "unknown-other-pid",
-                     "unknown-foreign-current", "foreign-owner"):
+                     "unknown-foreign-current", "foreign-owner", "foreign-tap",
+                     "stale-current", "other-pid-current", "foreign-native-owner"):
             with self.subTest(case=case):
+                proxy.write_text(original)
                 (self.f.home / "sessions/71.json").unlink(missing_ok=True)
                 self.f.process()
                 self.f.tap(start="100" if case in {"reused", "unknown-reused"} else "101",
@@ -350,6 +481,19 @@ class StatuslinePriorClaimTest(unittest.TestCase):
                     self.f.registry(sid="foreign")
                 elif case == "malformed-current":
                     self.f.registry().write_text("{")
+                elif case == "stale-current":
+                    self.f.registry(start="100")
+                elif case == "other-pid-current":
+                    path = self.f.registry()
+                    row = json.loads(path.read_text())
+                    path.write_text(json.dumps({**row, "pid": 72}))
+                elif case in {"foreign-tap", "foreign-native-owner"}:
+                    if case == "foreign-native-owner":
+                        self.f.registry()
+                    proxy = self.agent / "utilities/claude_process_identity.py"
+                    with proxy.open("a") as handle:
+                        handle.write("\n_original_uid = m.os.getuid()\n"
+                                     "m.os.getuid = lambda: _original_uid + 1\n")
                 elif case == "foreign-owner":
                     proxy = self.agent / "utilities/claude_process_identity.py"
                     with proxy.open("a") as handle:

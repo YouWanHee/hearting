@@ -254,7 +254,8 @@ sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
     mv -f "$sldir/.$S_SID.json.tmp" "$sldir/$S_SID.json" 2>/dev/null || true
   fi
   # stale 청소: mtime > 1일 세션 파일 제거(디렉토리 폭증 방지 — 종료된 세션 잔존물). find 없으면 skip.
-  if [ -n "$tap_json" ]; then
+  # Telemetry or a retained claim cannot resolve other identity evidence by age.
+  if [ -n "$tap_json" ] && [[ "$display_pid" =~ ^[0-9]+$ ]]; then
     find "$sldir" -maxdepth 1 \( -name '*.json' -o -name '.*.json.tmp' \) -mtime +1 -delete 2>/dev/null || true
   fi
 fi
