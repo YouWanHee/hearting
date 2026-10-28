@@ -25,7 +25,7 @@ question; person answers once in native question surface;
 
 Owner stage: `python3 "$AGENT_HOME/utilities/stage-dispatch-fallback.py" --node
 <node> --start`; route/slug/parent/harness inherit owner route/environment.
-A sealed parallel-group member starts its whole group in one batch. No depth 3.
+Start each sealed parallel group as one batch. Dispatch depth 3 is forbidden.
 
 Use this session's route; interactive `hearting run peer-steward start` only for
 long work needing human answers/recovery. Output: `hearting run pane open <command>`.
