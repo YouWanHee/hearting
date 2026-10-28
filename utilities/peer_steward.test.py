@@ -3815,8 +3815,14 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         self.assertNotEqual(live["watch_id"], dead["watch_id"],
                             f"live={live} dead={dead}")
         self._wait_for_lock(dead["watch_id"])
-        waits_before_dead = len(self._wait_calls())
-        self._wait_for_wait_calls(waits_before_dead + 1)
+        # Wait for this watch's own native wait, not for the total count to grow:
+        # that wait may already be logged before the count is read.
+        def dead_waits():
+            return [line for line in self._wait_calls() if " peer-dead" in f" {line} "]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not dead_waits():
+            time.sleep(0.02)
+        self.assertEqual(len(dead_waits()), 1, self._wait_calls())
         os.kill(int(dead["pid"]), signal.SIGKILL)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and peer_steward._pid_identity_ok(
@@ -3834,7 +3840,7 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
             new_arm["watcher"]["pid"], new_arm["watcher"]["pid_start"]))
         self.assertTrue(peer_steward._lock_held(
             self.watch_root / f"{fields['watch_id']}.lock"))
-        self.assertEqual(len(self._wait_calls()), waits_before_dead + 1,
+        self.assertEqual(len(dead_waits()), 1,
                          "reattachment adopts the one already launched native wait")
 
         self._release()
