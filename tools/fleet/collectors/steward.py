@@ -422,9 +422,76 @@ def _registry_record(harness, session_id):
     return None
 
 
-def session_liveness(harness, session_id, *, agents=None):
+class _EndObservation:
+    """One pass's reading of the live Codex/OpenCode processes, taken lazily and at most
+    once per harness, so a pass with only Claude holders reads no /proc at all."""
+
+    def __init__(self):
+        self._seen = {}
+
+    def _once(self, harness, read):
+        if harness not in self._seen:
+            try:
+                self._seen[harness] = read()
+            except Exception:
+                self._seen[harness] = None
+        return self._seen[harness]
+
+    def codex(self):
+        from . import codex
+        return self._once("codex", codex.open_rollout_sessions)
+
+    def opencode(self):
+        from . import opencode
+        return self._once("opencode", opencode.session_visibility)
+
+
+def end_observation():
+    """A fresh per-pass observation for ``session_liveness(..., observation=...)``."""
+    return _EndObservation()
+
+
+def _process_proof(harness, session_id, observation):
+    """``"live"`` | ``"ended"`` | ``"unknown"`` from the runtime's own session-ownership
+    proof, read backwards: a Codex rollout nobody holds open, or an OpenCode session no
+    client shows and no running runtime can still be running. Only a complete observation
+    can say ``ended``; an unreadable table or a PID namespace that hides processes is
+    ``unknown``."""
+    try:
+        if harness == "codex":
+            seen = observation.codex()
+            if not seen:
+                return "unknown"
+            if session_id in seen["open"]:
+                return "live"
+            if not seen["complete"]:
+                return "unknown"
+            from . import codex
+            return "ended" if codex.exact_rollout_for_session_id(session_id) else "unknown"
+        seen = observation.opencode()
+        if not seen:
+            return "unknown"
+        if session_id in seen["visible"]:
+            return "live"
+        if not seen["complete"]:
+            return "unknown"
+        from . import opencode
+        activity = opencode.session_activity(session_id)
+        if activity is None:
+            return "unknown"
+        updated, idle = activity
+        started = seen["earliest_start_ms"]
+        if started is None or updated < started or (idle is not None and idle >= updated):
+            return "ended"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def session_liveness(harness, session_id, *, agents=None, observation=None):
     """``"live"`` | ``"ended"`` | ``"unknown"``. Only proof of exit says ``ended``:
-    a herdr row means live; otherwise the registry record's process is checked
+    a herdr row means live; Codex and OpenCode then answer from the processes that hold
+    the session (``_process_proof``); otherwise the registry record's process is checked
     (dead pid, recycled pid, or an ``exited`` status). Anything unobserved is
     ``unknown`` and keeps counting."""
     harness = str(harness or "").lower()
@@ -441,6 +508,13 @@ def session_liveness(harness, session_id, *, agents=None):
         if (str(agent.get("agent") or "").lower() == harness and isinstance(identity, dict)
                 and identity.get("value") == session_id):
             return "live"
+    if harness in ("codex", "opencode"):
+        observation = end_observation() if observation is None else observation
+        proof = _process_proof(harness, session_id, observation)
+        if proof == "live":
+            return "live"
+        if proof == "ended" and _registry_record(harness, session_id) is None:
+            return "ended"
     try:
         record = _registry_record(harness, session_id)
         if record is None:
@@ -492,7 +566,7 @@ def _holder_name(harness, session_id, rows):
 
 
 def _repo_holders(repository_key, *, markers=None, relations=None, sessions=None, agents=None,
-                  _rows=None):
+                  observation=None, _rows=None):
     """Distinct current holders attributed to ``repository_key``.
 
     A holder belongs to the repository when its role shows there (``basis="role"``,
@@ -540,7 +614,7 @@ def _repo_holders(repository_key, *, markers=None, relations=None, sessions=None
         if basis is None:
             continue
         seen.add((harness, sid))
-        liveness = session_liveness(harness, sid, agents=agents)
+        liveness = session_liveness(harness, sid, agents=agents, observation=observation)
         out.append({"harness": harness, "session_id": sid,
                     "name": _holder_name(harness, sid, rows), "liveness": liveness,
                     "basis": basis, "counted": liveness != "ended"})
@@ -548,13 +622,14 @@ def _repo_holders(repository_key, *, markers=None, relations=None, sessions=None
 
 
 def repo_supervision(cwd=None, *, repository_key=None, limit=None, markers=None, relations=None,
-                     sessions=None, agents=None):
+                     sessions=None, agents=None, observation=None):
     """The one count of current supervisors in a repository (linked worktrees fold
     into their primary). The grant limit and the Fleet display both call this."""
     key = repository_key or _repository_key(cwd)
     limit = _steward_limit() if limit is None else limit
     holders = _repo_holders(key, markers=markers, relations=relations, sessions=sessions,
-                            agents=agents)
+                            agents=agents,
+                            observation=end_observation() if observation is None else observation)
     counted = sum(1 for holder in holders if holder["counted"])
     return {"repository": Path(key).parent.name if key else None, "repository_key": key,
             "holders": holders, "counted": counted, "limit": limit,
@@ -562,12 +637,13 @@ def repo_supervision(cwd=None, *, repository_key=None, limit=None, markers=None,
 
 
 def supervision_by_repository(sessions=None, *, limit=None, markers=None, relations=None,
-                              agents=None):
+                              agents=None, observation=None):
     """``{repository_key: repo_supervision(...)}`` for every repository that has a
     holder; a thin loop with no counting rule of its own."""
     markers = read_markers() if markers is None else markers
     relations = read_relations() if relations is None else relations
     rows = _context_rows(markers, relations, sessions)
+    observation = end_observation() if observation is None else observation
     keys = set()
     for relation in relations:
         if relation.get("released") is True:
@@ -588,7 +664,8 @@ def supervision_by_repository(sessions=None, *, limit=None, markers=None, relati
         if key:
             keys.add(key)
     return {key: repo_supervision(repository_key=key, limit=limit, markers=markers,
-                                  relations=relations, sessions=rows, agents=agents)
+                                  relations=relations, sessions=rows, agents=agents,
+                                  observation=observation)
             for key in sorted(keys)}
 
 
@@ -614,7 +691,8 @@ def _record_supervision(context, markers, relations):
         agents = None
     try:
         _last_supervision = supervision_by_repository(
-            context, limit=_steward_limit(), markers=markers, relations=relations, agents=agents)
+            context, limit=_steward_limit(), markers=markers, relations=relations, agents=agents,
+            observation=end_observation())
     except Exception:
         _last_supervision = None
 
