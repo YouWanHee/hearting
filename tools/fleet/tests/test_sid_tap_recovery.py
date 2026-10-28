@@ -19,7 +19,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from unittest import mock
+
+from test_process_identity import FakeClaudeProc
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _TOOLS_DIR not in sys.path:
@@ -191,6 +195,111 @@ class TapSidRecoveryTest(_HomeMixin, unittest.TestCase):
         claude.enrich(s)
         self.assertEqual(s.session_id, "own-sid")
         self.assertEqual(s.cost, 1.25)
+
+
+class StatuslinePriorClaimTest(unittest.TestCase):
+    """Real shell writes and actual Fleet reader across registry-loss events."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.f = FakeClaudeProc(self.root)
+        self.f.process()
+        self.agent = self.root / "agent"
+        (self.agent / "utilities").mkdir(parents=True)
+        source = Path(_STATUSLINE).resolve().parents[2]
+        (self.agent / "utilities/claude_process_identity.py").write_text(
+            "import importlib.util\n"
+            f"s=importlib.util.spec_from_file_location('native_helper', {str(source / 'utilities/claude_process_identity.py')!r})\n"
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+            "def statusline_identity(parent, sid, home):\n"
+            f"    return m.statusline_identity(71, sid, home, proc_root={str(self.f.root)!r})\n"
+            "def statusline_bindings(parent, sid, home):\n"
+            f"    return m.statusline_bindings(71, sid, home, proc_root={str(self.f.root)!r})\n")
+        # Record the PID delivered to the display helper, independently of the
+        # PID preserved in the telemetry tap. A retained claim is not a verdict.
+        self.display = self.root / "display-pid.json"
+        (self.agent / "tools/fleet").mkdir(parents=True)
+        (self.agent / "tools/fleet/session_handle.py").write_text(
+            "import json\n"
+            "def resolve_display_inputs(harness, sid, pid=None):\n"
+            f"    open({str(self.display)!r}, 'w').write(json.dumps(pid))\n"
+            "    return {}\n")
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        for name, value in (("read_proc_start", "101"), ("_comm_of", "8.7.6"),
+                            ("_read_cwd", (self.tmp.name, False))):
+            self.stack.enter_context(mock.patch.object(claude.procscan, name, return_value=value))
+
+    def reader(self):
+        return claude.session_id_of_process(71, home=str(self.f.home))
+
+    def event(self):
+        result = subprocess.run(["bash", _STATUSLINE], input=json.dumps({
+            "session_id": "current", "cwd": str(self.root), "cost": {"total_cost_usd": 2.25},
+            "pid": 9999, "proc_start": "9999"}), capture_output=True, text=True, timeout=30,
+            env={**os.environ, "HOME": str(self.root), "AGENT_HOME": str(self.agent),
+                 "CLAUDE_CONFIG_DIR": str(self.f.home), "FLEET_TITLE_DISABLE": "1",
+                 "HARNESS_CAPACITY_REFRESH_DISABLE": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tap = json.loads((self.f.home / ".statusline/current.json").read_text())
+        self.assertEqual(tap["cost"]["total_cost_usd"], 2.25)
+        self.assertIn("hearting_context_request", tap)
+        return tap
+
+    def test_conflict_survives_real_shell_overwrite_without_becoming_old_sid(self):
+        for selector in (None, "old", "current"):
+            with self.subTest(selector=selector):
+                self.f.process(argv=["claude"] + (["--session-id", selector] if selector else []))
+                self.f.tap(sid="old")
+                self.f.tap()
+                old = (self.f.home / ".statusline/old.json").read_bytes()
+                self.assertIsNone(self.reader())
+                tap = self.event()
+                self.assertIsNone(self.reader())
+                self.assertEqual((tap["pid"], tap["proc_start"]), (71, "101"))
+                self.assertEqual((self.f.home / ".statusline/old.json").read_bytes(), old)
+                self.assertIsNone(json.loads(self.display.read_text()))
+
+    def test_current_prior_tap_survives_historical_selector(self):
+        self.f.process(argv=["claude", "--session-id=old"])
+        self.f.tap()
+        self.assertEqual(self.reader(), "current")
+        tap = self.event()
+        self.assertEqual(self.reader(), "current")
+        self.assertEqual((tap["pid"], tap["proc_start"]), (71, "101"))
+
+    def test_foreign_exact_tap_is_not_overruled_by_callback_selector(self):
+        self.f.process(argv=["claude", "--session-id=current"])
+        self.f.tap(sid="foreign")
+        self.assertEqual(self.reader(), "foreign")
+        tap = self.event()
+        self.assertEqual(self.reader(), "foreign")
+        self.assertNotIn("pid", tap)
+        self.assertNotIn("proc_start", tap)
+
+    def test_invalid_prior_claims_are_not_copied(self):
+        for case in ("reused", "other-pid", "nearer", "service", "unknown", "foreign-current",
+                     "malformed-current"):
+            with self.subTest(case=case):
+                self.f.process()
+                self.f.tap(start="100" if case == "reused" else "101",
+                           pid=72 if case in {"other-pid", "nearer"} else 71)
+                if case == "nearer":
+                    self.f.process(71, parent=72)
+                    self.f.process(72)
+                elif case == "service":
+                    self.f.process(argv=["claude", "daemon", "run"])
+                elif case == "unknown":
+                    self.f.process(argv=["unrecognized-runtime-title"])
+                elif case == "foreign-current":
+                    self.f.registry(sid="foreign")
+                elif case == "malformed-current":
+                    self.f.registry().write_text("{")
+                tap = self.event()
+                self.assertNotIn("pid", tap)
+                self.assertNotIn("proc_start", tap)
 
 
 @unittest.skipUnless(os.path.exists(_STATUSLINE) and os.path.isdir("/proc") and shutil.which("cc"),

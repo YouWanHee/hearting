@@ -109,7 +109,7 @@ print("S_CTX=" + shlex.quote(str(cpct)))
 # `resolve_display_inputs()` needs the same pid to read `sessions/<pid>.json`'s
 # `nameSource` (Amendment 2 — statusline must apply the same derived-vs-user-set rule
 # Fleet applies, not print its own stdin `session_name` unconditionally).
-tap_pid=""; tap_start=""
+display_pid=""; tap_pid=""; tap_start=""
 identity_helper="$AGENT_HOME/utilities/claude_process_identity.py"
 [ -f "$identity_helper" ] || identity_helper="$(dirname "$AGENT_HOME")/utilities/claude_process_identity.py"
 if [ ! -f "$identity_helper" ]; then
@@ -121,18 +121,19 @@ if [ -n "$S_SID" ] && [ -f "$identity_helper" ]; then
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("claude_process_identity", sys.argv[1])
 mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-found = mod.statusline_identity(sys.argv[2], sys.argv[3], sys.argv[4])
-if found:
-    print(found["pid"], found["proc_start"])
+current, tap = mod.statusline_bindings(sys.argv[2], sys.argv[3], sys.argv[4])
+# A retained tap claim preserves conflict evidence, not current-SID proof.
+print(current["pid"] if current else "-",
+      tap["pid"] if tap else "-", tap["proc_start"] if tap else "-")
 PY
   )
-  read -r tap_pid tap_start <<< "$identity" || true
+  read -r display_pid tap_pid tap_start <<< "$identity" || true
 fi
 S_SESSION_DISPLAY=""
 session_helper="$AGENT_HOME/tools/fleet/session_handle.py"
 [ -f "$session_helper" ] || session_helper="$(dirname "$AGENT_HOME")/tools/fleet/session_handle.py"
 if [ -n "$S_SID" ] && [ -f "$session_helper" ]; then
-  S_SESSION_DISPLAY=$(python3 - "$session_helper" "$S_SID" "$tap_pid" "$S_CWD" <<'PY' 2>/dev/null || true
+  S_SESSION_DISPLAY=$(python3 - "$session_helper" "$S_SID" "$display_pid" "$S_CWD" <<'PY' 2>/dev/null || true
 import importlib.util, sys
 try:
     spec = importlib.util.spec_from_file_location("fleet_session_handle", sys.argv[1])
@@ -175,8 +176,8 @@ if [ -n "$S_SID" ]; then
   # 소유 claude pid + /proc starttime 을 tap 에 additive 주입 (F-25 tier-2 식별 증거) —
   # sessions/<pid>.json registry 가 살아있는 세션에서 소실되면(2026-07-20 실측) fleet 이
   # pid→sid 를 복구할 유일한 소스가 이 tap 이다. proc_start 는 PID 재사용 오귀속 방지 짝
-  # (F-26). $tap_pid/$tap_start 는 위 F-99 세션 이름 블록에서 이미 walk-up 해 계산했다
-  # (동일 pid 필요 — 중복 계산 대신 재사용).
+  # (F-26). 위 bounded lookup의 current proof 또는 fresh prior claim만 기록한다.
+  # prior claim 보존은 conflict를 지우지 않기 위한 것이며 display PID를 주지 않는다.
   tap_json=$input
   if command -v python3 >/dev/null 2>&1; then
     tap_with_policy=$(printf '%s' "$input" | python3 -c '

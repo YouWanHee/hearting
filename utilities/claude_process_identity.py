@@ -322,60 +322,92 @@ def observe_process(pid, *, proc_root: str | os.PathLike = "/proc"):
     _, start, parent, argv, executable = before
     tokens = _conversation_tokens(argv)
     launcher = os.path.basename(executable).lower()
-    native = (_native_claude_executable(executable) and tokens is not None
+    native_executable = _native_claude_executable(executable)
+    native = (native_executable and tokens is not None
               and os.path.basename(argv[0]).lower() not in {"node", "nodejs", "bun"})
     scripted = (launcher in {"node", "nodejs", "bun"} and tokens is not None
                 and os.path.basename(argv[0]).lower() in {"node", "nodejs", "bun"})
     mode = conversation_invocation(argv) if native or scripted else "unknown"
-    kind = ("service" if mode == "command" else "runtime") if native or scripted else "helper"
+    if native or scripted:
+        kind = {"command": "service", "session": "runtime"}.get(mode, "unknown")
+    elif native_executable and os.path.basename(argv[0]).lower() not in _EMBEDDED_HELPERS:
+        kind = "unknown"
+    else:
+        kind = "helper"
     return {"pid": int(pid), "proc_start": start, "ppid": parent,
             "argv": argv, "executable": executable, "kind": kind, "invocation": mode}
 
 
+def _focused_tap_claim(path: Path, pid, start: str):
+    """Read one bounded owner claim, never stdin-supplied PID evidence."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0))
+    try:
+        before = os.fstat(fd)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or before.st_size > 65536):
+            raise OSError("statusline fallback file unusable")
+        raw = os.read(fd, 65537)
+        stamp = lambda info: (info.st_dev, info.st_ino, info.st_size,
+                              info.st_mtime_ns, info.st_ctime_ns)
+        if (len(raw) > 65536 or stamp(os.fstat(fd)) != stamp(before)
+                or stamp(path.lstat()) != stamp(before)):
+            raise OSError("statusline fallback file changed")
+        row = json.loads(raw)
+        if not isinstance(row, dict):
+            raise ValueError("invalid statusline fallback")
+        sid = row.get("session_id") or path.name[:-5]
+        if (str(row.get("pid")) == str(pid) and str(row.get("proc_start")) == start
+                and isinstance(sid, str) and sid):
+            return sid
+        return None
+    finally:
+        os.close(fd)
+
+
 def _focused_tap_claims(home: Path, pid, start: str):
     """Bound registry-loss work without changing the census's raw tap reader."""
+    directory = home / ".statusline"
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        return set()  # first event; unreadable evidence is not an empty inventory
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise OSError("statusline fallback directory unusable")
     claims = set()
-    with os.scandir(home / ".statusline") as entries:
+    with os.scandir(directory) as entries:
         for count, entry in enumerate(entries):
             if count >= 128:
                 raise OSError("statusline fallback inventory incomplete")
             if entry.name.startswith(".") or not entry.name.endswith(".json"):
                 continue
-            fd = os.open(entry.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                         | getattr(os, "O_NONBLOCK", 0))
-            try:
-                before = os.fstat(fd)
-                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
-                        or before.st_size > 65536):
-                    raise OSError("statusline fallback file unusable")
-                raw = os.read(fd, 65537)
-                stamp = lambda info: (info.st_dev, info.st_ino, info.st_size,
-                                      info.st_mtime_ns, info.st_ctime_ns)
-                if (len(raw) > 65536 or stamp(os.fstat(fd)) != stamp(before)
-                        or stamp(os.lstat(entry.path)) != stamp(before)):
-                    raise OSError("statusline fallback file changed")
-                row = json.loads(raw)
-                if not isinstance(row, dict):
-                    raise ValueError("invalid statusline fallback")
-                sid = row.get("session_id") or entry.name[:-5]
-                if (str(row.get("pid")) == str(pid) and str(row.get("proc_start")) == start
-                        and isinstance(sid, str) and sid):
-                    claims.add(sid)
-            finally:
-                os.close(fd)
+            claim = _focused_tap_claim(Path(entry.path), pid, start)
+            if claim:
+                claims.add(claim)
     return claims
 
 
 def statusline_identity(parent_pid, sid: str, home: str | os.PathLike, *,
                         proc_root: str | os.PathLike = "/proc", max_depth: int = 5):
     """Bind only the nearest verified runtime; a mismatch never borrows an ancestor."""
+    return statusline_bindings(parent_pid, sid, home, proc_root=proc_root, max_depth=max_depth)[0]
+
+
+def statusline_bindings(parent_pid, sid: str, home: str | os.PathLike, *,
+                        proc_root: str | os.PathLike = "/proc", max_depth: int = 5):
+    """Return (current-SID proof, tap claim); retaining a claim selects no SID.
+
+    Failed selection may still preserve this callback's prior exact claim on
+    the freshly verified nearest runtime. It must never erase one side of a
+    conflict merely because telemetry is being replaced.
+    """
     if not isinstance(sid, str) or not sid or Path(sid).name != sid:
-        return None
+        return None, None
     pid = parent_pid
     for _ in range(max_depth):
         observed = observe_process(pid, proc_root=proc_root)
-        if observed is None or observed["kind"] == "service":
-            return None
+        if observed is None or observed["kind"] in {"service", "unknown"}:
+            return None, None
         if observed["kind"] == "helper":
             pid = observed["ppid"]
             continue
@@ -383,44 +415,48 @@ def statusline_identity(parent_pid, sid: str, home: str | os.PathLike, *,
         try:
             current, valid = _native_session_claim(Path(home), str(pid), start)
         except OSError:
-            return None
+            return None, None
         if not valid:
-            return None
+            return None, None
+        selected = current == sid
+        retained = False
         if current is None:
-            # Explicit current-session arguments may bind a first event. Resume
-            # selectors can be paths or a pre-fork SID and are not current proof.
-            tokens = _conversation_tokens(observed["argv"])
-            claims = set()
-            index = 1
-            while index < len(tokens):
-                word = tokens[index]
-                if word in {"--", "-p", "--print"}:
-                    break
-                if word in _CLAUDE_VALUE_OPTIONS:
-                    if index + 1 >= len(tokens):
+            try:
+                claims = _focused_tap_claims(Path(home), pid, start)
+            except (OSError, ValueError):
+                claims = None  # incomplete/unreadable, not first-event silence
+            if claims == set():
+                # Launch selectors may bind a first event only after checking
+                # prior exact taps. Resume values are never current proof.
+                tokens = _conversation_tokens(observed["argv"])
+                index = 1
+                while index < len(tokens):
+                    word = tokens[index]
+                    if word in {"--", "-p", "--print"}:
                         break
-                    if word == "--session-id":
-                        claims.add(tokens[index + 1])
-                    index += 2
-                elif word.startswith("--session-id="):
-                    claims.add(word.split("=", 1)[1])
-                    index += 1
-                elif word in _CLAUDE_FLAG_OPTIONS or word == "--fork-session":
-                    index += 1
-                else:
-                    break
-            if not claims:
-                # Registry-loss fallback is bounded to this config home. An
-                # incomplete or conflicting tap inventory cannot select a SID.
+                    if word in _CLAUDE_VALUE_OPTIONS:
+                        if index + 1 >= len(tokens):
+                            break
+                        if word == "--session-id":
+                            claims.add(tokens[index + 1])
+                        index += 2
+                    elif word.startswith("--session-id="):
+                        claims.add(word.split("=", 1)[1])
+                        index += 1
+                    elif word in _CLAUDE_FLAG_OPTIONS or word == "--fork-session":
+                        index += 1
+                    else:
+                        break
+            selected = claims == {sid}
+            if not selected:
                 try:
-                    claims = _focused_tap_claims(Path(home), pid, start)
+                    retained = _focused_tap_claim(Path(home) / ".statusline" / (sid + ".json"), pid, start) == sid
                 except (OSError, ValueError):
-                    return None
-            current = sid if claims == {sid} else None
-        if current != sid or observe_process(pid, proc_root=proc_root) != observed:
-            return None
-        return observed
-    return None
+                    pass
+        if observe_process(pid, proc_root=proc_root) != observed:
+            return None, None
+        return observed if selected else None, observed if selected or retained else None
+    return None, None
 
 
 def _remote_mount(home: Path, mounts_path: Path) -> bool:

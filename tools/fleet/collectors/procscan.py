@@ -940,7 +940,7 @@ def scan(harness_filter=None):
             claude_observation = claude_process_identity.observe_process(pid)
             if claude_observation and claude_observation["kind"] in {"service", "helper"}:
                 continue
-            if comm != "claude" and not claude_observation:
+            if comm != "claude" and (not claude_observation or claude_observation["kind"] != "runtime"):
                 continue
             harness = "claude"
         if harness_filter and harness not in harness_filter:

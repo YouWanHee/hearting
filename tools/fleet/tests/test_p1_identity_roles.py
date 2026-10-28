@@ -17,6 +17,33 @@ from test_process_identity import FakeClaudeProc
 
 
 class NativeBackgroundChainTest(unittest.TestCase):
+    def test_unknown_native_is_not_a_new_row_but_legacy_claude_unknown_rows_remain(self):
+        identity = procscan.claude_process_identity
+        with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
+            f = FakeClaudeProc(temporary)
+            executable = "/opt/claude/versions/8.7.6"
+            f.process(71, argv=["unrecognized-runtime-title"])
+            f.process(72, argv=["unrecognized-runtime-title"])
+            f.process(73)
+            (f.root / "73/cmdline").unlink()  # unreadable legacy comm=claude
+            f.process(74, argv=["8.7.6"], executable="/tmp/8.7.6")
+            f.process(75, argv=["claude", "daemon", "run"])
+            real_observe = identity.observe_process
+            stack.enter_context(mock.patch.object(identity, "observe_process",
+                side_effect=lambda pid: real_observe(pid, proc_root=f.root)))
+            lines = [f"71 8.7.6 01:00 {executable}", f"72 claude 01:00 {executable}",
+                     "73 claude 01:00 claude", "74 8.7.6 01:00 /tmp/8.7.6",
+                     "75 claude 01:00 claude daemon run"]
+            for name, value in (("_ps_lines", lines), ("_pid_ttys", {}),
+                    ("_detached_ttys", set()), ("proc_tree", {}), ("is_terminal_state", False),
+                    ("exec_child", None), ("_orca_dead_socks", set()), ("read_environ", {}),
+                    ("_read_argv", []), ("_read_cwd", (temporary, False))):
+                stack.enter_context(mock.patch.object(procscan, name, return_value=value))
+            stack.enter_context(mock.patch.object(procscan, "read_proc_start", return_value="101"))
+            rows = procscan.scan()
+            self.assertEqual([(r.pid, r.harness, r._invocation_mode) for r in rows],
+                             [(72, "claude", "unknown"), (73, "claude", "unknown")])
+
     def test_old_daemon_tap_and_next_statusline_event_have_one_correct_native_row(self):
         from fleet import session_cwd
         from fleet.explorer.live import _session_records
@@ -97,8 +124,8 @@ class NativeBackgroundChainTest(unittest.TestCase):
                 "import importlib.util\n"
                 f"s=importlib.util.spec_from_file_location('native_helper', {str(source / 'utilities/claude_process_identity.py')!r})\n"
                 "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
-                "def statusline_identity(parent, sid, home):\n"
-                f"    return m.statusline_identity(74, sid, home, proc_root={str(f.root)!r})\n")
+                "def statusline_bindings(parent, sid, home):\n"
+                f"    return m.statusline_bindings(74, sid, home, proc_root={str(f.root)!r})\n")
             result = subprocess.run(["bash", str(source / "adapters/claude/statusline.sh")],
                 input=json.dumps({"session_id": sid, "cwd": project}), capture_output=True,
                 text=True, timeout=30, env={**os.environ, "AGENT_HOME": str(agent),
