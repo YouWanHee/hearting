@@ -3177,14 +3177,22 @@ class FastFirstPublicationTest(unittest.TestCase):
         # The internal hint reaches dispatch only on the fast path; every
         # existing caller without it keeps the old call shape (--once/JSON
         # output unchanged), so old test doubles keep working.
-        with mock.patch.object(dispatch, "collect", return_value=[]), \
-             mock.patch("fleet.collectors.procscan.scan", return_value=[]):
-            fleet_collectors.collect_all(fast_first=True)
-            self.assertTrue(dispatch.collect.call_args.kwargs.get("fast_first", False))
-        with mock.patch.object(dispatch, "collect", return_value=[]), \
-             mock.patch("fleet.collectors.procscan.scan", return_value=[]):
-            fleet_collectors.collect_all()
-            self.assertNotIn("fast_first", dispatch.collect.call_args.kwargs)
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = os.path.join(tmp, "jobs.log")
+            open(jobs, "w").close()
+            with mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_JOBS": jobs,
+                "AGENT_RESOURCE_RUN_INDEX": os.path.join(
+                    tmp, "resource-runs.index.json"),
+            }):
+                with mock.patch.object(dispatch, "collect", return_value=[]), \
+                     mock.patch("fleet.collectors.procscan.scan", return_value=[]):
+                    fleet_collectors.collect_all(fast_first=True)
+                    self.assertTrue(dispatch.collect.call_args.kwargs.get("fast_first", False))
+                with mock.patch.object(dispatch, "collect", return_value=[]), \
+                     mock.patch("fleet.collectors.procscan.scan", return_value=[]):
+                    fleet_collectors.collect_all()
+                    self.assertNotIn("fast_first", dispatch.collect.call_args.kwargs)
 
 
 class AttemptStallProjectionTest(unittest.TestCase):

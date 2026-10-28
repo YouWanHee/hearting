@@ -31,6 +31,9 @@ from fleet.model import Session  # noqa: E402
 
 BENCHMARK_SCHEMA = "fleet-tick-benchmark-v3"
 FIXTURE_SCHEMA = "fleet-tick-fixture-v1"
+# Same passthrough set as tools/run-tests.py's isolated child environment. Every
+# other collector input is either a fixture path or absent.
+HERMETIC_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "TZ")
 SESSION_FIELDS = (
     "harness", "pid", "proc_start", "cwd", "elapsed_min", "session_id", "title",
     "summary", "model", "effort", "ctx_pct", "active_context_tokens",
@@ -142,6 +145,11 @@ def _materialize(fixture, fixture_root):
         expanded["runtime_homes"]["profile_beta"],
         os.path.join(fixture_root, "worktree-a"),
         os.path.join(fixture_root, "worktree-b"),
+        os.path.join(fixture_root, "home"),
+        os.path.join(fixture_root, "xdg-state"),
+        os.path.join(fixture_root, "xdg-data"),
+        os.path.join(fixture_root, "xdg-cache"),
+        os.path.join(fixture_root, "tmp"),
     ):
         os.makedirs(path, exist_ok=True)
     for rollout in expanded["rollouts"]:
@@ -582,10 +590,23 @@ def _hermetic_result(raw_fixture, fixture_hash, fixture_root, iterations):
     def fake_proc_rollout(pid, _cwd, _home):
         return proc_rollouts.get(pid)
 
+    fixture_env = {
+        "HOME": os.path.join(fixture_root, "home"),
+        "XDG_STATE_HOME": os.path.join(fixture_root, "xdg-state"),
+        "XDG_DATA_HOME": os.path.join(fixture_root, "xdg-data"),
+        "XDG_CACHE_HOME": os.path.join(fixture_root, "xdg-cache"),
+        "TMPDIR": os.path.join(fixture_root, "tmp"),
+        "AGENT_DISPATCH_JOBS": jobs_path,
+        "AGENT_RESOURCE_RUN_INDEX": os.path.join(
+            fixture_root, "resource-runs.index.json"),
+        "AGENT_HOME": str(Path(__file__).resolve().parents[3]),
+    }
+    for key in HERMETIC_ENV_KEYS:
+        if key in os.environ:
+            fixture_env[key] = os.environ[key]
+
     with contextlib.ExitStack() as stack:
-        stack.enter_context(mock.patch.dict(os.environ, {
-            "XDG_STATE_HOME": os.path.join(fixture_root, "xdg-state"),
-        }))
+        stack.enter_context(mock.patch.dict(os.environ, fixture_env, clear=True))
         stack.enter_context(_instrument(counters))
         stack.enter_context(mock.patch.object(
             procscan, "scan", side_effect=lambda **_kwargs: _fresh_sessions(fixture)
