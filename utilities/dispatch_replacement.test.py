@@ -21,6 +21,19 @@ import route_identity
 os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
 
 
+# Relevant technical lines from the saved exit-64 receipt; no spawn proof or model ID.
+HEADLESS_MODEL_REFUSAL = (
+    'trace.1=cascade=explicit>hard-eligibility>quality-band>capacity>recent-attempt-balance\n'
+    'trace.2=explicit=none;authorized=0\n'
+    'trace.3=eligibility=claude:ok,codex:ok,opencode:ok\n'
+    'trace.4=configured=codex,claude,opencode;selected=codex;source=configured-balanced;deviation_reason=none\n'
+    'route_defaults=--capability,--capability-mode,--intensity,--model-profile,--dispatch-depth,--worker-type,--owner,--assigned-contract\n'
+    'check=failed\n'
+    'reason=headless-main-session-only-model\n'
+    'detail=model selected by profile:deep is interactive dispatch-depth-0 main-session only\n'
+)
+
+
 _STATE_TMP = None
 _STATE_OLD = None
 
@@ -792,6 +805,95 @@ class ReplacementTest(unittest.TestCase):
         self.assertEqual(calls[0][calls[0].index('--attempt-id')+1],record['replacement_attempt_id'])
         self.assertEqual(result['reason'],'replacement-launch-pending')
         self.assertEqual(len(list((R._directory(self.jobs)/'claims').glob('*.json'))),1)
+
+    def test_returned_headless_model_refusal_is_not_launch_pending(self):
+        record = self.claim()
+        source_before = R._rows(self.jobs.read_text().splitlines())['att-source']
+        claim_path = R._record_path(self.jobs, record['family_id'])
+        claim_before = claim_path.read_bytes()
+        self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'accepted')
+        # Older/noisy output must neither supply detail nor escape the diagnostic bound.
+        output = ('check=failed\nreason=old-refusal\ndetail=old-detail\n'
+                  + 'selection-noise\n' * 25 + HEADLESS_MODEL_REFUSAL)
+        for stream in ('stdout', 'stderr'):
+            with self.subTest(stream=stream):
+                runner = mock.Mock(return_value=subprocess.CompletedProcess(
+                    ['launcher'], 64, output if stream == 'stdout' else '',
+                    output if stream == 'stderr' else ''))
+                with mock.patch('dispatch_replacement_batch.command', return_value=None):
+                    result = R.advance(self.jobs, 'att-source', run=runner,
+                                       authority_check=lambda *_: True)
+                runner.assert_called_once()
+                command = runner.call_args.args[0]
+                self.assertEqual(command[command.index('--attempt-id') + 1], record['replacement_attempt_id'])
+                self.assertEqual((result['state'], result['reason'], result['launcher_exit']),
+                                 ('needs-attention', 'headless-main-session-only-model', 64))
+                self.assertEqual((result['source_attempt_id'], result['attempt_id'], result['node']),
+                                 ('att-source', record['replacement_attempt_id'], 'frame'))
+                self.assertEqual(result['record'], record)
+                self.assertEqual(result['detail'],
+                                 'model selected by profile:deep is interactive dispatch-depth-0 main-session only')
+                combined = '\n'.join((output, '') if stream == 'stdout' else ('', output))
+                self.assertEqual(result['launcher_diagnostic'], '\n'.join(combined.splitlines()[-20:]))
+                self.assertIn('parent/controller', result['next_step'])
+                self.assertIn('model-eligibility restriction', result['next_step'])
+                self.assertIn('same replacement claim', result['next_step'])
+                self.assertNotIn('pending', result['next_step'])
+                self.assertNotIn('Retry', result['next_step'])
+                self.assertNotIn('retry_when', result)
+                self.assertNotIn('next_action', result)
+                self.assertEqual(R.effective_attempts(self.jobs, {'att-source'}), ({'att-source'}, []))
+                self.assertNotIn(record['replacement_attempt_id'], R._rows(self.jobs.read_text().splitlines()))
+                self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'accepted')
+                self.assertEqual(R._rows(self.jobs.read_text().splitlines())['att-source'], source_before)
+                self.assertEqual(claim_path.read_bytes(), claim_before)
+
+    def test_untyped_or_incomplete_launcher_result_remains_pending(self):
+        cases = [
+            ('no-registration', 0, ''),
+            ('untyped-exit75', 75, 'launcher unavailable\n'),
+            ('unstructured-exit64', 64, 'headless-main-session-only-model\n'),
+            ('missing-check', 64, 'reason=headless-main-session-only-model\n'),
+            ('missing-reason', 64, 'check=failed\ndetail=incomplete\n'),
+            ('different-exit', 65, HEADLESS_MODEL_REFUSAL),
+            ('success-exit', 0, HEADLESS_MODEL_REFUSAL),
+            ('later-incomplete', 64, HEADLESS_MODEL_REFUSAL + 'check=failed\n'),
+            ('later-success', 64, HEADLESS_MODEL_REFUSAL + 'check=ok\n'),
+            ('later-unknown', 64, HEADLESS_MODEL_REFUSAL + 'check=\n'),
+            ('different-reason', 64, 'check=failed\nreason=unknown-refusal\n'),
+        ]
+        record = self.claim()
+        for name, exit_code, output in cases:
+            with self.subTest(name=name), \
+                 mock.patch('dispatch_replacement_batch.command', return_value=None):
+                result = R.advance(self.jobs, 'att-source', authority_check=lambda *_: True,
+                    run=lambda *args, **kwargs: subprocess.CompletedProcess(args[0], exit_code, output, ''))
+                self.assertEqual((result['state'], result['reason'], result['launcher_exit']),
+                                 ('needs-attention', 'replacement-launch-pending', exit_code))
+                self.assertEqual(result['attempt_id'], record['replacement_attempt_id'])
+                self.assertNotIn('detail', result)
+                self.assertNotIn('next_step', result)
+                self.assertEqual(R.effective_attempts(self.jobs, {'att-source'}), ({'att-source'}, []))
+                self.assertNotIn(record['replacement_attempt_id'], R._rows(self.jobs.read_text().splitlines()))
+                self.assertEqual(R.recovery_delivery_state(self.jobs, 'att-source'), 'accepted')
+
+    def test_registered_successor_wins_over_launcher_refusal(self):
+        record = self.claim()
+        def register_then_refuse(command, **_kwargs):
+            self._successor(record, self.meta, 'open', launch_started='1')
+            return subprocess.CompletedProcess(command, 64, HEADLESS_MODEL_REFUSAL, '')
+        runner = mock.Mock(side_effect=register_then_refuse)
+        with mock.patch('dispatch_replacement_batch.command', return_value=None):
+            first = R.advance(self.jobs, 'att-source', run=runner, authority_check=lambda *_: True)
+            replay = R.advance(self.jobs, 'att-source', run=runner, authority_check=lambda *_: True)
+        for result in (first, replay):
+            self.assertEqual((result['state'], result['attempt_id']),
+                             ('running', record['replacement_attempt_id']))
+            self.assertNotIn('launcher_exit', result)
+        runner.assert_called_once()
+        effective, lineage = R.effective_attempts(self.jobs, {'att-source'})
+        self.assertEqual(effective, {record['replacement_attempt_id']})
+        self.assertEqual(lineage[0]['replacement_attempt_id'], record['replacement_attempt_id'])
 
     def test_slow_launcher_is_named_and_the_same_attempt_relaunches(self):
         import dispatch_lifecycle as L
@@ -3082,6 +3184,7 @@ class ReplacementTest(unittest.TestCase):
         self.assertTrue(request['network']['required'])
         self.assertIn(str(inventory.parent), request['read_roots'])
         self.assertEqual(access['source'], 'compute-runtime-defaults')
+        self.assertIsNone(access['at'])
         self.assertEqual(old.read_bytes(), old_bytes)
         replay = {'argv': ['--execution-access-file', str(old)], 'harness': 'opencode'}
         argv = R._replacement_argv({'execution_access': access}, {'worker_type': 'owner'}, replay)

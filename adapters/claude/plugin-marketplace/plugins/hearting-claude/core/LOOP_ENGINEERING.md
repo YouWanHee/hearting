@@ -164,6 +164,11 @@ and observes again without replaying work already owned by its live runner.
 Session hooks request that existing recovery runner and return; they do not
 replay global settlement history before delivering and acknowledging the
 session's own notices. The runner retains observation state across requests.
+Recipient checks use the registry's existing attempt index for the addressed
+records; they do not expand unrelated historical rows on each authority check.
+Lineage reads include both logical-session and physical-seat ledgers, reusing
+each file's observed bytes and parsed rows within the pass. Replacing one copy
+does not erase valid evidence in the other.
 An idle foreground waiter observes its exact parent's current row without a
 writer lock, and checks process-group cleanup only after its leader exits.
 Registry mutation keeps its fresh authority check inside the existing short

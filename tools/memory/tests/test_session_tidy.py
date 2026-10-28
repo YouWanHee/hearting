@@ -5193,6 +5193,7 @@ class SeatHandoverTest(TidyCase):
         self.killed_or_cancelled_owner_is_handed_over("cancelled")
 
     def test_lineage_reads_each_seat_ledger_once_per_read_context(self):
+        from collections import Counter
         from peer_read_context import PeerReadContext
         metas = [self.owner_row(f"att-owner-{n}", status="running", route=f"rt-{n}", digest=f"sha256:{n}{n}")
                  for n in range(3)]
@@ -5202,15 +5203,34 @@ class SeatHandoverTest(TidyCase):
             st.record_event(self.seat(PANE), "claude", "sid-A", "start", cwd=str(self.cwd), now=100)
         with self.iso.patched_environ({"HERDR_PANE_ID": PANE_BESIDE}):
             st.record_event(self.seat(PANE_BESIDE), "claude", "sid-A", "start", cwd=str(self.cwd), now=101)
-        reads = mock.patch.object(st, "_read_ledger_lines", wraps=st._read_ledger_lines)
-        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), reads as counted:
+        # The native session is shared across the two physical seats: three
+        # distinct canonical files, each read and parsed once per cold pass.
+        with self.iso.patched_environ():
+            paths = {st._ledger_path(self.seat(pane)) for pane in (PANE, PANE_BESIDE)}
+            paths.add(st._native_ledger_path(st.session_seat(self.seat(PANE), "claude", "sid-A")))
+        raw_reads = []
+        real_read = st.read_bytes
+        def read(path):
+            if Path(path).suffix == ".jsonl":
+                raw_reads.append(path)
+            return real_read(path)
+        with self.iso.patched_environ({"HERDR_PANE_ID": PANE}), \
+                mock.patch.object(st, "read_bytes", side_effect=read), \
+                mock.patch.object(st, "_read_ledger_lines", wraps=st._read_ledger_lines) as counted:
+            self.handover._LINEAGE_GRAPH_CACHE.clear()
             context = PeerReadContext()
             for meta in metas:
-                self.handover.effective_parent(meta, self.jobs, read_context=context)
-            self.assertEqual(counted.call_count, 2)                    # one read per seat, not per attempt
+                self.assertEqual(self.handover.effective_parent(meta, self.jobs, read_context=context), "sid-A")
+            self.assertEqual(Counter(raw_reads), Counter(paths))
+            self.assertEqual(Counter(st._ledger_path(call.args[0]) for call in counted.call_args_list),
+                             Counter(paths))
             counted.reset_mock()
-            self.handover.current_bindings("claude", "sid-A", self.jobs)
-            self.assertLessEqual(counted.call_count, 2)                # a context of its own reads each once
+            raw_reads.clear()
+            self.handover._LINEAGE_GRAPH_CACHE.clear()
+            self.assertEqual(len(self.handover.current_bindings("claude", "sid-A", self.jobs)), len(metas))
+            self.assertEqual(Counter(raw_reads), Counter(paths))
+            self.assertEqual(Counter(st._ledger_path(call.args[0]) for call in counted.call_args_list),
+                             Counter(paths))
 
     def test_shared_graph_marks_fork_merge_and_cycle_unresolved(self):
         from peer_read_context import PeerReadContext

@@ -340,11 +340,15 @@ def eligible_row(meta: dict) -> bool:
             and bool(meta.get("parent_sid")) and bool(meta.get("attempt_id")) and bool(route) and bool(digest))
 
 
-def latest_rows(jobs) -> dict:
-    """``attempt_id -> (status, metadata)`` from a registry file (last line of an attempt wins)."""
+def latest_rows(jobs, attempts=None) -> dict:
+    """Latest rows, optionally limited to addressed attempts through the existing index."""
     try:
         from dispatch_registry_cache import registry_view
-        return registry_view(Path(jobs)).handover_latest()
+        view = registry_view(Path(jobs))
+        if attempts is None:
+            return view.handover_latest()
+        return {attempt: row for attempt in attempts
+                if (row := view.handover_attempt(attempt)) is not None}
     except OSError:
         return {}
 
@@ -1451,7 +1455,7 @@ def record_recipient_binding(record: dict, storage_key: str, *, harness: str,
     jobs = Path(jobs) if jobs is not None else _default_jobs()
     if jobs is None:
         return None
-    latest = latest_rows(jobs)
+    latest = latest_rows(jobs, ids)
     targets = set()
     try:
         graph = _pass_lineage_graph(read_context)
@@ -1691,7 +1695,7 @@ def record_for_session(record: dict, allowed: Optional[frozenset], *, session=No
         # missing-row case may use the existing exact attempt binding fallback.
         ids = record.get("attempt_ids") or []
         jobs = Path(jobs) if jobs is not None else _default_jobs()
-        registered = latest_rows(jobs) if jobs is not None else {}
+        registered = latest_rows(jobs, ids) if jobs is not None else {}
         if any(attempt in registered for attempt in ids):
             return False
         if allowed is None:

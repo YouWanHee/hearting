@@ -4,6 +4,7 @@
 Uses real ledger, pending-record, courier and preparation paths; native I/O is fake.
 """
 import contextlib
+from collections import Counter
 import importlib.util
 import io
 import json
@@ -24,6 +25,12 @@ def fixture(name, relative):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def ledger_copies(seat, row):
+    """The two canonical files written by _append_ledger_entry for this event."""
+    logical = tidy.session_seat(seat, row["harness"], row["sid"])
+    return tuple(dict.fromkeys((tidy._native_ledger_path(logical), tidy._ledger_path(seat))))
 
 
 peer = fixture("lineage_peer_fixture", "utilities/peer_steward.test.py")
@@ -82,7 +89,8 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         path = tidy._ledger_path(seat)
         row = json.loads(path.read_text())
         del row["source"]
-        path.write_text(json.dumps(row) + "\n")
+        for copy in ledger_copies(seat, row):
+            copy.write_text(json.dumps(row) + "\n")
         return meta, record, seat, row
 
     def test_legacy_exact_binding_crosses_harness_without_parent_harness_and_reuses_context(self):
@@ -137,6 +145,30 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         self.assertEqual(handover.chain_end("claude", "legacy-only-Z", read_context=context),
                          ("legacy-only-Z", "self"))
 
+    def test_record_checks_use_current_attempt_index_without_expanding_history(self):
+        from dispatch_registry_cache import RegistryView
+        meta, record, seat = self.handoff("indexed-record")
+        missing = {"attempt_ids": ["att-unregistered"]}
+        # Neither the exact job nor the legacy missing-row fallback needs the
+        # global metadata mapping. Each call still observes the current view.
+        with mock.patch.object(RegistryView, "handover_latest", side_effect=AssertionError("global expansion")):
+            context = PeerReadContext()
+            self.assertEqual(handover.record_recipient(record, "indexed-record-A", harness="claude",
+                                                       read_context=context), "indexed-record-Z")
+            self.assertTrue(handover.record_for_session(missing, None, session="own-key", harness="claude",
+                storage_key="own-key", jobs=self.jobs_path, read_context=context))
+            self.assertFalse(handover.record_for_session({"attempt_ids": [*record["attempt_ids"],
+                *missing["attempt_ids"]]}, None, session="indexed-record-A", harness="claude",
+                storage_key="indexed-record-A", jobs=self.jobs_path, read_context=context))
+            changed = dict(meta, parent_sid="foreign-parent")
+            with self.jobs_path.open("a") as stream:
+                stream.write("now\trunning\t/w\t/w\ttask\t" +
+                             ",".join(k + "=" + v for k, v in changed.items()) + "\n")
+            self.assertIsNone(handover.record_recipient(record, "indexed-record-A", harness="claude",
+                                                        read_context=context))
+            self.assertFalse(handover.record_for_session(record, None, session="indexed-record-Z",
+                harness="claude", storage_key="indexed-record-A", jobs=self.jobs_path, read_context=context))
+
     def test_legacy_holder_follows_only_confirmed_same_harness_successor_and_denies_fork(self):
         import route_authority
         meta, record, seat, row = self.legacy_handoff("legacy-next", "codex", "claude")
@@ -186,10 +218,21 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
 
     def test_legacy_binding_exact_jobs_route_hash_node_never_grants_foreign_authority(self):
         meta, record, seat, row = self.legacy_handoff("legacy-exact")
+        paths = ledger_copies(seat, row)
         for key in ("jobs", "route", "hash", "node"):
             with self.subTest(key=key):
+                for path in paths:
+                    path.write_text(json.dumps(row) + "\n")
+                self.assertEqual(handover.record_recipient(record, "legacy-exact-A", harness="claude"),
+                                 "legacy-exact-Z")
                 foreign = dict(row, bindings=[dict(row["bindings"][0], **{key: "foreign-" + key})])
                 tidy._ledger_path(seat).write_text(json.dumps(foreign) + "\n")
+                # The logical copy still binds this exact job. A physical-only
+                # mutation cannot revoke that independent canonical evidence.
+                self.assertEqual(handover.record_recipient(record, "legacy-exact-A", harness="claude"),
+                                 "legacy-exact-Z")
+                for path in paths:
+                    path.write_text(json.dumps(foreign) + "\n")
                 self.assertEqual(handover.record_recipient(record, "legacy-exact-A", harness="claude"),
                                  "legacy-exact-B")
                 self.assertFalse(handover.owns(meta, "legacy-exact-Z", self.jobs_path))
@@ -232,7 +275,11 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         notice = self.notice()
         path = tidy._ledger_path(self.edge("claude", "A", "B"))
         other = tidy.Seat("pane", "other-valid")
-        tidy._append_ledger_entry(other, dict(event="start", harness="claude", sid="other", ts=1))
+        other_row = dict(event="start", harness="claude", sid="other", ts=1)
+        tidy._append_ledger_entry(other, other_row)
+        # Two seats produce four files: both logical and physical inputs count.
+        paths = set(ledger_copies(other, other_row)) | set(ledger_copies(
+            tidy.Seat("pane", path.stem), json.loads(path.read_text())))
         before = self.snapshot(path)
         context = PeerReadContext()
         handover._LINEAGE_GRAPH_CACHE.clear()  # Cold observation after writer-side retention.
@@ -243,11 +290,20 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             self.assertEqual(handover._LINEAGE_GRAPH_CACHE, {})
             self.assertEqual(context._lineage_graphs, {})
             self.assertIsNone(self.counts()["no_recipient"])
-        with mock.patch.object(tidy, "_read_ledger_lines", wraps=tidy._read_ledger_lines) as reads:
+        raw_reads = []
+        real_read = tidy.read_bytes
+        def read(candidate):
+            if Path(candidate).suffix == ".jsonl":
+                raw_reads.append(candidate)
+            return real_read(candidate)
+        with mock.patch.object(tidy, "read_bytes", side_effect=read), \
+                mock.patch.object(tidy, "_read_ledger_lines", wraps=tidy._read_ledger_lines) as reads:
             for _ in range(10):
                 self.assertEqual(handover.record_recipient(notice, "A", harness="claude",
                                                            read_context=context), "B")
-            self.assertEqual(reads.call_count, 2)
+            self.assertEqual(Counter(raw_reads), Counter(paths))
+            self.assertEqual(Counter(tidy._ledger_path(call.args[0]) for call in reads.call_args_list),
+                             Counter(paths))
         self.assertEqual(self.snapshot(path), before)
         with self.transport("A") as native:
             steward._resume_session_notice_obligations(self.duties(), self.store())
@@ -373,11 +429,20 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
                     seat = self.edge(source, tag + "-A", tag + "-B")
                     old = tag + "-B"
                 path, current = tidy._ledger_path(seat), tag + "-Y"
+                paths = ledger_copies(seat, json.loads(path.read_text().splitlines()[-1]))
                 current_harness = target if explicit else source
                 context = PeerReadContext()
                 self.assertEqual(handover.record_recipient_binding(record, tag + "-A",
                     harness=source, read_context=context), (current_harness, old))
                 self.replace_ledger(path, old, current)
+                if not explicit:
+                    # The unchanged logical relation and the new physical one
+                    # form a real fork; neither old nor new may receive yet.
+                    self.assertIsNone(handover.record_recipient_binding(record, tag + "-A",
+                        harness=source, read_context=context))
+                for copy in paths:
+                    if copy != path:
+                        self.replace_ledger(copy, old, current)
                 for reader in (context, PeerReadContext(), None):
                     with self.subTest(source=source, target=target, explicit=explicit):
                         self.assertEqual(handover.record_recipient_binding(record, tag + "-A",
@@ -391,6 +456,7 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
     def test_replacement_during_warm_read_or_cold_parse_is_not_cached(self):
         notice = self.notice(sid="race-A", key="race")
         path = tidy._ledger_path(self.edge("claude", "race-A", "race-B"))
+        paths = ledger_copies(tidy.Seat("pane", path.stem), json.loads(path.read_text()))
         context = PeerReadContext()
         self.assertEqual(handover.record_recipient(notice, "race-A", harness="claude",
                                                    read_context=context), "race-B")
@@ -408,7 +474,8 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             raw = real_read(candidate)
             if candidate == path and not changed:
                 changed = True
-                self.replace_ledger(path, "race-B", "race-C")
+                for copy in paths:
+                    self.replace_ledger(copy, "race-B", "race-C")
             return raw
 
         with mock.patch.object(tidy, "read_bytes", side_effect=read):
@@ -423,7 +490,8 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             rows = real_parse(seat, **kwargs)
             if tidy._ledger_path(seat) == path and not changed:
                 changed = True
-                self.replace_ledger(path, "race-C", "race-D")
+                for copy in paths:
+                    self.replace_ledger(copy, "race-C", "race-D")
             return rows
 
         with mock.patch.object(tidy, "_read_ledger_lines", side_effect=parse):
@@ -461,10 +529,14 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
         self.assertEqual([self.snapshot(p) for p in paths], before)
 
     def test_fleet_record_loop_and_history_reuse_each_observation(self):
+        paths = set()
         for index in range(3):
             self.notice(sid=f"fleet-{index}-A", key=f"fleet-{index}")
-            tidy._append_ledger_entry(tidy.Seat("pane", f"fleet-seat-{index}"), dict(event="succession",
-                source="tidy-clear", harness="claude", **{"from": f"fleet-{index}-A"}, sid=f"fleet-{index}-B"))
+            seat = tidy.Seat("pane", f"fleet-seat-{index}")
+            row = dict(event="succession", source="tidy-clear", harness="claude",
+                       **{"from": f"fleet-{index}-A"}, sid=f"fleet-{index}-B")
+            tidy._append_ledger_entry(seat, row)
+            paths.update(ledger_copies(seat, row))
         real_read = tidy.read_bytes
         raw = []
         def read(path):
@@ -474,7 +546,7 @@ class ObservationTest(peer._TmpRootMixin, unittest.TestCase):
             return data
         with mock.patch.object(tidy, "read_bytes", side_effect=read):
             self.assertEqual(self.counts()["no_recipient"], 3)
-            self.assertEqual(len(raw), 3)
+            self.assertEqual(Counter(Path(path) for path, _size in raw), Counter(paths))
             observed = list(raw)
             seat = tidy.Seat("pane", Path(raw[0][0]).stem)
             with mock.patch.object(tidy, "_lineage_transcript", return_value={"path": None, "status": "missing"}):
@@ -1063,6 +1135,8 @@ class BindingScopeDiscoveryTest(peer._TmpRootMixin, unittest.TestCase):
 
     def test_read_only_discovery_and_bindings_share_observed_bytes_and_parsing(self):
         jobs, origin, holder, metas, bindings, seats = self.seed("one-observation", structured=True)
+        paths = {path for seat in seats for path in ledger_copies(
+            seat, json.loads(tidy._ledger_path(seat).read_text()))}
         context = PeerReadContext()
         real_read = tidy.read_bytes
         raw = []
@@ -1075,8 +1149,9 @@ class BindingScopeDiscoveryTest(peer._TmpRootMixin, unittest.TestCase):
                 mock.patch.object(tidy, "_read_ledger_lines", wraps=tidy._read_ledger_lines) as parses, \
                 mock.patch.object(handover, "pane_seat", return_value=seats[0]):
             graph = handover.lineage_graph(read_context=context)
-            self.assertEqual(len(raw), len(seats))
-            self.assertEqual(parses.call_count, len(seats))
+            self.assertEqual(Counter(Path(path) for path, _size in raw), Counter(paths))
+            self.assertEqual(Counter(tidy._ledger_path(call.args[0]) for call in parses.call_args_list),
+                             Counter(paths))
             observed = list(raw)
             self.assertEqual(len(self.candidates(jobs, holder, context=context)), 13)
             self.assertEqual(len(handover.current_bindings("codex", holder, jobs, read_context=context)), 12)
@@ -1090,12 +1165,12 @@ class BindingScopeDiscoveryTest(peer._TmpRootMixin, unittest.TestCase):
                     jobs=jobs, read_context=context), ("codex", holder))
                 self.assertEqual(handover.effective_parent(meta, jobs, read_context=context), holder)
             self.assertEqual(raw, observed)
-            self.assertEqual(parses.call_count, len(seats))
+            self.assertEqual(parses.call_count, len(paths))
             # The next existing observation reads current bytes, even when it
             # reuses both the context and the global parsed graph.
             self.assertIs(handover.lineage_graph(read_context=context), graph)
             self.assertEqual(raw, observed + observed)
-            self.assertEqual(parses.call_count, len(seats))
+            self.assertEqual(parses.call_count, len(paths))
 
     def test_string_and_structured_explicit_scopes_follow_only_qualified_holder_hops(self):
         for legacy in (False, True):

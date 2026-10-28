@@ -203,8 +203,19 @@ class L2CollectorIntegrationTest(unittest.TestCase):
                                           (json.dumps(foreign_row, sort_keys=True) + "\n").encode())
                     handover._LINEAGE_GRAPH_CACHE.clear()
                     fleet_collectors.resolve_parent_edges([predecessor, successor], [job])
+                    # The native-session ledger still contains the exact
+                    # binding. Replacing only its physical copy cannot revoke it.
+                    self.assertEqual(job._parent_edge_sid, "new-parent")
+                    logical = tidy.session_seat(seat, harness, "new-parent")
+                    with tidy.seat_lock(seat.key):
+                        tidy.atomic_write(tidy._native_ledger_path(logical),
+                                          (json.dumps(foreign_row, sort_keys=True) + "\n").encode())
+                    handover._LINEAGE_GRAPH_CACHE.clear()
+                    fleet_collectors.resolve_parent_edges([predecessor, successor], [job])
                     self.assertIsNone(job._parent_edge_sid)
                     self.assertTrue(job._parent_edge_promoted_orphan)
+                    self.assertEqual(job.parent_sid, "old-parent")
+                    self.assertEqual(job._registry_metadata, metadata)
 
     def test_stale_app_server_and_absent_parent_all_grace_identically(self):
         # F-80 L2c: three different reasons a parent is "not visible" (stale filter,
