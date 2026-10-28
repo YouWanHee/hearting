@@ -565,6 +565,11 @@ class TestProgressLaunch(unittest.TestCase):
                 "nodes": [{"id": "eval-run", "kind": "resource-runner", "resource_transport": "detached-process"}]}))
             payload = (f"import sys, time; sys.path.insert(0, {str(ROOT / 'utilities')!r}); "
                        "from resource_progress import write_progress; assert write_progress(1, 'item'); time.sleep(.2)")
+            smoke_spec = importlib.util.spec_from_file_location("progress_smoke_fixture", SMOKE)
+            smoke = importlib.util.module_from_spec(smoke_spec)
+            smoke_spec.loader.exec_module(smoke)
+            smoke_input = root / "smoke-input"
+            smoke_input.write_text("progress fixture\n")
             children = []
             real_popen = subprocess.Popen
             def spawn(*args, **kwargs):
@@ -576,6 +581,14 @@ class TestProgressLaunch(unittest.TestCase):
                  mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "",
                                              "AGENT_RESOURCE_PROGRESS_FILE": str(root / "foreign.json"),
                                              "AGENT_RESOURCE_RUN_ID": "foreign", "AGENT_RESOURCE_NODE": "other"}):
+                # Use the normal producer payload and seal for this launch's
+                # exact command/cwd/environment, alongside the earlier mocks.
+                attestation = smoke.payload([smoke_input], [sys.executable, "-c", payload], root)
+                attestation.update(status="passed", exit_code=0)
+                attestation["attestation_hash"] = "sha256:" + hashlib.sha256(json.dumps(
+                    attestation, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                smoke.verify(attestation)
+                (root / "smoke.json").write_text(json.dumps(attestation))
                 R.main(["--registry", str(registry), "start", "--run-id", "auto", "--cwd", str(root),
                         "--log", str(log), "--route", str(route), "--node", "eval-run",
                         "--smoke-attestation", str(root / "smoke.json"), "--", sys.executable, "-c", payload])
@@ -766,11 +779,19 @@ class TestRunner(unittest.TestCase):
                 with mock.patch.object(G, "local_observation", return_value=observation), \
                      contextlib.redirect_stdout(output):
                     if mode == "main":
+                        smoke = load(root / "tools" / "smoke-attestation.py", "probe_smoke_fixture")
+                        attestation = smoke.payload([route_file], command, base)
+                        attestation.update(status="passed", exit_code=0)
+                        attestation["attestation_hash"] = "sha256:" + hashlib.sha256(json.dumps(
+                            attestation, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                        smoke.verify(attestation)
+                        smoke_path = base / "smoke.json"
+                        smoke_path.write_text(json.dumps(attestation))
                         with mock.patch.object(runner, "verify_launch_input"), \
                              mock.patch.object(runner, "register_registry"):
                             runner.main(["--registry", str(registry), "start", "--run-id", run_id,
                                 "--cwd", str(base), "--log", str(log), "--route", str(route_file),
-                                "--node", node_id, "--smoke-attestation", str(base / "unused-attestation"),
+                                "--node", node_id, "--smoke-attestation", str(smoke_path),
                                 "--", *command])
                     else:
                         import artifact_producer
