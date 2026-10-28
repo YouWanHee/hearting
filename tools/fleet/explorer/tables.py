@@ -435,7 +435,27 @@ def _session_unfold(grid, vm, x, use, y, session, c):
                 grid.add_hit(y, cursor, open_x, ("pane", tag, str(pane)))
     else:
         grid.put(x_val, y, "·", "dim")
+    _session_open_link(grid, x_lab, x_val, right, y + 1, tag)
     return y + 2
+
+
+SESSION_OPEN_LABEL = "PAGE"
+SESSION_OPEN_LINK = "(open ▸)"
+
+
+def _session_open_link(grid, x_lab, x_val, right, y, tag):
+    """The unfolded row's way to its session page, whose HISTORY lists the seat's generations.
+
+    It takes the spacer row under ASK. Only a wholly drawn ``(open ▸)`` is a target: a
+    ``("page", "session", tag)`` hit, which the reducer opens on press (no tree drag).
+    A spacer at or past the page's overflow probe row (``rows - 5``) stays blank, as before.
+    """
+    if y >= grid.rows - 5:
+        return
+    grid.put(x_lab, y, SESSION_OPEN_LABEL, "label", limit=right)
+    end = grid.put(x_val, y, SESSION_OPEN_LINK, "hearting", limit=right)
+    if end == x_val + _seg_width(SESSION_OPEN_LINK):
+        grid.add_hit(y, x_val, end, ("page", "session", tag))
 
 
 def _draw_overview_route(grid, x, use, y, route, steward=False):
