@@ -1831,7 +1831,13 @@ class OwnerInputIdentityLineageTest(unittest.TestCase):
         value = {"target": "target", "thread_id": "thread-1", "requests": []}
         route = {"route_id": "rt-owner", "route_hash": "sha256:owner"}
         armed = {"jobs": jobs, "route_id": "rt-owner", "route_hash": "sha256:owner"}
-        resource = {"route": jobs, "node": "full-run", "run_id": "run-1",
+        # The row names its sealed route file; an unreadable address is an
+        # unobserved holder, never a current one.
+        route_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(route_dir.cleanup)
+        route_file = Path(route_dir.name) / "rt-owner.json"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        resource = {"route": str(route_file), "node": "full-run", "run_id": "run-1",
                     "parent_attempt_id": "att-owner", "owner_wait": {
             "session_id": "thread-1", "route_id": "rt-owner", "route_hash": "sha256:owner",
             "jobs": str(Path(jobs).resolve()), "parent_attempt_id": "att-owner",

@@ -232,7 +232,10 @@ def inherit_resource_watch(route, ledger, armed, holder):
     """Copy an ancestor's exact watch bytes into this ledger, once.
 
     The watch keeps naming the route that recorded it; only its location moves
-    to the successor that now holds the run. Replay writes nothing.
+    to the successor that now holds the run. A replay writes nothing when the
+    watch and the READY/RUNNING records are all there, and otherwise finishes
+    only the steps an interrupted earlier call left (returns whether this call
+    wrote anything).
     """
     if armed.get("predecessor_kind") != "resource" or not holder.get("inherited"):
         raise SupervisorError("resource-watch-inheritance-not-applicable")
@@ -267,27 +270,41 @@ def inherit_resource_watch(route, ledger, armed, holder):
             break
     if raw is None:
         raise SupervisorError("resource-watch-inheritance-unavailable")
+    wrote = False
     with ledger.lock():
         if resource_continuation_cancelled(route, ledger):
             raise SupervisorError("resource-parent-close-requested")
+        present = False
         for watch in read_resource_watches(ledger, node):
             if resource_watch_key(watch) != resource_watch_key(armed):
                 continue
-            if watch == armed:
-                return False
-            raise SupervisorError("resource-watch-binding-conflict")
-        primary = read_armed(ledger).get(node)
-        target = armed_dir(ledger) / f"{node}.json"
-        if primary is not None and primary != armed:
-            target = resource_watch_storage_path(ledger, armed)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        WS._atomic_write(target, raw.decode("utf-8"))
-        if target.read_bytes() != raw:
-            raise SupervisorError("resource-watch-inheritance-mismatch")
+            if watch != armed:
+                raise SupervisorError("resource-watch-binding-conflict")
+            present = True
+        if not present:
+            primary = read_armed(ledger).get(node)
+            target = armed_dir(ledger) / f"{node}.json"
+            if primary is not None and primary != armed:
+                target = resource_watch_storage_path(ledger, armed)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            WS._atomic_write(target, raw.decode("utf-8"))
+            if target.read_bytes() != raw:
+                raise SupervisorError("resource-watch-inheritance-mismatch")
+            wrote = True
+        # Whether this call wrote the file or an earlier one was interrupted
+        # after it, finish only the steps still missing; never move a state that
+        # has already progressed, finished, or been cancelled.
         state = ledger.state()
         if state["workflow_state"] == "CREATED":
             ledger.set_workflow_state("READY", evidence={"armed": node}, actor="arm")
-        if node not in state["nodes"]:
+            wrote = True
+        state = ledger.state()
+        watch_sha = hashlib.sha256(raw).hexdigest()
+        if state["workflow_state"] in {"READY", "RUNNING"} and node not in state["nodes"] and not any(
+                entry.get("node") == node
+                and ((entry.get("evidence") or {}).get("inherited_watch") or {}).get(
+                    "watch_sha256") == watch_sha
+                for entry in ledger.journal()):
             chain = holder.get("chain") or []
             ledger.record(node, "RUNNING", evidence={"armed": True, "inherited_watch": {
                 "source_route_id": origin.get("route_id"),
@@ -295,11 +312,13 @@ def inherit_resource_watch(route, ledger, armed, holder):
                 "source_route_file": origin.get("route_file"),
                 "source_owner_attempt_id": (chain[-1] if chain else {}).get("owner_attempt_id"),
                 "successor_route": holder.get("route_file"),
-                "watch_sha256": hashlib.sha256(raw).hexdigest(),
+                "watch_sha256": watch_sha,
             }}, actor="arm")
+            wrote = True
         if ledger.state()["workflow_state"] == "READY":
             ledger.set_workflow_state("RUNNING", evidence={"armed": node}, actor="arm")
-    return True
+            wrote = True
+    return wrote
 
 
 def read_resource_watches(ledger, node=None, *, primary=None):
@@ -1205,7 +1224,8 @@ def _resource_owner_matches(left, right):
     left_owner, right_owner = left.get("owner_wait") or {}, right.get("owner_wait") or {}
     left_holder = OWNER_RESOURCE.resource_holder(left)
     right_holder = OWNER_RESOURCE.resource_holder(right)
-    if ((left_holder.get("route_id"), left_holder.get("route_hash"))
+    if (not left_holder.get("observed", True) or not right_holder.get("observed", True)
+            or (left_holder.get("route_id"), left_holder.get("route_hash"))
             != (right_holder.get("route_id"), right_holder.get("route_hash"))
             or left.get("resource_policy") != "supervised-owner"
             or right.get("resource_policy") != "supervised-owner"
@@ -1231,7 +1251,8 @@ def _resource_owner_matches(left, right):
         route={"route_id": left_holder.get("route_id"),
                "route_hash": left_holder.get("route_hash")},
         owner_attempt_id=other_owner.get("parent_attempt_id"),
-        session_id=other_owner.get("session_id"), jobs=other.get("jobs")) is not None
+        session_id=other_owner.get("session_id"), jobs=other.get("jobs"),
+        historical=True) is not None
 
 
 def _owner_input_matches_locked(route, armed, resource_row, owner_attempt_id, owner_session_id,
@@ -1293,7 +1314,10 @@ def _owner_settlement_snapshot(route, ledger, armed, row=None):
     owner = row.get("owner_wait") or {}
     if not isinstance(owner, dict):
         return None
-    owner_attempt_id = row.get("parent_attempt_id")
+    # The row's own owner is the run's recorded history (q1). Who settled it is
+    # the stage evidence's owner; a run no handoff moved was settled by that
+    # same original owner under its recorded session.
+    row_owner_id = row.get("parent_attempt_id")
     identity = RR.compute_execution_identity(row)
     row_digest = RESOURCE_RESUME.row_digest(row)
     resource_binding = OWNER_RESOURCE.resource_body_digest(row)
@@ -1319,15 +1343,22 @@ def _owner_settlement_snapshot(route, ledger, armed, row=None):
         return None
     holder = OWNER_RESOURCE.resource_holder(row)
     origin = holder.get("origin") or {}
+    owner_attempt_id = evidence.get("owner_attempt_id")
+    if holder.get("inherited"):
+        settling_session = evidence.get("owner_session_id")
+    else:
+        settling_session = owner.get("session_id")
     responsibility = OWNER_RESOURCE.current_responsibility(
         row, route=route, owner_attempt_id=owner_attempt_id,
-        session_id=owner.get("session_id"), jobs=jobs)
+        session_id=settling_session, jobs=jobs, historical=True)
     if (stage.get("state") != "STAGE_SUCCEEDED"
             or responsibility is None
             or not (owner_successor_start or owner_terminal_settlement)
-            or not owner_attempt_id or owner.get("parent_attempt_id") != owner_attempt_id
-            or evidence.get("owner_attempt_id") != owner_attempt_id
-            or (evidence.get("owner_session_id") is not None
+            or not row_owner_id or owner.get("parent_attempt_id") != row_owner_id
+            or not owner_attempt_id
+            or (not holder.get("inherited") and owner_attempt_id != row_owner_id)
+            or (not holder.get("inherited")
+                and evidence.get("owner_session_id") is not None
                 and evidence.get("owner_session_id") != owner.get("session_id"))
             or row.get("run_id") != armed.get("predecessor_id")
             or row.get("resource_policy") != "supervised-owner"
@@ -1912,7 +1943,7 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
             responsibility = OWNER_RESOURCE.current_responsibility(
                 row or {}, route=route, owner_attempt_id=owner_attempt_id,
                 session_id=(row or {}).get("owner_wait", {}).get("session_id"),
-                jobs=str(jobs))
+                jobs=str(jobs), historical=True)
             if (row is None or row.get("resource_policy") != "supervised-owner"
                     or responsibility is None
                     or row.get("route") != origin.get("route_file") or row.get("node") != node

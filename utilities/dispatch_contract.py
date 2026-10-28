@@ -8807,7 +8807,8 @@ def _resource_stage_marker_current(route, node, marker, marker_path, jobs):
         responsibility = __import__("dispatch_resource_wait").current_responsibility(
             row, route=route, owner_attempt_id=evidence.get("owner_attempt_id"),
             session_id=evidence.get("owner_session_id") or owner_wait.get("session_id"),
-            jobs=str(jobs_path) if jobs_path else str(owner_wait.get("jobs") or ""))
+            jobs=str(jobs_path) if jobs_path else str(owner_wait.get("jobs") or ""),
+            historical=True)
         if (stage.get("state") != "STAGE_SUCCEEDED"
                 or responsibility is None
                 or evidence.get("resource_execution_identity") != resource_identity

@@ -184,15 +184,25 @@ def resource_binding_matches(armed, row):
     return True
 
 
+class HolderUnobserved(JOIN.JoinContractError):
+    """A preserved run's holder, or the watches an ancestor kept, could not be read.
+
+    This is "could not look", never "nothing moved": callers retry the same
+    observation (the wait loop on its next poll, a new start as a retryable
+    refusal) instead of treating the answer as no transfer.
+    """
+
+
 def _pin_holder(route_file, route_id, route_hash, node, run_id, *, kind, jobs):
     import route_parent_close
     origin = {"route_file": route_file, "route_id": route_id, "route_hash": route_hash}
     try:
         return route_parent_close.pin_handoff_holder(
             route_file, route_id, route_hash, node, run_id, kind=kind, jobs=jobs)
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+    except Exception as error:  # an unexpected failure is never "no transfer"
         return {"route_file": route_file, "route_id": route_id, "route_hash": route_hash,
-                "inherited": False, "origin": origin, "chain": []}
+                "inherited": False, "origin": origin, "chain": [], "observed": False,
+                "unobserved_reason": "holder-unexpected:" + type(error).__name__}
 
 
 def resource_holder(row, *, kind="resource"):
@@ -201,45 +211,59 @@ def resource_holder(row, *, kind="resource"):
     owner = row.get("owner_wait") or {}
     route_id = owner.get("route_id") or row.get("route_id")
     route_hash = owner.get("route_hash") or row.get("route_hash")
-    if row.get("route") and (route_id is None or route_hash is None):
-        # Older rows name only their route file; the sealed file is the address.
-        try:
-            sealed = json.loads(Path(row["route"]).read_text(encoding="utf-8"))
-            if isinstance(sealed, dict):
-                route_id = route_id or sealed.get("route_id")
-                route_hash = route_hash or sealed.get("route_hash")
-        except (OSError, ValueError, TypeError):
-            pass
     return _pin_holder(row.get("route"), route_id, route_hash, row.get("node"),
                        row.get("run_id"), kind=kind, jobs=row.get("jobs"))
 
 
 def compute_holder(provenance, *, run_id=None, jobs=None):
-    """The route that currently holds one compute execution's provenance."""
+    """The route that currently holds one compute execution's provenance.
+
+    Accepts both shapes the same record appears in: the nested
+    ``meta.provenance`` (its ``resource`` sub-dict carries the route address)
+    and the flat resource provenance that `compute-hosts.execution_record`
+    already extracted. The record itself is never rewritten.
+    """
     provenance = provenance if isinstance(provenance, dict) else {}
-    identity = run_id or provenance.get("compute_run_id") or provenance.get("run_id")
-    return _pin_holder(provenance.get("route_file"), provenance.get("route_id"),
-                       provenance.get("route_hash"), provenance.get("node"), identity,
-                       kind="compute", jobs=jobs or provenance.get("jobs"))
+    nested = provenance.get("resource")
+    resource = nested if isinstance(nested, dict) else provenance
+    identity = run_id or provenance.get("compute_run_id")
+    return _pin_holder(resource.get("route_file"), resource.get("route_id"),
+                       resource.get("route_hash"), resource.get("node"), identity,
+                       kind="compute", jobs=jobs or resource.get("jobs"))
 
 
-def current_responsibility(row, *, route, owner_attempt_id, session_id, jobs):
-    """The one q2-q4 judgement: is `row` held by `route` and this current owner?
+def current_responsibility(row, *, route, owner_attempt_id, session_id, jobs, historical=False):
+    """Does `route` hold `row`, and is `owner_attempt_id` bound to that route?
 
-    q1 (which route/node/watch actually recorded the run) stays exact against
-    ``holder["origin"]``; this function answers only current holding, owner and
-    session. A row that no proven handoff moved keeps its exact prior checks.
+    Answers q2 (the route that holds the run) and q3 (the owner attempt bound
+    to that route). It does NOT answer q4, the native conversation: the effect
+    paths (context/wait/admit/aggregate/owner input) keep their own owner input
+    target/thread/lease, phase-state session and `_owner_row_proof` checks, and
+    an inherited row's `session_id` is deliberately not read here because the
+    recorded session is the previous owner's.
+
+    ``historical=True`` reads a recorded fact (marker currency, settlement
+    snapshot): the owner attempt need not be running now. Effect paths leave it
+    False, so for an inherited row the owner attempt must be open/running; that
+    separates a past owner of the same route from the current one.
+
+    q1 (which route/node/watch recorded the run) stays exact against
+    ``holder["origin"]``. A row no proven handoff moved keeps its exact checks.
+    A holder that could not be observed is not current.
     """
     route = route if isinstance(route, dict) else {}
     holder = resource_holder(row)
+    if not holder.get("observed", True):
+        return None
     if (holder.get("route_id") != route.get("route_id")
             or holder.get("route_hash") != route.get("route_hash")):
         return None
     owner = (row.get("owner_wait") or {}) if isinstance(row, dict) else {}
     expected_jobs = str(jobs) if jobs not in (None, "") else None
     if not holder.get("inherited"):
-        # Older rows named only their route file; its sealed address and the
-        # row's own jobs record are that row's origin.
+        # Older rows named only their route file; its sealed address (and the
+        # row's own jobs record) is that row's origin. This fallback replaces
+        # owner_wait.route_id/route_hash/jobs only when they are absent.
         row_route_id = owner.get("route_id") or holder.get("route_id")
         row_route_hash = owner.get("route_hash") or holder.get("route_hash")
         row_jobs = owner.get("jobs") or row.get("jobs")
@@ -263,34 +287,55 @@ def current_responsibility(row, *, route, owner_attempt_id, session_id, jobs):
             holder.get("route_id"), holder.get("route_hash"),
             str(Path(holder.get("route_file") or "").resolve())):
         return None
+    if not historical:
+        try:
+            if JOIN.exact_attempt_row(Path(selected), owner_attempt_id).status not in {
+                    "open", "running"}:
+                return None
+        except (JOIN.JoinContractError, OSError, ValueError, TypeError):
+            return None
     return holder
 
 
 def held_watches(route, jobs, node=None):
-    """Watches an ancestor route preserved for the node this successor resumes."""
+    """Watches an ancestor route preserved for the node this successor resumes.
+
+    Raises `HolderUnobserved` when the lineage, an ancestor ledger, a registry
+    or a row's holder cannot be read: an incomplete list is never returned as a
+    complete one, and an unreadable row is never dropped.
+    """
     if (route.get("continuation_contract_version") != 1
             or not str(route.get("reason") or "").startswith("owner-pin-handoff:")):
         return []
     import route_lineage as RL
     try:
         lineage = RL.verified_route_lineage(route, observe=True)
-    except (OSError, ValueError, TypeError):
-        return []
+    except (OSError, ValueError, TypeError) as error:
+        raise HolderUnobserved("route-lineage-unobserved:" + type(error).__name__) from error
     sup = supervisor()
     result, seen = [], set()
     for ancestor in lineage[1:]:
         try:
             ledger = sup.ledger_for(ancestor, str(jobs))
+            # `read_armed` skips a watch file it cannot parse; here that would
+            # make a kept run vanish from the list, so read each one strictly.
+            directory = sup.armed_dir(ledger)
+            for watch_file in sorted(directory.glob("*.json")) if directory.is_dir() else ():
+                json.loads(watch_file.read_text(encoding="utf-8"))
             watches = sup.read_resource_watches(ledger, node)
-        except (OSError, ValueError, TypeError):
-            continue
+        except (OSError, ValueError, TypeError) as error:
+            raise HolderUnobserved("ancestor-watches-unobserved:" + type(error).__name__) from error
         for armed in watches:
             try:
-                row = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))[
-                    "runs"][armed["predecessor_id"]]
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
+                runs = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))["runs"]
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                raise HolderUnobserved("registry-unobserved:" + type(error).__name__) from error
+            row = runs.get(armed.get("predecessor_id")) if isinstance(runs, dict) else None
+            if not isinstance(row, dict):
+                continue  # the watch names no row: nothing here to hold
             holder = resource_holder(row)
+            if not holder.get("observed", True):
+                raise HolderUnobserved("holder-unobserved:" + str(holder.get("unobserved_reason")))
             if not holder.get("inherited") or (
                     holder.get("route_id"), holder.get("route_hash")) != (
                     route.get("route_id"), route.get("route_hash")):
@@ -397,7 +442,11 @@ def context(args, control):
     for node in route.get("nodes", []):
         if not isinstance(node, dict) or node.get("kind") != "resource-runner":
             continue
-        for armed, _row in sup.resource_predecessors(ledger, node.get("id")):
+        try:
+            predecessors = sup.resource_predecessors(ledger, node.get("id"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise HolderUnobserved("registry-unobserved:" + type(error).__name__) from error
+        for armed, _row in predecessors:
             key = sup.resource_watch_key(armed)
             if key not in seen:
                 seen.add(key)
@@ -417,23 +466,37 @@ def context(args, control):
     for armed in sorted(armed_rows, key=lambda row: (str(row.get("node")),
                                                      str(row.get("predecessor_id")))):
         node = armed["node"]
-        data = json.loads(Path(armed["resource_registry"]).read_text())
+        try:
+            data = json.loads(Path(armed["resource_registry"]).read_text())
+        except (OSError, ValueError) as error:
+            raise HolderUnobserved("registry-unobserved:" + type(error).__name__) from error
         row = data.get("runs", {}).get(armed["predecessor_id"])
         if not isinstance(row, dict) or row.get("resource_policy") != "supervised-owner":
             continue
         owner = row.get("owner_wait") or {}
         holder = resource_holder(row)
-        responsibility = current_responsibility(
-            row, route=current_route, owner_attempt_id=args.parent_attempt_id,
-            session_id=control.thread_id, jobs=expected_jobs)
-        if responsibility is None:
+        proven = bool(holder.get("observed", True) and holder.get("inherited")
+                      and (holder.get("route_id"), holder.get("route_hash"))
+                      == (current_route["route_id"], current_route["route_hash"]))
+        if not proven and owner.get("parent_attempt_id") != args.parent_attempt_id:
             continue
-        origin = holder["origin"]
+        if not holder.get("observed", True):
+            if str(holder.get("unobserved_reason")).startswith("route-identity-mismatch"):
+                # The record names an address its own sealed file contradicts:
+                # that is a bad binding, not a read to retry.
+                raise JOIN.JoinContractError("resource-owner-binding-invalid")
+            raise HolderUnobserved("holder-unobserved:" + str(holder.get("unobserved_reason")))
         if binding is None:
             binding, _ = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=args.parent_attempt_id)
             if (binding is None or binding.route_file != current_route["route_file"]
                     or binding.route_id != args.route_id or binding.route_hash != args.route_hash):
                 raise JOIN.JoinContractError("resource-owner-route-changed")
+        responsibility = current_responsibility(
+            row, route=current_route, owner_attempt_id=args.parent_attempt_id,
+            session_id=control.thread_id, jobs=expected_jobs)
+        if responsibility is None:
+            raise JOIN.JoinContractError("resource-owner-binding-invalid")
+        origin = holder["origin"]
         pinned_owner_identity = (str(owner.get("owner_pid", "")),
                                  str(owner.get("owner_start", "")))
         remote_identity = compute_execution_identity(row)
@@ -635,21 +698,48 @@ def acknowledge(path, parent, receipt_id):
 
 def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
     """Scan every exact resource and deliver one ready receipt through the existing outbox."""
-    pending = pending_prompt(path, args.parent_attempt_id, args, control)
+    correction = "Continue the same work using the pending user correction; preserve the resource request."
+
+    def look(observation):
+        """An unobserved holder is looked at again on the next poll, never read as "nothing"."""
+        while True:
+            try:
+                return observation(), False
+            except HolderUnobserved:
+                if control.pending():
+                    return None, True
+                sleep(1)
+
+    pending, interrupted = look(lambda: pending_prompt(path, args.parent_attempt_id, args, control))
+    if interrupted:
+        return correction
     if pending:
         return pending
-    found = context(args, control)
+    found, interrupted = look(lambda: context(args, control))
+    if interrupted:
+        return correction
     if found is None:
         return None
     sup, route, ledger, candidates = found
     if control.pending():
-        return "Continue the same work using the pending user correction; preserve the resource request."
-    # The first wait after a proven owner-pin handoff records the inherited
-    # watches once; later waits replay them without writing.
-    for armed, row in candidates:
-        holder = resource_holder(row)
-        if holder.get("inherited"):
-            sup.inherit_resource_watch(route, ledger, armed, holder)
+        return correction
+
+    def inherit():
+        # The first wait after a proven owner-pin handoff records the inherited
+        # watches once; later waits resume only what an interrupted write left.
+        for armed, row in candidates:
+            holder = resource_holder(row)
+            if holder.get("inherited"):
+                try:
+                    sup.inherit_resource_watch(route, ledger, armed, holder)
+                except sup.SupervisorError as error:
+                    if str(error) == "resource-watch-inheritance-unavailable":
+                        raise HolderUnobserved(str(error)) from error
+                    raise
+
+    _, interrupted = look(inherit)
+    if interrupted:
+        return correction
     for armed, row in candidates:
         if (row.get("resource_policy") in {"verified-resume", "supervised-owner"}
                 and row.get("status") == "running"):
@@ -674,7 +764,9 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
             if str(error) == "resource-model-child-pending":
                 continue
             return "Continue the same work using the pending user correction; preserve the resource request."
-        refreshed = context(args, control)
+        refreshed, interrupted = look(lambda: context(args, control))
+        if interrupted:
+            return correction
         if refreshed is None:
             raise JOIN.JoinContractError("resource-owner-context-lost")
         actual = next((item for _, item in refreshed[3]
@@ -683,7 +775,9 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
               "run_id": row["run_id"], "payload_spawned": bool(actual and actual.get("launch_state") == "started"),
               "verification_pass": False, "workflow_complete": False})
 
-    refreshed = context(args, control)
+    refreshed, interrupted = look(lambda: context(args, control))
+    if interrupted:
+        return correction
     if refreshed is None:
         raise JOIN.JoinContractError("resource-owner-context-lost")
     sup, route, ledger, candidates = refreshed
@@ -698,7 +792,9 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
     while True:
         if control.pending():
             return "Continue the same work using the pending user correction; preserve the active resource."
-        current = context(args, control)
+        current, interrupted = look(lambda: context(args, control))
+        if interrupted:
+            return "Continue the same work using the pending user correction; preserve the active resource."
         if current is None:
             raise JOIN.JoinContractError("resource-owner-context-lost")
         sup, route, ledger, current_rows = current
@@ -711,7 +807,9 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
             for child in getattr(args, "resource_children", {}).get(key, ()):
                 child.poll()  # Only actual unreaped Popen children, never rediscovered PIDs.
         sup.poll_once(route, ledger)
-        refreshed = context(args, control)
+        refreshed, interrupted = look(lambda: context(args, control))
+        if interrupted:
+            return "Continue the same work using the pending user correction; preserve the active resource."
         if refreshed is None:
             raise JOIN.JoinContractError("resource-owner-context-lost")
         ready = []

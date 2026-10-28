@@ -797,6 +797,17 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     import resource_run_registry as RR
     sup = OWNER_RESOURCE.supervisor()
     ledger = sup.ledger_for(route, jobs) if route.get("route_id") else None
+
+    def held_history(current_route, current_jobs, node):
+        # Runs an ancestor kept for this node protect a new start like any
+        # other predecessor. A history that could not be read to its end is not
+        # "no conflict": the start is refused with the same retryable token the
+        # captured-history checks use, and the next attempt reads it again.
+        try:
+            return OWNER_RESOURCE.held_watches(current_route, str(current_jobs), node)
+        except OWNER_RESOURCE.HolderUnobserved as error:
+            print("resource-runner: held history unobserved: " + str(error), file=sys.stderr)
+            raise ValueError("resource-reservation-changed") from error
     # Capture compute predecessor evidence before taking the ledger or registry
     # writer lock. The callback below rechecks each captured row byte identity.
     try:
@@ -808,7 +819,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     initial_history_pairs = sup.resource_predecessors(ledger, args.node) if ledger else []
     if ledger:
         known_history = {sup.resource_watch_key(armed_row) for armed_row, _ in initial_history_pairs}
-        for armed_row, row in OWNER_RESOURCE.held_watches(route, str(jobs), args.node):
+        for armed_row, row in held_history(route, jobs, args.node):
             if sup.resource_watch_key(armed_row) in known_history:
                 continue
             known_history.add(sup.resource_watch_key(armed_row))
@@ -927,7 +938,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         history_pairs = sup.resource_predecessors(ledger, args.node) if ledger else []
         if ledger:
             known_history = {sup.resource_watch_key(armed_row) for armed_row, _ in history_pairs}
-            for armed_row, row in OWNER_RESOURCE.held_watches(route, str(jobs), args.node):
+            for armed_row, row in held_history(route, jobs, args.node):
                 if sup.resource_watch_key(armed_row) in known_history:
                     continue
                 known_history.add(sup.resource_watch_key(armed_row))
@@ -1249,11 +1260,17 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                         and provenance.get("route_file") == str(Path(route_file).resolve(strict=True)))
     holder = None if exact_provenance else OWNER_RESOURCE.compute_holder(
         provenance, run_id=compute_run_id, jobs=str(jobs))
-    inherited_provenance = bool(holder and holder.get("inherited")
+    inherited_provenance = bool(holder and holder.get("observed", True) and holder.get("inherited")
                                 and (holder.get("route_id"), holder.get("route_hash"),
                                      holder.get("route_file"))
                                 == (route.get("route_id"), route.get("route_hash"),
                                     str(Path(route_file).resolve(strict=True))))
+    if holder is not None and not holder.get("observed", True) and not exact_provenance:
+        fail_compute("resource-compute-observation-unavailable", differences=[
+            {"field": "provenance.holder", "expected": "readable route lineage",
+             "actual": holder.get("unobserved_reason")}],
+            next_action="restore access to the route lineage, then retry the same compute run",
+            retryable=True)
     if (not exact_provenance and not inherited_provenance) or Path(
             provenance.get("registry", "")).resolve(strict=False) != registry:
         fail_compute("resource-compute-route-mismatch", differences=[
@@ -1362,11 +1379,25 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
         original = json.loads(registry.read_text(encoding="utf-8")).get("runs", {}).get(
             armed.get("predecessor_id"))
         original_holder = OWNER_RESOURCE.resource_holder(original or {})
+        if not original_holder.get("observed", True):
+            fail_compute("resource-compute-observation-unavailable", differences=[
+                {"field": "resource.holder", "expected": "readable route lineage",
+                 "actual": original_holder.get("unobserved_reason")}],
+                next_action="restore access to the route lineage, then retry the same compute run",
+                retryable=True)
         if (original_holder.get("route_id"), original_holder.get("route_hash")) != (
                 route.get("route_id"), route.get("route_hash")):
             continue
+        if not original_holder.get("inherited") and (
+                armed.get("route_id") != route.get("route_id")
+                or armed.get("route_hash") != route.get("route_hash")):
+            continue
         parent = provenance.get("contract") or {}
-        origin = original_holder.get("origin") or {}
+        # A run no handoff moved is bound to this route's own file and hash; only
+        # an inherited run is bound to the address that first recorded it.
+        origin = (original_holder.get("origin") or {} if original_holder.get("inherited") else
+                  {"route_file": str(Path(route_file).resolve(strict=True)),
+                   "route_hash": route.get("route_hash")})
         candidate_bindings = [
             ("resource_policy", "supervised-owner",
              original.get("resource_policy") if isinstance(original, dict) else None),

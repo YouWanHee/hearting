@@ -406,12 +406,15 @@ class ComputeRunAdoptionTest(unittest.TestCase):
                                    "route_hash": self.route["route_hash"],
                                    "route_file": str(self.route_file),
                                    "owner_attempt_id": "att-original"}]}
+            # Like the real holder: a run no handoff moved has the address its
+            # own record names as its origin.
+            recorded = (document or {}).get("route") or (document or {}).get("route_file")
             return {"route_id": self.route["route_id"],
                     "route_hash": self.route["route_hash"],
                     "route_file": str(self.route_file), "inherited": False,
                     "origin": {"route_id": self.route["route_id"],
                                "route_hash": self.route["route_hash"],
-                               "route_file": str(self.route_file)},
+                               "route_file": recorded or str(self.route_file)},
                     "chain": []}
         return holder
 
@@ -422,6 +425,18 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         self.assertEqual(adopted["execution"]["run_id"], "compute-1")
         self.assertEqual(adopted["route"], str(self.route_file.resolve()))
         self.assertEqual(adopted["parent_attempt_id"], "att-owner")
+
+    def test_adopt_compute_run_without_handoff_still_compares_the_current_route_file(self):
+        # A run no handoff moved is bound to this route's own file: a row that
+        # names another file under the same id/hash is not adopted.
+        self.original["route"] = str(self.root / "another-route.json")
+        self.registry.write_text(json.dumps({"schema_version": 1,
+                                             "runs": {"full-run": self.original}}))
+        with self.assertRaises(SystemExit) as refused:
+            self._run_adoption()
+        self.assertEqual(refused.exception.code, 65)
+        self.assertIn("resource-compute-binding-conflict", refused.exception.resource_message)
+        self.assertIn("resource.route", refused.exception.resource_message)
 
     def test_adopt_compute_run_refuses_route_free_provenance(self):
         runs = self._run_adoption(route_free=True)
