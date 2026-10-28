@@ -1711,6 +1711,12 @@ consume that result when the shared replacement lineage proves a launched
 successor and its owner-route ancestry includes the resource route. Ordinary
 start checks the current owner's input lease, pending corrections and exact
 resource evidence before creating the existing once-only successor claim.
+Terminal settlement uses the same registered lineage after the consumer has
+finished: both owner rows may already be done, and both may carry ordinal 1
+from the same replacement claim. The original-attempt edge, family, claim and
+launch record establish the handoff; ordinal inequality and a live consumer
+are not completion requirements. A foreign family, unlaunched consumer or still
+live original owner cannot settle the predecessor's pending resource stage.
 
 A missing output after an exact successful resource exit is re-observed by
 poll. When the same execution and sentinel remain proven and the output arrives,
