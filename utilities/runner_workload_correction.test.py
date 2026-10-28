@@ -104,6 +104,12 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
             "OPENCODE_CONFIG_DIR": str(self.base / "opencode"),
         })
         self.addCleanup(self._restore_environment)
+        # This workload books every requester on the private "default" server.
+        # The imported module otherwise retains the driver's earlier endpoint,
+        # which makes its real successor mark contradict those same bookings.
+        endpoint = mock.patch.object(peer_steward, "_HERDR_SESSION", "default")
+        endpoint.start()
+        self.addCleanup(endpoint.stop)
         dispatch_registry_cache.clear_cache()
         dispatch_registry_cache.reset_metrics()
         self.addCleanup(dispatch_registry_cache.clear_cache)
@@ -833,7 +839,8 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                 counts["batch_activation_calls"] += 1
             return None
 
-        def checked_reconcile(store, duties=None, *, read_context=None, retry_state=None):
+        def checked_reconcile(store, duties=None, *, read_context=None, retry_state=None,
+                              notice_selection=None, runner_incarnation=None):
             if not runner_store:
                 runner_store.append(store)
             if (runner_store[0] is store
@@ -844,8 +851,11 @@ class RunnerWorkloadCorrectionTest(unittest.TestCase):
                     counts["reconcile_retry_state_passes"] += 1
             cpu_started = time.process_time()
             try:
-                return original_reconcile(store, duties, read_context=read_context,
-                                          retry_state=retry_state)
+                return original_reconcile(
+                    store, duties, read_context=read_context, retry_state=retry_state,
+                    notice_selection=notice_selection,
+                    runner_incarnation=runner_incarnation,
+                )
             finally:
                 if (runner_store[0] is store
                         and monitoring[0] and phase[0] == "runner"):

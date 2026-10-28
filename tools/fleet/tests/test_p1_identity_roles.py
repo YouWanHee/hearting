@@ -104,6 +104,13 @@ class NativeBackgroundChainTest(unittest.TestCase):
                 self.assertEqual([(r["tag"], r["repo"], r["repo_id"]) for r in shown],
                                  [("?1", "SR_CorrNet_SD", "SR_CorrNet_SD")])
                 self.assertEqual(keys["?1"]["sid"], sid)
+                for selected in ({"claude"}, iter(["claude"])):
+                    filtered = procscan.scan(harness_filter=selected)
+                    self.assertEqual([(r.pid, r.harness) for r in filtered], [(73, "claude")])
+                    self.assertFalse(filtered.census_complete)
+                    self.assertIn("harness-filter-partial", filtered.census_reasons)
+                for selected in ({"codex"}, {"opencode"}):
+                    self.assertEqual(procscan.scan(harness_filter=selected), [])
 
             # Both consumers reject even an old resolved daemon-bound tap.
             self.assertEqual(process_identity.process_identity(71, "claude").confidence,

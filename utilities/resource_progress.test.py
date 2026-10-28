@@ -1605,9 +1605,11 @@ class ExperimentObservationTest(unittest.TestCase):
         from peer_obligations import _ordinary_notice_target
         identity = {"jobs": "/state/jobs.log", "storage_recipient": "sid-codex",
                     "lineage": {"kind": "provenance", "harness": "codex", "session_id": "sid-codex"}}
-        rows = {"seat-b": [{"from": "sid-codex", "sid": "sid-claude", "harness": "claude",
+        rows = {"seat-b": [{"event": "handover", "from": "sid-codex",
+                            "sid": "sid-claude", "harness": "claude",
                             "source": "retire", "ts": 10.0}],
-                "seat-c": [{"from": "sid-claude", "sid": "sid-claude-2", "harness": "claude",
+                "seat-c": [{"event": "handover", "from": "sid-claude",
+                            "sid": "sid-claude-2", "harness": "claude",
                             "source": "clear", "ts": 20.0}]}
         with mock.patch.object(handover, "_lineage_seats", return_value={}):
             self.assertEqual(handover.session_successor("sid-codex"), ("", ""))
@@ -1619,8 +1621,7 @@ class ExperimentObservationTest(unittest.TestCase):
             self.assertEqual(_ordinary_notice_target(identity, "codex-native-queue"),
                              ("claude", "sid-claude-2", "sid-codex"))
         with mock.patch.object(handover, "_lineage_seats", side_effect=OSError("ledger")):
-            self.assertEqual(_ordinary_notice_target(identity, "codex-native-queue"),
-                             ("codex", "sid-codex", "sid-codex"))
+            self.assertIsNone(_ordinary_notice_target(identity, "codex-native-queue"))
 
     def test_terminal_observation_keeps_durable_live_checkpoint_and_adds_one_final_notice(self):
         with tempfile.TemporaryDirectory() as tmp:

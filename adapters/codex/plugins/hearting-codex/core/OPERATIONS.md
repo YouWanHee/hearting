@@ -1261,8 +1261,12 @@ courier for the exact current `effective_parent` session. Native and recovery
 delivery share the notice claim; forms and busy turns use the courier's
 existing retained-message path. Codex and OpenCode keep their existing
 retained completion controllers.
-Confirmed session handover changes the recipient, while the signed notice stays
-under the registered parent's storage key. A run notice that names only the
+Confirmed session handover follows the unique tidy lineage, while the signed notice stays
+under the registered parent's storage key. Incomplete lineage observation leaves
+current authority unresolved and is retried without changing the ledger; exact
+historical receipts still settle their original delivery. Fleet joins the current
+recipient's harness and session together, and incomplete pending observations
+leave its absence count unknown. A run notice that names only the
 session that launched the run follows that session's seat the same way: the
 session that took the seat over receives it, across harnesses. If an older outer observer cannot
 process this retained duty, its exact PID and existing lock identify a safe
@@ -2626,6 +2630,14 @@ a finished attempt remains pending while its exact result delivery is open.
 An exact ACK or explicit no-delivery decision makes the committed outcome ready
 without waiting for route closure. Missing or unreadable delivery evidence stays
 unknown, and executor readiness keeps its existing closure rules.
+
+Route-free session notices keep their original storage SID, delivery id, receipt
+digest and ACK identity while the current recipient follows the confirmed same-
+harness lineage. New notices retain a duty in the existing peer obligation
+runner; activation also discovers valid open records left by older writers. The
+runner rechecks the recipient and one exact live pane before sending. An exact
+received peer reference or native history receipt ACKs stored records; queued
+or ambiguous transfers remain pending.
 
 **S1** no execution authority — a steward never edits the target root's source, artifact,
 registry, or spec, and never asks the target session to do what its own session refused

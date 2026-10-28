@@ -35,7 +35,15 @@ For durable completion delivery, an exact native receipt remains valid after
 the transport claim expires or changes owner. All carriers reuse that receipt
 through the delivery's existing immutable identity and `ack_received` CAS; an
 ACK write failure leaves the verified receipt usable for suppressing another
-send while settlement is retried naturally. Output, process exit, queue
+send while settlement is retried naturally. The original body's receipt markers
+bind that identity for first writes and receipt retries, including retained
+notices. Native notice watchers use the same claim and recipient check at their
+add callback, and keep the original submission identity for historical receipt
+settlement; a replacement row remains a different identity even with the same
+receipt digest. Ordinary notices keep their stored provenance or exact parent
+or owner-session authority, then use the common confirmed recipient lineage.
+The existing notice courier carries both current and legacy duties through the
+same grouping, first-write and receipt checks. Output, process exit, queue
 acceptance, or an incomplete native-history read is not receipt evidence.
 Receiving a notice settles delivery only: it does not complete the work or its
 follow-up. When native receipt evidence is absent or unknown, emission remains
@@ -131,8 +139,9 @@ adding new refusal rules.
 Read-only work shared during one input may reuse that input's parsed snapshot.
 A shared registry view may live across scan passes while its file generation is
 unchanged; each pass still checks the current generation and re-observes any
-other input it depends on. The snapshot is not authority for a state-changing
-action: claims, acknowledgements, handovers, and sends recheck the current row
+other input it depends on. Notice discovery shares that pass's registry view
+and completeness judgment before reconciliation. The snapshot is not authority
+for a state-changing action: claims, acknowledgements, handovers, and sends recheck the current row
 and binding under their existing lock. Recovery callbacks reconnect the
 existing owner of work; they do not repeat work already owned by its live
 runner.
@@ -155,6 +164,11 @@ and observes again without replaying work already owned by its live runner.
 Session hooks request that existing recovery runner and return; they do not
 replay global settlement history before delivering and acknowledging the
 session's own notices. The runner retains observation state across requests.
+Recipient checks use the registry's existing attempt index for the addressed
+records; they do not expand unrelated historical rows on each authority check.
+Lineage reads include both logical-session and physical-seat ledgers, reusing
+each file's observed bytes and parsed rows within the pass. Replacing one copy
+does not erase valid evidence in the other.
 An idle foreground waiter observes its exact parent's current row without a
 writer lock, and checks process-group cleanup only after its leader exits.
 Registry mutation keeps its fresh authority check inside the existing short

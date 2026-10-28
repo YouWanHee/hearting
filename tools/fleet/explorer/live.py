@@ -1714,6 +1714,9 @@ def _system_record(snapshot, session_rows, compute, accepted_detail, usage, now=
         pending = _num(delivery.get("pending", delivery.get("total")))
         if pending is not None:
             peer_delivery["pending"] = int(pending)
+        no_recipient = delivery.get("no_recipient")
+        if isinstance(no_recipient, int) and not isinstance(no_recipient, bool):
+            peer_delivery["no_recipient"] = no_recipient
     peer_messages = _get(snapshot, "peer_messages")
     records = _get(peer_messages, "records") if peer_messages is not None else None
     if isinstance(records, (list, tuple)):
