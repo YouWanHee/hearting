@@ -277,8 +277,9 @@ def _draw_cross_links(grid, edges, boxes, frames, right, clear_of):
                     and (sx1, ly) not in lane_cells)
         if drawable:
             allowed = {(sx1, ly), (frames[a[4]][2], ly), (frames[b[4]][0], ly)}
-            drawable = all((xx, ly) not in occupied or (xx, ly) in allowed
-                           for xx in range(sx1, dx0))
+            drawable = (all((xx, ly) not in lane_cells for xx in range(sx1, dx0))
+                        and all((xx, ly) not in occupied or (xx, ly) in allowed
+                                for xx in range(sx1, dx0)))
         if drawable:
             grid.put(sx1, ly, "├", a[5], limit=right)
             for xx in range(sx1 + 1, dx0 - 1):
