@@ -194,8 +194,9 @@ def _draw_page(grid, vm, state):
 
 
 def _page_canvas(vm, state, cols, logical_rows, pane_x, keep_rows=(), complete_page=False,
-                 viewport_rows=0):
+                 viewport_rows=0, beat=1):
     grid = _PageGrid(cols, logical_rows, pane_x, keep_rows, complete_page, viewport_rows)
+    grid.beat = int(bool(beat))
     spill_y = max(0, int(logical_rows) - 5)
     for x in range(pane_x, grid.cols):
         grid.put(x, spill_y, "━", "line")
@@ -293,6 +294,7 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
     requested = max(0, int(offsets.get("pane", 0)))
 
     grid = CellGrid(cols, rows)
+    grid.beat = int(bool(beat))
     tree_layout = chrome.draw_explorer(grid, vm, state)
 
     def render_page(offset, complete_page=False):
@@ -303,7 +305,7 @@ def draw(view_model, nav_state=None, cols=140, rows=45, beat=1):
         # Each page is a separate logical canvas, not a repaint of the sidebar.
         grid.mark_moved()
         page, overflow = _page_canvas(vm, state, int(cols), logical_rows, pane_x,
-                                      (keep_start, keep_end), complete_page, viewport_rows)
+                                      (keep_start, keep_end), complete_page, viewport_rows, beat=beat)
         overflow = overflow or page.page_incomplete
         maximum = _page_max(page, pane_x, logical_rows, viewport_rows, offset, overflow)
         return page, overflow, maximum, logical_rows

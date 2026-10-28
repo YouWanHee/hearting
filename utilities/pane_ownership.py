@@ -166,6 +166,46 @@ def _native_claude_executable(command):
     return Path(command).name == "claude" or "/claude/versions/" in command
 
 
+def verified_terminal_caller(process_info, *, pid=None):
+    """Bind a foreground shell job to a pane without granting agent ownership.
+
+    Stdio may be redirected: /proc's controlling tty, not isatty(0), is the
+    evidence. All ancestry records are read twice, including their start times.
+    No controlling terminal or inaccessible process namespace means no proof.
+    """
+    if not isinstance(process_info, dict):
+        return False
+    try:
+        caller = _process(os.getpid() if pid is None else pid)
+        shell = _process(process_info.get("shell_pid"))
+        group = process_info.get("foreground_process_group_id")
+        tty = process_info.get("tty")
+        if (not caller or not shell or not caller[3] or caller[3] != shell[3]
+                or type(group) is not int or group <= 0
+                or caller[2] != group or caller[4] != group or shell[4] != group
+                or not isinstance(tty, str) or not tty.startswith("/dev/")
+                or os.stat(tty).st_rdev != caller[3]):
+            return False
+        chain, current = [], caller
+        for _ in range(32):
+            if (not current or current[3] != caller[3]
+                    or _registered_worker(current[0]) or _runtime(current[0])[1]):
+                return False
+            chain.append(current)
+            if current[0] == shell[0]:
+                break
+            current = _process(current[1])
+        else:
+            return False
+        foreground = [_process(item.get("pid")) for item in
+                      process_info.get("foreground_processes") or [] if isinstance(item, dict)]
+        if not any(p and p[2:5] == (group, caller[3], group) for p in foreground):
+            return False
+        return all(_process(p[0]) == p for p in chain)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _runtime(pid):
     try:
         argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")

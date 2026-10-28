@@ -283,14 +283,19 @@ def linked_resources(route, path, jobs, attempts, *, all_known=False):
     registries, _ = RR.indexed_paths()
     ledger = WS.WorkflowLedger(route["route_id"], route["route_hash"], jobs=jobs)
     armed_dir = ledger.root / "armed"
-    for record in armed_dir.glob("*.json"):
+    named = set()
+    for record in [*armed_dir.glob("*.json"), *armed_dir.glob("resource-runs/**/*.json")]:
         try:
             armed = json.loads(record.read_text())
         except (OSError, ValueError):
             continue
-        if (armed.get("route_id") == route["route_id"] and armed.get("route_hash") == route["route_hash"]
-                and armed.get("resource_registry")):
+        # Position is ownership: a watch in this ledger holds its run even
+        # though its own route fields may still name the route that recorded it.
+        if armed.get("resource_registry"):
             registries.append(Path(armed["resource_registry"]))
+            if armed.get("predecessor_kind") == "resource" and armed.get("predecessor_id"):
+                named.add((str(Path(armed["resource_registry"])), armed["predecessor_id"]))
+    import dispatch_resource_wait as OWNER_RESOURCE
     result = []
     for registry in sorted(set(registries)):
         try:
@@ -303,11 +308,18 @@ def linked_resources(route, path, jobs, attempts, *, all_known=False):
             if not isinstance(run, dict):
                 continue
             owner = run.get("owner_wait") or {}
-            if not all_known and (run.get("route") != str(path.resolve())
+            exact = not (run.get("route") != str(path.resolve())
                     or run.get("parent_attempt_id") not in attempts
                     or run.get("jobs") not in {None, "", str(jobs)}
                     or owner.get("route_hash", route["route_hash"]) != route["route_hash"]
-                    or run.get("node") not in {n["id"] for n in route.get("nodes", [])}):
+                    or run.get("node") not in {n["id"] for n in route.get("nodes", [])})
+            held = (str(registry), rid) in named
+            holder = (OWNER_RESOURCE.resource_holder(run)
+                      if not exact and not held and not all_known else None)
+            inherited = bool(holder and holder.get("observed", True) and holder.get("inherited")
+                             and (holder.get("route_id"), holder.get("route_hash"))
+                             == (route["route_id"], route["route_hash"]))
+            if not all_known and not exact and not held and not inherited:
                 continue
             result.append({"kind": "resource", "run_id": rid, "registry": str(registry),
                            "row": {**run, "_registry": str(registry)}})
@@ -328,8 +340,15 @@ def linked_resources(route, path, jobs, attempts, *, all_known=False):
             continue
         provenance = meta.get("provenance") or {}
         binding = provenance.get("route") or {}
-        if all_known or (binding.get("route_id") == route["route_id"] and binding.get("route_file") == str(path.resolve())
-                and provenance.get("attempt_id") in attempts):
+        exact = (binding.get("route_id") == route["route_id"]
+                 and binding.get("route_file") == str(path.resolve())
+                 and provenance.get("attempt_id") in attempts)
+        holder = None if exact or all_known else OWNER_RESOURCE.compute_holder(
+            provenance, run_id=meta_path.parent.name)
+        inherited = bool(holder and holder.get("observed", True) and holder.get("inherited")
+                         and (holder.get("route_id"), holder.get("route_hash"))
+                         == (route["route_id"], route["route_hash"]))
+        if all_known or exact or inherited:
             state = compute._run_state(config, meta_path.parent.name)
             result.append({"kind": "compute", "run_id": meta_path.parent.name,
                            "state": "stopped" if state["stop_reason"] else state["state"],
@@ -1143,12 +1162,12 @@ def verified_owner_pin_handoff_close(route, *, jobs=None):
                    and (row.get("pin") or {}).get("harness") == target_harness
                    and target_harness != launch_harness]
         close_at = datetime.fromisoformat(str(close_intent.get("at", "")).replace("Z", "+00:00"))
+        # The writer proved its authority at record time
+        # (`capability-route._change_pins`); a later seat handover must not
+        # re-judge a pin the route's parent already recorded.
         changes = [row for row in changes
                    if isinstance(row.get("by"), dict)
                    and row["by"].get("harness") in AUTH.PIN_HARNESSES
-                   and (row["by"].get("session_id") == metadata.get("parent_sid")
-                        # The parent the seat was handed to pins with the same authority.
-                        or AUTH.owns(metadata, row["by"].get("session_id"), jobs))
                    and datetime.fromisoformat(str(row.get("at", "")).replace("Z", "+00:00")) <= close_at]
         if not target_harness or not changes:
             return None
@@ -1157,6 +1176,102 @@ def verified_owner_pin_handoff_close(route, *, jobs=None):
                 "successor": successor, "successor_route": str(successor_path_value or "")}
     except (OSError, ValueError, TypeError, KeyError, UnicodeError, AttributeError):
         return None
+
+
+def pin_handoff_holder(route_file, route_id, route_hash, node, run_id, *, kind="resource", jobs=None):
+    """The route that now holds a run recorded under one route.
+
+    Identity unless that route was closed by a verified owner-pin handoff whose
+    result preserved this run and whose successor resumes this node; then the
+    successor holds it, hop by hop to the end of the lineage.
+
+    ``observed`` separates "nothing moved" from "could not look": an unclosed
+    route, a close that is not an owner-pin handoff, a run that was not
+    preserved, an unproven handoff, or a successor that resumes elsewhere is an
+    observed identity. An unreadable or mismatched route file or outcome, a
+    cycle, or any other failure returns the last proven address with
+    ``observed: False`` and ``unobserved_reason``; callers must not read that as
+    "no transfer".
+    """
+    if route_file and (not route_id or not route_hash):
+        # A legacy registry row may omit its own route id. The sealed file it
+        # names is the same address, so read that identity instead of guessing.
+        try:
+            sealed_identity = json.loads(Path(route_file).read_text(encoding="utf-8"))
+            route_id = route_id or sealed_identity.get("route_id")
+            route_hash = route_hash or sealed_identity.get("route_hash")
+        except (OSError, ValueError, TypeError, AttributeError) as error:
+            origin = {"route_file": route_file, "route_id": route_id, "route_hash": route_hash}
+            return {**origin, "inherited": False, "origin": origin, "chain": [], "observed": False,
+                    "unobserved_reason": "route-unreadable:" + type(error).__name__}
+    origin = {"route_file": route_file, "route_id": route_id, "route_hash": route_hash}
+    current = {"route_file": route_file, "route_id": route_id, "route_hash": route_hash,
+               "inherited": False, "origin": origin, "chain": [],
+               "observed": True, "unobserved_reason": None}
+    if not route_file:
+        return current
+
+    def unobserved(reason):
+        return {**current, "observed": False, "unobserved_reason": reason}
+
+    def preserved(outcome):
+        resources = outcome.get("resources")
+        return isinstance(resources, list) and any(
+            isinstance(item, dict) and item.get("run_id") == run_id
+            and item.get("kind") == kind and item.get("preserved") is True
+            for item in resources)
+
+    seen = set()
+    try:
+        while True:
+            identity = (current["route_id"], current["route_hash"])
+            if not all(identity) or not current["route_file"]:
+                return unobserved("route-address-incomplete")
+            if identity in seen:
+                return unobserved("lineage-cycle")
+            seen.add(identity)
+            path = Path(current["route_file"])
+            try:
+                sealed = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError) as error:
+                return unobserved("route-unreadable:" + type(error).__name__)
+            if (not isinstance(sealed, dict) or sealed.get("route_id") != current["route_id"]
+                    or sealed.get("route_hash") != current["route_hash"]):
+                return unobserved("route-identity-mismatch")
+            try:
+                outcome = json.loads(path.with_suffix(".outcome.json").read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return current  # the route was never closed: nothing moved
+            except (OSError, ValueError, UnicodeError) as error:
+                return unobserved("outcome-unreadable:" + type(error).__name__)
+            if not isinstance(outcome, dict):
+                return unobserved("outcome-invalid")
+            # Most rows end here: the cheap sidecar says this route kept nothing.
+            if outcome.get("summary") != "owner-pin-handoff" or not preserved(outcome):
+                return current
+            proof = verified_owner_pin_handoff_close(sealed, jobs=jobs)
+            successor = (proof or {}).get("successor")
+            if not isinstance(successor, dict):
+                return current
+            nodes = [item.get("id") for item in successor.get("nodes") or [] if isinstance(item, dict)]
+            reused = [item.get("node_id") for item in successor.get("reused_nodes") or []
+                      if isinstance(item, dict)]
+            if successor.get("resume_from_node") != node or node not in nodes or node in reused:
+                return current
+            successor_file = proof.get("successor_route")
+            current = {"route_file": successor_file,
+                       "route_id": successor.get("route_id"),
+                       "route_hash": successor.get("route_hash"),
+                       "inherited": True, "origin": current["origin"],
+                       "chain": [*current["chain"], {
+                           "route_id": successor.get("route_id"),
+                           "route_hash": successor.get("route_hash"),
+                           "route_file": successor_file,
+                           "owner_attempt_id": proof.get("owner_attempt_id"),
+                       }],
+                       "observed": True, "unobserved_reason": None}
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, AttributeError) as error:
+        return unobserved("holder-unexpected:" + type(error).__name__)
 
 
 def recover_attempt(jobs, metadata):

@@ -1664,6 +1664,65 @@ class TestResourceLifecycle(WorkflowFixture):
         self.assertEqual(payload["parent_attempt_id"], "att-fixture")
 
 
+    def test_inherit_resource_watch_copies_source_bytes_once(self):
+        source = {"route_id": "rt-inherit-source", "route_hash": "sha256:source",
+                  "artifact_root": str(self.base), "nodes": [{"id": "full-run"}]}
+        successor = {"route_id": "rt-inherit-successor", "route_hash": "sha256:successor",
+                     "artifact_root": str(self.base),
+                     "continuation_contract_version": 1,
+                     "reason": "owner-pin-handoff:att-old:claude",
+                     "source_route_id": source["route_id"],
+                     "source_route_hash": source["route_hash"],
+                     "nodes": [{"id": "full-run"}]}
+        registry = self.base / "runs.json"
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {}}))
+        jobs_path = self.base / "jobs.log"
+        jobs_path.write_text("")
+        armed = {"route_id": source["route_id"], "route_hash": source["route_hash"],
+                 "route_file": str(self.base / "source-route.json"), "node": "full-run",
+                 "predecessor_kind": "resource", "predecessor_id": "run-1",
+                 "resource_registry": str(registry), "jobs": str(jobs_path),
+                 "successor_external": True, "successors": ["run-verify"]}
+        source_ledger = SUP.ledger_for(source, str(jobs_path))
+        SUP.armed_dir(source_ledger).mkdir(parents=True, exist_ok=True)
+        source_path = SUP.armed_dir(source_ledger) / "full-run.json"
+        source_path.write_text(json.dumps(armed))
+        source_bytes = source_path.read_bytes()
+        holder = {"inherited": True, "route_id": successor["route_id"],
+                  "route_hash": successor["route_hash"],
+                  "route_file": str(self.base / "successor-route.json"),
+                  "origin": {"route_file": armed["route_file"],
+                             "route_id": source["route_id"],
+                             "route_hash": source["route_hash"]},
+                  "chain": [{"route_id": successor["route_id"],
+                             "route_hash": successor["route_hash"],
+                             "route_file": str(self.base / "successor-route.json"),
+                             "owner_attempt_id": "att-old"}]}
+        ledger = SUP.ledger_for(successor, str(jobs_path))
+        self.assertTrue(SUP.inherit_resource_watch(successor, ledger, armed, holder))
+        target = SUP.armed_dir(ledger) / "full-run.json"
+        self.assertEqual(target.read_bytes(), source_bytes)
+        self.assertEqual(source_path.read_bytes(), source_bytes)
+        self.assertFalse(SUP.inherit_resource_watch(successor, ledger, armed, holder))
+        arm_entries = [entry for entry in ledger.journal()
+                       if entry.get("actor") == "arm" and entry.get("node") == "full-run"]
+        self.assertEqual(len(arm_entries), 1, arm_entries)
+        inherited = (arm_entries[0].get("evidence") or {}).get("inherited_watch") or {}
+        self.assertEqual(inherited.get("source_route_id"), source["route_id"])
+        self.assertEqual(inherited.get("source_owner_attempt_id"), "att-old")
+        self.assertEqual(inherited.get("watch_sha256"),
+                         hashlib.sha256(source_bytes).hexdigest())
+        self.assertEqual(source_path.read_bytes(), source_bytes)
+
+        conflict_route = {**successor, "route_id": "rt-inherit-conflict",
+                          "route_hash": "sha256:conflict"}
+        conflict_ledger = SUP.ledger_for(conflict_route, str(jobs_path))
+        SUP.armed_dir(conflict_ledger).mkdir(parents=True, exist_ok=True)
+        (SUP.armed_dir(conflict_ledger) / "full-run.json").write_text(
+            json.dumps({**armed, "successor_external": False}))
+        with self.assertRaisesRegex(SUP.SupervisorError, "resource-watch-binding-conflict"):
+            SUP.inherit_resource_watch(conflict_route, conflict_ledger, armed, holder)
+
 # ---------------------------------------------------------------------------
 # F. the graph contract itself, and the BC_ResNet_tf regression
 # ---------------------------------------------------------------------------
@@ -1851,18 +1910,26 @@ class OwnerInputIdentityLineageTest(unittest.TestCase):
             supervisor_lease_is_held=lambda *_args: True,
         )
         value = {"target": "target", "thread_id": "thread-1", "requests": []}
+        route = {"route_id": "rt-owner", "route_hash": "sha256:owner"}
         armed = {"jobs": jobs, "route_id": "rt-owner", "route_hash": "sha256:owner"}
-        resource = {"owner_wait": {
+        # The row names its sealed route file; an unreadable address is an
+        # unobserved holder, never a current one.
+        route_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(route_dir.cleanup)
+        route_file = Path(route_dir.name) / "rt-owner.json"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        resource = {"route": str(route_file), "node": "full-run", "run_id": "run-1",
+                    "parent_attempt_id": "att-owner", "owner_wait": {
             "session_id": "thread-1", "route_id": "rt-owner", "route_hash": "sha256:owner",
             "jobs": str(Path(jobs).resolve()), "parent_attempt_id": "att-owner",
             "owner_pid": 444, "owner_start": "200",
         }}
         self.assertTrue(SUP._owner_input_matches_locked(
-            armed, resource, "att-owner", "thread-1", value, input_module))
+            route, armed, resource, "att-owner", "thread-1", value, input_module))
         resource["owner_wait"]["owner_pid"] = 222
         resource["owner_wait"]["owner_start"] = "99"
         self.assertFalse(SUP._owner_input_matches_locked(
-            armed, resource, "att-owner", "thread-1", value, input_module))
+            route, armed, resource, "att-owner", "thread-1", value, input_module))
 
 
 class TestCapabilityIntegration(WorkflowFixture):

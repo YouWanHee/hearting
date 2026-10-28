@@ -1659,6 +1659,93 @@ class OpenCodeTurnCarrierTest(IsolatedRootMixin, unittest.TestCase):
             ]), 0)
         return json.loads(output.getvalue())
 
+    def test_v2_plugin_delivers_one_turn_and_settles_without_resend(self):
+        """The V2 translation layer carries one opencode-turn record through the native
+        prompt shape, settles it from session.context, and does not send it again."""
+        self.seed_turn()
+        plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
+        js = r'''
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const plugin = (await import(pathToFileURL(PLUGIN))).default;
+const prompts = [], logs = [], contextRows = [];
+let releaseIdle, releaseSecond, secondProcessed = false;
+const idleGate = new Promise((resolve) => { releaseIdle = resolve });
+const secondGate = new Promise((resolve) => { releaseSecond = resolve });
+const sessionID = "ses-oc-parent";
+const hooks = new Map();
+const ctx = {
+  location: { directory: process.cwd(), project: { id: "fixture" } },
+  app: { log: async (entry) => { logs.push(entry.body); } },
+  session: {
+    get: async ({ sessionID: sid }) => ({ data: {
+      id: sid, agent: "build", title: "Main work", parentID: null,
+      location: { directory: process.cwd() },
+    } }),
+    prompt: async (request) => {
+      if (!request || typeof request.text !== "string" || request.prompt) {
+        throw new Error("PromptInput requires top-level text");
+      }
+      prompts.push(request);
+      contextRows.push({ id: "msg_fixture", time: { created: Date.now() },
+                         type: "user", text: request.text });
+      return { data: { info: { id: "msg_fixture", sessionID, role: "user" },
+                       parts: [{ type: "text", text: request.text }] } };
+    },
+    context: async () => ({ data: contextRows }),
+    hook: async (name, fn) => hooks.set("session." + name, fn),
+  },
+  tool: { hook: async (name, fn) => hooks.set("tool." + name, fn) },
+  shell: { hook: async (name, fn) => hooks.set("shell." + name, fn) },
+  event: { subscribe: async function* ({ signal }) {
+    await idleGate;
+    yield { type: "session.idle", data: { sessionID } };
+    await secondGate;
+    yield { type: "session.idle", data: { sessionID } };
+    secondProcessed = true;
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+  } },
+  permission: { hook: async (name, fn) => hooks.set("permission." + name, fn) },
+};
+const cleanup = await plugin.setup(ctx);
+const carrierLog = (stage, reason) => logs.some((row) =>
+  row?.service === "hearting-completion-carrier" && row.extra?.stage === stage
+  && row.extra?.reason === reason);
+try {
+  await hooks.get("tool.execute.before")({ tool: "shell", sessionID, input: { command: "launch" } });
+  const env = {};
+  await hooks.get("shell.create.before")({ command: "launch", env });
+  assert.equal(env.AGENT_PARENT_COMPLETION_CARRIER, "opencode-turn:" + sessionID);
+  releaseIdle();
+  for (let i = 0; i < 200 && !carrierLog("settle", "native-receipt"); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.ok(carrierLog("settle", "native-receipt"),
+            "the V2 carrier did not settle from session.context evidence: " + JSON.stringify(logs));
+  assert.equal(prompts.length, 1, "one record must produce exactly one prompt");
+  assert.equal(prompts[0].sessionID, sessionID);
+  assert.equal(prompts[0].delivery, "steer");
+  assert.equal(typeof prompts[0].text, "string");
+  assert.ok(prompts[0].text.includes("att-0000000000000000000000000000bbbb"));
+  releaseSecond();
+  for (let i = 0; i < 100 && !secondProcessed; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(secondProcessed, true, "the second idle was not processed");
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  assert.equal(prompts.length, 1, "a settled turn was delivered again on the next idle");
+  console.log(JSON.stringify({ prompts, logs }));
+} finally { await cleanup(); }
+'''.replace("PLUGIN", json.dumps(str(plugin)))
+        env = self.env()
+        run = subprocess.run(["node", "--input-type=module", "-e", js], env=env, cwd=str(self.root),
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+        self.assertEqual(self.state(), "acked")
+        result = json.loads(run.stdout.strip().splitlines()[-1])
+        self.assertEqual(len(result["prompts"]), 1)
+        self.assertNotIn("prompt", result["prompts"][0])
+
     def test_the_sweep_steps_claim_render_and_settle_one_record(self):
         self.seed_turn()
         roots = self.cli("roots")

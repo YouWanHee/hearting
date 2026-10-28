@@ -2,8 +2,11 @@
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from tools.fleet.explorer import peers
 from tools.fleet.explorer.frame import draw
+from tools.fleet.explorer.peers import LANE_HEAD_LEFT, LANE_HEAD_RIGHT
 from tools.fleet.explorer.state import NavState
 from tools.fleet.explorer.view_model import load_fixture
 
@@ -51,6 +54,38 @@ def _lane_gutter_delta(frame, vm, expected_cells):
                 if 0 <= py < len(normalized) and 0 <= px < len(normalized[py]):
                     normalized[py][px] = list(frame.cells[yy][xx])
     return normalized
+
+
+LEGACY_HEADS = {"◀": LANE_HEAD_LEFT, "▶": LANE_HEAD_RIGHT}
+
+
+def _arrow_glyph_delta(expected_cells):
+    """The approved head change: the pane's old wide triangles are now the smaller ◂ ▸."""
+    for row in expected_cells:
+        for cell in row:
+            if cell[0] in LEGACY_HEADS:
+                cell[0] = LEGACY_HEADS[cell[0]]
+    return expected_cells
+
+
+def _lane_region(vm, boxes):
+    """Every cell a side lane or its two labels paint, in screen coordinates."""
+    cells = set()
+    for lane in vm.peer_edges.get("side_lanes", ()):
+        if len(lane) < 2:
+            continue
+        upper, lower = str(lane[0]), str(lane[1])
+        if upper not in boxes or lower not in boxes:
+            continue
+        top, bottom = boxes[upper], boxes[lower]
+        edge = top[2]
+        for yy in range(top[1] + 1, bottom[3] + 3):
+            for xx in range(edge, edge + 6):
+                cells.add((yy, xx))
+        for yy in (top[3] + 1, top[3] + 2):
+            for xx in range(top[0] + 2, top[2]):
+                cells.add((yy, xx))
+    return cells
 
 
 def _history_recede_delta(expected_cells):
@@ -101,6 +136,7 @@ class PeerPaneReference(unittest.TestCase):
                         expected["hits"], frame.tree_scroll)
                     expected_cells = [row[SEPARATOR:] for row in expected_cells[5:]]
                     expected_cells = _lane_gutter_delta(frame, vm, expected_cells)
+                    expected_cells = _arrow_glyph_delta(expected_cells)
                     expected_cells = _history_recede_delta(expected_cells)
                     expected_hits = [[hit[0] - 5, hit[1] - SEPARATOR, hit[2] - SEPARATOR, hit[3]]
                                      for hit in expected_full_hits
@@ -313,19 +349,19 @@ class PeerWrappedLayout(unittest.TestCase):
                         self.assertEqual(edge, lower_edge)
                         glyph = lambda xx, yy: frame.cells[yy][xx][0]
                         for top, bottom in ((uy, ub), (fy, fb)):
-                            self.assertEqual(glyph(edge + 1, top + 1), "◀")
+                            self.assertEqual(glyph(edge + 1, top + 1), LANE_HEAD_LEFT)
                             self.assertEqual(glyph(edge, top + 2), "├")
                             self.assertEqual(glyph(edge, bottom), "┘", "the corner stays whole")
                         self.assertEqual([glyph(xx, uy + 2) for xx in range(edge, edge + 4)],
                                          list("├──┐"))
                         self.assertTrue(all(glyph(edge + 3, yy) == "│" for yy in range(uy + 3, fy + 1)))
                         self.assertEqual([glyph(xx, fy + 1) for xx in range(edge + 1, edge + 4)],
-                                         list("◀─┘"))
+                                         [LANE_HEAD_LEFT, "─", "┘"])
                         self.assertEqual([glyph(xx, fy + 2) for xx in range(edge, edge + 6)],
                                          list("├────┘"))
                         self.assertTrue(all(glyph(edge + 5, yy) == "│" for yy in range(uy + 2, fy + 2)))
                         self.assertEqual([glyph(xx, uy + 1) for xx in range(edge + 1, edge + 6)],
-                                         list("◀───┐"))
+                                         [LANE_HEAD_LEFT, "─", "─", "─", "┐"])
                         if owners:
                             self.assertEqual(glyph(edge, fy + 3), "┤", "the owner divider stays whole")
                         # The gutter column right of the lanes belongs to the next card's left gap.
@@ -342,8 +378,167 @@ class PeerWrappedLayout(unittest.TestCase):
             self.skipTest("the frames are not side by side at this width")
         row = max(src[1], dst[1]) + 2
         line = "".join(frame.cells[row][xx][0] for xx in range(src[2], dst[0]))
-        self.assertTrue(line.startswith("├"), line)
-        self.assertTrue(line.endswith("▶"), line)
+        # The approved fixture path: tail on e4's border, two frame borders, head beside f5.
+        self.assertEqual(line, "├─╫───╫" + LANE_HEAD_RIGHT)
+        self.assertEqual(frame.cells[row][src[0]][0], "│", "the tail row is not an owner divider")
+        self.assertEqual(frame.cells[row][dst[0]][0], "│", "the head row is not an owner divider")
+
+
+def _fleet_mesh(dst="d4", owners=True, clear=False):
+    """One repo with six wrapped columns (two side-lane pairs) and a second repo's steer."""
+    from tools.fleet.explorer.view_model import ExplorerViewModel
+    values = load_fixture(FIXTURES / "view_model.json").to_mapping()
+    hearting = [("50", True), ("e2", False), ("1f", False), ("79", False),
+                ("8b", False), ("d5", False), ("d4", False), ("d7", False)]
+    sessions = [{"tag": tag, "harness": "claude", "title": f"hearting task {index}",
+                 "state": "idle", "repo": "hearting", "steward": steward,
+                 "context": 40, "window": 1.0}
+                for index, (tag, steward) in enumerate(hearting)]
+    sessions.append({"tag": "a7", "harness": "claude", "title": "SR CorrNet eval",
+                     "state": "idle", "repo": "SR_CorrNet_SD", "context": 30, "window": 1.0})
+    values["sessions"] = sessions
+    values["peer_nodes"] = [
+        ["hearting", [["50", "e2"], ["1f", "79"], ["8b"], ["d5"], ["d4"], ["d7"]]],
+        ["SR_CorrNet_SD", [["a7"]]],
+    ]
+    links = [[["50", "claude"], ["e2", "claude"], "steer", "1m ago", "n"],
+             [["e2", "claude"], ["50", "claude"], "steer", "2m ago", "n"],
+             [["1f", "claude"], ["79", "claude"], "steer", "3m ago", "n"],
+             [["79", "claude"], ["1f", "claude"], "steer", "4m ago", "n"]]
+    edges = {"links": links, "cross": [["a7", dst, "3h 22m"]],
+             "side_lanes": [["50", "e2"], ["1f", "79"]], "cards": {}, "watches": []}
+    if owners:
+        stage = {"name": "plan", "state": "done"}
+        edges["cards"] = {tag: {"owners": [{"state": "idle", "label": "lab", "stages": [stage]}]}
+                          for tag in ("d4", "d5", "a7")}
+    values["peer_edges"] = edges
+    seats = [list(seat) for seat in values.get("seats", ())]
+    if clear:
+        seats.append(["a7", "x", 4, "22:47 · 6m ago", True])
+    values["seats"] = seats
+    return ExplorerViewModel.from_mapping(values)
+
+
+class PeerCrossLinks(unittest.TestCase):
+    def test_cross_links_only_paint_their_tail_and_badge(self):
+        for cols in (120, 180, 206, 240):
+            for dst in ("d4", "d5"):
+                for owners in (False, True):
+                    vm = _fleet_mesh(dst=dst, owners=owners, clear=True)
+                    tall = draw(vm, NavState(view="PEERS", title="PEERS"), cols, 60, beat=1)
+                    with mock.patch.object(peers, "_draw_cross_links", lambda *a, **k: None):
+                        tall_plain = draw(vm, NavState(view="PEERS", title="PEERS"), cols, 60, beat=1)
+                    for rows, offset, full, plain in ((60, 0, tall, tall_plain), (26, 3, None, None)):
+                        if full is None:
+                            state = NavState(view="PEERS", title="PEERS", scroll=(("pane", offset),))
+                            full = draw(vm, state, cols, rows, beat=1)
+                            with mock.patch.object(peers, "_draw_cross_links", lambda *a, **k: None):
+                                plain = draw(vm, state, cols, rows, beat=1)
+                        boxes = _card_boxes(tall)
+                        shifted = {tag: (box[0], box[1] - offset, box[2], box[3] - offset)
+                                   for tag, box in boxes.items()}
+                        lane = {(y - offset, x) for y, x in _lane_region(vm, boxes)}
+                        protected = set(lane)
+                        for box in shifted.values():
+                            protected.update((y, x) for y in range(box[1], box[3] + 1)
+                                             for x in range(box[0], box[2] + 1))
+                        diffs = []
+                        for y in range(min(len(full.cells), len(plain.cells))):
+                            for x in range(cols):
+                                if list(full.cells[y][x]) != list(plain.cells[y][x]):
+                                    diffs.append((y, x))
+                        with self.subTest(cols=cols, dst=dst, owners=owners, offset=offset):
+                            self.assertEqual(full.pane_scroll[4], offset)
+                            for y, x in diffs:
+                                if (y, x) not in protected:
+                                    continue
+                                allowed = False
+                                for edge in vm.peer_edges["cross"]:
+                                    src, target = str(edge[0]), str(edge[1])
+                                    if src not in shifted or target not in shifted:
+                                        continue
+                                    a, b = shifted[src], shifted[target]
+                                    ly = max(a[1], b[1]) + 2
+                                    allowed = allowed or (a[0] <= x <= a[2] and y == a[3])
+                                    allowed = allowed or (y == ly and x == a[2])
+                                self.assertTrue(allowed,
+                                                f"cross paint escaped into protected cells: {(y, x)}")
+                            self.assertFalse(any((y, x) in lane for y, x in diffs),
+                                             "cross paint covered a side lane")
+
+    def test_cross_heads_and_tails_meet_card_boundaries(self):
+        seen = 0
+        cases = [("fixture", load_fixture(FIXTURES / "view_model.json"), cols)
+                 for cols in (168, 180, 206, 240)]
+        cases += [("mesh", _fleet_mesh(dst=dst, owners=True, clear=True), cols)
+                  for cols in (168, 206) for dst in ("d4", "d5")]
+        for name, vm, cols in cases:
+            frame = draw(vm, NavState(view="PEERS", title="PEERS"), cols, 60, beat=1)
+            boxes = _card_boxes(frame)
+            rows = frame.text_rows()
+            for y, row in enumerate(rows[5:], 5):
+                for x, glyph in enumerate(row):
+                    if glyph != LANE_HEAD_RIGHT or x < SEPARATOR:
+                        continue
+                    seen += 1
+                    dest = [box for box in boxes.values() if box[0] == x + 1 and box[1] < y < box[3]]
+                    self.assertEqual(len(dest), 1, f"{name} {cols} head ({x},{y}) has no destination card")
+                    dest_box = dest[0]
+                    self.assertEqual(rows[y][dest_box[0]], "│", "head row is an owner divider")
+                    tail = x - 1
+                    while tail > SEPARATOR and rows[y][tail] in "─╫":
+                        tail -= 1
+                    self.assertEqual(rows[y][tail], "├", f"{name} {cols} head ({x},{y}) has no tail")
+                    source = [box for box in boxes.values() if box[2] == tail and box[1] < y < box[3]]
+                    self.assertEqual(len(source), 1, f"{name} {cols} tail ({tail},{y}) has no source card")
+                    source_box = source[0]
+                    self.assertEqual(rows[y][source_box[0]], "│", "tail row is an owner divider")
+        self.assertGreater(seen, 0, "no cross head was drawn in any case")
+
+    def test_cross_badge_starts_after_the_clear_marker(self):
+        base = load_fixture(FIXTURES / "view_model.json").to_mapping()
+        seats = [list(seat) for seat in base["seats"]]
+        for seat in seats:
+            if seat[0] == "e4":
+                seat[2], seat[3] = 4, "22:47 · 6m ago"
+        vm = _variant(seats=seats)
+        clear = "◂ gen 3 · 6m"
+        for cols in (120, 140, 168):
+            with self.subTest(cols=cols):
+                full = draw(vm, NavState(view="PEERS", title="PEERS"), cols, 60, beat=1)
+                with mock.patch.object(peers, "_draw_cross_links", lambda *a, **k: None):
+                    plain = draw(vm, NavState(view="PEERS", title="PEERS"), cols, 60, beat=1)
+                boxes = _card_boxes(full)
+                box = boxes["e4"]
+                row = "".join(full.cells[box[3]][x][0] for x in range(box[0], box[2] + 1))
+                start = row.index(clear)
+                self.assertGreaterEqual(start, 1)
+                for x in range(box[0] + start, box[0] + start + len(clear)):
+                    self.assertEqual(full.cells[box[3]][x], plain.cells[box[3]][x],
+                                     "cross paint covered the clear marker")
+                self.assertIn("steer 3h 22m", row)
+                self.assertLess(row.index(clear), row.index("steer 3h 22m"))
+                if cols < 168:                    # the frames are stacked here, so the relation is a badge
+                    self.assertIn("[f5]", row)
+                    self.assertLess(row.index(clear), row.index("[f5]"))
+                    self.assertEqual(row[-1], "┘", "the badge overwrote the card corner")
+
+    def test_cross_layout_is_stable_while_scrolled(self):
+        vm = _fleet_mesh(owners=True, clear=True)
+        for cols in (168, 206):
+            for offset in (3, 7):
+                with self.subTest(cols=cols, offset=offset):
+                    tall = draw(vm, NavState(view="PEERS", title="PEERS"), cols, 60, beat=1)
+                    short = draw(vm, NavState(view="PEERS", title="PEERS",
+                                              scroll=(("pane", offset),)), cols, 26, beat=1)
+                    self.assertGreater(offset, 0)
+                    self.assertEqual(short.pane_scroll[4], offset)
+                    tall_rows, short_rows = tall.text_rows(), short.text_rows()
+                    for y in range(4, short.pane_scroll[3]):
+                        if "── LINKS" in short_rows[y] or "── LINKS" in tall_rows[y + offset]:
+                            break
+                        self.assertEqual(short_rows[y][SEPARATOR:], tall_rows[y + offset][SEPARATOR:],
+                                         f"scrolled pane row {y} differs from the shifted long render")
 
 
 if __name__ == "__main__":
