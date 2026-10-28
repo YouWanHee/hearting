@@ -1262,7 +1262,9 @@ delivery share the notice claim; forms and busy turns use the courier's
 existing retained-message path. Codex and OpenCode keep their existing
 retained completion controllers.
 Confirmed session handover changes the recipient, while the signed notice stays
-under the registered parent's storage key. If an older outer observer cannot
+under the registered parent's storage key. A run notice that names only the
+session that launched the run follows that session's seat the same way: the
+session that took the seat over receives it, across harnesses. If an older outer observer cannot
 process this retained duty, its exact PID and existing lock identify a safe
 observer replacement: accepted records remain intact and the replacement takes
 the same lock. A supported observer and the native carrier stay alive.

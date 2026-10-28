@@ -951,6 +951,26 @@ def _lineage_holder(rows_by_seat: dict, key: tuple, registered: str, harness: st
     return current, harness
 
 
+def session_successor(session: str, *, read_context=None) -> tuple[str, str]:
+    """``(session, harness)`` now holding the seat ``session`` handed over, else ``("", "")``.
+
+    A notice addressed to a session itself, not to one of its jobs, follows the seat:
+    the latest handover row out of a session names who took it over (a cross-pane
+    retire included), and that session's own later rows continue the chain."""
+    rows = [row for seat_rows in _lineage_seats(read_context=read_context).values()
+            for row in seat_rows if row.get("sid") and row.get("from")]
+    current, harness, seen = session, "", {session}
+    while True:
+        later = [(float(row.get("ts", 0) or 0), index, row) for index, row in enumerate(rows)
+                 if row.get("from") == current and str(row["sid"]) not in seen]
+        if not later:
+            break
+        row = max(later, key=lambda item: item[:2])[2]
+        current, harness = str(row["sid"]), str(row.get("harness") or "")
+        seen.add(current)
+    return (current, harness) if current != session else ("", "")
+
+
 def _effective(meta: dict, jobs=None, *, read_context=None, extra_seats=()) -> tuple[str, str]:
     """``(session, harness)`` answering for ``meta``'s attempt now: the lineage holder of its
     logical job.  The chain may cross panes and harnesses (a seat change hands a Codex parent's
