@@ -1,4 +1,4 @@
-"""Open one Hearting pane beside the caller without moving anyone's focus.
+"""Open a Hearting pane, or explicitly tidy the caller's existing panes.
 
 ``open_pane`` is the one place Hearting creates a terminal pane. It uses the
 terminal the caller already sits in: a Herdr pane proven to be the caller's,
@@ -6,7 +6,7 @@ then the tmux server ``$TMUX`` names when it answers, else none
 (``surface="none"`` with the command line a person can run). Placement reads
 the tab's shape and fills it as a 2×2 grid; a full tab reuses an agentless empty
 shell, then the newest other tab of the same workspace, then gets one new tab.
-It never re-lays out a tab, retries, or closes a pane, and it reports what the
+Opening never re-lays out a tab, retries, or closes a pane, and reports what the
 pane list showed right after opening.
 
 A surface only places, labels and lists panes; the command it runs is composed
@@ -20,10 +20,12 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shlex
+import signal
 import subprocess
 from typing import Optional
 
@@ -61,6 +63,106 @@ class Near:
     pane: Optional[str] = None
     workspace: Optional[str] = None
     same_tab: bool = False
+
+
+@dataclass
+class TidyResult:
+    """The last observed tab/order; notes distinguish partial and unknown state."""
+
+    surface: str
+    tab: Optional[str] = None
+    panes: list = field(default_factory=list)
+    changed: bool = False
+    notes: list = field(default_factory=list)
+
+    def json(self):
+        return asdict(self)
+
+
+class _TidyError(Exception):
+    pass
+
+
+_RECT = ("x", "y", "width", "height")
+_SUPERVISOR = re.compile(r"^(?:\[[^\]\r\n]+\]\s*)?⚑")
+
+
+def _rect(value):
+    return (isinstance(value, dict) and all(type(value.get(k)) is int for k in _RECT)
+            and min(value["x"], value["y"]) >= 0 and min(value["width"], value["height"]) > 0)
+
+
+def _reading(layout):
+    """Validate geometry before using it to address or move any existing pane."""
+    if not isinstance(layout, dict) or not _rect(layout.get("area")):
+        raise _TidyError("pane-layout-invalid")
+    area, panes = layout["area"], layout.get("panes")
+    if (not isinstance(panes, list) or not panes or any(
+            not isinstance(p, dict) or not isinstance(p.get("pane_id"), str)
+            or not p["pane_id"] or not _rect(p.get("rect")) for p in panes)):
+        raise _TidyError("pane-layout-invalid")
+    if len({p["pane_id"] for p in panes}) != len(panes):
+        raise _TidyError("pane-layout-invalid")
+    for i, pane in enumerate(panes):
+        r = pane["rect"]
+        if any(r[k] < area[k] or r[k] + r[size] > area[k] + area[size]
+               for k, size in (("x", "width"), ("y", "height"))):
+            raise _TidyError("pane-layout-invalid")
+        for other in panes[:i]:
+            b = other["rect"]
+            if all(max(r[k], b[k]) < min(r[k] + r[size], b[k] + b[size])
+                   for k, size in (("x", "width"), ("y", "height"))):
+                raise _TidyError("pane-layout-invalid")
+    return sorted(panes, key=lambda p: (p["rect"]["y"], p["rect"]["x"]))
+
+
+def _grid_rows(n):
+    cols = math.isqrt(n - 1) + 1
+    return [min(cols, n - i) for i in range(0, n, cols)]
+
+
+def _grid_cells(area, n, border=0):
+    """Integer cells for full-width rows; tmux dividers consume one cell."""
+    rows, cells = _grid_rows(n), []
+    height = area["height"] - border * (len(rows) - 1)
+    y = area["y"]
+    for i, count in enumerate(rows):
+        h = height // (len(rows) - i)
+        width, x = area["width"] - border * (count - 1), area["x"]
+        for j in range(count):
+            w = width // (count - j)
+            if min(w, h) < 4 or (border == 0 and (count - j > 10 or len(rows) - i > 10)):
+                raise _TidyError("pane-grid-too-small")
+            cells.append(dict(zip(_RECT, (x, y, w, h))))
+            width -= w
+            x += w + border
+        height -= h
+        y += h + border
+    return cells
+
+
+def _grid_matches(layout, cells):
+    panes = _reading(layout)
+    return len(panes) == len(cells) and all(
+        all(abs(p["rect"][k] - r[k]) <= 1 for k in _RECT) for p, r in zip(panes, cells))
+
+
+def _tidy_order(layout, caller):
+    panes = _reading(layout)
+    first = next((p["pane_id"] for p in panes if any(
+        _SUPERVISOR.match(p.get(key) or "") for key in ("display_agent", "title"))), caller)
+    ids = [p["pane_id"] for p in panes]
+    if first not in ids:
+        raise _TidyError("pane-caller-unconfirmed")
+    return [first] + [p for p in ids if p != first]
+
+
+def _shell_record(info):
+    from pane_ownership import _process
+    record = _process(info.get("shell_pid")) if isinstance(info, dict) else None
+    if record is None:
+        raise _TidyError("pane-process-unconfirmed")
+    return record[0], record[5]
 
 
 def _run(argv):
@@ -256,6 +358,52 @@ class HerdrSurface:
             report += ["--token", f"{name}={value}"]
         return self._ok(*report) and renamed
 
+    def process_info(self, pane):
+        info = self._result("pane", "process-info", "--pane", pane).get("process_info")
+        return info if isinstance(info, dict) and info.get("pane_id") == pane else None
+
+    def tidy_snapshot(self, pane):
+        layout = self.layout(pane)
+        ordered = _reading(layout)
+        workspace, tab = layout["workspace_id"], layout["tab_id"]
+        tabs, inventory = self.tabs(workspace), self.panes(workspace)
+        context = self._result("workspace", "get", workspace).get("workspace")
+        named = next((t for t in tabs or [] if t["tab_id"] == tab), None)
+        if (not named or not isinstance(context, dict) or context.get("workspace_id") != workspace
+                or type(context.get("focused")) is not bool or not isinstance(context.get("label"), str)
+                or not isinstance(named.get("label"), str) or inventory is None
+                or {p["pane_id"] for p in inventory if p.get("tab_id") == tab}
+                != {p["pane_id"] for p in ordered}
+                or layout.get("focused_pane_id") not in {p["pane_id"] for p in ordered}):
+            raise _TidyError("pane-snapshot-unconfirmed")
+        identity = {}
+        for p in ordered:
+            pid = p["pane_id"]
+            metadata = self._result("pane", "get", pid).get("pane")
+            if (not isinstance(metadata, dict) or metadata.get("pane_id") != pid
+                    or metadata.get("workspace_id") != workspace or metadata.get("tab_id") != tab
+                    or not isinstance(metadata.get("terminal_id"), str) or not metadata["terminal_id"]):
+                raise _TidyError("pane-identity-unconfirmed")
+            identity[pid] = (metadata["terminal_id"], *_shell_record(self.process_info(pid)))
+            for key in ("display_agent", "title"):
+                p[key] = metadata.get(key)
+        return {**layout, "identity": identity, "names": (context["label"], named["label"]),
+                "active": (context["focused"], context.get("active_tab_id")),
+                "tabs": {t["tab_id"] for t in tabs}}
+
+    def move(self, pane, *, tab=None, target=None, direction="right", ratio=.5, workspace=None):
+        destination = (["--tab", tab, "--target-pane", target, "--split", direction,
+                        "--ratio", format(ratio, ".9g")] if tab else ["--new-tab", "--workspace", workspace])
+        return self._result("pane", "move", pane, *destination, "--no-focus").get("move_result", {})
+
+    def resize(self, pane, direction, amount):
+        return self._result("pane", "resize", "--pane", pane, "--direction", direction,
+                            "--amount", format(amount, ".9g")).get("resize", {})
+
+    def swap(self, source, target):
+        return self._result("pane", "swap", "--source-pane", source,
+                            "--target-pane", target).get("swap", {})
+
 
 class TmuxSurface:
     """The tmux server ``$TMUX`` names, through ``runner(argv) -> CompletedProcess``."""
@@ -376,6 +524,59 @@ class TmuxSurface:
         for name, value in labels.items():
             ok = self._tmux("set-option", "-p", "-t", pane, f"@hearting_{name}", value) is not None and ok
         return ok
+
+    def process_info(self, pane):
+        found = self._describe(pane, "#{pane_pid}", "#{pane_tty}")
+        try:
+            from pane_ownership import _process
+            record = _process(int(found[0])) if found else None
+            if record:
+                return {"pane_id": pane, "shell_pid": record[0], "tty": found[1],
+                        "foreground_process_group_id": record[4],
+                        "foreground_processes": [{"pid": record[4]}]}
+        except (ValueError, TypeError):
+            pass
+        return None
+
+    def tidy_snapshot(self, pane):
+        found = self._describe(pane, "#{session_id}", "#{window_id}", "#{window_zoomed_flag}",
+                               "#{window_width}", "#{window_height}", "#{window_layout}",
+                               "#{window_name}", "#{session_name}", "#{pane-border-status}")
+        if not found:
+            raise _TidyError("pane-snapshot-unconfirmed")
+        session, window, zoomed, width, height, original, name, session_name, border = found
+        rows = self._rows(8, "list-panes", "-t", window, "-F", "\t".join([
+            "#{pane_id}", "#{pane_left}", "#{pane_top}", "#{pane_width}", "#{pane_height}",
+            "#{pane_active}", "#{pane_pid}", "#{pane_title}"]))
+        try:
+            width, height = int(width), int(height)
+            panes, identity, focus = [], {}, []
+            for pid, x, y, w, h, active, process, title in rows or []:
+                x, y, w, h = map(int, (x, y, w, h))
+                if border == "top" and y == 1:
+                    y, h = 0, h + 1
+                elif border == "bottom" and y + h == height - 1:
+                    h += 1
+                panes.append({"pane_id": pid, "rect": dict(zip(_RECT, (x, y, w, h))), "title": title})
+                identity[pid] = _shell_record({"shell_pid": int(process)})
+                if active == "1":
+                    focus.append(pid)
+        except (ValueError, TypeError):
+            raise _TidyError("pane-snapshot-unconfirmed") from None
+        active = self._tmux("display-message", "-p", "-t", session, "#{window_id}")
+        tabs = self.tabs(session)
+        layout = {"workspace_id": session, "tab_id": window, "zoomed": zoomed == "1",
+                  "area": dict(zip(_RECT, (0, 0, width, height))), "panes": panes,
+                  "focused_pane_id": focus[0] if len(focus) == 1 else None,
+                  "identity": identity, "names": (session_name, name),
+                  "active": active.strip() if active is not None else None,
+                  "tabs": {t["tab_id"] for t in tabs or []}, "original_layout": original}
+        if (pane not in identity or len(focus) != 1 or active is None or tabs is None
+                or any(not re.fullmatch(r"%[0-9]+", p["pane_id"]) for p in panes)):
+            raise _TidyError("pane-snapshot-unconfirmed")
+        if not layout["zoomed"]:
+            _reading(layout)
+        return layout
 
 
 def _peer_message():
@@ -504,6 +705,435 @@ def caller_surface():
         if surface.workspace_of(pane):
             return Near(surface, pane=pane)
     return None
+
+
+def _tidy_caller():
+    """Tidy alone accepts a proven foreground shell job as well as an agent."""
+    from pane_ownership import verified_terminal_caller
+    session = os.environ.get("AGENT_HERDR_SESSION") or None
+    surface = HerdrSurface(session=session)
+    pane = os.environ.get("HERDR_PANE_ID", "")
+    proven = _caller_herdr_pane(session) if pane else ""
+    if proven:
+        return Near(surface, pane=proven)
+    if pane and verified_terminal_caller(surface.process_info(pane)):
+        return Near(surface, pane=pane)
+    socket, pane = os.environ.get("TMUX", "").split(",", 1)[0], os.environ.get("TMUX_PANE", "")
+    if socket and pane:
+        surface = TmuxSurface(socket=socket)
+        if verified_terminal_caller(surface.process_info(pane)):
+            return Near(surface, pane=pane)
+    return None
+
+
+@contextmanager
+def _tidy_signals(cleanup=False):
+    """One command lifetime, restoring the caller's handlers on every exit."""
+    previous = {}
+
+    def interrupted(signum, _frame):
+        raise _TidyError(f"pane-tidy-interrupted:{signal.Signals(signum).name}")
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                old = signal.signal(sig, signal.SIG_IGN if cleanup else interrupted)
+                previous[sig] = old
+            except ValueError:  # an embedded caller outside the main thread
+                break
+        yield
+    finally:
+        for sig, old in previous.items():
+            signal.signal(sig, old)
+
+
+def _same_snapshot(base, current):
+    for key in ("workspace_id", "tab_id", "area", "zoomed", "identity", "focused_pane_id", "names", "active", "tabs"):
+        if base[key] != current[key]:
+            raise _TidyError(f"pane-state-changed:{key}")
+
+
+def _split_rect(rect, direction, ratio):
+    axis, size = ("x", "width") if direction == "right" else ("y", "height")
+    length = int(rect[size] * ratio + .5)
+    return ({**rect, size: length}, {**rect, axis: rect[axis] + length, size: rect[size] - length})
+
+
+def _canonical_splits(layout):
+    """Recognize the row/remaining-columns tree, independent of split ratios.
+
+    An unfamiliar tree is rebuilt instead of guessing which divider resize will
+    affect. Each recognized boundary has a first-child pane and second-child
+    pane touching it, matching Herdr's nearest-edge resize semantics.
+    """
+    panes, splits, out = _reading(layout), layout.get("splits"), []
+    if not isinstance(splits, list):
+        return None
+
+    def walk(area, counts):
+        if counts == [1]:
+            matches = [p for p in panes if p["rect"] == area]
+            return len(matches) == 1
+        direction = "down" if len(counts) > 1 else "right"
+        found = [s for s in splits if s.get("rect") == area and s.get("direction") == direction]
+        if len(found) != 1:
+            return False
+        split = found[0]
+        ratio = split.get("ratio")
+        if type(ratio) not in (int, float) or not math.isfinite(ratio) or not .1 <= ratio <= .9:
+            return False
+        first, second = _split_rect(area, direction, ratio)
+        desired = 1 / (len(counts) if len(counts) > 1 else counts[0])
+        out.append((split, desired, first, second))
+        return (walk(first, counts[:1] if len(counts) > 1 else [1])
+                and walk(second, counts[1:] if len(counts) > 1 else [counts[0] - 1]))
+    return out if walk(layout["area"], _grid_rows(len(panes))) and len(out) == len(splits) else None
+
+
+def _layout_state(layout):
+    return (layout.get("workspace_id"), layout.get("tab_id"), layout.get("area"),
+            layout.get("focused_pane_id"), layout.get("zoomed"), layout.get("splits"),
+            [(p["pane_id"], p["rect"]) for p in _reading(layout)])
+
+
+class _HerdrTidy:
+    """One finite rearrangement; its staging and obligations die with the call."""
+
+    def __init__(self, surface, base, result):
+        self.surface, self.base, self.result = surface, base, result
+        self.workspace, self.tab, self.focus = (base[k] for k in ("workspace_id", "tab_id", "focused_pane_id"))
+        self.expected, self.staging, self.pending = base, None, None
+        self.locations = {p: self.tab for p in base["identity"]}
+
+    def check(self):
+        live = self.surface.layout(self.focus)
+        context = self.surface._result("workspace", "get", self.workspace).get("workspace", {})
+        if (not live or _layout_state(live) != _layout_state(self.expected)
+                or context.get("focused") is not True or context.get("active_tab_id") != self.tab
+                or context.get("label") != self.base["names"][0]):
+            raise _TidyError("pane-layout-changed")
+
+    def bound(self, layout, tab, ids):
+        if (not isinstance(layout, dict) or layout.get("workspace_id") != self.workspace
+                or layout.get("tab_id") != tab or layout.get("area") != self.base["area"]
+                or layout.get("zoomed") is not False
+                or {p["pane_id"] for p in _reading(layout)} != set(ids)
+                or (tab == self.tab and layout.get("focused_pane_id") != self.focus)):
+            raise _TidyError("pane-operation-unconfirmed")
+        return layout
+
+    def move(self, pane, *, tab=None, target=None, direction="right", ratio=.5, cleanup=False):
+        if not cleanup:
+            self.check()
+        previous = self.locations[pane]
+        self.pending = pane
+        was_changed = self.result.changed
+        self.result.changed = True
+        response = self.surface.move(pane, tab=tab, target=target, direction=direction,
+                                     ratio=ratio, workspace=self.workspace)
+        if not isinstance(response, dict):
+            raise _TidyError("pane-move-unconfirmed")
+        if response.get("changed") is False:
+            self.result.changed, self.pending = was_changed, None
+            raise _TidyError("pane-move-unchanged")
+        created = response.get("created_tab")
+        if tab is None and isinstance(created, dict):
+            candidate = created.get("tab_id")
+            if (isinstance(candidate, str) and candidate.startswith(self.workspace + ":")
+                    and candidate not in self.base["tabs"] and created.get("workspace_id") == self.workspace):
+                self.staging = candidate
+        tab = tab or self.staging
+        metadata = response.get("pane", {})
+        if (response.get("changed") is not True or not tab
+                or response.get("previous_pane_id") != pane
+                or response.get("previous_workspace_id") != self.workspace
+                or response.get("previous_tab_id") != previous
+                or not isinstance(metadata, dict) or metadata.get("pane_id") != pane
+                or metadata.get("workspace_id") != self.workspace or metadata.get("tab_id") != tab
+                or metadata.get("terminal_id") != self.base["identity"][pane][0]):
+            raise _TidyError("pane-move-unconfirmed")
+        expected_target = {p for p, t in self.locations.items() if t == tab} | {pane}
+        target_layout = self.bound(response.get("target_layout"), tab, expected_target)
+        if response.get("focused_pane_id") != target_layout.get("focused_pane_id"):
+            raise _TidyError("pane-move-unconfirmed")
+        expected_source = {p for p, t in self.locations.items() if t == previous} - {pane}
+        source_layout = response.get("source_layout")
+        if expected_source:
+            self.bound(source_layout, previous, expected_source)
+        elif response.get("closed_tab_id") != previous:
+            raise _TidyError("pane-staging-unconfirmed")
+        self.locations[pane], self.pending = tab, None
+        self.expected = target_layout if tab == self.tab else source_layout
+        return target_layout
+
+    def reshape(self, cells):
+        if _grid_matches(self.expected, cells):
+            return
+        boundaries = _canonical_splits(self.expected)
+        if boundaries is not None:
+            for split, desired, _a, _b in boundaries:
+                # Earlier outer resizes change rects, never the split identities.
+                current = next(b for b in _canonical_splits(self.expected) if b[0]["id"] == split["id"])
+                item, _, first, second = current
+                delta = desired - item["ratio"]
+                if abs(delta) < 1e-6:
+                    continue
+                axis, size = ("x", "width") if item["direction"] == "right" else ("y", "height")
+                direction = ("right" if axis == "x" else "down") if delta > 0 else ("left" if axis == "x" else "up")
+                edge = first[axis] + first[size]
+                panes = _reading(self.expected)
+                anchor = next(p["pane_id"] for p in panes if
+                              (p["rect"][axis] + p["rect"][size] if delta > 0 else p["rect"][axis]) == edge
+                              and all(p["rect"][k] >= item["rect"][k]
+                                      and p["rect"][k] + p["rect"][s] <= item["rect"][k] + item["rect"][s]
+                                      for k, s in (("x", "width"), ("y", "height"))))
+                for amount in (min(abs(delta), .5), max(0, abs(delta) - .5)):
+                    if not amount:
+                        continue
+                    self.check()
+                    was_changed = self.result.changed
+                    self.result.changed = True
+                    response = self.surface.resize(anchor, direction, amount)
+                    if isinstance(response, dict) and response.get("changed") is False:
+                        self.result.changed = was_changed
+                    if (not isinstance(response, dict) or response.get("changed") is not True
+                            or response.get("pane_id") != anchor or response.get("focused_pane_id") != self.focus):
+                        raise _TidyError("pane-resize-unconfirmed")
+                    before = self.expected
+                    self.expected = self.bound(response.get("layout"), self.tab, self.locations)
+                    if _layout_state(before) == _layout_state(self.expected):
+                        raise _TidyError("pane-resize-unconfirmed")
+            return
+        # Leave F in the original tab, preserving its identity and local focus.
+        queue = [self.focus] + [p["pane_id"] for p in _reading(self.expected) if p["pane_id"] != self.focus]
+        staged = self.move(queue[1])
+        for pane in queue[2:]:
+            largest = max(_reading(staged), key=lambda p: p["rect"]["width"] * p["rect"]["height"])
+            direction = "right" if largest["rect"]["width"] >= largest["rect"]["height"] else "down"
+            staged = self.move(pane, tab=self.staging, target=largest["pane_id"], direction=direction)
+        rows, index, seeds = _grid_rows(len(queue)), 0, []
+        for i, count in enumerate(rows):
+            seeds.append(queue[index])
+            if i:
+                self.move(queue[index], tab=self.tab, target=seeds[i - 1], direction="down",
+                          ratio=1 / (len(rows) - i + 1))
+            index += count
+        index = 0
+        for count in rows:
+            for j in range(1, count):
+                self.move(queue[index + j], tab=self.tab, target=queue[index + j - 1],
+                          ratio=1 / (count - j + 1))
+            index += count
+
+    def reorder(self, desired):
+        def swap(other):
+            self.check()
+            was_changed = self.result.changed
+            self.result.changed = True
+            response = self.surface.swap(self.focus, other)
+            if isinstance(response, dict) and response.get("changed") is False:
+                self.result.changed = was_changed
+            if (not isinstance(response, dict) or response.get("changed") is not True
+                    or response.get("source_pane_id") != self.focus or response.get("target_pane_id") != other
+                    or response.get("focused_pane_id") != self.focus):
+                raise _TidyError("pane-swap-unconfirmed")
+            self.expected = self.bound(response.get("layout"), self.tab, self.locations)
+        for i, wanted in enumerate(desired):
+            actual = [p["pane_id"] for p in _reading(self.expected)]
+            other = actual[i]
+            if wanted == other:
+                continue
+            if self.focus in (wanted, other):
+                swap(other if wanted == self.focus else wanted)
+            else:
+                swap(wanted)
+                swap(other)
+                swap(wanted)
+
+    def cleanup(self):
+        if not self.staging and not self.pending:
+            return
+        inventory = self.surface.panes(self.workspace)
+        if inventory is None:
+            self.result.notes.append("pane-staging-unconfirmed:" + (self.staging or self.pending))
+            return
+        by_id = {p["pane_id"]: p.get("tab_id") for p in inventory}
+        if not self.staging and self.pending:
+            candidate = by_id.get(self.pending)
+            if (candidate and candidate not in self.base["tabs"]
+                    and all(p["pane_id"] in self.locations for p in inventory if p.get("tab_id") == candidate)):
+                self.staging = candidate
+        self.locations.update({p: t for p, t in by_id.items() if p in self.locations})
+        remaining = [p for p, t in by_id.items() if t == self.staging and p in self.locations]
+        if not remaining:
+            return
+        anchor = next((p for p, t in by_id.items() if p in self.locations and t == self.tab), None)
+        if not anchor:
+            self.result.notes.append("pane-staging-retained:" + self.staging)
+            return
+        for pane in remaining:
+            try:
+                metadata = self.surface._result("pane", "get", pane).get("pane", {})
+                if metadata.get("terminal_id") != self.base["identity"][pane][0]:
+                    raise _TidyError("pane-identity-changed")
+                self.move(pane, tab=self.tab, target=anchor, cleanup=True)
+            except (Exception, KeyboardInterrupt):
+                # A lost/mismatching reply can follow an applied move. The next
+                # inventory, rather than that reply, decides what is retained.
+                pass
+        after = self.surface.panes(self.workspace)
+        tabs = self.surface.tabs(self.workspace)
+        if after is None or tabs is None:
+            self.result.notes.append("pane-staging-unconfirmed:" + self.staging)
+        else:
+            retained = [p["pane_id"] for p in after
+                        if p.get("tab_id") == self.staging and p["pane_id"] in self.locations]
+            for pane in retained:
+                self.result.notes.append(f"pane-staging-retained:{self.staging}:{pane}")
+            if not retained and any(t["tab_id"] == self.staging for t in tabs):
+                self.result.notes.append("pane-staging-retained:" + self.staging)
+
+
+def _tidy_herdr(surface, base, desired, cells, result):
+    engine = _HerdrTidy(surface, base, result)
+    try:
+        engine.reshape(cells)
+        engine.reorder(desired)
+    finally:
+        with _tidy_signals(cleanup=True):
+            try:
+                engine.cleanup()
+            except (Exception, KeyboardInterrupt):
+                result.notes.append("pane-staging-unconfirmed:" + (engine.staging or "unknown"))
+
+
+def _tmux_grid(area, cells, ids):
+    """tmux's custom layout parser assigns its internal pane list to these cells."""
+    def block(rect, children=None, bracket=None, pane=None):
+        s = f'{rect["width"]}x{rect["height"]},{rect["x"]},{rect["y"]}'
+        return s + (bracket[0] + ",".join(children) + bracket[1] if children else f",{pane[1:]}")
+    rows = []
+    for count in _grid_rows(len(ids)):
+        part, part_ids = cells[:count], ids[:count]
+        cells, ids = cells[count:], ids[count:]
+        row = {**part[0], "width": area["width"]}
+        leaves = [block(r, pane=p) for r, p in zip(part, part_ids)]
+        rows.append(leaves[0] if count == 1 else block(row, leaves, "{}"))
+    value = rows[0] if len(rows) == 1 else block(area, rows, "[]")
+    checksum = 0
+    for byte in value.encode("ascii"):
+        checksum = (((checksum >> 1) | ((checksum & 1) << 15)) + byte) & 0xffff
+    return f"{checksum:04x},{value}"
+
+
+def _tidy_tmux(surface, base, desired, cells, result):
+    current = base
+    geometry_changed = not _grid_matches(base, cells)
+    try:
+        if geometry_changed:
+            # A transport failure can be ambiguous: changed means a mutation was
+            # attempted, until a fresh snapshot can confirm its result.
+            result.changed = True
+            custom = _tmux_grid(base["area"], cells, [p["pane_id"] for p in _reading(base)])
+            if surface._tmux("select-layout", "-t", base["tab_id"], custom) is None:
+                raise _TidyError("pane-layout-apply-failed")
+            current = surface.tidy_snapshot(desired[0])
+            _same_snapshot(base, current)
+            if not _grid_matches(current, cells):
+                raise _TidyError("pane-grid-unconfirmed")
+        for index, wanted in enumerate(desired):
+            actual = [p["pane_id"] for p in _reading(current)]
+            other = actual[index]
+            if wanted == other:
+                continue
+            focus = base["focused_pane_id"]
+            if focus in (wanted, other):
+                source, target, detached = (other if wanted == focus else wanted), focus, []
+            else:
+                source, target, detached = wanted, other, ["-d"]
+            # Re-read the active identity immediately before a swap with focus semantics.
+            fresh = surface.tidy_snapshot(wanted)
+            _same_snapshot(base, fresh)
+            if fresh["panes"] != current["panes"]:
+                raise _TidyError("pane-layout-changed")
+            result.changed = True
+            if surface._tmux("swap-pane", *detached, "-s", source, "-t", target) is None:
+                raise _TidyError("pane-swap-failed")
+            current = surface.tidy_snapshot(wanted)
+            _same_snapshot(base, current)
+    except (_TidyError, KeyboardInterrupt):
+        if geometry_changed:
+            # Restore only known cells, without replacing panes or overwriting
+            # a concurrent geometry/focus change. One attempt, never a retry loop.
+            with _tidy_signals(cleanup=True):
+                try:
+                    fresh = surface.tidy_snapshot(desired[0])
+                    _same_snapshot(base, fresh)
+                    if _grid_matches(fresh, cells):
+                        if surface._tmux("select-layout", "-t", base["tab_id"], base["original_layout"]) is None:
+                            result.notes.append("pane-layout-restore-unconfirmed")
+                except (Exception, KeyboardInterrupt):
+                    result.notes.append("pane-layout-restore-unconfirmed")
+        raise
+
+
+def tidy_panes(*, near=None):
+    """Rearrange only the caller's existing panes, once, with no typed input."""
+    from session_tidy import is_worker
+    if is_worker():
+        return TidyResult("none", notes=["worker-refused"])
+    checked = near is not None
+    near = near or _tidy_caller()
+    if near is None:
+        if any(os.environ.get(key) for key in ("CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID")):
+            return TidyResult("cmux", notes=["Hearting pane tidy is not supported on cmux."])
+        return TidyResult("none", notes=["pane-caller-unconfirmed"])
+    surface = near.surface
+    result = TidyResult(surface.name)
+    try:
+        with _tidy_signals():
+            workspace = surface.workspace_of(near.pane)
+            if not workspace:
+                raise _TidyError("pane-layout-unavailable")
+            with workspace_lock(surface, workspace):
+                if not checked:
+                    fresh = _tidy_caller()
+                    if (fresh is None or fresh.pane != near.pane or fresh.surface.name != surface.name
+                            or getattr(fresh.surface, "socket", None) != getattr(surface, "socket", None)
+                            or getattr(fresh.surface, "session", None) != getattr(surface, "session", None)):
+                        raise _TidyError("pane-caller-unconfirmed")
+                base = surface.tidy_snapshot(near.pane)
+                result.tab = base["tab_id"]
+                if base.get("zoomed"):
+                    raise _TidyError("pane-tab-zoomed")
+                result.panes = [p["pane_id"] for p in _reading(base)]
+                desired = _tidy_order(base, near.pane)
+                cells = _grid_cells(base["area"], len(desired), int(surface.name == "tmux"))
+                if _grid_matches(base, cells) and desired == result.panes:
+                    return result
+                if surface.name == "herdr":
+                    if base["active"] != (True, base["tab_id"]):
+                        raise _TidyError("pane-tab-inactive")
+                    _tidy_herdr(surface, base, desired, cells, result)
+                else:
+                    _tidy_tmux(surface, base, desired, cells, result)
+                final = surface.tidy_snapshot(near.pane)
+                _same_snapshot(base, final)
+                result.panes = [p["pane_id"] for p in _reading(final)]
+                if not _grid_matches(final, cells) or result.panes != desired:
+                    raise _TidyError("pane-grid-unconfirmed")
+    except (Exception, KeyboardInterrupt) as exc:
+        result.notes.append(str(exc) if isinstance(exc, _TidyError) else
+                            "pane-tidy-interrupted" if isinstance(exc, KeyboardInterrupt) else
+                            f"pane-tidy-unconfirmed:{type(exc).__name__}")
+        if result.tab:
+            try:
+                live = surface.layout(near.pane)
+                result.panes = [p["pane_id"] for p in _reading(live)] if live else []
+            except Exception:
+                result.panes = []
+            if not result.panes:
+                result.notes.append("pane-layout-unconfirmed")
+    return result
 
 
 def _labels(labels, group):
