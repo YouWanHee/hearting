@@ -2471,7 +2471,7 @@ def _finish_retire_cleanup(store, duty, ident, foreground):
 
 
 def _resume_retire_obligation(duty, store, *, read_context=None,
-                              persist_followup=False):
+                              persist_followup=False, runner_lock_held=False):
     global _HERDR_SESSION
     intent = duty.get("intent") or {}
     ident = dict((duty.get("intent") or {}).get("identity") or {})
@@ -2606,7 +2606,8 @@ def _resume_retire_obligation(duty, store, *, read_context=None,
                          observation={"phase": "waiting", "reason": readiness.reason,
                                       "state": readiness.state})
             return
-        cmd_retire(argparse.Namespace(target=target, _resume_request_id=duty["id"]))
+        cmd_retire(argparse.Namespace(target=target, _resume_request_id=duty["id"],
+                                     _runner_lock_held=runner_lock_held))
     finally:
         _HERDR_SESSION = old_server
 
@@ -2866,7 +2867,10 @@ def cmd_retire(args):
     if harness == "claude":
         # The retained runner uses this same lock; only one observer answers
         # the exit dialog while the foreground command is still returning.
-        with peer_obligations.legacy_runner_lock(store) as acquired:
+        # A runner already holding it must not contend with its own second fd.
+        lock = (contextlib.nullcontext(True) if getattr(args, "_runner_lock_held", False)
+                else peer_obligations.legacy_runner_lock(store))
+        with lock as acquired:
             if acquired:
                 return _retire_claude_background_confirm(
                     target, pane, harness, ident, identity, finish,
@@ -8773,7 +8777,7 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
                     if acquired:
                         _resume_retire_obligation(
                             duty, store, read_context=read_context,
-                            persist_followup=True)
+                            persist_followup=True, runner_lock_held=True)
             elif kind == "registered-batch":
                 _resume_registered_obligation(duty, store, read_context=read_context)
             elif kind == "run-notice":

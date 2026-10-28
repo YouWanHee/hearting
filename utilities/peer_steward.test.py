@@ -9626,6 +9626,43 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
             self.assertIn("reason=retire-already-pending", line)
             confirm.assert_not_called()
 
+    def test_waiting_retire_answers_immediate_background_dialog_in_same_runner_pass(self):
+        world = _RetireWorld(harness="claude", status="working", exits=False)
+        self.retire(world)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty_id = store.list()[0]["id"]
+        self.assertEqual(store.get(duty_id)["observation"].get("phase", "waiting"), "waiting")
+        self.assertEqual(world.actions(), [])
+        dialog = ("Background work is running\n❯ 1. Exit and stop tasks\n"
+                  "2. Move to background and exit\n3. Stay\n"
+                  "Enter to confirm · Esc to cancel\n")
+        world.status = "idle"
+        normal_run = world.run
+        selected = []
+
+        def exit_and_confirm(argv, **kwargs):
+            if argv[:3] == ["herdr", "pane", "send-text"]:
+                selected.append(argv[-1])
+            if argv[:3] == ["herdr", "pane", "send-keys"]:
+                if selected == ["/exit"]:
+                    world.screen = dialog
+                elif selected == ["/exit", "1"]:
+                    world.exits = True
+            return normal_run(argv, **kwargs)
+
+        world.run = exit_and_confirm
+        self._run_retire_runner(world, once=True)
+        settled = store.get(duty_id)
+        self.assertEqual((settled["state"], settled["result"], settled["cleanup"]),
+                         ("complete", "normal-exit", "complete"))
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-text", "w1:pOld", "/exit"],
+            ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+            ["herdr", "pane", "send-text", "w1:pOld", "1"],
+            ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
+
     def test_retire_subject_treats_only_same_birth_same_namespace_zombie_as_gone(self):
         def stat_row(state, start):
             fields = [state, *(["0"] * 18), start]
