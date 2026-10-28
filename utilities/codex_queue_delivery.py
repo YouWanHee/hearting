@@ -5,7 +5,8 @@ The app-server queue API is used directly so Hearting can supply a stable
 ``clientUserMessageId`` and inspect only its own pending item. One completion
 observation pass may reuse a bounded queue-only connection. The interactive
 TUI remains the only subscriber and approval owner; no events are subscribed
-to and no user-owned queue item is edited, deleted, or reordered.
+to and no user-owned queue item is edited or reordered. An ACKed exact
+Hearting item may be best-effort deleted after full identity and body checks.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import sqlite3
@@ -27,6 +29,23 @@ from typing import Any
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 MAX_QUEUE_PAGES = 16
 MAX_PAGE_SIZE = 100
+MAX_QUEUE_RETIREMENTS = 4
+NATIVE_QUEUE_CLIENT_ID = "codex-native-queue-v1"
+NATIVE_QUEUE_BATCH_CLIENT_ID = "codex-native-queue-batch-v1"
+_PRIOR_SUCCESS_FOLLOWUP = (
+    "The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
+    "Continue and complete the original user task itself, preserving every explicit content and output-format "
+    "requirement from that request; this receipt supplements the task and does not replace it with a receipt-only response. "
+    "Read the exact result and perform the already approved parent review/follow-through in this turn, "
+    "or run its existing registered continuation. On the first user-facing close, explain what changed and why, "
+    "the observed before/after, checks actually run (including reused, skipped, and unrun checks), applicable "
+    "commit/PR/deployment/serving state, and limits or remaining work. Do not invent deployment or operating "
+    "results. Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual "
+    "finalization is required. An automatic repeat of this exact result or a cleanup-only notice after the "
+    "follow-through is handled does not call for the same action or a new user ACK; preserve a new failure, "
+    "conflict, unfinished work, or direct user question."
+)
+_CURRENT_SUCCESS_FOLLOWUP_START = "Original request/format apply."
 
 
 class QueueDeliveryError(RuntimeError):
@@ -60,7 +79,8 @@ def resolve_endpoint(path: Path) -> Path:
 class _WebSocket:
     """Small synchronous WebSocket client for Codex's local UDS control API."""
 
-    def __init__(self, path: Path, *, timeout: float):
+    def __init__(self, path: Path, *, timeout: float,
+                 deadline: float | None = None):
         path = resolve_endpoint(path)
         try:
             info = path.lstat()
@@ -70,15 +90,18 @@ class _WebSocket:
             raise QueueDeliveryError("queue-endpoint-permissions-unsafe")
         self.path = path
         self.timeout = timeout
+        self.deadline = deadline
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.socket.settimeout(timeout)
         try:
+            self.socket.settimeout(_rpc_timeout(timeout, deadline))
             self.socket.connect(str(path))
-            self._upgrade()
+            self._upgrade(deadline=deadline)
         except (OSError, QueueDeliveryError) as exc:
             self.socket.close()
             if isinstance(exc, QueueDeliveryError):
                 raise
+            if deadline is not None and time.monotonic() >= deadline:
+                raise QueueDeliveryError("queue-operation-deadline-exceeded") from exc
             raise QueueDeliveryError("queue-endpoint-unavailable") from exc
         self.next_id = 1
         self.request_sent = False
@@ -86,8 +109,11 @@ class _WebSocket:
     def close(self) -> None:
         self.socket.close()
 
-    def _read_until(self, marker: bytes, limit: int) -> bytes:
+    def _read_until(self, marker: bytes, limit: int, *,
+                    deadline: float | None = None) -> bytes:
         while marker not in self.buffer:
+            if deadline is not None:
+                self.socket.settimeout(_rpc_timeout(self.timeout, deadline))
             if len(self.buffer) > limit:
                 raise QueueDeliveryError("queue-websocket-header-oversized")
             chunk = self.socket.recv(4096)
@@ -99,7 +125,7 @@ class _WebSocket:
         del self.buffer[:end]
         return value
 
-    def _upgrade(self) -> None:
+    def _upgrade(self, *, deadline: float | None = None) -> None:
         key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
         request = (
             "GET /rpc HTTP/1.1\r\n"
@@ -109,11 +135,14 @@ class _WebSocket:
             f"Sec-WebSocket-Key: {key}\r\n"
             "Sec-WebSocket-Version: 13\r\n\r\n"
         )
+        if deadline is not None:
+            self.socket.settimeout(_rpc_timeout(self.timeout, deadline))
         self.socket.sendall(request.encode("ascii"))
         # The buffer is initialized lazily because the handshake precedes the
         # rest of the instance state.
         self.buffer = bytearray()
-        response = self._read_until(b"\r\n\r\n", 16 * 1024).decode("latin-1")
+        response = self._read_until(b"\r\n\r\n", 16 * 1024,
+                                    deadline=deadline).decode("latin-1")
         lines = response.split("\r\n")
         if not lines or " 101 " not in f" {lines[0]} ":
             raise QueueDeliveryError("queue-websocket-upgrade-refused")
@@ -198,29 +227,61 @@ class _WebSocket:
             if final:
                 return initial_opcode or opcode, bytes(parts)
 
-    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    def request(self, method: str, params: dict[str, Any], *,
+                deadline: float | None = None) -> dict[str, Any]:
         self.request_sent = False
-        deadline = time.monotonic() + self.timeout
+        absolute_deadline = getattr(self, "deadline", None)
+        if deadline is not None:
+            absolute_deadline = (deadline if absolute_deadline is None
+                                 else min(absolute_deadline, deadline))
+        if absolute_deadline is not None and time.monotonic() >= absolute_deadline:
+            raise QueueDeliveryError("queue-operation-deadline-exceeded")
+        request_deadline = time.monotonic() + self.timeout
+        if absolute_deadline is not None:
+            request_deadline = min(request_deadline, absolute_deadline)
+        operation_deadline_wins = (absolute_deadline is not None
+                                   and absolute_deadline <= time.monotonic() + self.timeout)
+        self.socket.settimeout(max(0.0, request_deadline - time.monotonic()))
         request_id = self.next_id
         self.next_id += 1
         self.request_sent = True  # A partial send also has an ambiguous outcome.
-        self._send_frame(0x1, json.dumps({
-            "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
-        }, separators=(",", ":")).encode("utf-8"))
+        try:
+            self._send_frame(0x1, json.dumps({
+                "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+            }, separators=(",", ":")).encode("utf-8"))
+        except (OSError, TimeoutError) as exc:
+            if (operation_deadline_wins and absolute_deadline is not None
+                    and time.monotonic() >= absolute_deadline):
+                raise QueueDeliveryError("queue-operation-deadline-exceeded",
+                                         ambiguous=self.request_sent) from exc
+            raise QueueDeliveryError("queue-websocket-timeout",
+                                     ambiguous=self.request_sent) from exc
         self.request_sent = True
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = request_deadline - time.monotonic()
             if remaining <= 0:
+                if operation_deadline_wins:
+                    raise QueueDeliveryError("queue-operation-deadline-exceeded",
+                                             ambiguous=self.request_sent)
                 raise QueueDeliveryError("queue-websocket-timeout", ambiguous=self.request_sent)
             try:
-                opcode, raw = self._recv_message(deadline=deadline)
+                opcode, raw = self._recv_message(deadline=request_deadline)
             except QueueDeliveryError as exc:
+                if (operation_deadline_wins and exc.reason == "queue-websocket-timeout"
+                        and absolute_deadline is not None
+                        and time.monotonic() >= absolute_deadline):
+                    raise QueueDeliveryError("queue-operation-deadline-exceeded",
+                                             ambiguous=self.request_sent) from exc
                 if (not exc.ambiguous and method in {"thread/queue/add", "thread/queue/start"}
                         and exc.reason in {"queue-websocket-message-oversized",
                                            "queue-websocket-frame-invalid"}):
                     raise QueueDeliveryError(exc.reason, ambiguous=True) from exc
                 raise
             except (OSError, TimeoutError) as exc:
+                if (operation_deadline_wins and absolute_deadline is not None
+                        and time.monotonic() >= absolute_deadline):
+                    raise QueueDeliveryError("queue-operation-deadline-exceeded",
+                                             ambiguous=self.request_sent) from exc
                 raise QueueDeliveryError("queue-websocket-timeout", ambiguous=self.request_sent) from exc
             if opcode != 0x1:
                 continue
@@ -249,19 +310,28 @@ class _WebSocket:
             return result
 
     def initialize(self) -> None:
+        if self.deadline is not None:
+            self.socket.settimeout(_rpc_timeout(self.timeout, self.deadline))
         result = self.request("initialize", {
             "clientInfo": {"name": "hearting-native-queue", "title": "Hearting Queue", "version": "1"},
             "capabilities": {"experimentalApi": True},
-        })
+        }, deadline=self.deadline)
         if not isinstance(result, dict):
             raise QueueDeliveryError("queue-initialize-result-invalid")
+        if self.deadline is not None:
+            self.socket.settimeout(_rpc_timeout(self.timeout, self.deadline))
         self._send_frame(0x1, json.dumps({"jsonrpc": "2.0", "method": "initialized"},
                                          separators=(",", ":")).encode("utf-8"))
 
 
-def _connect(path: Path, timeout: float) -> _WebSocket:
-    client = _WebSocket(path, timeout=timeout)
+def _connect(path: Path, timeout: float, *,
+             deadline: float | None = None) -> _WebSocket:
+    if deadline is not None:
+        _rpc_timeout(timeout, deadline)
+    client = _WebSocket(path, timeout=timeout, deadline=deadline)
     try:
+        if deadline is not None:
+            _rpc_timeout(timeout, deadline)
         client.initialize()
         return client
     except Exception:
@@ -272,9 +342,11 @@ def _connect(path: Path, timeout: float) -> _WebSocket:
 class DeliverySession:
     """Reuse one queue-only WebSocket for a bounded completion observation pass."""
 
-    def __init__(self, path: Path, *, timeout: float = 5.0):
+    def __init__(self, path: Path, *, timeout: float = 5.0,
+                 deadline: float | None = None):
         self.path: Path | None = None
         self.timeout = timeout
+        self.deadline = deadline
         self.client: _WebSocket | None = None
 
     def __enter__(self) -> "DeliverySession":
@@ -293,8 +365,14 @@ class DeliverySession:
                 pass
 
     def request(self, path: Path, method: str, params: dict[str, Any], *,
-                timeout: float | None = None) -> dict[str, Any]:
+                timeout: float | None = None,
+                deadline: float | None = None) -> dict[str, Any]:
         timeout = self.timeout if timeout is None else timeout
+        if self.deadline is not None:
+            deadline = (self.deadline if deadline is None
+                        else min(self.deadline, deadline))
+        if deadline is not None:
+            _rpc_timeout(timeout, deadline)
         try:
             endpoint = resolve_endpoint(path)
         except QueueDeliveryError:
@@ -309,12 +387,13 @@ class DeliverySession:
             self.path = endpoint
             raise QueueDeliveryError("queue-session-endpoint-changed")
         if self.client is None:
-            self.client = _connect(endpoint, timeout)
+            self.client = _connect(endpoint, timeout, **_deadline_kwargs(deadline))
         client = self.client
         client.timeout = timeout
-        client.socket.settimeout(timeout)
+        client.deadline = deadline
+        client.socket.settimeout(_rpc_timeout(timeout, deadline))
         try:
-            return client.request(method, params)
+            return client.request(method, params, **_deadline_kwargs(deadline))
         except QueueDeliveryError as exc:
             if not exc.reason.startswith("queue-rpc-refused:"):
                 self.close()
@@ -330,13 +409,20 @@ def _session_kwargs(session):
     return {"session": session} if session is not None else {}
 
 
+def _deadline_kwargs(deadline):
+    # Callers without a deadline keep the original call shape.
+    return {"deadline": deadline} if deadline is not None else {}
+
+
 def _rpc(path: Path, method: str, params: dict[str, Any], *, timeout: float,
-         session: DeliverySession | None = None) -> dict[str, Any]:
+         session: DeliverySession | None = None,
+         deadline: float | None = None) -> dict[str, Any]:
     if session is not None:
-        return session.request(path, method, params, timeout=timeout)
-    client = _connect(path, timeout)
+        return session.request(path, method, params, timeout=timeout,
+                               **_deadline_kwargs(deadline))
+    client = _connect(path, timeout, **_deadline_kwargs(deadline))
     try:
-        return client.request(method, params)
+        return client.request(method, params, **_deadline_kwargs(deadline))
     except QueueDeliveryError as exc:
         if exc.ambiguous:
             raise
@@ -348,8 +434,18 @@ def _rpc(path: Path, method: str, params: dict[str, Any], *, timeout: float,
         client.close()
 
 
+def _rpc_timeout(timeout: float, deadline: float | None) -> float:
+    if deadline is None:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise QueueDeliveryError("queue-operation-deadline-exceeded")
+    return min(timeout, remaining)
+
+
 def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
-               session: DeliverySession | None = None) -> list[dict[str, Any]]:
+               session: DeliverySession | None = None,
+               deadline: float | None = None) -> list[dict[str, Any]]:
     if not thread_id:
         raise QueueDeliveryError("queue-thread-id-missing")
     cursor = None
@@ -358,8 +454,9 @@ def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
         params: dict[str, Any] = {"threadId": thread_id, "limit": MAX_PAGE_SIZE}
         if cursor:
             params["cursor"] = cursor
-        response = _rpc(path, "thread/queue/list", params, timeout=timeout,
-                        **_session_kwargs(session))
+        response = _rpc(path, "thread/queue/list", params,
+                        timeout=_rpc_timeout(timeout, deadline),
+                        **_session_kwargs(session), **_deadline_kwargs(deadline))
         page = response.get("data")
         if not isinstance(page, list):
             raise QueueDeliveryError("queue-list-response-invalid")
@@ -368,6 +465,202 @@ def list_queue(path: Path, thread_id: str, *, timeout: float = 5.0,
         if not cursor:
             return values
     raise QueueDeliveryError("queue-list-page-limit-exceeded")
+
+
+def delete_queue_item(path: Path, thread_id: str, submission_id: str, *,
+                      timeout: float = 5.0,
+                      session: DeliverySession | None = None,
+                      deadline: float | None = None) -> bool:
+    """Delete one exact native queued submission; unknown results are failures."""
+    if (not isinstance(thread_id, str) or not thread_id
+            or not isinstance(submission_id, str) or not submission_id):
+        raise QueueDeliveryError("queue-delete-identity-invalid")
+    result = _rpc(path, "thread/queue/delete", {
+        "threadId": thread_id, "queuedSubmissionId": submission_id,
+    }, timeout=_rpc_timeout(timeout, deadline),
+                  **_session_kwargs(session), **_deadline_kwargs(deadline))
+    deleted = result.get("deleted")
+    if not isinstance(deleted, bool):
+        raise QueueDeliveryError("queue-delete-response-invalid")
+    return deleted
+
+
+def native_client_message_id(storage_key: str, delivery_ids, *, batch: bool = False) -> str:
+    """Stable queue ID shared by the producer and exact-item retirement."""
+    namespace = NATIVE_QUEUE_BATCH_CLIENT_ID if batch else NATIVE_QUEUE_CLIENT_ID
+    material = "\0".join((namespace, storage_key, *sorted(delivery_ids)))
+    return "delivery-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def native_completion_body(storage_key: str, records: list[dict], receipt: dict,
+                           followup: str) -> str:
+    """Build producer bytes from the canonical receipt and immutable markers."""
+    from dispatch_recipient_receipt import receipt_marker
+
+    envelope = "AGENT_HARNESS_COMPLETION_V1\n" + json.dumps(
+        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+    markers = "\n" + "\n".join(receipt_marker(record, storage_key) for record in records)
+    return envelope + followup + markers
+
+
+def native_batch_unit_body(root: Path, storage_key: str, records: list[dict]) -> str:
+    """Render one producer-identical sibling batch unit."""
+    import dispatch_session_sweep as sweep
+    members = sorted(records, key=lambda record: record["delivery_id"])
+    return sweep.delivery_context([(root, [
+        {**record, "attempts": 0, sweep.STORAGE_KEY: storage_key} for record in members])])
+
+
+def prior_followup_text(current: str) -> str | None:
+    """The one exact historical completion wording retained for recovery."""
+    head, newline, rest = current.partition("\n")
+    if not head.startswith(_CURRENT_SUCCESS_FOLLOWUP_START):
+        return None
+    return _PRIOR_SUCCESS_FOLLOWUP + newline + rest
+
+
+def retire_acked_completion(root: Path, path: Path, thread_id: str, seed: dict | list[dict],
+                            storage_key: str, *, timeout: float = 1.0,
+                            deadline: float | None = None,
+                            session: DeliverySession | None = None,
+                            expected_body: str | list[str] | None = None,
+                            expected_client_id: str | None = None) -> bool:
+    """Best-effort remove exact, fully ACKed Hearting completion items.
+
+    The caller supplies the exact receiver thread. Any incomplete, changed, or
+    ambiguous evidence preserves the queue item. The total caller deadline also
+    bounds connection initialization and every paginated list RPC.
+    """
+    import dispatch_pending_delivery as pending
+    from dispatch_completion_join import completion_followup_text
+    from dispatch_recipient_receipt import IDENTITY_KEY, MARKER_RE, identity_binding
+
+    seeds = seed if isinstance(seed, list) else [seed]
+    if (not seeds or any(not isinstance(row, dict)
+                         or row.get("recipient_kind") != "codex-native-queue"
+                         or row.get("state") != "acked" for row in seeds)):
+        return False
+    try:
+        fresh_records = []
+        for row in seeds:
+            delivery_id = row.get("delivery_id")
+            if not isinstance(delivery_id, str) or not delivery_id.startswith("delivery-"):
+                return False
+            fresh = pending.read(root, storage_key, delivery_id)
+            if not isinstance(fresh, dict) or fresh.get("state") != "acked":
+                return False
+            expected_identity = row.get(IDENTITY_KEY)
+            if not isinstance(expected_identity, dict):
+                expected_identity = pending.received_ack_identity(row, storage_key, delivery_id)
+            if pending.received_ack_identity(fresh, storage_key, delivery_id) != expected_identity:
+                return False
+            fresh_records.append(fresh)
+        candidates = []
+        if expected_body is not None:
+            bodies = expected_body if isinstance(expected_body, list) else [expected_body]
+            candidates.append((fresh_records, expected_client_id or native_client_message_id(
+                storage_key, [row["delivery_id"] for row in fresh_records]), bodies))
+        else:
+            for fresh in fresh_records:
+                receipt = fresh.get("receipt")
+                jobs = receipt.get("job_registry") if isinstance(receipt, dict) else None
+                if not isinstance(jobs, str) or not jobs:
+                    continue
+                followup = completion_followup_text(
+                    receipt, jobs=jobs,
+                    surface=str(Path(__file__).resolve().parents[1] / "adapters" / "codex" / "bin" / "preflight.sh"),
+                )
+                bodies = [native_completion_body(storage_key, [fresh], receipt, followup)]
+                prior_followup = prior_followup_text(followup)
+                if prior_followup is not None:
+                    bodies.append(native_completion_body(storage_key, [fresh], receipt, prior_followup))
+                candidates.append((
+                    [fresh], native_client_message_id(storage_key, [fresh["delivery_id"]]), bodies))
+        if not candidates:
+            return False
+        end = deadline if deadline is not None else time.monotonic() + 1.5
+        queue = list_queue(path, thread_id, timeout=_rpc_timeout(timeout, end),
+                           session=session, deadline=end)
+        # Batch-v1 has no saved aggregate receipt, so reconstruct only from the
+        # exact marker set on a listed item. Multi-member own-set v1 stays
+        # courier-only because its original receipt cannot be recovered here.
+        seed_ids = {row["delivery_id"] for row in fresh_records}
+        for item in queue:
+            content = item.get("input") if isinstance(item, dict) else None
+            if (not isinstance(content, list) or len(content) != 1
+                    or not isinstance(content[0], dict) or content[0].get("type") != "text"
+                    or set(content[0]) - {"type", "text", "text_elements"}
+                    or content[0].get("text_elements", []) != []
+                    or not isinstance(content[0].get("text"), str)):
+                continue
+            input_text = content[0]["text"]
+            marker_lines = [line for line in input_text.splitlines() if "HEARTING_RECEIPT_V1" in line]
+            if not marker_lines or any(not re.fullmatch(
+                    r"HEARTING_RECEIPT_V1 delivery-[A-Za-z0-9._-]{1,128} [0-9a-f]{64}", line)
+                    for line in marker_lines):
+                continue
+            parsed = [MARKER_RE.fullmatch(line) for line in marker_lines]
+            if any(match is None for match in parsed):
+                continue
+            marker_ids = [match.group(1) for match in parsed]
+            if len(set(marker_ids)) != len(marker_ids) or not seed_ids.intersection(marker_ids):
+                continue
+            client_id = native_client_message_id(storage_key, marker_ids, batch=True)
+            if item.get("clientUserMessageId") != client_id:
+                continue
+            members = []
+            valid = True
+            for marker_id, match in zip(marker_ids, parsed):
+                member = pending.read(root, storage_key, marker_id)
+                try:
+                    if (not isinstance(member, dict) or member.get("state") != "acked"
+                            or member.get("recipient_kind") != "codex-native-queue"
+                            or identity_binding(pending.received_ack_identity(
+                                member, storage_key, marker_id)) != match.group(2)):
+                        valid = False
+                        break
+                except Exception:
+                    valid = False
+                    break
+                members.append(member)
+            if not valid:
+                continue
+            try:
+                rendered = native_batch_unit_body(root, storage_key, members)
+            except Exception:
+                continue
+            if not _peer_text_input(item.get("input"), rendered):
+                continue
+            candidates.append((members, client_id, [rendered]))
+        deleted = 0
+        for member_records, client_id, candidate_bodies in candidates:
+            if deleted >= MAX_QUEUE_RETIREMENTS:
+                break
+            matches = [item for item in queue if item.get("clientUserMessageId") == client_id]
+            if (len(matches) != 1 or not isinstance(matches[0].get("id"), str)
+                    or not matches[0]["id"]
+                    or sum(item.get("id") == matches[0]["id"] for item in queue) != 1
+                    or not any(_peer_text_input(matches[0].get("input"), body)
+                               for body in candidate_bodies)):
+                continue
+            exact = True
+            for fresh in member_records:
+                latest = pending.read(root, storage_key, fresh["delivery_id"])
+                if (not isinstance(latest, dict) or latest.get("state") != "acked"
+                        or latest.get("recipient_kind") != "codex-native-queue"
+                        or pending.received_ack_identity(latest, storage_key, fresh["delivery_id"])
+                        != pending.received_ack_identity(fresh, storage_key, fresh["delivery_id"])):
+                    exact = False
+                    break
+            if not exact:
+                continue
+            if delete_queue_item(path, thread_id, matches[0]["id"],
+                                 timeout=_rpc_timeout(timeout, end), session=session,
+                                 deadline=end):
+                deleted += 1
+        return deleted > 0
+    except Exception:  # noqa: BLE001 - retirement is advisory; preserve the ACK result.
+        return False
 
 
 def _latest_turn(path: Path, thread_id: str, *, timeout: float,

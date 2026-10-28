@@ -34,6 +34,8 @@ Two questions, two functions:
 Both answers come from one lineage judgment (:func:`_lineage_holder`), so delivery and resume
 authority never disagree. Both answer "the registered parent" when usable state has no
 relation. Unavailable lineage leaves authority unresolved until observation recovers.
+:func:`record_retire_handover` reports an unreadable registry typed so its caller
+keeps the accepted handover pending instead of treating unknown ownership as empty.
 """
 
 from __future__ import annotations
@@ -295,6 +297,17 @@ class LineageAttempts(frozenset):
     lineage_notice = True
 
 
+class RegistryUnreadable(OSError):
+    """The jobs registry exists but its ownership rows could not be read.
+
+    Distinct from "nothing currently owned": a caller keeps its acceptance
+    continuation pending and retries the same observation instead of settling
+    a transfer that never reached the seat ledger. ``reason`` names the state
+    for callers that carry a string receipt rather than this class."""
+
+    reason = "registry-unreadable"
+
+
 def _st():
     import session_tidy
     return session_tidy
@@ -378,8 +391,10 @@ def _all_snapshots_uncached() -> list[dict]:
 def handover_rows(seat, *, read_context=None) -> list[dict]:
     """The seat ledger's handover rows, oldest first."""
     def load():
-        return [e for e in _st()._read_ledger_lines(seat)
-                if e.get("event") == ROW_EVENT and e.get("from")]
+        st = _st()
+        with st.seat_ledger_readonly_scope():
+            return [e for e in st._read_ledger_lines(seat)
+                    if e.get("event") == ROW_EVENT and e.get("from")]
 
     rows = (read_context.handover_rows(seat, load) if read_context is not None else load())
     return sorted(rows, key=lambda r: float(r.get("ts", 0) or 0))
@@ -410,9 +425,10 @@ def _transition_rows(seat_key: Optional[str] = None) -> list[tuple[str, dict]]:
         if path.is_symlink():
             continue
         key = path.stem
-        for row in st._read_ledger_lines(st.Seat("pane", key)):
-            if row.get("event") in {ROW_EVENT, "steward-release"}:
-                out.append((key, row))
+        with st.seat_ledger_readonly_scope():
+            for row in st._read_ledger_lines(st.Seat("pane", key)):
+                if row.get("event") in {ROW_EVENT, "steward-release"}:
+                    out.append((key, row))
     return out
 
 
@@ -1152,6 +1168,75 @@ def _lineage_holder(graph: LineageGraph, key: tuple, registered: str, harness: s
     return end, harness, state
 
 
+def session_successor(session: str, *, harness=None, read_context=None) -> tuple[str, str]:
+    """Resolve a session notice's unique confirmed seat chain, including retire.
+
+    Job authority remains in _lineage_holder. Only provenance notices use these
+    cross-harness seat transitions; ambiguous or unreadable observations raise
+    instead of restoring the original recipient.
+    """
+    st = _st()
+    edges, legacy_retire, vertices = set(), set(), set()
+    for rows in _lineage_seats(read_context=read_context).values():
+        for row in rows:
+            edge = st.tidy_lineage_edge(row)
+            if edge is not None:
+                name, origin, target = edge
+                left, right = (name, origin), (name, target)
+            elif row.get("event") == "handover" and row.get("source") == "retire":
+                source = st._handover_origin(row)
+                if source is None:
+                    continue
+                right = (row.get("harness"), row.get("sid"))
+                if isinstance(row.get("from"), str):
+                    # Older accepted retire rows stored only a source SID.
+                    legacy_retire.add((source[1], right))
+                    vertices.add(right)
+                    continue
+                left = source
+            else:
+                continue
+            vertices.update((left, right))
+            edges.add((left, right))
+    if harness:
+        start = (harness, session)
+    else:
+        origins = {left for left, _right in edges if left[1] == session}
+        if len(origins) > 1:
+            raise OSError("notice-lineage-unresolved")
+        start = next(iter(origins), ("", session))
+    vertices.add(start)
+    for origin, right in legacy_retire:
+        sources = {vertex for vertex in vertices if vertex[1] == origin}
+        for left in sources or {("", origin)}:
+            edges.add((left, right))
+    outgoing, incoming, adjacent = {}, {}, {}
+    for origin, target in edges:
+        outgoing.setdefault(origin, set()).add(target)
+        incoming.setdefault(target, set()).add(origin)
+        adjacent.setdefault(origin, set()).add(target)
+        adjacent.setdefault(target, set()).add(origin)
+    # Check the whole connected component, so a downstream query cannot revive
+    # authority on one side of a fork, merge, or cycle.
+    component, remaining = set(), [start]
+    while remaining:
+        vertex = remaining.pop()
+        if vertex in component:
+            continue
+        component.add(vertex)
+        remaining.extend(adjacent.get(vertex, ()))
+    if any(len(outgoing.get(vertex, ())) > 1 or len(incoming.get(vertex, ())) > 1
+           for vertex in component):
+        raise OSError("notice-lineage-unresolved")
+    current, seen = start, {start}
+    while outgoing.get(current):
+        current = next(iter(outgoing[current]))
+        if current in seen:
+            raise OSError("notice-lineage-unresolved")
+        seen.add(current)
+    return (current[1], current[0]) if current != start else ("", "")
+
+
 def _effective(meta: dict, jobs=None, *, read_context=None, extra_seats=()) -> tuple[str, str]:
     """``(session, harness)`` answering for ``meta``'s attempt now: the lineage holder of its
     logical job.  The chain may cross panes and harnesses (a seat change hands a Codex parent's
@@ -1296,16 +1381,26 @@ def _notice_recipient_binding(lineage, jobs, source_harness, *, read_context=Non
     from harness_capabilities import HARNESSES, parent_completion
     try:
         kind = lineage["kind"]
+        if kind == "provenance":
+            successor, successor_harness = session_successor(
+                lineage["session_id"], harness=source_harness, read_context=read_context)
+            if successor:
+                return (successor_harness, successor) if successor_harness in HARNESSES else None
         if kind == "attempt-parent":
             from dispatch_completion_join import current_attempt_row
             row = current_attempt_row(jobs, lineage["attempt_id"]) if jobs is not None else None
             if (row is None or row.status not in {"open", "running", "done"}
                     or row.metadata.get("parent_sid") != lineage["session_id"]
                     or _registered_parent_harness(row.metadata) != source_harness
-                    or row.metadata.get("parent_completion_delivery") != parent_completion(source_harness).get("carrier")
-                    or not eligible_row(row.metadata)):
+                    or row.metadata.get("parent_completion_delivery") != parent_completion(source_harness).get("carrier")):
                 return None
-            sid, holder_harness = _effective(row.metadata, jobs, read_context=read_context)
+            if eligible_row(row.metadata):
+                sid, holder_harness = _effective(row.metadata, jobs, read_context=read_context)
+            else:
+                sid, state = chain_end(source_harness, lineage["session_id"], read_context=read_context)
+                holder_harness = source_harness
+                if state == "unresolved":
+                    return None
             return (holder_harness, sid) if sid and holder_harness in HARNESSES else None
         if kind == "owner-session":
             from dispatch_completion_join import current_attempt_row, read_supervisor_phase_state
@@ -1460,6 +1555,19 @@ def storage_recipients(session: str, env=None, harness: Optional[str] = None, *,
                     lineage_storage.add(parent)
                     seen.add(parent)
                     cursor = parent
+        # A provenance-only notice follows main's accepted retire transition,
+        # even when this origin has no job binding of its own. The empty attempt
+        # scope admits notices only; each record still checks its current pair.
+        retire_origins = {origin[1] for rows in graph.ledger_rows.values() for row in rows
+                          if row.get("event") == "handover" and row.get("source") == "retire"
+                          and (origin := _st()._handover_origin(row)) is not None}
+        for origin in retire_origins:
+            try:
+                target, target_harness = session_successor(origin, read_context=read_context)
+            except (OSError, ValueError, TypeError):
+                continue
+            if target == session and (not current_harness or target_harness == current_harness):
+                lineage_storage.add(origin)
         owed: dict = {}
         # Explicit registry bindings remain valid across the existing cross-seat retire
         # path; same-harness clear inheritance comes only from the normalized graph.
@@ -2015,17 +2123,22 @@ def record_locked(seat, harness: str, sid: str, event: str, source: str, now: fl
 def record_retire_handover(predecessor_sid: str, predecessor_harness: str, successor_sid: str,
                            successor_harness: str, *, env=None, jobs=None,
                            now: Optional[float] = None, successor_seat=None) -> Optional[dict]:
-    """Hand a retired predecessor's routes to its seat successor, across harnesses.
+    """Record the current holder's transfer to its exact seat successor.
 
-    Called after ``peer-steward retire`` proved the predecessor exited and the caller runs in the
-    pane started beside it.  The predecessor's unfinished depth-1 work (registered or inherited)
-    are bound to the successor in the successor's seat: one ledger row, whose bindings name the
-    registered parent their pending records stay stored under, and the seat's snapshot (now
-    naming the successor) that lets :func:`effective_parent` find it.  Registry rows are untouched.
-    Returns the row (the existing one when repeated), or None when there is nothing to hand over
-    -- including attempts the predecessor already handed to another session.
-    A deferred retire supplies the seat proven by its immutable requester and
-    original successor mark; its observer need not own that physical pane.
+    A validated typed acceptance may call this before reply delivery or physical
+    retirement; retained retire settlement also calls it for legacy and missed
+    transitions. The predecessor's unfinished depth-1 work (registered or
+    inherited) is bound in the successor's existing seat ledger. Bindings retain
+    the registered parent under which pending records stay stored, and registry
+    rows remain untouched. ``source=retire`` keeps its exact binding-selection
+    meaning for both callers. Returns the existing row on replay, or None when
+    there is nothing currently owned to hand over, including attempts already
+    handed to another session. When the registry file exists but its rows cannot
+    be read, ownership is unknown rather than empty, so this raises
+    :class:`RegistryUnreadable` instead of returning None; callers keep their
+    existing continuation pending and observe again. Deferred retire uses the
+    seat proved by its immutable requester and original successor mark; its
+    observer need not own that physical pane.
     """
     if not predecessor_sid or not successor_sid or predecessor_sid == successor_sid:
         return None
@@ -2052,9 +2165,16 @@ def record_retire_handover(predecessor_sid: str, predecessor_harness: str, succe
                          record.handover_metadata())
                         for status, record in _handover_candidate_rows(jobs, predecessor_sid)
                         if record.handover_metadata().get("attempt_id")}
-            except OSError:
+            except FileNotFoundError:
+                # No registry file yet: nothing has been registered, so an
+                # empty ownership answer is verified rather than unknown.
                 view = None
                 rows = {}
+            except OSError as exc:
+                # The file exists but its rows could not be read. Returning an
+                # empty answer here would read as "nothing to hand over" and let
+                # an accepted handover settle without the successor binding.
+                raise RegistryUnreadable(f"jobs registry unreadable: {exc}") from exc
         possible_rows = _handover_candidates(
             predecessor_harness, predecessor_sid, jobs, rows=rows)
         if not possible_rows:

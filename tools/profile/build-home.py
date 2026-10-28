@@ -499,6 +499,75 @@ def _resolve_worker_account_path(value, *, env, cwd=None):
     return path.resolve(strict=False)
 
 
+def codex_worker_launch_values(agent_home, source, home, worker_type, home_environment):
+    """Project Codex worker launch values without changing either home."""
+    agent_home, source, home = Path(agent_home).resolve(), Path(source), Path(home)
+    home_environment = Path(home_environment).expanduser()
+    config = read_worker_toml(source / 'config.toml')
+    original_config_dir = (source / 'config.toml').resolve().parent
+    origins = sorted({str(folder / name) for folder in (source, original_config_dir)
+                      for name in ('hooks.json', 'config.toml')})
+    overrides = ['features.apps=false', 'features.plugins=false',
+                 'features.default_mode_request_user_input=false']
+    if worker_type != 'owner':
+        overrides += ['features.multi_agent=false', 'agents.enabled=false']
+
+    def toml_value(value):
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if isinstance(value, str):
+            return json.dumps(value)
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, list):
+            return '[' + ','.join(toml_value(item) for item in value) + ']'
+        if isinstance(value, dict):
+            return '{' + ','.join(json.dumps(key) + '=' + toml_value(item)
+                                  for key, item in value.items()) + '}'
+        raise ValueError('unsupported worker config value')
+
+    if worker_type == 'owner':
+        # Preserve native policy/defaults without loading the parent's
+        # unrelated custom-role catalog. Assigned fallbacks use the native
+        # default agent with their explicitly resolved model/profile.
+        owner_agents = {name: value for name, value in config.get('agents', {}).items()
+                        if not isinstance(value, dict)}
+        overrides.append('agents=' + toml_value(owner_agents))
+    # CLI dotted-key overrides do not parse quoted path components. Replace
+    # the whole table so IDs containing dots/@ retain their exact identity.
+    for field in ('mcp_servers', 'plugins'):
+        narrowed = {name: {**value, 'enabled': False}
+                    for name, value in config.get(field, {}).items()}
+        if field == 'mcp_servers':
+            # Disabled servers need only a valid transport descriptor. Do
+            # not copy auth headers/env secrets into command arguments.
+            narrowed = {name: {**({'url': 'https://localhost.invalid'} if 'url' in value
+                                 else {'command': 'true'}), 'enabled': False}
+                        for name, value in config.get(field, {}).items()}
+        overrides.append(field + '=' + toml_value(narrowed))
+    # Native built-in skills are seeded in a fresh home. Disable their actual
+    # paths using the documented per-path control, without a private flag.
+    disabled = set()
+    for base in (source / 'skills', home / 'skills', source / 'plugins/cache',
+                 home_environment / '.codex/plugins/cache', home_environment / '.agents/skills'):
+        if base.is_dir():
+            for skill in base.rglob('SKILL.md'):
+                disabled.add(str(skill.parent))
+                disabled.add(str(skill))
+                if skill.is_relative_to(source / 'skills'):
+                    disabled.add(str(home / 'skills' / skill.parent.relative_to(source / 'skills')))
+                    disabled.add(str(home / 'skills' / skill.relative_to(source / 'skills')))
+    overrides.append('skills.config=[' + ','.join(
+        '{path=' + json.dumps(path) + ',enabled=false}' for path in sorted(disabled)) + ']')
+    return {
+        'CODEX_HOME': str(home),
+        'HEARTING_WORKER_HOME': str(home),
+        'HEARTING_MODEL_CONFIG_HOME': str(source.expanduser().absolute()),
+        'HEARTING_CODEX_HOOK_SOURCES': json.dumps(origins),
+        'HEARTING_CODEX_WORKER_OVERRIDES': json.dumps(overrides),
+    }
+
+
 def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, destination=None, profile=None):
     """Default typed profile for every launch; never changes the caller's home.
 
@@ -607,50 +676,9 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
                              'agent-modes': 'adapters/codex/modes', 'agent-plugin-marketplace': 'adapters/codex/plugin-marketplace',
                              'hearting-readme.md': 'adapters/codex/README.md'}.items():
             symlink(agent_home / target, home / name)
-        config = read_worker_toml(source / 'config.toml')
-        original_config_dir = (source / 'config.toml').resolve().parent
-        origins = sorted({str(folder / name) for folder in (source, original_config_dir)
-                          for name in ('hooks.json', 'config.toml')})
-        values['HEARTING_CODEX_HOOK_SOURCES'] = json.dumps(origins)
-        # Disabled plugin entries still sync their payloads unless the global feature is off.
-        overrides = ['features.apps=false', 'features.plugins=false', 'features.multi_agent=false',
-                     'features.default_mode_request_user_input=false', 'agents.enabled=false']
-        def toml_value(value):
-            if isinstance(value, bool):
-                return 'true' if value else 'false'
-            if isinstance(value, str):
-                return json.dumps(value)
-            if isinstance(value, (int, float)):
-                return str(value)
-            if isinstance(value, list):
-                return '[' + ','.join(toml_value(item) for item in value) + ']'
-            if isinstance(value, dict):
-                return '{' + ','.join(json.dumps(key) + '=' + toml_value(item) for key, item in value.items()) + '}'
-            raise ValueError('unsupported worker config value')
-        # CLI dotted-key overrides do not parse quoted path components. Replace
-        # the whole table so IDs containing dots/@ retain their exact identity.
-        for field in ('mcp_servers', 'plugins'):
-            narrowed = {name: {**value, 'enabled': False} for name, value in config.get(field, {}).items()}
-            if field == 'mcp_servers':
-                # Disabled servers need only a valid transport descriptor. Do
-                # not copy auth headers/env secrets into command arguments.
-                narrowed = {name: {**({'url': 'https://localhost.invalid'} if 'url' in value else {'command': 'true'}),
-                                   'enabled': False} for name, value in config.get(field, {}).items()}
-            overrides.append(field + '=' + toml_value(narrowed))
-        # Native built-in skills are seeded in a fresh home. Disable their actual
-        # paths using the documented per-path control, without a private flag.
-        disabled = set()
-        for base in (source / 'skills', home / 'skills', source / 'plugins/cache',
-                     Path.home() / '.codex/plugins/cache', Path.home() / '.agents/skills'):
-            if base.is_dir():
-                for skill in base.rglob('SKILL.md'):
-                    disabled.add(str(skill.parent))
-                    disabled.add(str(skill))
-                    if skill.is_relative_to(source / 'skills'):
-                        disabled.add(str(home / 'skills' / skill.parent.relative_to(source / 'skills')))
-                        disabled.add(str(home / 'skills' / skill.relative_to(source / 'skills')))
-        overrides.append('skills.config=[' + ','.join('{path=' + json.dumps(path) + ',enabled=false}' for path in sorted(disabled)) + ']')
-        values.update(CODEX_HOME=str(home), HEARTING_CODEX_WORKER_OVERRIDES=json.dumps(overrides))
+        values.update(codex_worker_launch_values(
+            agent_home, source, home, worker_type, home_env,
+        ))
     elif harness == 'claude':
         source = Path(env.get('CLAUDE_CONFIG_DIR') or Path(home_env) / '.claude')
         source = source.resolve(strict=False)
@@ -808,6 +836,11 @@ def build_worker_home(agent_home, harness, worker_type, identity, *, env=None, d
                 'source': str(agent_home), 'profile': profile,
                 'schema': 2, 'identity': identity, 'key': key,
                 'destination': destination is not None}
+    if harness == 'codex':
+        metadata.update(
+            codex_config_home=str(source.expanduser().absolute()),
+            home_environment=str(Path(home_env).expanduser().absolute()),
+        )
     if harness == 'claude':
         metadata['claude_secure_storage_dir'] = secure_storage
     write_json(home / 'worker-home.json', metadata)

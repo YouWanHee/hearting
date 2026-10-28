@@ -34,6 +34,61 @@ def _contract_error(reason, detail=""):
     return DispatchContractError(reason, detail)
 
 
+def _native_claude_capacity(terminal, metadata):
+    """The existing native reader's exact Claude quota result, not a generic invalid envelope."""
+    attempt = metadata.get("attempt_id")
+    log_file = metadata.get("log_file")
+    if (not attempt or not isinstance(log_file, str)
+            or not Path(log_file).name.endswith(f".{attempt}.claude.jsonl")):
+        return False
+    try:
+        log_path = Path(log_file)
+        if log_path.is_symlink() or not log_path.is_file():
+            return False
+    except OSError:
+        return False
+    return (
+        isinstance(terminal, Mapping)
+        and metadata.get("harness") == "claude"
+        and terminal.get("state") == "invalid"
+        and terminal.get("source") == "exact-claude-result"
+        and terminal.get("reason") == "claude-result-capacity"
+        and terminal.get("failure_class") == "capacity"
+        and terminal.get("failure_note") == "dead-capacity"
+    )
+
+
+def _closed_native_capacity(status, metadata, *, jobs=None, lines=None):
+    """Recover the exact legacy invalid-envelope row only from its bound raw attempt log."""
+    if (status != "done" or jobs is None
+            or metadata.get("note") != "dead-invalid-envelope"
+            or metadata.get("failure_class") != "invalid-envelope"
+            or metadata.get("classifier_source") != "completion-join-invalid-envelope-v1"
+            or metadata.get("reconcile_reason") != "terminal-invalid:claude-result-capacity"):
+        return False
+    attempt = metadata.get("attempt_id")
+    log_file = metadata.get("log_file")
+    if (not attempt or not isinstance(log_file, str)
+            or not Path(log_file).name.endswith(f".{attempt}.claude.jsonl")):
+        return False
+    try:
+        import dispatch_replacement as DR
+        rows = DR._rows(Path(jobs).read_text().splitlines() if lines is None else lines)
+        if attempt not in rows:
+            return False
+        fields, current = rows[attempt]
+        if (fields[1] != status or current != dict(metadata)
+                or current.get("route_id") != metadata.get("route_id")
+                or current.get("route_hash") != metadata.get("route_hash")
+                or current.get("route_node") != metadata.get("route_node")):
+            return False
+        return _native_claude_capacity(DR.terminal_observation(fields, current), current)
+    except Exception:
+        # Registry or classifier uncertainty is a refusal; this read-only
+        # eligibility branch never turns it into replacement authority.
+        return False
+
+
 class ContinuationDecision(NamedTuple):
     allowed: bool
     state: str
@@ -87,21 +142,25 @@ def _replacement_kind(status, meta, *, jobs=None, lines=None):
         return None
     if meta.get('note') in DR.DEATH_NOTES and status not in {'cancelled', 'killed'}:
         return 'silent'
-    if (meta.get('worker_type') == 'owner' and status == 'done'
-            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')):
+    native_closed_capacity = _closed_native_capacity(status, meta, jobs=jobs, lines=lines)
+    capacity_row = (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity'
+                    or native_closed_capacity)
+    if (meta.get('worker_type') == 'owner' and status == 'done' and capacity_row):
         return 'capacity'
     if meta.get('worker_type') == 'owner' and status == 'done' and meta.get('note') in DR.RUNTIME_DEATH_NOTES:
         return 'runtime'  # the owner's runtime died under it; only an explicit `start` replaces it
-    if (jobs is not None and meta.get('worker_type') == 'frame' and status == 'done'
-            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')
-            and DR._frame_rule_top(jobs, meta)):
-        return DR.FRAME_CAPACITY
-    if (jobs is not None and meta.get('worker_type') == 'frame' and status == 'done'
-            and (meta.get('note') == 'dead-capacity' or meta.get('failure_class') == 'capacity')
-            and DR._frame_pair_rotation_verified(jobs, meta)):
-        # A verified rotated alternative uses ordinary capacity recovery; it
-        # does not claim the frame rule's top-to-deep transition.
-        return 'capacity'
+    if jobs is not None and meta.get('worker_type') == 'frame' and status == 'done' and capacity_row:
+        if DR._same_role_successful_frame_peer_harness(jobs, meta, lines=lines):
+            # The ordinary route selector may replay this missing leg at the
+            # peer's already-admitted persona. This is harness placement only;
+            # the frame's sealed profile/role remain unchanged.
+            return 'capacity'
+        if DR._frame_rule_top(jobs, meta):
+            return DR.FRAME_CAPACITY
+        if DR._frame_pair_rotation_verified(jobs, meta):
+            # A verified rotated alternative uses ordinary capacity recovery; it
+            # does not claim the frame rule's top-to-deep transition.
+            return 'capacity'
     return None
 
 
@@ -342,6 +401,11 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
         terminal = facts["terminal"]
         state, verdict = str(terminal.get("state") or "absent"), str(terminal.get("verdict") or "")
         if state != "valid":
+            if _native_claude_capacity(terminal, metadata or {}):
+                return ContinuationDecision(False, "typed", "typed-capacity", "typed-close",
+                    detail="dead-capacity", census={key: terminal[key] for key in (
+                        "reason", "failure_note", "failure_class", "quota_window",
+                        "quota_reset_epoch", "quota_model_scope") if terminal.get(key) is not None})
             reason = "terminal-" + state
             if terminal.get("reason"):
                 reason += ":" + str(terminal["reason"])
@@ -459,11 +523,41 @@ def decide_continuation(route=None, *, action, jobs=None, owner_attempt_id=None,
                                     next_action="observe" if registered else "start")
     stopped = answerable_owner_end(status, metadata) if action in {"owner", "owner-input"} else ""
     if action == "owner-input":
-        # Keeping an answer cannot spawn an owner or disturb uncertain transport.
+        from route_parent_close import row_requested
+        closing = (metadata.get("parent_close_requested") == "1"
+                   or status in {"cancelled", "killed"}
+                   or jobs is not None and metadata.get("attempt_id")
+                   and row_requested(metadata, jobs))
+        if closing:
+            return ContinuationDecision(False, "protected", "cancelled-by-parent", "settle")
+        # Ended owners keep their answer for the existing terminal continuation.
         if stopped:
             return ContinuationDecision(True, "retained", next_action="correct")
         if status in {"open", "running"} and facts.get("accepting", True) and facts.get("reachable"):
             return ContinuationDecision(True, "queued", next_action="handback")
+        # A bound, open channel is durable admission even when its consumer or
+        # process observation is unavailable. The caller may recover only after
+        # a second, complete observation; this branch itself never starts it.
+        if (status in {"open", "running"} and facts.get("bound")
+                and not facts.get("lease_held")):
+            process = facts.get("process")
+            continuation = facts.get("owner_continuation")
+            recover = (
+                facts.get("recoverable") is True
+                and facts.get("queued") is True
+                and facts.get("thread_match") is True
+                and facts.get("caller_owns") is True
+                and facts.get("harness") == "codex"
+                and metadata.get("harness") == "codex"
+                and metadata.get("launch_claimed") == "1"
+                and metadata.get("launch_started") == "1"
+                and process is not None and process.state == "quiescent"
+                and continuation is not None
+                and continuation.state == "quiescent"
+                and continuation.reason == "registered-resources-preserved"
+            )
+            return ContinuationDecision(True, "recover" if recover else "stored",
+                next_action="start", detail="" if recover else str(facts.get("store_reason") or "consumer-unavailable"))
     parked, cancellation = facts.get("parked"), None
     if action == "owner":
         from route_parent_close import row_requested
@@ -1210,6 +1304,40 @@ def recovery_task(record, source, history):
     return history["task"]
 
 
+def _frame_peer_recovery_harness(candidate, history, route):
+    """A cross-harness frame recovery may reuse only its exact successful same-persona peer."""
+    if (not isinstance(route, dict)
+            or (candidate.get("resolved") or {}).get("worker_type") != "frame"
+            or candidate.get("harness") == history.get("harness")
+            or candidate.get("route_id") != route.get("route_id")
+            or candidate.get("route_node") != history.get("route_node")
+            or candidate.get("route_node") not in {"frame", "frame-alternative"}):
+        return False
+    try:
+        import dispatch_replacement as DR
+        rows = DR._rows(Path(history["jobs"]).read_text().splitlines())
+        source = rows.get(history.get("attempt_id"))
+        if source is None:
+            return False
+        fields, metadata = source
+        return (fields[1] == "done"
+                and metadata.get("route_id") == route.get("route_id")
+                and metadata.get("route_hash") == route.get("route_hash")
+                and DR._same_role_successful_frame_peer_harness(
+                    history["jobs"], metadata) == candidate.get("harness"))
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return False
+
+
+_GRANT_FIELD_WORDS = ("read_roots", "read_enforcement", "network", "writable_roots",
+                      "file_enforcement", "runtime_sandbox", "execution_access")
+
+
+def _adapter_policy_field(label):
+    """A permission field that carries no file, read or network grant."""
+    return not any(word in label for word in _GRANT_FIELD_WORDS)
+
+
 def permission_mismatch_detail(previous, current):
     """Describe a historical permission difference with its exact evidence source."""
     old, new = _granted_permission_pair(previous, current)
@@ -1382,7 +1510,9 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
     """
     owner = worker_type == "owner"
     pinned = sealed_pin_harness(route, worker_type=worker_type) if route else None
-    keys = ("jobs", "worktree") if owner or pinned else REPLACEMENT_FIXED_KEYS
+    frame_peer = bool(route and worker_type == "frame"
+                      and _frame_peer_recovery_harness(candidate, history, route))
+    keys = ("jobs", "worktree") if owner or pinned or frame_peer else REPLACEMENT_FIXED_KEYS
     for key in keys:
         if candidate.get(key) != history.get(key):
             raise _contract_error("replacement-input-tuple-mismatch", key)
@@ -1390,10 +1520,19 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
         raise _contract_error("pin-ignored-for-replacement", pinned)
     drift = candidate.get("launch_home") != history.get("launch_home")
     old, new = history.get("resolved") or {}, candidate.get("resolved") or {}
+    if frame_peer:
+        node = next((row for row in route.get("nodes", [])
+                     if isinstance(row, dict) and row.get("id") == candidate.get("route_node")), None)
+        expected_profile = transition["to"] if transition else (node or {}).get("model_profile")
+        if (not node or new.get("model_profile") != expected_profile
+                or new.get("model_role") != node.get("role")):
+            raise _contract_error("replacement-input-tuple-mismatch", "frame-model-role-profile")
     if transition and new.get("model_profile") != transition["to"]:
         raise _contract_error("replacement-input-tuple-mismatch", "resolved")
     ignored = RECOVERY_SELECTION_VALUES if route else frozenset()
-    if owner and route and candidate.get("harness") != history.get("harness"):
+    cross_runtime = (bool(route) and candidate.get("harness") != history.get("harness")
+                     and (owner or frame_peer))
+    if cross_runtime:
         ignored = ignored | {"sandbox", "permission_mode", "parent_sandbox", "parent_transport"}
     for key in sorted(set(old) | set(new)):
         expected = (parent_values or {}).get(key, old.get(key))
@@ -1404,7 +1543,9 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
                 and new.get("model_profile") == transition["to"]
                 and (key != "resolved_model_settings" or (new.get(key) or {}).get("profile") == transition["to"])):
             continue
-        if not (drift and key in RELEASE_DERIVED_VALUES):
+        # A key the sealing release never recorded has no stored value to keep;
+        # after a release move the current release supplies it.
+        if not (drift and (key in RELEASE_DERIVED_VALUES or key not in old)):
             raise _contract_error("replacement-input-tuple-mismatch", "resolved")
     # Sealing includes the raw argv as history. Check what the candidate will
     # actually receive against its own checked current binding, rather than
@@ -1426,8 +1567,7 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
                 and flag in options and options[flag] != [str(expected)]):
             raise _contract_error("replacement-argv-mismatch", flag)
     sealed, granted = _granted_permission_pair(history, candidate)
-    cross_owner = owner and candidate.get("harness") != history.get("harness")
-    if cross_owner:
+    if cross_runtime:
         require_recovery_grant_addresses(candidate, history, route=route, access=access)
     elif (candidate.get("harness") == "opencode"
           and "opencode_selected_agent_permission" not in
@@ -1443,11 +1583,22 @@ def require_recovery_work(candidate, history, *, route=None, worker_type=None,
         if (granted.get("execution_access") or {}).get("request_sha256") != access["request_sha256"]:
             raise _contract_error("replacement-input-tuple-mismatch", "execution_access")
         granted, sealed = _without_recovery_access(granted), _without_recovery_access(sealed)
-    # A cross-harness owner goes through the ordinary access-grant launcher.
+    added = set()
+    if drift:
+        # Same rule as the resolved keys above, for adapter policy records only:
+        # file, read and network grants stay strictly comparable.
+        recorded = history.get("applied_permissions") or {}
+        added = {key for key in granted if key not in sealed and key not in recorded
+                 and _adapter_policy_field(key)}
+        granted = {key: value for key, value in granted.items() if key not in added}
+    # Cross-harness owner/frame recovery goes through the ordinary access-grant launcher.
     # Its runtime permission spelling differs, while the exact approved request
     # and addresses above remain bound. Same-harness grants stay comparable.
-    if not cross_owner and granted != sealed:
-        detail = permission_mismatch_detail(history, candidate)
+    if not cross_runtime and granted != sealed:
+        shown = {**candidate, "applied_permissions": {
+            key: value for key, value in (candidate.get("applied_permissions") or {}).items()
+            if key not in added}}
+        detail = permission_mismatch_detail(history, shown)
         raise _contract_error("replacement-input-tuple-mismatch", detail or "applied_permissions")
     if (not owner and _work_options(candidate.get("argv", []), harness=candidate.get("harness"))
             != _work_options(history.get("argv", []), harness=history.get("harness"))):
@@ -1802,23 +1953,127 @@ def resource_predecessor_finished(row, *, observation=None):
                  or resource_process_group_quiescent(row)))
 
 
+def _resource_operation(row):
+    operation = row.get("resource_operation") if isinstance(row, dict) else None
+    if not isinstance(operation, dict) or operation.get("schema_version") != 1:
+        return None
+    identity = operation.get("operation_id")
+    request_sha = operation.get("request_sha256")
+    command_sha = operation.get("command_record_sha256")
+    body_sha = operation.get("body_sha256")
+    source = operation.get("input")
+    if (not isinstance(identity, str) or not re.fullmatch(r"[0-9a-f]{64}", identity)
+            or not isinstance(request_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", request_sha)
+            or not isinstance(command_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", command_sha)
+            or not isinstance(operation.get("command_record_path"), str)
+            or not isinstance(body_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", body_sha)
+            or not isinstance(operation.get("work_request_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", operation["work_request_sha256"])
+            or not isinstance(source, dict)
+            or not isinstance(source.get("id"), str) or not source["id"]
+            or not isinstance(source.get("digest"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source["digest"])
+            or not isinstance(source.get("target"), str)
+            or not isinstance(source.get("source_session"), str) or not source["source_session"]
+            or source.get("state") != "turn-completed"
+            or not isinstance(source.get("turn_ids"), list) or not source["turn_ids"]
+            or any(not isinstance(turn, str) or not turn for turn in source["turn_ids"])):
+        return None
+    return operation
+
+
+def _same_resource_owner(left, right):
+    left_wait, right_wait = left.get("owner_wait") or {}, right.get("owner_wait") or {}
+    return (left.get("resource_policy") == right.get("resource_policy") == "supervised-owner"
+            and left.get("route") == right.get("route")
+            and left.get("route_id") == right.get("route_id")
+            and left.get("node") == right.get("node")
+            and left.get("jobs") == right.get("jobs")
+            and left.get("parent_attempt_id") == right.get("parent_attempt_id")
+            and left_wait.get("parent_attempt_id") == right_wait.get("parent_attempt_id")
+            and left_wait.get("session_id") == right_wait.get("session_id")
+            and left_wait.get("route_id") == right_wait.get("route_id")
+            and left_wait.get("route_hash") == right_wait.get("route_hash")
+            and left_wait.get("jobs") == right_wait.get("jobs"))
+
+
+def _independent_resource_operations(left, right):
+    """Only distinct exact operations selected under the same live owner may overlap."""
+    first, second = _resource_operation(left), _resource_operation(right)
+    if not first or not second or not _same_resource_owner(left, right):
+        return False
+    a, b = first["input"], second["input"]
+    return (first["operation_id"] != second["operation_id"]
+            and first["body_sha256"] != second["body_sha256"]
+            and first["request_sha256"] != second["request_sha256"]
+            and a["target"] == b["target"]
+            and first["work_request_sha256"] == second["work_request_sha256"]
+            and first.get("route_plan_digest") == second.get("route_plan_digest"))
+
+
 def require_resource_predecessors(rows, candidate, *, observations=None):
     """Recheck execution and evidence-address protection within the existing reservation lock."""
     from dispatch_resource_wait import resource_evidence_paths_conflict
     observations = observations or {}
+    unique_rows, seen = [], set()
     for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        if key not in seen:
+            seen.add(key)
+            unique_rows.append(row)
+    finished_cache = {}
+    def finished(row):
+        marker = id(row)
+        if marker in finished_cache:
+            return finished_cache[marker]
+        execution = row.get("execution") if isinstance(row, dict) else None
+        captured = observations.get(row.get("run_id"))
+        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+            result = bool(captured and captured.get("row") == row
+                          and resource_predecessor_finished(row, observation=captured))
+        else:
+            result = resource_predecessor_finished(row)
+        finished_cache[marker] = result
+        return result
+
+    active_legacy = [row for row in unique_rows
+                     if row.get("resource_policy") == "supervised-owner"
+                     and _resource_operation(row) is None
+                     and not finished(row)]
+    for row in unique_rows:
         if row.get("resource_policy") == "observer":
             if resource_evidence_paths_conflict(row, candidate):
                 raise ValueError("resource-route-body-conflict")
             continue
         execution = row.get("execution") if isinstance(row, dict) else None
-        if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
-            captured = observations.get(row.get("run_id"))
-            if (not captured or captured.get("row") != row
-                    or not resource_predecessor_finished(row, observation=captured)):
-                raise ValueError("resource-route-body-conflict")
-        elif not resource_predecessor_finished(row):
-            raise ValueError("resource-route-body-conflict")
+        is_finished = finished(row)
+        if not is_finished:
+            # A legacy live primary may be preserved beside one newly proven
+            # operation. It remains the old flat-view row; no legacy row is
+            # inferred to authorize another launch.
+            legacy_pair = (len(active_legacy) == 1 and row is active_legacy[0]
+                           and row.get("resource_policy") == "supervised-owner"
+                           and _resource_operation(candidate) is not None
+                           and _same_resource_owner(row, candidate))
+            if not legacy_pair:
+                previous_operation = _resource_operation(row)
+                candidate_operation = _resource_operation(candidate)
+                if candidate_operation is None or previous_operation is None:
+                    raise ValueError("resource-route-body-conflict")
+                if previous_operation["operation_id"] == candidate_operation["operation_id"]:
+                    raise ValueError("resource-operation-duplicate")
+                if not _independent_resource_operations(row, candidate):
+                    raise ValueError("resource-operation-authorization-conflict")
+        elif (_resource_operation(row) is not None
+              and _resource_operation(candidate) is not None
+              and _resource_operation(row)["operation_id"] == _resource_operation(candidate)["operation_id"]
+              and row.get("run_id") != candidate.get("run_id")
+              and row.get("status") == "succeeded"):
+            # A new registry id cannot turn a completed exact operation into a
+            # second success or an unbounded repetition.
+            raise ValueError("resource-operation-duplicate")
         if resource_evidence_paths_conflict(row, candidate):
             raise ValueError("resource-route-body-conflict")
 

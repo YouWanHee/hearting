@@ -689,6 +689,25 @@ class EnrichTest(EnvTmpTestCase):
         self.assertEqual(origin_node["handoff_to"], {"harness": "claude", "session_id": "sess-r"})
         self.assertEqual(receiver_node["handoff_from"], {"harness": "claude", "session_id": "sess-o"})
 
+    def test_targeted_enrich_keeps_other_sessions_as_handoff_context(self):
+        r1 = _fake_route("rt-1", "research")
+        route_chain.append("claude", "sess-o", _line_for(
+            r1, event="compose", harness="claude", session_id="sess-o", ts=1.0))
+        route_chain.append("claude", "sess-r", _line_for(
+            r1, event="start", harness="claude", session_id="sess-r", ts=2.0))
+        origin = _sess(harness="claude", session_id="sess-o")
+        receiver = _sess(harness="claude", session_id="sess-r")
+        origin.route_chain = {"cached": "preserve"}
+
+        with mock.patch("fleet.route.load", side_effect=lambda *a, **k: r1), \
+                mock.patch("fleet.route.load_outcome",
+                           side_effect=lambda *a, **k: {"present": False}):
+            route_chain.enrich([origin, receiver], only_sessions=[receiver])
+
+        self.assertEqual(origin.route_chain, {"cached": "preserve"})
+        self.assertEqual(receiver.route_chain["nodes"][0]["handoff_from"],
+                         {"harness": "claude", "session_id": "sess-o"})
+
     def test_enrich_merges_alias_keys_by_ts(self):
         r1 = _fake_route("rt-1", "research")
         r2 = _fake_route("rt-2", "draft")

@@ -200,7 +200,12 @@ The legacy hook table below describes the V1 `server()` entrypoint. V2 loads
 uses the Promise API `setup(ctx)` and registers `ctx.tool`, `ctx.shell`,
 `ctx.session`, and `ctx.event` hooks. The flat `hearting-guards.js` file keeps
 the V1 `server()` export. The global installer projects both paths so OpenCode
-V2's package-directory discovery can find the V2 entrypoint.
+V2's package-directory discovery can find the V2 entrypoint. OpenCode V2 skips a
+package whose entry resolves outside the package directory, so runtime
+activation writes `plugins/hearting-guards/index.ts` as an owned regular file
+that imports the activated bundle's `hearting-guards.js` by absolute path,
+rather than a link into the bundle. Plugins load in the OpenCode server; a
+TUI relaunch alone does not attach a plugin the server has not loaded.
 
 V2 worker sessions are identified from their exact native session title/agent;
 the shared service process environment is not treated as worker identity.
@@ -210,6 +215,11 @@ guards. Successful and typed provider HTTP outcomes feed the existing scoped
 eligibility cache without storing response bodies or credentials.
 
 The terminal client plugin API is separate (`cli.json`, `@opencode/plugin/tui`).
+V2 skips a `tui.json`/`cli.json` plugin entry that names a plain file, so the
+Hearting TUI identity plugin loads as the discovered package
+`plugins/hearting-tui-identity/`, whose `tui.ts` entry activation renders as an
+owned regular file importing the activated bundle's
+`tui/hearting-tui-identity.ts`; the V1 file entry stays for V1 clients.
 The current adapter does not port external Herdr TUI code to that API. V2
 session/environment forwarding and native permission enforcement still need
 same-head verification by the supervisor; fixture registration is not native

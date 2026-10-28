@@ -68,6 +68,7 @@ shared-utility-deferred	recovery_history.py
 shared-utility-deferred	report_verification_projection.py
 shared-utility-deferred	resource_resume.py
 shared-utility-deferred	review_input.py
+shared-utility-deferred	retained_review_completion.py
 shared-utility-deferred	review_watchdog.py
 shared-utility-deferred	session_tidy_idle.py
 shared-utility-deferred	session_tidy_policy.py
@@ -130,6 +131,7 @@ utility-deferred	codex-managed-completion.py
 utility-deferred	codex-managed-entry.py
 utility-deferred	codex-managed-gateway.py
 utility-deferred	codex_app_server_supervisor.test.py
+utility-deferred	codex_capacity_resume.py
 utility-deferred	codex_dispatch_terminal.py
 utility-deferred	codex_dispatch_terminal.test.py
 utility-deferred	codex_hook_definition_age.py
@@ -279,6 +281,7 @@ utility-deferred	stage_dispatch_fallback.test.py
 utility-deferred	stage_session_contract.py
 utility-deferred	stage_session_runtime.py
 utility-deferred	stage_session_runtime.test.py
+utility-deferred	steward_check.py
 utility-deferred	subdivision_batch_admission.py
 utility-deferred	tidy_decisions.py
 utility-deferred	tidy_transcripts.py
@@ -392,3 +395,4 @@ tool-deferred	test-isolation.tsv
 tool-deferred	web-bundle
 utility-deferred	artifact_directory_bundle.py
 utility-deferred	codex_shared_daemon_live_driver.py
+utility-deferred	retained_review_completion.test.py

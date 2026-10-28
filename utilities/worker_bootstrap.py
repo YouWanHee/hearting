@@ -252,11 +252,19 @@ def _non_git_runtime_candidate(root: Path, values, source_root) -> str:
             return ""
 
         source = Path(source_root).expanduser().resolve(strict=False) if source_root else root.parent
+        configured_home = Path(values.get("HOME") or Path.home()).expanduser().resolve(strict=False)
+        home_source = source == configured_home and source != Path("/")
+        managed_home_state = state_root_real.is_relative_to(configured_home)
 
         def overlaps(left: Path, right: Path) -> bool:
             return (left == right or left.is_relative_to(right) or right.is_relative_to(left))
 
-        if overlaps(candidate, source) or overlaps(candidate, root):
+        source_overlap = overlaps(candidate, source)
+        home_default_exception = (home_source and managed_home_state
+                                  and candidate.is_relative_to(runtimes_root_real)
+                                  and candidate != runtimes_root_real)
+        if ((source_overlap and not home_default_exception)
+                or overlaps(candidate, root)):
             return ""
         if "releases" in candidate.parts or ".harness" in candidate.parts:
             return ""
@@ -762,7 +770,8 @@ def plan_leg_prompt(route, node_id=None, primary_report=None) -> str:
     for row in (plan or {}).get("handed_over") or []:
         lines.append(f"Handed over by leg {row['leg']}: " + "; ".join(row["items"]))
     if leg.get("parallel"):
-        lines.append("Parallel slices the plan suggests: " + "; ".join(leg["parallel"]))
+        lines.append("Approved slices: use these when assigning workers or permitted sub-sessions; "
+                     "report slices without results as unfinished: " + "; ".join(leg["parallel"]))
     added = {(n.get("plan_stage") or {}).get("id"): n["id"] for n in route.get("nodes") or [] if n.get("plan_stage")}
     for stage in leg.get("extra_stages") or []:
         if stage["id"] in added:
@@ -891,8 +900,17 @@ def assignment_prompt(args, task: str, environ) -> str:
     if getattr(args, "worker_type", None) != "frame":
         route_file = getattr(args, "route_file", None)
         if not route_file:
+            plan_prompt = ""
+            binding = getattr(args, "owner_route_binding", None)
+            bound_route_file = getattr(binding, "route_file", None)
+            if getattr(args, "worker_type", None) == "owner" and bound_route_file:
+                try:
+                    route = json.loads(Path(bound_route_file).read_text(encoding="utf-8"))
+                    plan_prompt = plan_leg_prompt(route)
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    pass
             return (f"Assignment:\n{task.rstrip()}\n\n{completion_scope_prompt()}"
-                    f"{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")
+                    f"{plan_prompt}{owner_gate_prompt(args)}{owner_inline_marker_prompt(args)}{owner_close_prompt(args)}")
         route = json.loads(Path(route_file).read_text(encoding="utf-8"))
         source_worktree = _linked_slice_source_worktree(args, route)
         scope_environment = _child_scope_environment(args, route, environ, source_worktree)

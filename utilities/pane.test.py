@@ -8,20 +8,26 @@ reach nothing but those recorders.
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 _SURFACE_ENV = ("HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_TAB_ID", "HERDR_WORKSPACE_ID",
-                "TMUX", "TMUX_PANE", "AGENT_HERDR_SESSION")
+                "TMUX", "TMUX_PANE", "AGENT_HERDR_SESSION", "CMUX_WORKSPACE_ID", "CMUX_SURFACE_ID")
 _MUTATIONS = (("pane", "split"), ("tab", "create"), ("pane", "run"), ("pane", "send-text"),
               ("pane", "rename"), ("pane", "report-metadata"), ("split-window",), ("new-window",),
-              ("send-keys",), ("select-pane",), ("set-option",))
+              ("send-keys",), ("select-pane",), ("set-option",), ("pane", "move"),
+              ("pane", "resize"), ("pane", "swap"), ("pane", "close"), ("tab", "close"),
+              ("layout", "apply"), ("select-layout",), ("swap-pane",), ("kill-pane",),
+              ("kill-window",), ("kill-server",))
 
 _RECORDER = """#!{python}
 import json, os, sys
@@ -50,7 +56,7 @@ class PaneCliTest(unittest.TestCase):
             os.environ.pop(key, None)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for name in ("herdr", "tmux"):
+        for name in ("herdr", "tmux", "cmux"):
             path = self.bin / name
             path.write_text(_RECORDER.format(python=sys.executable), encoding="utf-8")
             path.chmod(0o700)
@@ -76,7 +82,9 @@ class PaneCliTest(unittest.TestCase):
     def mutations(self):
         found = []
         for call in self.calls():
-            words = [word for word in call[1:] if not word.startswith("-")]
+            words = call[1:]
+            if words[:1] in (["-S"], ["--session"]):
+                words = words[2:]
             if any(tuple(words[:len(verb)]) == verb for verb in _MUTATIONS):
                 found.append(call)
         return found
@@ -127,6 +135,54 @@ class PaneCliTest(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["surface"], "none")
         self.assertTrue(self.calls())
         self.assertEqual(self.mutations(), [])
+
+    def tidy(self, *args, entry=None, **extra):
+        return subprocess.run([*(entry or [sys.executable, str(_HERE / "pane.py")]), "tidy", *args],
+                              cwd=self.root, env=self.env(**extra), capture_output=True, text=True, timeout=60)
+
+    def test_tidy_help_extra_args_and_no_surface(self):
+        help_result = self.tidy("--help")
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("Herdr and tmux", help_result.stdout)
+        self.assertIn("not supported on cmux", help_result.stdout)
+        self.assertIn("key settings", help_result.stdout)
+        self.assertEqual(self.tidy("unexpected").returncode, 2)
+        for entry in (None, ["sh", str(_ROOT / "tools/install/harness.sh"), "run", "pane"]):
+            result = self.tidy(entry=entry, AGENT_HOME=str(_ROOT))
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(len(result.stdout.splitlines()), 1)
+            self.assertEqual(json.loads(result.stdout)["notes"], ["pane-caller-unconfirmed"])
+        self.assertEqual(self.calls(), [])
+
+    def test_tidy_worker_and_cmux_touches_no_terminal(self):
+        for marker in ({"AGENT_SESSION_ROLE": "worker"}, {"AGENT_DISPATCH_CHILD": "1"},
+                       {"AGENT_DISPATCH_DEPTH": "2"}):
+            result = self.tidy(HERDR_PANE_ID="w1:p0", TMUX="/private/socket,1,0", TMUX_PANE="%0", **marker)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["notes"], ["worker-refused"])
+        result = self.tidy(CMUX_WORKSPACE_ID="workspace-one", CMUX_SURFACE_ID="surface-one")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["notes"], ["Hearting pane tidy is not supported on cmux."])
+        self.assertEqual(self.calls(), [])
+
+    def test_tidy_unproven_herdr_and_tmux_make_no_mutations(self):
+        result = self.tidy(HERDR_PANE_ID="w1:p0", TMUX="/private/socket,1,0", TMUX_PANE="%0")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertTrue(self.calls())
+        self.assertEqual(self.mutations(), [])
+
+    def test_tidy_success_unchanged_and_partial_failure_json_exit_contract(self):
+        sys.path.insert(0, str(_HERE))
+        import pane
+        from terminal_surface import TidyResult
+        for changed, notes, exit_code in ((True, [], 0), (False, [], 0), (True, ["pane-move-unconfirmed"], 1)):
+            expected = TidyResult("herdr", "w1:t1", ["w1:p0", "w1:p1"], changed, notes)
+            stdout = io.StringIO()
+            with mock.patch.object(pane, "tidy_panes", return_value=expected), contextlib.redirect_stdout(stdout):
+                self.assertEqual(pane.main(["tidy"]), exit_code)
+            self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+            self.assertEqual(json.loads(stdout.getvalue()), expected.json())
+        self.assertEqual(self.calls(), [])
 
 
 if __name__ == "__main__":

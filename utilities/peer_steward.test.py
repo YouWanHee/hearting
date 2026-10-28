@@ -6,6 +6,7 @@ import copy
 import errno
 import fcntl
 import hashlib
+import io
 import importlib.util
 import json
 import math
@@ -2001,13 +2002,16 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self._release()
         self._wait_for_receipt(self._fields(proc.stdout)["watch_id"])
 
-    def _unbound_watch(self, mode, extra_env=None):
+    def _unbound_watch(self, extra_env=None):
         identity_path = self.tmp_root / "identity.json"
         # The first get sees no session; the following native wait/get sees the
         # session created by first input. Keep that transition consistent across
         # the fake Herdr calls so the observer can prove the same pane identity.
         identity_path.write_text(json.dumps({"session_id": "", "once": True}))
-        env = self._env(mode)
+        # Held: the detached watcher's native wait blocks on the FIFO, so the
+        # first session cannot bind before the unbound arm is read below. An
+        # idle wait returned at once and let a slow test read the bound arm.
+        env = self._env("held")
         env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
         env.update(extra_env or {})
         proc = self._run("watch", "peer-a", env=env)
@@ -2022,20 +2026,22 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
     def test_watch_on_a_pane_before_its_first_session_arms_on_the_pane(self):
         """2026-10-10 regression: a fresh Codex has no session until its first
         input, and `watch` refused it (`watch-identity-unverified`)."""
-        watch_id, _arm, _identity, _env = self._unbound_watch("idle")
+        watch_id, _arm, identity_path, _env = self._unbound_watch()
+        identity_path.write_text(json.dumps({"session_id": "sid-fake"}))
+        self._release()
         receipt = self._wait_for_receipt(watch_id)
         self.assertEqual((receipt["agent"]["session_id"], receipt["agent"]["pane"]), ("sid-fake", "w1:p9"))
 
     def test_sidless_watch_marker_uses_resolved_name_and_pane(self):
         _watch_id, _arm, _identity, env = self._unbound_watch(
-            "idle", {"FAKE_HERDR_NAME": "hearting-1d"})
+            {"FAKE_HERDR_NAME": "hearting-1d"})
         markers = peer_steward.peer_message.read_steward_markers()
         entry = markers[("claude", "steward-1")]["targets"]["hearting-1d"]
         self.assertEqual((entry["harness"], entry["session_id"], entry["name"], entry["pane"]),
                          ("claude", None, "hearting-1d", "w1:p9"))
 
     def test_pane_armed_watch_keeps_the_session_it_took(self):
-        watch_id, arm_path, identity_path, env = self._unbound_watch("held")
+        watch_id, arm_path, identity_path, env = self._unbound_watch()
         identity_path.write_text(json.dumps({"session_id": "sid-first"}))
         again = self._run("watch", "w1:p9", env=env)
         self.assertEqual(self._fields(again.stdout.splitlines()[0]).get("watch_id"), watch_id)
@@ -2064,7 +2070,7 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         state_file = self.tmp_root / "agent-state.txt"
         state_file.write_text("working")
         watch_id, arm_path, identity_path, env = self._unbound_watch(
-            "held", {"FAKE_HERDR_AGENT_STATE_FILE": str(state_file),
+            {"FAKE_HERDR_AGENT_STATE_FILE": str(state_file),
                      "FAKE_HERDR_WAIT_STATE": "idle"})
         original_arm = json.loads(arm_path.read_text())
         original_deadline = original_arm["deadline"]
@@ -2239,7 +2245,7 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         import contextlib
         import io
 
-        watch_id, arm_path, identity_path, env = self._unbound_watch("held")
+        watch_id, arm_path, identity_path, env = self._unbound_watch()
         original_arm = json.loads(arm_path.read_text())
         original_deadline = original_arm["deadline"]
         paths = peer_steward._watch_paths(watch_id, self.watch_root)
@@ -3831,8 +3837,14 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         self.assertNotEqual(live["watch_id"], dead["watch_id"],
                             f"live={live} dead={dead}")
         self._wait_for_lock(dead["watch_id"])
-        waits_before_dead = len(self._wait_calls())
-        self._wait_for_wait_calls(waits_before_dead + 1)
+        # Wait for this watch's own native wait, not for the total count to grow:
+        # that wait may already be logged before the count is read.
+        def dead_waits():
+            return [line for line in self._wait_calls() if " peer-dead" in f" {line} "]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not dead_waits():
+            time.sleep(0.02)
+        self.assertEqual(len(dead_waits()), 1, self._wait_calls())
         os.kill(int(dead["pid"]), signal.SIGKILL)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and peer_steward._pid_identity_ok(
@@ -3850,7 +3862,7 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
             new_arm["watcher"]["pid"], new_arm["watcher"]["pid_start"]))
         self.assertTrue(peer_steward._lock_held(
             self.watch_root / f"{fields['watch_id']}.lock"))
-        self.assertEqual(len(self._wait_calls()), waits_before_dead + 1,
+        self.assertEqual(len(dead_waits()), 1,
                          "reattachment adopts the one already launched native wait")
 
         self._release()
@@ -4619,6 +4631,55 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertIsNone(resolved[1])
         self.assertEqual((resolved[0]["harness"], resolved[0]["session_id"],
                           resolved[0]["pane"]), ("claude", "sid-child", "w1:pX"))
+
+    def test_unrelated_unknown_identity_does_not_block_exact_name_or_tag(self):
+        rows = [self._inventory_row(), self._inventory_row(
+            harness="claude", sid="sid-unrelated", name="other", pane="w1:pU")]
+        self._set_inventory(rows)
+        self._native_sid_by_pid.pop(40001, None)
+        self._native_sid_by_harness["claude"] = ""
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_retire_target", side_effect=self._target_for), \
+             mock.patch.object(peer_steward, "_retire_pane_info", side_effect=self._pane_info_for), \
+             mock.patch.object(peer_steward, "_prompt_process_session",
+                               wraps=peer_steward._prompt_process_session) as process_session, \
+             mock.patch.object(peer_steward, "_prompt_fleet_tag",
+                               side_effect=lambda _harness, sid, **_kw:
+                               ({"sid-child": "3e", "sid-unrelated": "7a"}.get(sid), None)):
+            named = peer_steward._resolve_prompt_target("child")
+            tagged = peer_steward._resolve_prompt_target("[3e]")
+        self.assertIsNone(named[1])
+        self.assertIsNone(tagged[1])
+        self.assertEqual((named[0]["pane"], tagged[0]["pane"]), ("w1:pX", "w1:pX"))
+        self.assertEqual(process_session.call_count, 4,
+                         "only the matching pane needs native identity proof per address")
+
+        self._native_sid_by_pid.pop(40000, None)
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_retire_target", side_effect=self._target_for), \
+             mock.patch.object(peer_steward, "_retire_pane_info", side_effect=self._pane_info_for):
+            uncertain = peer_steward._resolve_prompt_target("child")
+        self.assertIsNone(uncertain[0])
+        self.assertEqual(uncertain[1:], ("target-identity-unverified", ["w1:pX"]))
+
+    def test_native_identity_can_discover_a_registry_name_when_census_has_no_name(self):
+        row = self._inventory_row(sid=None, name=None)
+        self._set_inventory([row])
+        self._census_panes[0].pop("agent_session", None)
+        self._native_sid_by_pid[40000] = "sid-native-only"
+        target = ("idle", {"harness": "claude", "session_id": "-",
+                            "name": None, "pane": "w1:pX"}, 0, None)
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=([row], None)), \
+             mock.patch.object(peer_steward, "_retire_target", return_value=target), \
+             mock.patch.object(peer_steward, "_retire_pane_info", side_effect=self._pane_info_for), \
+             mock.patch.object(peer_steward, "_from_name", return_value="registry-only"):
+            resolved = peer_steward._resolve_prompt_target("registry-only")
+        self.assertIsNone(resolved[1])
+        self.assertEqual((resolved[0]["session_id"], resolved[0]["pane"]),
+                         ("sid-native-only", "w1:pX"))
 
     def test_same_pane_duplicate_observation_merges_optional_name_and_identity(self):
         rows = [self._inventory_row(sid=None, name=None), self._inventory_row()]
@@ -8512,12 +8573,14 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
         with st.seat_lock(seat.key):
             card = st.write_card(seat, harness, sid, "card body", prompt_seq=seq)
             if receipt and harness == "claude":
-                st._write_consumed(seat, generation=card["generation"], receipts=[f"claude:{new}:0"])
+                st._write_consumed(st.session_seat(seat, harness, sid),
+                                   generation=card["generation"], receipts=[f"claude:{new}:0"])
             clear._write_reservation({
                 "schema": 1, "nonce": "n0nce", "status": "cleared", "created": now - 30,
                 "deadline": now + 570,
                 "seat": {"kind": "pane", "key": seat.key, "pane": pane,
-                         "harness": harness, "project_key": ""},
+                         "harness": harness, "project_key": "",
+                         "session": {"harness": harness, "sid": sid}},
                 "harness": harness, "sid": sid, "cwd": str(self.tmp_root), "new_session": new,
                 "card_generation": card["generation"], "prompt_seq": seq, "continue_off": False,
                 "continued": {"state": "pending", "deadline": now + window}})
@@ -8701,7 +8764,7 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
 
         def rewrite(seat):
             with self.st.seat_lock(seat.key):
-                self.st.write_card(seat, "claude", "sid-B", "new card")
+                self.st.write_card(seat, "claude", self.booking()["sid"], "new card")
 
         def expired(_seat):
             data = self.booking()
@@ -8709,7 +8772,9 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
             self.path.write_text(json.dumps(data), encoding="utf-8")
 
         for change, reason in ((bump, "new-input"), (rewrite, "card-changed"),
-                               (self.st.mark_card_handed_off, "handed-off"), (expired, "expired")):
+                               (lambda seat: self.st.mark_card_handed_off(
+                                   self.st.session_seat(seat, "claude", self.booking()["sid"])),
+                                "handed-off"), (expired, "expired")):
             with self.subTest(reason=reason):
                 change(self.cleared())
                 with mock.patch.object(peer_steward, "_herdr_prompt",
@@ -8825,7 +8890,7 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                     (self.TWO, None, "split", "w1:p1", "down"),
                     (self.THREE, None, "split", "w1:p0", "down"),
                     (self.FOUR, "w1:p3", "reuse", "w1:p3", None),
-                    (self.FOUR, None, "tab", "w1", None)):
+                    (self.FOUR, None, "split", "w1:p0", "right")):
                 with self.subTest(kind=kind, action=action, target=target):
                     calls = []
                     def run(argv, **kwargs):
@@ -8882,6 +8947,78 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                             self.assertEqual(create[create.index("--ratio") + 1], "0.5")
                         else:
                             self.assertEqual(create[create.index("--workspace") + 1], "w1")
+
+    def test_beside_a_full_reference_tab_splits_that_pane_instead_of_spilling(self):
+        """The reference tab wins over a newer tab with room: split it, never fill another."""
+        reference = self.layout(self.FOUR)
+        reference["tab_id"] = "w1:t1"
+        newer = self.layout(self.TWO)
+        newer["tab_id"] = "w1:t2"
+        newer["panes"] = [{"pane_id": f"w1:p2-{i}", "rect": pane["rect"]}
+                          for i, pane in enumerate(newer["panes"])]
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            action = argv[1:3]
+            if action == ["pane", "layout"]:
+                target = argv[argv.index("--pane") + 1]
+                return _herdr_json({"result": {"layout":
+                                               newer if target.startswith("w1:p2-") else reference}})
+            if action == ["tab", "list"]:
+                return _herdr_json({"result": {"tabs": [
+                    {"tab_id": "w1:t1", "workspace_id": "w1", "number": 1},
+                    {"tab_id": "w1:t2", "workspace_id": "w1", "number": 2}]}})
+            if action == ["pane", "list"]:
+                return _herdr_json({"result": {"panes": [
+                    {"pane_id": pane["pane_id"], "workspace_id": "w1", "tab_id": layout["tab_id"]}
+                    for layout in (reference, newer) for pane in layout["panes"]
+                ] + [{"pane_id": "w1:pNew", "workspace_id": "w1", "tab_id": "w1:t1"}]}})
+            if action == ["pane", "split"]:
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pNew", "focused": False}}})
+            if action == ["tab", "create"]:
+                return _herdr_json({"result": {"root_pane": {"pane_id": "w1:pTab", "focused": False}}})
+            if action == ["agent", "start"]:
+                return _herdr_json({"result": {"agent": {"agent": "codex", "name": "grid"}}})
+            if action == ["pane", "get"]:
+                return _herdr_json({"result": {"pane": {"pane_id": argv[3], "agent": "codex"}}})
+            if action == ["pane", "process-info"]:
+                return _herdr_json({"result": {"process_info": {
+                    "pane_id": argv[-1], "shell_pid": 7, "foreground_process_group_id": 7,
+                    "foreground_processes": [{"pid": 7}]}}})
+            if action == ["pane", "wait-output"]:
+                return _herdr_json({"result": {}})
+            raise AssertionError(argv)
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_pane_has_agent", return_value="pane-occupied"), \
+             mock.patch.object(peer_steward, "_pane_foreground_shell", return_value=None), \
+             mock.patch.object(peer_steward, "_wait_for_shell_prompt", return_value=True), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
+             mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value=None), \
+             mock.patch.object(peer_steward, "_process_session", return_value=None), \
+             mock.patch.object(peer_steward, "_read_screen", return_value=None), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["start", "grid", "--kind", "codex",
+                                    "--beside", "w1:p0", "--cwd", str(self.tmp_root)])
+        self.assertEqual(rc, 0, printed.call_args_list)
+        splits = [a for a in calls if a[1:3] == ["pane", "split"]]
+        self.assertEqual(len(splits), 1, calls)
+        split = splits[0]
+        self.assertEqual(split[split.index("--pane") + 1], "w1:p0")
+        self.assertIn("--no-focus", split)
+        self.assertEqual(split[split.index("--direction") + 1], "right")
+        self.assertFalse(any(a[1:3] == ["tab", "create"] for a in calls))
+        self.assertFalse(any(a[1:3] == ["tab", "list"] for a in calls))
+        self.assertFalse(any(a[1:3] == ["pane", "layout"]
+                             and a[a.index("--pane") + 1].startswith("w1:p2-") for a in calls))
+        start = next(a for a in calls if a[1:3] == ["agent", "start"])
+        self.assertEqual(start[start.index("--pane") + 1], "w1:pNew")
 
 
 class ProjectStartTest(_TmpRootMixin, unittest.TestCase):
@@ -8992,7 +9129,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
         super().setUp()
         # These tests own startup/readiness; terminal_surface.test.py owns layout selection.
         placement = mock.patch.object(terminal_surface, "place",
-                                      side_effect=lambda surface, pane=None, workspace=None:
+                                      side_effect=lambda surface, pane=None, workspace=None, **kwargs:
                                       ("split", pane, "right"))
         placement.start()
         self.addCleanup(placement.stop)
@@ -9917,8 +10054,10 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                                    side_effect=lambda pid: "700" if pid == 101 else "800"), \
                  mock.patch.object(peer_steward.os, "stat", side_effect=stat), \
                  mock.patch.object(peer_steward, "_seat_handover", return_value=None), \
+                 mock.patch.object(peer_steward, "_request_watch_terminal", return_value=0), \
                  mock.patch.object(peer_steward.time, "monotonic", side_effect=lambda: next(clock)), \
                  mock.patch.object(peer_steward.time, "sleep"), \
+                 mock.patch.object(peer_steward, "_runner_readiness_loop"), \
                  mock.patch("builtins.print"):
                 self.assertEqual(peer_steward.cmd_obligation_runner(
                     SimpleNamespace(state_root=self.tmp_root, lock_fd=lock_fd)), 0)
@@ -10474,6 +10613,123 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
 class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
     """The recorded successor inherits; observers and later pane occupants do not."""
 
+    def test_waiting_normal_retire_cuts_over_before_busy_or_unknown_without_exit(self):
+        for predecessor, successor in (("claude", "codex"), ("claude", "opencode"),
+                                      ("codex", "claude"), ("codex", "opencode"),
+                                      ("opencode", "claude"), ("opencode", "codex")):
+            for subject, readiness_state in (("same", "pending"), ("same", "unknown"),
+                                             ("unknown", "unknown")):
+                with self.subTest(predecessor=predecessor, successor=successor,
+                                  subject=subject, readiness=readiness_state), \
+                     tempfile.TemporaryDirectory() as root, \
+                     mock.patch.dict(os.environ, {"XDG_STATE_HOME": root,
+                                                  "AGENT_PEER_LEDGER_ROOT": root}):
+                    store, duty = self.booking(predecessor, successor)
+                    original_intent = json.loads(json.dumps(duty["intent"]))
+                    candidate = {"pane": "w1:pNew", "harness": successor,
+                                 "session_id": "new-sid"}
+                    old = dict(duty["intent"]["identity"])
+                    with mock.patch.object(peer_steward, "_retire_subject_state", return_value=subject), \
+                         mock.patch.object(peer_steward, "_prompt_current_candidate",
+                                           return_value=(candidate, None)), \
+                         mock.patch.object(peer_steward, "_retire_target",
+                                           return_value=("working", old, 0, None)), \
+                         mock.patch.object(peer_steward, "_pane_readiness", return_value=SimpleNamespace(
+                             state=readiness_state, reason="bound-registered-work-" + readiness_state)) as ready, \
+                         mock.patch.object(peer_steward.subprocess, "run") as native:
+                        peer_steward._resume_retire_obligation(duty, store)
+                        self.assert_authority()
+                        self.assertEqual(self.handover.effective_parent_harness(
+                            self.meta, self.jobs_path), successor)
+                        native.assert_not_called()
+                        if subject == "same":
+                            self.assertEqual(ready.call_args.kwargs["purpose"], "input")
+                        # The same accepted mark survives a busy pass; replay
+                        # still proves the recipient without another request.
+                        self.assertTrue(peer_steward._seat_successor_path("w1:pNew").exists())
+                        peer_steward._resume_retire_obligation(store.get(duty["id"]), store)
+                        self.assert_authority()
+                        native.assert_not_called()
+                    self.assertEqual(store.get(duty["id"])["intent"], original_intent)
+                    self.assertNotEqual(store.get(duty["id"])["state"], "complete")
+
+    def test_waiting_normal_retire_does_not_trust_an_unproven_successor(self):
+        for changed in ("missing", "late", "replaced", "unverified"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as root, \
+                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": root,
+                                              "AGENT_PEER_LEDGER_ROOT": root}):
+                store, duty = self.booking()
+                path = peer_steward._seat_successor_path("w1:pNew")
+                if changed == "missing":
+                    path.unlink()
+                elif changed in {"late", "replaced"}:
+                    mark = json.loads(path.read_text())
+                    if changed == "late":
+                        mark["at"] = duty["accepted_at"] + 1
+                    else:
+                        mark["successor"]["session_id"] = "other-sid"
+                    path.write_text(json.dumps(mark))
+                candidate = {"pane": "w1:pNew", "harness": "opencode", "session_id": "new-sid"}
+                with mock.patch.object(peer_steward, "_retire_subject_state", return_value="unknown"), \
+                     mock.patch.object(peer_steward, "_prompt_current_candidate", return_value=(
+                         None if changed == "unverified" else candidate,
+                         "target-identity-unverified" if changed == "unverified" else None)), \
+                     mock.patch.object(peer_steward.subprocess, "run") as native:
+                    peer_steward._resume_retire_obligation(duty, store)
+                    native.assert_not_called()
+                self.assert_authority("old-sid")
+
+    def test_normal_retire_keeps_past_notification_states_and_protects_actual_executors(self):
+        from dispatch_attempt_policy import AttemptDecision, RegisteredWorkObservation
+        history = tuple(RegisteredWorkObservation(
+            attempt_id="past-" + str(i),
+            decision=AttemptDecision("succeeded", "advance", "owner", "completed"),
+            process_state="quiescent", evidence_state="terminal",
+            pane_relation="parent", delivery_state="unknown",
+            provenance=(("pending_state", state), ("membership", member)))
+            for i, (state, member) in enumerate((("rejected", "exact"),
+                ("acked", "replacement-one"), ("acked", "replacement-two"))))
+        for executor in (None, "live", "unknown"):
+            with self.subTest(executor=executor), tempfile.TemporaryDirectory() as root, \
+                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": root,
+                                              "AGENT_PEER_LEDGER_ROOT": root}):
+                store, duty = self.booking("claude", "codex")
+                # A complete kernel identity, as the ordinary retire booking
+                # records it; only native observations are fixtures here.
+                duty["intent"]["identity"]["foreground"].update(group=4242, argv=["claude"])
+                peer_steward.peer_obligations._write_atomic(store._record_path(duty["id"]), duty)
+                world = _RetireWorld(harness="claude")
+                bound = history
+                if executor:
+                    bound += (RegisteredWorkObservation(
+                        attempt_id="actual-executor", decision=AttemptDecision(
+                            "running" if executor == "live" else "unknown", "wait", "owner", "active"),
+                        process_state=executor, evidence_state="unknown", pane_relation="executor"),)
+                candidate = {"pane": "w1:pNew", "harness": "codex", "session_id": "new-sid"}
+                pending = []
+                for i, item in enumerate(history):
+                    path = Path(root) / ("past-delivery-" + str(i) + ".json")
+                    path.write_text(json.dumps(dict(item.provenance)))
+                    pending.append((path, path.read_bytes()))
+                with mock.patch.object(peer_steward, "_prompt_current_candidate",
+                                       return_value=(candidate, None)), \
+                     mock.patch.object(peer_steward.peer_obligations, "bound_work_for_pane",
+                                       return_value=(bound, "observed")) as observed:
+                    rc, line = RetireTest.retire(self, world, clear_existing=False,
+                                                resume_request_id=duty["id"])
+                self.assertEqual(rc, 0, line)
+                self.assert_authority()
+                self.assertTrue(any(call.kwargs.get("include_parent") is False
+                                    for call in observed.call_args_list))
+                if executor:
+                    self.assertEqual(world.actions(), [], line)
+                    self.assertNotEqual(store.get(duty["id"])["state"], "complete")
+                else:
+                    self.assertIn("retired=true", line)
+                    self.assertEqual(store.get(duty["id"])["state"], "complete")
+                for path, original in pending:
+                    self.assertEqual(path.read_bytes(), original)
+
     def booking(self, predecessor="claude", successor="opencode"):
         import dispatch_seat_handover as handover
         self.handover = handover
@@ -10506,7 +10762,9 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
     def test_gone_predecessor_hands_over_from_an_observer_on_every_harness(self):
         import session_tidy
         import pane_ownership
-        for predecessor, successor in (("claude", "opencode"), ("opencode", "codex"), ("codex", "claude")):
+        for predecessor, successor in (("claude", "codex"), ("claude", "opencode"),
+                                      ("codex", "claude"), ("codex", "opencode"),
+                                      ("opencode", "claude"), ("opencode", "codex")):
             with self.subTest(predecessor=predecessor, successor=successor):
                 # Each chain has its own isolated state, as independent seats do.
                 with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {
@@ -10571,6 +10829,189 @@ class DeferredRetireHandoverTest(_TmpRootMixin, unittest.TestCase):
             native.assert_not_called()
         self.assert_authority()
         self.assertEqual(store.get(duty["id"]), completed)
+
+    def _blank_requester(self, store, duty):
+        changed = json.loads(json.dumps(duty))
+        changed["intent"]["requester"]["pane"] = ""
+        peer_steward.peer_obligations._write_atomic(store._record_path(duty["id"]), changed)
+        return store.get(duty["id"])
+
+    def _verified_requester_observation(self, pane, *, expected_harness=None,
+                                        expected_sid=None, target_observation=None,
+                                        pane_info=None, **_kwargs):
+        state, ident, _code, reason = target_observation
+        if (reason or ident.get("pane") != pane
+                or ident.get("harness") != expected_harness
+                or ident.get("session_id") != expected_sid):
+            return None, reason or "target-identity-unverified"
+        info = pane_info or {"pane_id": pane, "foreground_processes": [{"pid": 4242}]}
+        return {"state": state, "harness": expected_harness, "session_id": expected_sid,
+                "pane": pane, "_identity": dict(ident, server="default"),
+                "_pane_info": info, "_native_session_id": expected_sid}, None
+
+    def _legacy_identity_patches(self):
+        ident = {"server": "default", "pane": "w1:pNew", "harness": "opencode",
+                 "session_id": "new-sid", "name": "new"}
+        info = {"pane_id": "w1:pNew", "foreground_processes": [{"pid": 4242}]}
+        return (
+            mock.patch.object(peer_steward, "_retire_target",
+                              return_value=("idle", ident, 0, None)),
+            mock.patch.object(peer_steward, "_retire_pane_info", return_value=info),
+            mock.patch.object(peer_steward, "_prompt_current_candidate",
+                              side_effect=self._verified_requester_observation),
+        )
+
+    def test_legacy_empty_pane_reconciles_and_keeps_original_intent(self):
+        store, duty = self.booking()
+        duty = self._blank_requester(store, duty)
+        original_requester = json.loads(json.dumps(duty["intent"]["requester"]))
+        with self._legacy_identity_patches()[0], self._legacy_identity_patches()[1], \
+             self._legacy_identity_patches()[2]:
+            self.assertEqual(peer_steward._retire_handover(duty), "1")
+        self.assert_authority()
+        current = store.get(duty["id"])
+        self.assertEqual(current["intent"]["requester"], original_requester)
+        self.assertEqual(current["id"], duty["id"])
+
+    def test_two_installed_legacy_requests_reconcile_from_their_exact_preacceptance_marks(self):
+        cases = (
+            ("retire-407ed2a6eef9409ac778fe003ca67d19", "wB:p8S",
+             "165a3725-d811-4cfa-b553-a15417c86b31",
+             "01a17279-6706-7553-8779-33a8494ea126", "wB:p99"),
+            ("retire-8a1db76365414b3c02603500d366c97f", "wB:p8Z",
+             "10812155-0099-4d99-ab90-5df3e90a9936",
+             "01a17279-5310-7dd1-83be-6a50b70f2e2a", "wB:p98"),
+        )
+        for duty_id, predecessor_pane, predecessor_sid, successor_sid, successor_pane in cases:
+            with self.subTest(target=predecessor_pane), tempfile.TemporaryDirectory() as root, \
+                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": root}):
+                meta = {"attempt_id": "att-" + duty_id.removeprefix("retire-"),
+                    "dispatch_depth": "1", "worker_type": "owner",
+                    "parent_sid": predecessor_sid, "parent_harness": "claude",
+                    "route_id": "rt-" + duty_id.removeprefix("retire-"),
+                    "route_hash": "sha256:" + duty_id.removeprefix("retire-"),
+                    "route_node": "owner"}
+                self.jobs_path.write_text("now\trunning\t0\tjob\tlog\t" +
+                    ",".join(f"{key}={value}" for key, value in meta.items()) + "\n")
+                original_jobs = self.jobs_path.read_bytes()
+                identity = {"server": "default", "pane": predecessor_pane,
+                    "harness": "claude", "session_id": predecessor_sid, "name": "predecessor",
+                    "foreground": {"pid": 166000 + len(duty_id), "start": "165000"}}
+                requester = {"session_id": successor_sid, "harness": "codex",
+                    "pane": "", "server": "default"}
+                peer_steward._mark_seat_successor(
+                    successor_pane, predecessor_pane, "codex", successor_sid)
+                store = peer_steward.peer_obligations.ObligationStore()
+                duty = store.create(duty_id, "retire", identity,
+                                    {"target": predecessor_pane, "requester": requester})
+                observed = {"server": "default", "pane": successor_pane,
+                    "harness": "codex", "session_id": successor_sid, "name": "successor"}
+                pane_info = {"pane_id": successor_pane,
+                    "foreground_processes": [{"pid": 171000 + len(duty_id)}]}
+                def current(pane, *, expected_harness=None, expected_sid=None,
+                            target_observation=None, pane_info=None, **_kwargs):
+                    state, ident, _code, reason = target_observation
+                    if (reason or ident.get("pane") != pane
+                            or ident.get("harness") != expected_harness
+                            or ident.get("session_id") != expected_sid):
+                        return None, reason or "target-identity-unverified"
+                    info = pane_info or {"pane_id": pane,
+                        "foreground_processes": [{"pid": 171000 + len(duty_id)}]}
+                    return {"state": state, "harness": expected_harness,
+                        "session_id": expected_sid, "pane": pane,
+                        "_identity": dict(ident, server="default"), "_pane_info": info,
+                        "_native_session_id": expected_sid}, None
+                with mock.patch.object(peer_steward, "_retire_target",
+                                       return_value=("idle", observed, 0, None)), \
+                     mock.patch.object(peer_steward, "_retire_pane_info", return_value=pane_info), \
+                     mock.patch.object(peer_steward, "_prompt_current_candidate", side_effect=current):
+                    self.assertEqual(peer_steward._retire_handover(duty), "1")
+                import dispatch_seat_handover as handover
+                self.assertEqual(handover.effective_parent(meta, self.jobs_path), successor_sid)
+                self.assertEqual(self.jobs_path.read_bytes(), original_jobs)
+                self.assertEqual(store.get(duty_id)["intent"]["requester"], requester)
+
+    def test_legacy_completed_runner_reconciles_before_reusing_settled_followup(self):
+        store, duty = self.booking()
+        duty = self._blank_requester(store, duty)
+        duty = store.update(duty["id"], state="complete", result="normal-exit",
+            observation={"phase": "complete", "terminal_followup": "complete",
+                         "terminal_followup_result": "none"})
+        with self._legacy_identity_patches()[0], self._legacy_identity_patches()[1], \
+             self._legacy_identity_patches()[2]:
+            peer_steward._resume_retire_obligation(duty, store)
+        self.assert_authority()
+        self.assertEqual(store.get(duty["id"])["intent"]["requester"]["pane"], "")
+        self.assertEqual(store.get(duty["id"])["observation"]["terminal_followup_result"], "1")
+
+    def test_legacy_blank_pane_uses_the_existing_retire_target_command(self):
+        store, duty = self.booking()
+        duty = self._blank_requester(store, duty)
+        store.update(duty["id"], state="complete", result="normal-exit",
+                     observation={"phase": "complete", "terminal_followup": "pending"})
+        for target in ("wB:p8S", "wB:p8Z", "wX:pA"):
+            self.assertEqual(peer_steward.build_parser().parse_args(["retire", target]).target, target)
+        parsed = peer_steward.build_parser().parse_args(["retire", "old"])
+        def target(pane, *, server=None):
+            if pane == "old":
+                return "unknown", {"harness": "-", "name": "old", "pane": "-", "session_id": "-"}, 1, "pane-unverified"
+            return "idle", {"server": "default", "pane": "w1:pNew", "harness": "opencode",
+                            "session_id": "new-sid", "name": "new"}, 0, None
+        with mock.patch.object(peer_steward, "_retire_target", side_effect=target), \
+             mock.patch.object(peer_steward, "_current_session_identity", return_value=("new-sid", "opencode")), \
+             mock.patch.object(peer_steward, "_caller_pane", return_value="w1:pNew"), \
+             mock.patch.object(peer_steward, "_herdr_missing", return_value=False), \
+             self._legacy_identity_patches()[1], self._legacy_identity_patches()[2], \
+             mock.patch.object(peer_steward, "_request_watch_terminal", return_value=0), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(parsed.target, "old")
+            self.assertEqual(peer_steward.cmd_retire(parsed), 0)
+        self.assert_authority()
+
+    def test_legacy_blank_requester_reuses_id_only_for_its_proven_successor(self):
+        store, duty = self.booking()
+        duty = self._blank_requester(store, duty)
+        with self._legacy_identity_patches()[0], self._legacy_identity_patches()[1], \
+             self._legacy_identity_patches()[2]:
+            self.assertEqual(peer_steward.reserve_handoff_retire(
+                "old", duty["intent"]["identity"], duty["intent"]["requester"] | {"pane": "w1:pNew"}),
+                duty["id"])
+            with self.assertRaisesRegex(ValueError, "requester-conflict"):
+                peer_steward.reserve_handoff_retire(
+                    "old", duty["intent"]["identity"],
+                    {"session_id": "later-sid", "harness": "opencode",
+                     "pane": "w1:pNew", "server": "default"})
+        self.assertEqual(len(store.list(kinds={"retire"})), 1)
+        self.assert_authority("old-sid")
+
+    def test_missing_late_replaced_ambiguous_and_unverified_legacy_marks_grant_nothing(self):
+        for failure in ("missing", "late", "replaced", "ambiguous", "unverified"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root, \
+                 mock.patch.dict(os.environ, {"XDG_STATE_HOME": root}):
+                store, duty = self.booking()
+                duty = self._blank_requester(store, duty)
+                marker = peer_steward._seat_successor_path("w1:pNew")
+                if failure == "missing":
+                    marker.unlink()
+                elif failure == "late":
+                    mark = json.loads(marker.read_text())
+                    mark["at"] = duty["accepted_at"] + 1
+                    marker.write_text(json.dumps(mark))
+                elif failure == "replaced":
+                    peer_steward._mark_seat_successor("w1:pNew", "w1:pOld", "opencode", "later-sid")
+                elif failure == "ambiguous":
+                    peer_steward._mark_seat_successor("w1:pElse", "w1:pOld", "opencode", "new-sid")
+                patches = self._legacy_identity_patches()
+                if failure == "unverified":
+                    patches = (patches[0], patches[1],
+                               mock.patch.object(peer_steward, "_prompt_current_candidate",
+                                                 return_value=(None, "target-identity-unverified")))
+                with patches[0], patches[1], patches[2]:
+                    result = peer_steward._retire_handover(duty)
+                self.assertIn(result, (None, "skipped:successor-unverified"))
+                self.assert_authority("old-sid")
+                self.assertTrue(marker.exists() or failure == "missing")
+                store._record_path(duty["id"]).unlink(missing_ok=True)
 
     def test_detached_lifecycle_repairs_only_the_booked_successor(self):
         store, duty = self.booking()
@@ -10874,6 +11315,38 @@ def _legacy_notice(harness, sid, *, key, subject, text, jobs, route_id="route-fr
     # Historical retention failure leaves the original record for discovery.
     peer_obligations.retain_session_notice(Path(jobs), harness, sid, record)
     return record
+
+
+class AcceptedHandoffRunnerSelectionTest(_TmpRootMixin, unittest.TestCase):
+    def test_exact_accepted_handoff_replay_keeps_notice_and_steward_duties(self):
+        import session_tidy_runner as runner
+        root = self.tmp_root
+        predecessor = {"server": "default", "pane": "old-pane", "harness": "codex",
+                       "session_id": "old-session"}
+        retire = {"intent": {"kind": "retire", "identity": predecessor, "target": "old-target"},
+                  "state": "pending"}
+        accepted = {"id": "accepted-message", "state": "complete",
+                    "intent": {"kind": "message", "ref": "accepted-ref", "handoff_acceptance": True}}
+        notices = [{"id": kind, "intent": {"kind": kind}}
+                   for kind in ("session-notice", "run-notice", "steward-check")]
+        store = SimpleNamespace(root=root, list=lambda **_kw: [accepted], get=lambda _id: retire)
+        row = {"acceptance": {"read_and_accepted": True, "settled": True, "retire_id": "retire-id"}}
+        replayed = peer_steward._HANDOFF_ACCEPTANCE_REPLAYED
+        with mock.patch.object(peer_steward.peer_message, "_read_pending", return_value=row), \
+             mock.patch.object(runner, "_handoff_context", return_value=(
+                 {"target": "old-target"}, predecessor, {}, {}, "old-target")):
+            self.assertEqual(peer_steward._runner_duties(store, notices), [*notices, accepted])
+            self.assertEqual(peer_steward._settled_handoff_acceptance_duties(store), [accepted])
+            retire["intent"]["identity"] = {**predecessor, "session_id": "unrelated"}
+            self.assertEqual(peer_steward._runner_duties(store, notices), notices)
+            self.assertEqual(peer_steward._settled_handoff_acceptance_duties(store), [])
+            retire["intent"]["identity"] = predecessor
+            key = (str(root.resolve()), accepted["id"])
+            replayed.add(key)
+            try:
+                self.assertEqual(peer_steward._runner_duties(store, notices), notices)
+            finally:
+                replayed.discard(key)
 
 
 class SessionNoticeIntegrationCorrectionTest(_TmpRootMixin, unittest.TestCase):

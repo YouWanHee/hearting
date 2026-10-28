@@ -95,6 +95,7 @@ class ConfigFields(unittest.TestCase):
 
     def test_first_tick_process_row_is_kept_and_gpu_processes_use_renderer_record_shape(self):
         snapshot = {"sessions": [{"harness": "codex", "pid": 44, "proc_start": 100,
+                                  "session_id": "sid-exact", "session_tag": "a3",
                                   "cwd": "/work/SR_CorrNet-wt/branch", "liveness": "working"}],
                     "resources": [], "compute_hosts": {"hosts": [{"host": "host-a", "gpus": [
                         {"index": 0, "processes": [{"command": "python -B /tmp/resume.py --request-sha256 0123456789abcdef",
@@ -105,9 +106,23 @@ class ConfigFields(unittest.TestCase):
         vm = build_view_model(snapshot, now=2_000_000_000)
         self.assertEqual(len(vm.sessions), 1)
         self.assertEqual(vm.system["gpu_processes"][0]["session_id"], "sid-exact")
+        self.assertEqual(vm.system["gpu_processes"][0]["session_tag"], "a3")
         self.assertEqual(vm.system["gpu_processes"][0]["command"], "resume.py")
         self.assertEqual(vm.system["gpu_processes"][0]["vram"], "2.5 GB")
         self.assertEqual(vm.system["gpu_processes"][0]["age"], "1h 0m")
+
+    def test_unmatched_gpu_owner_keeps_exact_id_but_has_no_display_tag(self):
+        snapshot = {"sessions": [], "resources": [], "compute_hosts": {"hosts": [{"host": "host-a", "gpus": [
+            {"index": 0, "processes": [{"command": "python train.py", "used_memory_mib": 1024,
+                "elapsed_s": 60, "cwd": "/work/repo",
+                "session_owner": {"harness": "codex", "session_id": "departed-session"}}]}]}]},
+            "unregistered_gpu": []}
+
+        vm = build_view_model(snapshot, now=2_000_000_000)
+        process = vm.system["gpu_processes"][0]
+
+        self.assertEqual(process["session_id"], "departed-session")
+        self.assertIsNone(process["session_tag"])
 
     def test_compute_host_uses_per_thread_cpu_and_swap_telemetry(self):
         host = {"host": "host-a", "self": True, "reachable": True, "cpu_count": 4,
@@ -175,6 +190,8 @@ class RealDataFidelity(unittest.TestCase):
                         hearting={"version": "v3.42.0-2-gdc406c55a-dirty", "install_method": "unmanaged"},
                         usage_snapshots=usage)
         self.assertEqual(vm.system["install"]["version"], "v3.42.0-2-gdc406c55a-dirty")
+        self.assertEqual(vm.hearting, {"version": "v3.42.0-2-gdc406c55a-dirty",
+                                       "install_method": "unmanaged"})
         self.assertRegex(vm.system["usage_api"]["freshness"], r"^\d\d:\d\d$")
 
     def test_route_uses_recorded_result_name_and_default_version_helper_keeps_build(self):
@@ -259,10 +276,25 @@ class SourceBackedRecords(unittest.TestCase):
     def test_install_flags_and_runtimes_come_from_the_install_record(self):
         vm = self.vm(hearting={"version": "v3.41.1", "install_method": "managed/pinned",
                                "source": "distribution", "runtimes": ["claude", "codex"]})
+        self.assertEqual(vm.hearting, {"version": "v3.41.1", "install_method": "managed/pinned"})
         self.assertEqual(vm.system["install"]["managed"], True)
         self.assertEqual(vm.system["install"]["pinned"], True)
         self.assertEqual(vm.system["install"]["distribution"], True)
         self.assertEqual(tuple(vm.system["runtimes"]), ("claude", "codex"))
+
+    def test_unbounded_configured_host_stays_full_in_compute_projection(self):
+        host_name = "trainer-west-gpu-node-01"
+        host = {"host": host_name, "self": True, "reachable": True, "cpu_count": 4,
+                "cpu_utilization_pct": 25, "memory_total_mib": 8192,
+                "memory_used_mib": 4096, "gpus": []}
+        vm = self.vm(hearting={"version": "v3.50.3-20-gad247e2b6",
+                               "install_method": "managed/stable"},
+                     compute_hosts={"hosts": [host]})
+
+        self.assertEqual(vm.hosts[0]["name"], host_name)
+        self.assertEqual(vm.compute[0][0], host_name)
+        self.assertEqual(vm.hearting, {"version": "v3.50.3-20-gad247e2b6",
+                                       "install_method": "managed/stable"})
 
     def test_memory_rows_drop_bookkeeping_and_the_provenance_header(self):
         memory = {"by_repo": {"demo-app": [
@@ -300,6 +332,224 @@ class CountWords(unittest.TestCase):
         self.assertEqual(count_word(0, "session"), "0 sessions")
         self.assertEqual(count_word(1, "harness", "harnesses"), "1 harness")
         self.assertEqual(count_word(3, "harness", "harnesses"), "3 harnesses")
+
+
+class BacklogAndCurrentTaskProjection(unittest.TestCase):
+    def test_backlog_progress_uses_explicit_tags_exact_route_links_and_success(self):
+        from tools.fleet.explorer.live import _memory_backlog
+
+        records = [
+            {"id": "todo", "canonical_id": "todo", "type": "project", "status": "active",
+             "tags": ("backlog",), "headline": "unlinked task", "links": (), "artifact_refs": ()},
+            {"id": "doing", "canonical_id": "doing", "type": "project", "status": "active",
+             "tags": ("backlog",), "headline": "current task", "links": ("rt-current",),
+             "artifact_refs": ()},
+            {"id": "done", "canonical_id": "done", "type": "project", "status": "active",
+             "tags": ("backlog",), "headline": "settled task", "links": (),
+             "artifact_refs": ("artifact/rt-settled/report.md",)},
+            {"id": "failed", "canonical_id": "failed", "type": "project", "status": "active",
+             "tags": ("backlog",), "headline": "failed task", "links": ("rt-failed",),
+             "artifact_refs": ()},
+            {"id": "note", "canonical_id": "note", "type": "fact", "status": "active",
+             "tags": (), "headline": "not backlog", "links": (), "artifact_refs": ()},
+            {"id": "superseded", "canonical_id": "superseded", "type": "project",
+             "status": "superseded", "tags": ("backlog",), "headline": "old", "links": ()},
+        ]
+        routes = [
+            {"id": "rt-current", "state": "working", "outcome": None, "stages": []},
+            {"id": "rt-settled", "state": "done", "outcome": "success", "stages": []},
+            {"id": "rt-failed", "state": "done", "outcome": "failed", "stages": []},
+        ]
+        backlog = _memory_backlog({"memory": {"database": {
+            "state": "success", "by_repo": {"repo": records}, "limited": False}}}, routes)
+        progress = {row["id"]: row["progress"] for row in backlog["by_repo"]["repo"]}
+        self.assertEqual(progress, {"todo": "TODO", "doing": "DOING", "done": "DONE",
+                                    "failed": "TODO"})
+
+    def test_current_task_summary_uses_the_exact_focused_session_and_stage_states(self):
+        from types import SimpleNamespace
+        from tools.fleet.explorer.live import _current_task_summary
+
+        focus = SimpleNamespace(key=SimpleNamespace(harness="claude", sid="sid-a"),
+                                obligations=({"state": "running", "attempt_id": "attempt-1"},),
+                                health=SimpleNamespace(state="success"))
+        detail = SimpleNamespace(focus=focus, seats={}, config=None, panes={})
+        session_index = {"a1": {"sid": "sid-a", "ids": ("sid-a",),
+                                 "session": {"harness": "claude"}}}
+        routes = [{"id": "rt-current", "session_tag": "a1", "state": "working",
+                   "stages": [{"name": "plan", "st": "done"},
+                              {"name": "execute", "st": "active"},
+                              {"name": "test", "st": "todo"}]}]
+        summary = _current_task_summary(detail, (), session_index, routes)
+        self.assertEqual(summary["session_tag"], "a1")
+        self.assertIn("test", summary["todo"])
+        self.assertIn("execute", summary["doing"])
+        self.assertIn("plan", summary["done"])
+        self.assertTrue(any("attempt-" in value for value in summary["doing"]))
+
+    def test_memory_backlog_display_keeps_unavailable_unknown_and_body_free(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.state import NavState, reduce
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        unavailable = ExplorerViewModel.from_mapping({
+            "system": {"memory_backlog": {"state": "unavailable", "by_repo": {}}}})
+        text = "\n".join(draw(unavailable, NavState(view="MEMORY"), 140, 45).text_rows())
+        self.assertIn("database unavailable · count unknown", text)
+        self.assertNotIn("TODO 0", text)
+
+        stale = ExplorerViewModel.from_mapping({
+            "system": {"memory_backlog": {"state": "failed", "stale": True,
+                                           "by_repo": {"repo": [{"id": "task-1",
+                                                                   "title": "last good task",
+                                                                   "progress": "TODO"}]}}}})
+        stale_state = NavState(view="MEMORY")
+        stale_frame = draw(stale, stale_state, 140, 45)
+        stale_hit = next(hit for hit in stale_frame.hits
+                         if hit.action == ("fold", "memory:backlog", "repo"))
+        stale_state, _ = reduce(stale_state, {"type": "click", "action": stale_hit.action}, stale_frame)
+        stale_text = "\n".join(draw(stale, stale_state, 140, 45).text_rows())
+        self.assertIn("database failed · showing last good", stale_text)
+        self.assertIn("TODO 1", stale_text)
+        self.assertIn("last good task", stale_text)
+
+    def test_peer_count_stays_unknown_or_marks_last_good_after_empty_unhealthy_source(self):
+        from tools.fleet.explorer.frame import draw
+        from tools.fleet.explorer.live import build_view_model
+        from tools.fleet.explorer.state import NavState, reduce
+        from tools.fleet.explorer.view_model import ExplorerViewModel
+
+        unknown = build_view_model({"sessions": [], "resources": [],
+                                    "observations": {"optional:peers": {"state": "unknown"}}})
+        unknown_text = "\n".join(draw(unknown, NavState(view="PEERS"), 140, 45).text_rows())
+        self.assertIn("? links", unknown_text)
+        self.assertIn("observation unknown", unknown_text)
+        self.assertNotIn("0 links", unknown_text)
+
+        stale = ExplorerViewModel.from_mapping({
+            "peer_edges": {"links": [[ ["a1", "claude"], ["b1", "codex"], "steer", "1m", ""]]},
+            "system": {"peer_observation": {"state": "unknown", "last_good": True}},
+        })
+        stale_text = "\n".join(draw(stale, NavState(view="PEERS"), 140, 45).text_rows())
+        self.assertIn("1 link · last good · observation unknown", stale_text)
+
+        vm = ExplorerViewModel.from_mapping({
+            "system": {"memory_backlog": {"state": "success", "limited": False,
+                                           "by_repo": {"repo": [{"id": "task-1", "title": "Fix repo click",
+                                                                   "progress": "TODO"}]}}}})
+        state = NavState(view="MEMORY")
+        frame = draw(vm, state, 140, 45)
+        self.assertNotIn("Fix repo click", "\n".join(frame.text_rows()))
+        hit = next(item for item in frame.hits if item.action == ("fold", "memory:backlog", "repo"))
+        state, _ = reduce(state, {"type": "click", "action": hit.action}, frame)
+        expanded = "\n".join(draw(vm, state, 140, 45).text_rows())
+        self.assertIn("Fix repo click", expanded)
+        self.assertIn("task-1", expanded)
+
+
+class ParallelRouteProjection(unittest.TestCase):
+    def test_idle_owner_state_stays_idle_while_active_route_stage_is_running(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools.fleet.explorer import live
+
+        owner = SimpleNamespace(depth=1, route_node=None, liveness="idle", route_id="rt-owner",
+                                harness="codex", model="gpt-6.1-sol", effort="high",
+                                cwd="/synthetic/repo", attempt_id="owner-attempt",
+                                work_projection=SimpleNamespace(result=None), slug="owner")
+        slot = {"view": {"nodes": [{"id": "execute", "state": "active",
+                                     "unit": "dev/backend"}],
+                         "execution_topology": "staged", "capability": "autopilot-code",
+                         "cwd": "/synthetic/repo", "slug": "owner"},
+                "record": {"result": None, "slug": "owner"}, "jobs": [owner], "sessions": []}
+        with patch.object(live, "_collect_routes", return_value={"rt-owner": slot}):
+            routes, _nodes = live._route_records(
+                {"resources": []}, [], {}, lambda _cwd: "repo", 1000)
+        self.assertEqual(routes[0]["state"], "idle")
+        self.assertEqual(routes[0]["activity"], "running")
+        self.assertEqual(routes[0]["worker_stage"], "execute")
+
+    def test_parallel_groups_and_connectors_follow_recorded_dependencies(self):
+        from tools.fleet.explorer.live import _parallel_stage_details
+        from tools.fleet.explorer.grid import CellGrid
+        from tools.fleet.explorer.pages import _stage_grid
+
+        source = [
+            {"id": "prep", "state": "done", "depends_on": []},
+            {"id": "worker-a", "state": "active", "depends_on": ["prep"],
+             "parallel_group": "workers"},
+            {"id": "worker-b", "state": "active", "depends_on": ["prep"],
+             "parallel_group": "workers"},
+            {"id": "finish", "state": "todo", "depends_on": ["worker-a", "worker-b"]},
+        ]
+        stages = _parallel_stage_details(source, 1000)
+        self.assertEqual(len(stages), 3)
+        self.assertEqual(stages[1]["members"], ("worker-a", "worker-b"))
+        self.assertEqual(stages[1]["depends_on"], ("prep",))
+        grid = CellGrid(140, 30)
+        _stage_grid(grid, 2, 1, stages, 120, 27)
+        text = "\n".join(grid.rows_text())
+        self.assertIn("∥ 2-way", text)
+        self.assertTrue(any(cell[0] in ("▶", "◀", "▼")
+                            for row in grid.cells for cell in row))
+
+    def test_recorded_route_graph_keeps_horizontal_flow_and_stacks_parallel_stages(self):
+        from tools.fleet.explorer.live import _parallel_stage_details
+        from tools.fleet.explorer.grid import CellGrid
+        from tools.fleet.explorer.pages import _stage_grid
+
+        def tops(text, names):
+            found = {}
+            for row, line in enumerate(text):
+                for name in names:
+                    column = line.find("┌─ " + name + " ")
+                    if column >= 0 and name not in found:
+                        found[name] = (row, column)
+            return found
+
+        serial = _parallel_stage_details(
+            [{"id": name, "state": "done", "depends_on": [before] if before else []}
+             for name, before in (("plan", None), ("execute", "plan"), ("test", "execute"),
+                                  ("report", "test"))], 1000)
+        grid = CellGrid(280, 40)
+        _stage_grid(grid, 2, 1, serial, 262, 38)
+        boxes = tops(grid.rows_text(), ("plan", "execute", "test", "report"))
+        self.assertEqual({row for row, _column in boxes.values()}, {1})
+        self.assertEqual(sorted(boxes, key=lambda name: boxes[name][1]),
+                         ["plan", "execute", "test", "report"])
+        self.assertEqual(sum(row.count("▶") for row in grid.rows_text()), 3)
+        self.assertFalse(any("▼" in row for row in grid.rows_text()))
+
+        framed = _parallel_stage_details([
+            {"id": "frame", "state": "done", "depends_on": []},
+            {"id": "frame-alternative", "state": "done", "depends_on": []},
+            {"id": "plan", "state": "active", "depends_on": ["frame", "frame-alternative"]},
+            {"id": "execute", "state": "todo", "depends_on": ["plan"]},
+        ], 1000)
+        grid = CellGrid(150, 30)
+        _stage_grid(grid, 2, 1, framed, 140, 28)
+        text = grid.rows_text()
+        boxes = tops(text, ("frame", "frame-alternative", "plan", "execute"))
+        self.assertEqual(boxes["frame"][1], boxes["frame-alternative"][1])
+        self.assertLess(boxes["frame"][0], boxes["frame-alternative"][0])
+        self.assertEqual(boxes["plan"][0], boxes["execute"][0])
+        self.assertLess(boxes["frame"][1], boxes["plan"][1])
+        joint = "".join(line[boxes["plan"][1] - 3] for line in text)
+        self.assertIn("┐", joint)
+        self.assertIn("├", joint)
+        self.assertIn("┘", joint)
+
+    def test_stage_array_order_without_dependency_evidence_draws_no_arrows(self):
+        from tools.fleet.explorer.live import _parallel_stage_details
+        from tools.fleet.explorer.grid import CellGrid
+        from tools.fleet.explorer.pages import _stage_grid
+
+        stages = _parallel_stage_details(
+            [{"id": name, "state": "todo"} for name in ("one", "two", "three")], 1000)
+        grid = CellGrid(140, 30)
+        _stage_grid(grid, 2, 1, stages, 120, 27)
+        self.assertFalse(any(cell[0] in ("▶", "◀", "▼")
+                             for row in grid.cells for cell in row))
 
 
 if __name__ == "__main__":

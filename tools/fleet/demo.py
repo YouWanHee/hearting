@@ -261,6 +261,83 @@ def collect(harness_filter=None):
     return sessions, jobs
 
 
+def answer_wait_snapshot(now=None, harness_filter=None):
+    """A hermetic current/older answer-wait view in Fleet's shared cache shape."""
+    from .refresh import fleet_answer_wait_view
+
+    now = time.time() if now is None else now
+    items = [
+        {"id": "demo:S1:approval", "source": "S1-approval", "kind": "approval",
+         "since": now - 7 * 60, "stale": "current", "harness": "claude",
+         "session_id": "demo-claude-1"},
+        {"id": "demo:S4:older", "source": "S4", "kind": "decision",
+         "since": now - 90 * 60, "stale": "older", "harness": "codex",
+         "session_id": "demo-codex-1"},
+    ]
+    if harness_filter:
+        allowed = set(harness_filter)
+        items = [item for item in items if item["harness"] in allowed]
+
+    by_session = {}
+    for item in items:
+        if item["stale"] == "current":
+            key = item["harness"] + "\0" + item["session_id"]
+            by_session.setdefault(key, []).append(item["id"])
+    return fleet_answer_wait_view({
+        "items": items, "by_session": by_session, "unattributed": [],
+        "total": sum(item["stale"] == "current" for item in items),
+        "older": sum(item["stale"] == "older" for item in items),
+        "health": [], "observed_at": now, "complete": True,
+    })
+
+
+def merge_answer_waits(observed, synthetic):
+    """Add demo waits to the real body-free cache view without asserting unknown health."""
+    from .refresh import fleet_answer_wait_view
+
+    observed = fleet_answer_wait_view(observed)
+    synthetic = fleet_answer_wait_view(synthetic)
+    if synthetic is None:
+        return observed
+    if observed is None:
+        observed = {"items": [], "by_session": {}, "unattributed": [],
+                    "total": 0, "older": 0,
+                    "health": [{"source": "cache", "state": "unknown"}],
+                    "observed_at": None, "complete": False}
+
+    items = list(observed.get("items", ()) or ())
+    known_ids = {item.get("id") for item in items if item.get("id") is not None}
+    added = [item for item in synthetic.get("items", ()) or ()
+             if item.get("id") not in known_ids]
+    items.extend(added)
+
+    by_session = {key: list(ids or ())
+                  for key, ids in (observed.get("by_session", {}) or {}).items()}
+    unattributed = list(observed.get("unattributed", ()) or ())
+    for item in added:
+        ident = item.get("id")
+        harness, sid = item.get("harness"), item.get("session_id")
+        if ident is not None and harness and sid:
+            key = str(harness) + "\0" + str(sid)
+            ids = by_session.setdefault(key, [])
+            if ident not in ids and item.get("stale") == "current":
+                ids.append(ident)
+        elif ident is not None and ident not in unattributed:
+            unattributed.append(ident)
+
+    complete = observed.get("complete") is True and synthetic.get("complete") is True
+    total, older = observed.get("total", 0), observed.get("older", 0)
+    if complete:
+        total += sum(item.get("stale") == "current" for item in added)
+        older += sum(item.get("stale") == "older" for item in added)
+    return fleet_answer_wait_view({
+        "items": items, "by_session": by_session, "unattributed": unattributed,
+        "total": total, "older": older,
+        "health": observed.get("health", ()),
+        "observed_at": observed.get("observed_at"), "complete": complete,
+    })
+
+
 def memory_snapshot():
     """Demo-only active periodic batch; never touches the real memory store."""
     return {

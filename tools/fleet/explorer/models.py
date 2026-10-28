@@ -55,13 +55,120 @@ def _chips(grid, x, y, items, current, chosen, action_key, right, labels=None):
     return x
 
 
+PICK_ROWS = 8          # visible rows of the model list; the box grows by this many rows, the list scrolls
+
+
+def _same_model(item, model):
+    """``item`` names ``model``; a profile cell may drop the ``opencode-go/`` provider the catalog keeps."""
+    if item is None or model is None:
+        return False
+    item, model = str(item), str(model)
+    return item == model or item == "opencode-go/" + model or model == "opencode-go/" + item
+
+
+def _chips_fit(items, labels, room):
+    return sum(len(str(labels.get(item, item))) + 5 for item in items) <= room
+
+
+def model_matches(items, query, labels=None):
+    """``items`` whose id or shown name holds every space-separated word of ``query`` (case-insensitive)."""
+    labels = labels or {}
+    words = str(query or "").lower().split()
+    return tuple(item for item in items
+                 if all(word in (str(item) + " " + str(labels.get(item, ""))).lower() for word in words))
+
+
+def _provider_counts(items):
+    counts = {}
+    for item in items:
+        provider = str(item).partition("/")[0] if "/" in str(item) else ""
+        if provider:
+            counts[provider] = counts.get(provider, 0) + 1
+    return counts
+
+
+def _model_picker(grid, x, y, right, items, current, chosen, labels, values, offsets, source=None):
+    """A filter row and a scrolling list holding every model: each row is a click target, the
+    wheel scrolls it, and the row hit ``("models.find", count, cursor item)`` lets keys move and pick."""
+    query = values.get("ui:mfind", "")
+    editing = values.get("ui:mfocus") == "1"
+    found = model_matches(items, query, labels)
+    try:
+        cursor = max(0, min(len(found) - 1, int(values.get("ui:mcursor", -1))))
+    except (TypeError, ValueError):
+        cursor = 0
+    if "ui:mcursor" not in values:
+        active = chosen if chosen is not None else current
+        cursor = next((index for index, item in enumerate(found) if _same_model(item, active)), 0)
+    top_max = max(0, len(found) - PICK_ROWS)
+    top = max(0, min(top_max, int(offsets.get("mpick", max(0, cursor - PICK_ROWS + 1)))))
+    field = 26
+    grid.put(x, y, "⌕ ", "line" if editing else "dim", limit=right)
+    shown = clip_cells(query, field - 1) + ("▏" if editing else "")
+    end = grid.put(x + 2, y, shown or "type to filter", "soft" if editing else "dim", limit=right)
+    for col in range(end, x + 2 + field):
+        grid.put(col, y, "·" if not editing else " ", "dim", limit=right)
+    grid.add_hit(y, x, x + 2 + field, ("models.find", len(found), found[cursor] if found else "", cursor, top,
+                                             PICK_ROWS))
+    cursor_x = grid.put(x + 2 + field, y, f"  {len(found)}/{len(items)}", "soft", limit=right)
+    hint = ("  ↑↓ PgUp/PgDn · Enter pick · Esc done" if editing else "  click or e to search")
+    grid.put(cursor_x, y, hint, "dim", limit=right)
+    counts = _provider_counts(items)
+    about = " · ".join(f"{name} {count}" for name, count in counts.items())
+    if source:
+        about = (about + "  · " if about else "") + source
+    if about:
+        grid.put(x, y - 1, about, "dim", limit=right)
+    active = chosen if chosen is not None else current
+    for row in range(PICK_ROWS):
+        yy = y + 1 + row
+        index = top + row
+        if index >= len(found):
+            if row == 0:
+                grid.put(x + 2, yy, "no model matches the filter", "dim", limit=right)
+            continue
+        item = found[index]
+        on = _same_model(item, active)
+        here = _same_model(item, current)
+        mark = "▸ " if editing and index == cursor else "  "
+        cursor_x = grid.put(x - 2, yy, mark, "soft", limit=right)
+        text = str(item)
+        label = str(labels.get(item, ""))
+        cursor_x = grid.put(cursor_x, yy, ("[ " + text + " ]") if on else ("  " + text + "  "),
+                            "chip_on" if on else "title_dim", limit=right - 12)
+        if label and label != text and label != text.partition("/")[2]:
+            cursor_x = grid.put(cursor_x + 1, yy, label, "dim", limit=right - 12)
+        if here:
+            grid.put(cursor_x + 1, yy, "now", "label", limit=right - 2)
+        grid.add_hit(yy, x - 2, right - 8, ("ui", "model", item))
+        grid.add_hit(yy, x - 2, right - 1, ("scroll", "mpick", top_max, -1))
+    if top_max:
+        grid.put(right - 8, y + 1, "▲" if top else " ", "dim", limit=right)
+        grid.put(right - 8, y + PICK_ROWS, "▼" if top < top_max else " ", "dim", limit=right)
+        span = f"{top + 1}-{min(len(found), top + PICK_ROWS)}"
+        grid.put(right - 2 - len(span), y + PICK_ROWS // 2, span, "dim", limit=right)
+    return PICK_ROWS
+
+
+def _catalog_note(data, harness):
+    source = _dict(_dict(data.get("catalog_sources")).get(harness))
+    if source.get("state") != "available":
+        return ""
+    return "from cache, callability not checked"
+
+
 def _model_cell(grid, x, y, harness, value, shown, effort_keys, room, limit=None):
     edge = x + room if limit is None else min(x + room, limit)
     if value is None:
         return _write(grid, x, y, "— not set", "dim", limit=edge)
     model, effort = (tuple(value) + (None, None))[:2]
     name = shown.get(str(model), model)
-    cursor = _write(grid, x, y, clip_cells(str(name), room - 9), "hb_" + harness, limit=limit)
+    try:
+        from .. import render
+        model_key = render._model_key(model)
+    except Exception:
+        model_key = "fam_other"
+    cursor = _write(grid, x, y, clip_cells(str(name), room - 9), model_key, limit=limit)
     cursor = _write(grid, cursor, y, " · ", "dim", limit=limit)
     return _write(grid, cursor, y, effort or "·", effort_keys.get(effort, "dim"), limit=edge)
 
@@ -92,6 +199,8 @@ def _draw_context(grid, data, state, x, y, width):
     cmds, warnings = [], []
     for harness in ("claude", "codex", "opencode"):
         selected = state.fold_map().get("ui:ctx:" + harness)
+        if selected not in units:
+            selected = None
         window = units.get(selected, context.get(harness))
         grid.put(x + 1, y, harness, "hb_" + harness)
         cutoff1, cutoff2 = ((t1 or 0) / 1e6, (t2 or 0) / 1e6)
@@ -115,7 +224,9 @@ def _draw_context(grid, data, state, x, y, width):
         if source_text:
             grid.put(chip_end + 1, y, clip_cells(source_text, x + width - chip_end - 2), "dim", limit=right)
         if selected:
-            cmds.append(f"hearting model set {harness} context-window {units.get(selected, 0)}")
+            amount = units[selected]
+            cmds.append((harness, amount,
+                         f"hearting model set {harness} context-window {amount}"))
         if window is not None and t2 is not None and t2 >= window:
             warnings.append(harness)
         y += 2
@@ -127,16 +238,236 @@ def _draw_context(grid, data, state, x, y, width):
     grid.put(x + 3, y, "urgent", "label")
     _chips(grid, bx, y, ("600K", "650K", "700K", "750K"), "700K", chosen2, "tidy2", right - 1)
     y += 1
-    grid.put(x + 3, y, "세 하네스 공통 · 설정 변경은 실행되지 않습니다", "dim", limit=right)
+    grid.put(x + 3, y, "세 하네스 공통 · 설정은 Apply로 변경", "dim", limit=right)
     y += 1
     if warnings:
         grid.put(x + 3, y, "tidy point meets or exceeds window: " + ", ".join(warnings), "g_blocked", limit=right)
         y += 1
-    for command in cmds:
+    for harness, amount, command in cmds:
         cursor = grid.put(x + 3, y, "$ " + command, "soft", limit=right - 14)
         grid.put(cursor + 2, y, "[ apply ]", "chip_on", limit=right)
-        grid.add_hit(y, cursor + 2, cursor + 11, ("ui", "apply", "적용: " + command + " (시안이라 실행 안 함)"))
+        grid.add_hit(y, cursor + 2, cursor + 11,
+                     ("models.apply", harness, "context-window", amount, False))
         y += 1
+
+
+_EDITED_FIELDS = ("strategy:", "weights:", "affinity:")   # read-only lines the editor replaces
+_STRATEGY_NOTES = {
+    "balanced": "remaining usage sets each harness's share; recent attempts fill it",
+    "capacity-aware": "most remaining usage first; unknown usage is skipped",
+    "least-recent-attempts": "plain rotation by recent attempts",
+}
+_ALLOC_CHOICES = {
+    "window": (10, 20, 30, 60, 100),
+    "usage_gate_used_percent": (70, 80, 85, 90, 95, 100),
+    "usage_headroom_exponent": (1, 2, 3, 4),
+    "depth_affinity_weight": (0.5, 0.65, 0.85, 1.0),
+    "harness_weights": (0.2, 0.3, 0.5, 0.7, 1.0),
+}
+
+
+def _alloc_label(name):
+    parent, _dot, child = name.partition(".")
+    return {"strategy": "strategy", "usage_gate_used_percent": "usage gate %",
+            "usage_headroom_exponent": "usage effect", "window": "window",
+            "depth_affinity_weight": "prefer strength", "harness_weights": "share " + child,
+            "depth_affinity": child + " prefers"}.get(parent, name)
+
+
+def _num(value):
+    if isinstance(value, float):
+        text = f"{value:g}"
+        return text if "." in text or "e" in text else text + ".0"
+    return str(value)
+
+
+def _alloc_options(name, current):
+    options = list(_ALLOC_CHOICES[name.partition(".")[0]])
+    if isinstance(current, (int, float)) and not isinstance(current, bool) and current not in options:
+        options.append(current)
+    return tuple(_num(item) for item in sorted(options))
+
+
+def allocation_changes(allocation, folds):
+    """``((key, old text, new text), ...)`` the pending chips differ from the current file on."""
+    values = _dict(allocation.get("values"))
+    current = {name: _num(values.get(name)) for name in
+               ("strategy", "window", "usage_gate_used_percent", "usage_headroom_exponent",
+                "depth_affinity_weight")}
+    for role in ("owner", "worker"):
+        current["depth_affinity." + role] = str(_dict(values.get("depth_affinity")).get(role) or "none")
+    for harness in allocation.get("harnesses") or ():
+        current["harness_weights." + harness] = _num(float(_dict(values.get("harness_weights")).get(harness, 1.0)))
+    changes = []
+    for name, old in current.items():
+        new = folds.get("ui:alloc:" + name)
+        if new is not None and new != old:
+            changes.append((name, old, new))
+    return tuple(changes)
+
+
+def _alloc_row(grid, x, y, right, label, name, options, current, folds, note="", inert=""):
+    grid.put(x + 3, y, label, "label", limit=right)
+    cursor = _chips(grid, x + 20, y, options, current, folds.get("ui:alloc:" + name), "alloc:" + name, right)
+    if inert:
+        grid.put(cursor + 1, y, "· " + inert, "lvl_y", limit=right)
+    elif note:
+        grid.put(cursor + 1, y, note, "dim", limit=right)
+    return y + 1
+
+
+def _draw_allocation_editor(grid, allocation, state, x, y, right):
+    """Every existing allocation key as choices, with what the chosen strategy ignores, a preview and Apply."""
+    folds = state.fold_map()
+    values = _dict(allocation.get("values"))
+    strategy = folds.get("ui:alloc:strategy") or str(values.get("strategy"))
+    inert = _dict(_dict(allocation.get("inert")).get(strategy))
+    y = _alloc_row(grid, x, y, right, "strategy", "strategy", tuple(allocation.get("strategies") or ()),
+                   str(values.get("strategy")), folds, _STRATEGY_NOTES.get(strategy, ""))
+    rows = (("usage gate %", "usage_gate_used_percent",
+             "skip a harness past this used share while another is under it"),
+            ("usage effect", "usage_headroom_exponent", "how strongly remaining usage shapes the share"),
+            ("window", "window", "recent attempts counted"))
+    for label, name, note in rows:
+        y = _alloc_row(grid, x, y, right, label, name, _alloc_options(name, values.get(name)),
+                       _num(values.get(name)), folds, note, inert.get(name, ""))
+    weights = _dict(values.get("harness_weights"))
+    for harness in allocation.get("harnesses") or ():
+        current = float(weights.get(harness, 1.0))
+        y = _alloc_row(grid, x, y, right, "share " + harness, "harness_weights." + harness,
+                       _alloc_options("harness_weights", current), _num(current), folds,
+                       "1.0 = full share; lower takes fewer new placements", inert.get("harness_weights", ""))
+    affinity = _dict(values.get("depth_affinity"))
+    choices = tuple(allocation.get("harnesses") or ()) + ("none",)
+    for role in ("worker", "owner"):
+        y = _alloc_row(grid, x, y, right, role + " prefers", "depth_affinity." + role, choices,
+                       str(affinity.get(role) or "none"), folds, "", inert.get("depth_affinity", ""))
+    y = _alloc_row(grid, x, y, right, "prefer strength", "depth_affinity_weight",
+                   _alloc_options("depth_affinity_weight", values.get("depth_affinity_weight")),
+                   _num(values.get("depth_affinity_weight")), folds, "0.5 = no lean",
+                   inert.get("depth_affinity_weight", ""))
+    changes = allocation_changes(allocation, folds)
+    if changes:
+        preview = "  ·  ".join(f"{_alloc_label(name)} {old} → {new}" for name, old, new in changes)
+        grid.put(x + 3, y, "change", "label", limit=right)
+        dry_x = min(x + 20 + cell_width(preview) + 3, right - 25)
+        grid.put(x + 20, y, preview, "soft", limit=dry_x - 2)
+        payload = tuple((name, new) for name, _old, new in changes)
+        grid.put(dry_x, y, "[ dry-run ]", "title_dim", limit=right)
+        grid.add_hit(y, dry_x, dry_x + 11, ("alloc.apply", payload, True))
+        grid.put(dry_x + 13, y, "[ apply ]", "chip_on", limit=right)
+        grid.add_hit(y, dry_x + 13, dry_x + 22, ("alloc.apply", payload, False))
+        y += 1
+    status = str(state.status or "")
+    if status.startswith("allocation"):
+        failed = "failed" in status or "invalid" in status
+        grid.put(x + 3, y, status, "g_blocked" if failed else "soft", limit=right)
+        y += 1
+    if not allocation.get("user_file"):
+        grid.put(x + 3, y, "no user policy file yet: Apply creates it from the shipped defaults", "dim",
+                 limit=right)
+        y += 1
+    return y
+
+
+_STEWARD_CHOICES = {"check_interval_seconds": (600, 1800, 3600, 7200, 21600, 86400),
+                    "max_supervisors_per_repo": (1, 2, 3, 4, 8)}
+_STEWARD_LABELS = {"check_interval_seconds": "check every", "max_supervisors_per_repo": "per repo"}
+
+
+def _interval(seconds):
+    """Seconds shown as minutes or hours; the file keeps seconds."""
+    seconds = int(seconds)
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 60}m" if seconds % 60 == 0 else f"{seconds}s"
+
+
+def _steward_shown(name, value):
+    return _interval(value) if name == "check_interval_seconds" else str(value)
+
+
+def steward_changes(steward, folds):
+    """``((key, old seconds/count, new), ...)`` the pending steward chips differ from the file on."""
+    values = _dict(steward.get("values"))
+    changes = []
+    for name in _STEWARD_CHOICES:
+        if values.get(name) is None:
+            continue
+        old, new = str(values[name]), folds.get("ui:steward:" + name)
+        if new is not None and new != old:
+            changes.append((name, old, new))
+    return tuple(changes)
+
+
+def _draw_supervisors(grid, census, limit, x, y, right):
+    """Current supervisors per repository as counted by the steward collector. The count is
+    that census, not the ⚑ marks: a fresh grant can count before its ⚑ appears."""
+    grid.put(x + 3, y, "supervising", "label", limit=right)
+    if not isinstance(census, (list, tuple)):
+        grid.put(x + 20, y, f"· / {limit} per repo (not counted yet)", "dim", limit=right)
+        return y + 1
+    if not census:
+        grid.put(x + 20, y, f"none · {limit} per repo allowed", "soft", limit=right)
+        return y + 1
+    for repo in census[:4]:
+        repo = _dict(repo)
+        shown = repo.get("limit") if repo.get("limit") is not None else limit
+        holders = [str(holder.get("name") or str(holder.get("session_id") or "?")[:8])
+                   + ("" if holder.get("counted", True) else " (ended)")
+                   for holder in repo.get("holders") or () if isinstance(holder, Mapping)]
+        text = (f"{repo.get('repository') or '?'} · {repo.get('counted', 0)} / {shown} supervising"
+                + (" · " + ", ".join(holders) if holders else ""))
+        over = bool(repo.get("over_limit"))
+        grid.put(x + 20, y, text + (" · over limit" if over else ""), "g_blocked" if over else "soft",
+                 limit=right)
+        y += 1
+    if len(census) > 4:
+        grid.put(x + 20, y, f"+{len(census) - 4} more repositories", "dim", limit=right)
+        y += 1
+    return y
+
+
+def _draw_steward_editor(grid, steward, state, x, y, right):
+    """Supervision check interval and per-repo supervisor limit, edited like the allocation keys."""
+    folds = state.fold_map()
+    values = _dict(steward.get("values"))
+    notes = {"check_interval_seconds": "a supervising session checks its targets this often without a notice",
+             "max_supervisors_per_repo": "sessions that may hold the supervisor flag in one repo"}
+    for name, choices in _STEWARD_CHOICES.items():
+        current = values.get(name)
+        if current is None:
+            continue
+        options = sorted(set(choices) | {int(current)})
+        labels = {str(item): _steward_shown(name, item) for item in options}
+        grid.put(x + 3, y, _STEWARD_LABELS[name], "label", limit=right)
+        cursor = _chips(grid, x + 20, y, tuple(str(item) for item in options), str(current),
+                        folds.get("ui:steward:" + name), "steward:" + name, right, labels)
+        grid.put(cursor + 1, y, notes[name], "dim", limit=right)
+        y += 1
+    y = _draw_supervisors(grid, steward.get("supervisors"), values.get("max_supervisors_per_repo"),
+                          x, y, right)
+    changes = steward_changes(steward, folds)
+    if changes:
+        preview = "  ·  ".join(f"{_STEWARD_LABELS[name]} {_steward_shown(name, old)} → {_steward_shown(name, new)}"
+                               for name, old, new in changes)
+        grid.put(x + 3, y, "change", "label", limit=right)
+        dry_x = min(x + 20 + cell_width(preview) + 3, right - 25)
+        grid.put(x + 20, y, preview, "soft", limit=dry_x - 2)
+        payload = tuple(("steward." + name, new) for name, _old, new in changes)
+        grid.put(dry_x, y, "[ dry-run ]", "title_dim", limit=right)
+        grid.add_hit(y, dry_x, dry_x + 11, ("alloc.apply", payload, True))
+        grid.put(dry_x + 13, y, "[ apply ]", "chip_on", limit=right)
+        grid.add_hit(y, dry_x + 13, dry_x + 22, ("alloc.apply", payload, False))
+        y += 1
+    status = str(state.status or "")
+    if status.startswith("steward"):
+        failed = "failed" in status or "invalid" in status
+        grid.put(x + 3, y, status, "g_blocked" if failed else "soft", limit=right)
+        y += 1
+    grid.put(x + 3, y, "affects new checks and new supervisor grants only",
+             "dim", limit=right + 1)
+    return y + 1
 
 
 def draw_models(grid: CellGrid, vm, state, x=X, y=3):
@@ -235,8 +566,12 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
     current_model, current_effort = (tuple(current) + (None, None))[:2] if current else (None, None)
     model_choice = model_choice or current_model or next(iter(choices.get(harness, ())), None)
     effort_choice = effort_choice or current_effort or "high"
-    changed = current is None or (model_choice, effort_choice) != (current_model, current_effort)
-    box_top, box_bottom = y, y + 8
+    changed = current is None or not (_same_model(model_choice, current_model)
+                                      and effort_choice == current_effort)
+    harness_choices = tuple(choices.get(harness, ()))
+    picking = not _chips_fit(harness_choices, shown, right - 2 - (x + 13))
+    extra = PICK_ROWS if picking else 0
+    box_top, box_bottom = y, y + 8 + extra
     box_left = x + 1
     for col in range(box_left + 1, right):
         grid.put(col, box_top, "─", "line")
@@ -261,34 +596,49 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         _model_cell(grid, box_left + 59, y + 1, harness, (model_choice, effort_choice), shown, effort_keys, 40,
                     limit=right)
     grid.put(box_left + 3, y + 3, "model", "label")
-    _chips(grid, box_left + 12, y + 3, choices.get(harness, ()), current_model, values.get("ui:model"), "model", right - 2, shown)
-    grid.put(box_left + 3, y + 4, "effort", "label")
+    if picking:
+        _model_picker(grid, box_left + 12, y + 3, right - 1, harness_choices, current_model,
+                      values.get("ui:model"), shown, values, dict(state.scroll),
+                      _catalog_note(data, harness))
+    else:
+        _chips(grid, box_left + 12, y + 3, harness_choices, current_model, values.get("ui:model"), "model",
+               right - 2, shown)
+    grid.put(box_left + 3, y + 4 + extra, "effort", "label")
     effort_options = tuple(data.get("efforts", ())) + (("runtime-default",) if harness == "opencode" else ())
-    _chips(grid, box_left + 12, y + 4, effort_options, current_effort, values.get("ui:effort"), "effort", right - 2)
+    _chips(grid, box_left + 12, y + 4 + extra, effort_options, current_effort, values.get("ui:effort"), "effort",
+           right - 2)
     command = f"hearting model set {harness} profile/{profile} {model_choice}@{effort_choice}"
-    grid.put(box_left + 3, y + 6, "$ ", "line")
+    command_y = y + 6 + extra
+    grid.put(box_left + 3, command_y, "$ ", "line")
     edge = right                   # the box's right border is column ``right``: nothing crosses it
-    grid.put(box_left + 5, y + 6, command, "soft" if changed else "dim", limit=edge)
+    # the two buttons follow the command on its row and stay inside the box; a long model id
+    # gives up the command's tail, never the buttons
+    dry_x = min(box_left + 5 + cell_width(command) + 3, right - 25)
+    grid.put(box_left + 5, command_y, command, "soft" if changed else "dim",
+             limit=dry_x - 2 if changed else edge)
     if changed:
-        # the two buttons follow the command on its row; the box's border cuts what runs past it
-        dry_x = box_left + 5 + cell_width(command) + 3
-        grid.put(dry_x, y + 6, "[ dry-run ]", "title_dim", limit=edge)
-        grid.add_hit(y + 6, dry_x, dry_x + 11, ("ui", "apply", "dry-run: " + command + " --dry-run (시안이라 실행 안 함)"))
+        grid.put(dry_x, command_y, "[ dry-run ]", "title_dim", limit=edge)
+        grid.add_hit(command_y, dry_x, dry_x + 11,
+                     ("models.apply", harness, "profile", profile, model_choice,
+                      effort_choice, True))
         apply_x = dry_x + 11 + 2
-        grid.put(apply_x, y + 6, "[ apply ]", "chip_on", limit=edge)
-        grid.add_hit(y + 6, apply_x, apply_x + 9, ("ui", "apply", "적용: " + command + " (시안이라 실행 안 함)"))
-    y += 10
+        grid.put(apply_x, command_y, "[ apply ]", "chip_on", limit=edge)
+        grid.add_hit(command_y, apply_x, apply_x + 9,
+                     ("models.apply", harness, "profile", profile, model_choice,
+                      effort_choice, False))
+    y += 10 + extra
     if slim:
-        grid.put(box_left + 3, box_top + 7, "pool", "label")
+        grid.put(box_left + 3, box_top + 7 + extra, "pool", "label")
         pool = pools.get(profile)
         if pool:
             order, note = pool
             pool_order = order[0] if order and isinstance(order[0], (list, tuple)) else order
-            cursor = grid.put(box_left + 12, box_top + 7, " › ".join(pool_order), "soft", limit=right - 2)
+            cursor = grid.put(box_left + 12, box_top + 7 + extra, " › ".join(pool_order), "soft",
+                              limit=right - 2)
             if note:
-                grid.put(cursor, box_top + 7, "  " + note, "dim", limit=right - 2)
+                grid.put(cursor, box_top + 7 + extra, "  " + note, "dim", limit=right - 2)
         else:
-            grid.put(box_left + 12, box_top + 7, "route-sealed explicit choice only", "dim", limit=right - 2)
+            grid.put(box_left + 12, box_top + 7 + extra, "route-sealed explicit choice only", "dim", limit=right - 2)
     foot = "models.conf → .bak backup · new sessions and launches only · sealed routes keep their choice"
     grid.put(box_left + 2, box_bottom, " ", "branch_s")
     grid.put(box_left + 3, box_bottom, foot, "dim", limit=right)
@@ -300,6 +650,9 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
     _section(grid, x, left, y, "DISPATCH ALLOCATION", "~/.config/hearting/dispatch-defaults.yaml")
     y += 1
     fields = allocation.get("fields", ())
+    if isinstance(allocation.get("values"), Mapping):
+        y = _draw_allocation_editor(grid, allocation, state, x, y, right)
+        fields = [field for field in fields if field[0] not in _EDITED_FIELDS]
     for label, fragments in fields:
         grid.put(x + 3, y, label, "dim")
         cursor = x + 20
@@ -309,5 +662,10 @@ def draw_models(grid: CellGrid, vm, state, x=X, y=3):
         y += 1
     if allocation:
         grid.put(x + 3, y, allocation.get("note", "·"), "dim", limit=right + 1)
+    steward = _dict(data.get("steward"))
+    if isinstance(steward.get("values"), Mapping):
+        y += 2
+        _section(grid, x, left, y, "SUPERVISION", "steward · same file")
+        y = _draw_steward_editor(grid, steward, state, x, y + 1, right) - 1
     if not beside:
         _draw_context(grid, data, state, x, y + 2, min(grid.cols - x - 2, 100))

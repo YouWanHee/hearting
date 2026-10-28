@@ -809,6 +809,60 @@ def _allocation_fields(policy):
     return fields
 
 
+_ALLOCATION_OPTIONAL = ("usage_gate_used_percent", "depth_affinity", "depth_affinity_weight",
+                        "usage_headroom_exponent", "harness_weights")
+
+
+def _allocation_editable(module, policy):
+    """Current allocation values and, per strategy, the keys it leaves without effect (and why)."""
+    values = module.query_allocation(policy)
+    if not values:
+        return {}
+    strategies = sorted(module.ALLOCATION_STRATEGIES)
+    probe = {key: None for key in _ALLOCATION_OPTIONAL}
+    inert = {name: dict(module.inert_allocation_keys(dict(probe, strategy=name))) for name in strategies}
+    enabled = [name for name in ("claude", "codex", "opencode")
+               if name in ((policy.get("harnesses") or {}).get("enabled") or ("claude", "codex", "opencode"))]
+    path = module.default_config_path()
+    return {"values": {"strategy": values.get("strategy"), "window": values.get("window"),
+                       "usage_gate_used_percent": values.get("usage_gate_used_percent"),
+                       "usage_headroom_exponent": values.get("usage_headroom_exponent"),
+                       "depth_affinity_weight": values.get("depth_affinity_weight"),
+                       "depth_affinity": dict(values.get("depth_affinity") or {}),
+                       "harness_weights": dict(values.get("harness_weights") or {})},
+            "strategies": strategies, "inert": inert, "harnesses": enabled,
+            "user_file": os.path.realpath(path) != os.path.realpath(module.SHIPPED_CONFIG_PATH)}
+
+
+_STEWARD_KEYS = ("check_interval_seconds", "max_supervisors_per_repo")
+
+
+def _supervisors():
+    """This repository first, then every other one holding a supervisor, from the steward
+    collector's last pass (``None`` before it ran). Nothing here counts on its own."""
+    from ..collectors import steward
+    census = steward.last_supervision()
+    if census is None:
+        return None
+    here = steward._repository_key(os.getcwd())
+    rows = [census[key] for key in sorted(census, key=lambda key: (key != here, key))]
+    if here and here not in census:
+        rows.insert(0, {"repository": Path(here).parent.name, "repository_key": here,
+                        "holders": [], "counted": 0, "limit": None, "over_limit": False})
+    return rows
+
+
+def _steward_editable(module, policy):
+    """The steward check interval and per-repo supervisor limit through the shared policy reader."""
+    current = module.query_steward_policy(policy)
+    values = {key: current[key] for key in _STEWARD_KEYS}
+    try:
+        supervisors = _supervisors()
+    except Exception:
+        supervisors = None
+    return {"values": values, "supervisors": supervisors}
+
+
 def _read_tidy_points():
     """Read the context alert thresholds; unavailable or malformed source stays unknown."""
     try:
@@ -872,17 +926,20 @@ def read_model_config():
             pools[profile] = [[list(bands.get("primary") or ())], note]
         pools.setdefault("top", None)
         allocation = {"fields": _allocation_fields(policy),
-                      "note": "these keys have no setter command yet — Fleet would edit the YAML and run its validator"}
+                      "note": "new dispatch decisions only · running and sealed routes keep their choice"}
+        allocation.update(_allocation_editable(module, policy))
+        steward = _steward_editable(module, policy)
     except Exception:
-        pools, allocation = {}, {}
+        pools, allocation, steward = {}, {}, {}
     try:
         from .. import render
         shown = {}
         for models in choices.values():
             for model in models:
                 shown[model] = render._clean_model(render._dispatch_display_model(model)) or model
-        for model in main_only.values():
-            shown[model] = render._clean_model(render._dispatch_display_model(model)) or model
+        for models in main_only.values():
+            for model in models:
+                shown[model] = render._clean_model(render._dispatch_display_model(model)) or model
     except Exception:
         shown = {}
     return {"profiles": [p for p in _PROFILES if any(m.get(p) for m in profile_map.values())],
@@ -890,7 +947,7 @@ def read_model_config():
             "efforts": list(_EFFORTS), "pools": pools, "effort_keys": dict(_EFFORT_KEYS), "shown": shown,
             "context": context, "context_source": dict(_CONTEXT_SOURCE), "catalog_sources": catalog_sources,
             "tidy": _read_tidy_points(),
-            "token_units": dict(_TOKEN_UNITS), "allocation": allocation}
+            "token_units": dict(_TOKEN_UNITS), "allocation": allocation, "steward": steward}
 
 
 def collect_aux(request, *, snapshot=None, now=None):

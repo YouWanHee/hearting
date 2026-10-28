@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -18,6 +19,27 @@ import dispatch_replacement as R
 import dispatch_contract as D
 import route_identity
 os.environ.setdefault("HEARTING_CAPACITY_PROBE_CLI", os.devnull)  # never ask a real Claude login
+
+
+_STATE_TMP = None
+_STATE_OLD = None
+
+
+def setUpModule():
+    # The hard usage reader now consults Fleet's shared gauge cache; keep this
+    # module off the developer's live ~/.local/state store.
+    global _STATE_TMP, _STATE_OLD
+    _STATE_TMP = tempfile.TemporaryDirectory()
+    _STATE_OLD = os.environ.get("FLEET_USAGE_STATE_DIR")
+    os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_TMP.name
+
+
+def tearDownModule():
+    if _STATE_OLD is None:
+        os.environ.pop("FLEET_USAGE_STATE_DIR", None)
+    else:
+        os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_OLD
+    _STATE_TMP.cleanup()
 
 
 class ReplacementTest(unittest.TestCase):
@@ -1671,6 +1693,115 @@ class ReplacementTest(unittest.TestCase):
         with self.assertRaises(D.DispatchContractError) as caught:R.admission(self.jobs,spawned,second)
         self.assertEqual(caught.exception.reason,'retry-already-claimed')
 
+    def _sr_child_retry(self):
+        # Real owner rows bind through owner_route_*, not the child's route_id.
+        self.meta.update(worker_type='owner', route_id='', route_hash='', route_node='',
+                         owner_route_file=str(self.path), owner_route_id='rt-test',
+                         owner_route_hash='sha256:test')
+        self._owner()
+        owner=R._rows(self.jobs.read_text().splitlines())['att-source'][1]
+        successor=self._successor(self.claim(), owner, status='open', launch_started='1')
+        child={
+            'attempt_schema_version':'2', 'dispatch_depth':'2', 'transport':'headless',
+            'execution_surface':'registered-headless', 'registered_worker':'1',
+            'fallback_hop':'same-harness-headless', 'worker_type':'stage', 'harness':'codex',
+            'attempt_id':'att-child', 'parent_attempt_id':'att-source',
+            'route_id':'rt-test', 'route_hash':'sha256:test', 'route_node':'execute',
+            'note':'dead-parent-terminated', 'failure_class':'runtime',
+            'launch_started':'1',
+        }
+        self.write(child, append=True)
+        candidate={k:v for k,v in child.items() if k not in {'note','failure_class','launch_started'}}
+        candidate.update(attempt_id='att-child-next', automatic_retry_of='att-child',
+                         parent_attempt_id=successor['attempt_id'])
+        return child, candidate, successor
+
+    def _sr_retry_admission(self, candidate):
+        before=self.jobs.read_bytes()
+        try:
+            return D._automatic_retry_admission(
+                self.jobs.read_text().splitlines(), candidate, jobs=self.jobs)
+        finally:
+            self.assertEqual(self.jobs.read_bytes(), before)
+
+    def test_sr_child_retry_registers_once_under_launched_owner_successor(self):
+        child, candidate, _=self._sr_child_retry()
+        before=self.jobs.read_bytes()
+        claims={p:p.read_bytes() for p in R._directory(self.jobs).rglob('*.json')}
+        # The real registration boundary holds the jobs lock during lineage reads.
+        row='now\topen\t'+str(self.root)+'\t'+str(self.root)+'\tchild-next\t'+','.join(
+            k+'='+v for k,v in candidate.items())
+        self.assertTrue(D.claim_attempt_row(self.jobs, candidate['attempt_id'], row, launch=True))
+        self.assertFalse(D.claim_attempt_row(self.jobs, candidate['attempt_id'], row, launch=True))
+        self.assertTrue(self.jobs.read_bytes().startswith(before))
+        self.assertEqual({p:p.read_bytes() for p in claims}, claims)
+        with self.assertRaises(D.DispatchContractError) as caught:
+            self._sr_retry_admission({**candidate, 'attempt_id':'att-child-duplicate'})
+        self.assertEqual(caught.exception.reason, 'retry-already-claimed')
+
+    def test_sr_child_retry_keeps_same_parent_and_follows_multiple_owner_generations(self):
+        child, candidate, successor=self._sr_child_retry()
+        self._sr_retry_admission({**candidate, 'parent_attempt_id':child['parent_attempt_id']})
+        source=self._die(successor, note='dead-exact-pid', failure_class='contract',
+                         launch_outcome='never-launched')
+        final=self._successor(R.claim(self.jobs, source['attempt_id']), source,
+                              status='open', launch_started='1')
+        self._sr_retry_admission({**candidate, 'parent_attempt_id':final['attempt_id']})
+        with self.assertRaises(D.DispatchContractError):
+            self._sr_retry_admission(candidate)  # An intermediate owner is no longer current.
+
+    def test_sr_child_retry_rejects_foreign_route_node_parent_and_non_owner(self):
+        child, candidate, successor=self._sr_child_retry()
+        for changes in ({'parent_attempt_id':'att-unrelated'}, {'route_id':'rt-other'},
+                        {'route_hash':'sha256:other'}, {'route_node':'test'},
+                        {'dispatch_depth':'1'}):
+            with self.subTest(changes=changes), self.assertRaises(D.DispatchContractError) as caught:
+                self._sr_retry_admission({**candidate, **changes})
+            self.assertEqual(caught.exception.reason, 'retry-predecessor-binding-mismatch')
+        original=self.jobs.read_bytes()
+        for changes in ({'owner_route_id':'rt-other'}, {'owner_route_hash':'sha256:other'},
+                        {'worker_type':'frame'}, {'registered_worker':'0'}):
+            self.jobs.write_bytes(original)
+            self._die(successor, **changes)
+            with self.subTest(changes=changes), self.assertRaises(D.DispatchContractError) as caught:
+                self._sr_retry_admission(candidate)
+            self.assertEqual(caught.exception.reason, 'retry-predecessor-binding-mismatch')
+        self.jobs.write_bytes(original)
+        self._die(child, route_node='')
+        with self.assertRaises(D.DispatchContractError) as caught:
+            self._sr_retry_admission({**candidate, 'route_node':''})
+        self.assertEqual(caught.exception.reason, 'retry-predecessor-binding-mismatch')
+
+    def test_sr_child_retry_rejects_unlaunched_damaged_and_competing_owner_claims(self):
+        _, candidate, successor=self._sr_child_retry()
+        original=self.jobs.read_bytes()
+        for changes in ({'launch_started':'0', 'launch_claimed':'0',
+                         'launch_outcome':'never-launched'},
+                        {'replacement_claim_digest':'wrong-digest'}):
+            self.jobs.write_bytes(original)
+            self._die(successor, **changes)
+            with self.subTest(changes=changes), self.assertRaises(D.DispatchContractError):
+                self._sr_retry_admission(candidate)
+        self.jobs.write_bytes(original)
+        self.write({**successor, 'attempt_id':'att-competing-owner'}, status='open', append=True)
+        with self.assertRaises(D.DispatchContractError):
+            self._sr_retry_admission(candidate)
+
+    def test_sr_child_retry_preserves_process_and_semantic_result_refusals(self):
+        child, candidate, _=self._sr_child_retry()
+        for state in ('live', 'unverifiable'):
+            with self.subTest(state=state), mock.patch.object(
+                    D, 'attempt_process_quiescence',
+                    return_value=SimpleNamespace(state=state, reason='fixture')):
+                with self.assertRaises(D.DispatchContractError) as caught:
+                    self._sr_retry_admission(candidate)
+                self.assertEqual(caught.exception.reason, 'retry-predecessor-not-retryable')
+        for verdict in ('fail', 'blocked'):
+            self._die(child, note='dead-worker-'+verdict, failure_class=verdict)
+            with self.subTest(verdict=verdict), self.assertRaises(D.DispatchContractError) as caught:
+                self._sr_retry_admission(candidate)
+            self.assertEqual(caught.exception.reason, 'retry-predecessor-not-retryable')
+
     # -- an owner stopped at a usage limit: a pause with its own family, never the silent budget ----
     def _owner(self,**changes):
         self.write({**self.meta,'worker_type':'owner','launch_started':'1',**changes})
@@ -3115,6 +3246,14 @@ class ReplacementTest(unittest.TestCase):
                 R._check_tuple({**newer,'resolved':{'model':'m2','permission_mode':'config'}},old)
         same_release=dict(old,resolved={'model':'m3','permission_mode':'default'})
         with self.assertRaises(D.DispatchContractError):R._check_tuple(same_release,old)
+        # A key the older release never sealed (runtime_dir, added later) follows the
+        # current release; a key the older release did seal still has to match.
+        added={**newer,'resolved':{**newer['resolved'],'runtime_dir':'/checkout/.agent_runtime'}}
+        R._check_tuple(added,old)
+        with self.assertRaises(D.DispatchContractError):
+            R._check_tuple(added,dict(old,resolved={**old['resolved'],'runtime_dir':None}))
+        with self.assertRaises(D.DispatchContractError):
+            R._check_tuple(dict(old,resolved={**old['resolved'],'runtime_dir':'/checkout/.agent_runtime'}),old)
 
     def test_permission_widening_and_narrowing_are_refused_with_axis_values(self):
         base = {
@@ -3165,6 +3304,20 @@ class ReplacementTest(unittest.TestCase):
         self.assertIn("predecessor='not-requested'", widened.exception.detail)
         self.assertIn("candidate='enforced'", widened.exception.detail)
         self.assertIn('child_spawned=0', widened.exception.detail)
+
+    def test_a_release_added_policy_record_follows_the_release_and_grants_stay_strict(self):
+        sealed = {'attempt_id': 'att-release-added', 'jobs': str(self.jobs.resolve()),
+                  'worktree': str(self.root / 'wt'), 'launch_home': '/release/v1', 'resolved': {},
+                  'applied_permissions': {'runtime_sandbox': 'workspace-write'}}
+        newer = {**sealed, 'launch_home': '/release/v2', 'applied_permissions': {
+            **sealed['applied_permissions'], 'commit_policy': {'may_commit': True}}}
+        R._check_tuple(newer, sealed)
+        with self.assertRaises(D.DispatchContractError):
+            R._check_tuple({**newer, 'launch_home': '/release/v1'}, sealed)
+        with self.assertRaises(D.DispatchContractError) as refused:
+            R._check_tuple({**newer, 'applied_permissions': {
+                **newer['applied_permissions'], 'nested_headless_network': True}}, sealed)
+        self.assertIn('axis=network', refused.exception.detail)
 
     def test_a_release_root_spelled_through_its_pointer_is_the_same_permission(self):
         # TF rt-34ca7756: the owner's rules named releases/v3.13.0, the correcting session's
@@ -3970,10 +4123,360 @@ class FrameTopCapacityTest(unittest.TestCase):
 
 
 
+class ClosedNativeFrameCapacityRecoveryTest(unittest.TestCase):
+    """A closed invalid-envelope row may recover only from its exact native quota log."""
+
+    harness = "claude"
+    write = ReplacementTest.write
+    claim = ReplacementTest.claim
+    bind_fixture_route = ReplacementTest.bind_fixture_route
+    rows = FrameTopCapacityTest.rows
+    kind = FrameTopCapacityTest.kind
+
+    def set_route(self, **changes):
+        policy = {"primary": ["codex", "claude"], "relief": ["opencode"],
+                  "last_resort": [], "promote_relief_below": 25}
+        self.node.update(role="deep maker", harness_policy=policy)
+        frame = {**self.node, "kind": "map-worker", "unit": "plan/frame"}
+        peer = {"id": "frame-alternative", "kind": "map-worker", "unit": "plan/frame",
+                "worker_type": "frame",
+                "dispatch_depth": 1,
+                "role": "deep maker", "model_profile": "top", "harness_policy": dict(policy)}
+        self.route.update(effective_intensity="standard", nodes=[frame, peer],
+            profile_selection_contract_version=1,
+            dispatch_evidence={"tuples": [{"status": "supported", "child_harness": harness}
+                                            for harness in ("claude", "codex", "opencode")]},
+            dispatch_allocation={"strategy": "capacity-aware", "window": 30,
+                "harness_order": ["codex", "claude", "opencode"],
+                "usage_gate_used_percent": 90}, **changes)
+        self.bind_fixture_route()
+
+    def _native_result(self, *, status=429):
+        reset = int(time.time()) + 3600
+        self.log_path.write_text("".join(json.dumps(value) + "\n" for value in (
+            {"type": "rate_limit_event", "session_id": "sid-capacity", "rate_limit_info": {
+                "status": "rejected", "rateLimitType": "five_hour", "resetsAt": reset,
+                "unifiedWindows": {"five_hour": {"utilization": 1}}, "isUsingOverage": False}},
+            {"type": "result", "session_id": "sid-capacity", "is_error": True,
+             "subtype": "success", "terminal_reason": "api_error", "api_error_status": status},
+        )), encoding="utf-8")
+        return reset
+
+    def setUp(self):
+        FrameTopCapacityTest.setUp(self)
+        self.args.model_role = "deep maker"
+        self.args.worker_type = "frame"
+        self.args.dispatch_depth = 1
+        self.args.model_profile = "top"
+        self.args.model = "m-top"
+        self.args.resolved_model_settings = {"profile": "top", "role": "deep maker",
+                                             "model": "m-top", "effort": "max"}
+        source_input = R._directory(self.jobs) / "inputs" / "att-source.json"
+        source_input.unlink()
+        self.log_path = self.root / "frame.att-source.claude.jsonl"
+        self._native_result()
+        self.meta.update(model_role="deep maker", model_profile="top", harness="claude",
+            note="dead-invalid-envelope", failure_class="invalid-envelope",
+            classifier_source="completion-join-invalid-envelope-v1",
+            reconcile_reason="terminal-invalid:claude-result-capacity", log_file=str(self.log_path),
+            route_file=str(self.path), route_node="frame")
+        self.meta.update(D.parse_registry_metadata(
+            R.seal_launch_input(self.args, "claude", "the raw task")))
+        self.write(self.meta)
+        self.peer = {key: value for key, value in self.meta.items()
+                     if key not in {"replacement_input_digest", "launch_outcome"}}
+        self.peer.update(attempt_id="att-peer", route_node="frame-alternative", harness="codex",
+                         model="gpt-6.1-sol", note="completed-marker", failure_class="pass",
+                         log_file=str(self.root / "peer.att-peer.codex.jsonl"))
+        self.write(self.peer, append=True)
+
+    def _candidate_input(self, record):
+        source = self.rows()["att-source"][1]
+        history = R.launch_input(self.jobs, "att-source", source)
+        args = SimpleNamespace(**history["resolved"])
+        args.attempt_id = record["replacement_attempt_id"]
+        args.jobs_path = self.jobs
+        args.worktree = str(self.root)
+        args.route_id = self.route["route_id"]
+        args.route_hash = self.route["route_hash"]
+        args.route_file = str(self.path)
+        args.route_node = "frame"
+        args.model_role = "deep maker"
+        args.model_profile = "top"
+        args.model = "gpt-6.1-sol"
+        args.resolved_model_settings = {"profile": "top", "role": "deep maker",
+                                       "model": "gpt-6.1-sol", "effort": "high"}
+        args.replacement_input_argv = list(history["argv"])
+        args.launch_lifecycle = (history.get("applied_permissions") or {}).get("launch_lifecycle", "detached")
+        digest_field = R.seal_launch_input(args, "codex", history["task"])
+        digest = D.parse_registry_metadata(digest_field)["replacement_input_digest"]
+        candidate = R.launch_input(self.jobs, record["replacement_attempt_id"], {
+            "attempt_id": record["replacement_attempt_id"],
+            "replacement_input_digest": digest,
+            "jobs": str(self.jobs.resolve()),
+        })
+        metadata = {**source, "attempt_id": record["replacement_attempt_id"],
+                    "automatic_retry_of": "att-source", "harness": "codex",
+                    "model": "gpt-6.1-sol", "model_role": "deep maker", "model_profile": "top",
+                    "note": "", "failure_class": "", "launch_outcome": "",
+                    **D.parse_registry_metadata(digest_field)}
+        return history, candidate, metadata
+
+    def _public_start(self, launches):
+        import work_start as W
+
+        def join(**kwargs):
+            rows = self.rows()
+            ready = all(rows[aid][0][1] == "done" for aid in kwargs["expected_attempts"])
+            return {"state": "ready" if ready else "timeout", "children": []}
+
+        def launch(command, **kwargs):
+            launches.append(command)
+            source = self.rows()["att-source"][1]
+            binding = R.source_binding(self.jobs, source)
+            record = R._read(R._record_path(self.jobs, binding[0]))
+            _, _, metadata = self._candidate_input(record)
+            metadata.update(launch_claimed="1", launch_started="1")
+            self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), metadata), record)
+            row = (f"now\trunning\t{self.root}\t{self.root}\tframe\t"
+                   + ",".join(f"{key}={value}" for key, value in metadata.items()))
+            self.assertTrue(D.claim_attempt_row(self.jobs, metadata["attempt_id"], row, launch=True))
+            return subprocess.CompletedProcess(command, 0, "registered=1\nstarted=1\nchild_spawned=1\n", "")
+
+        # Reuse the existing sealed-input/authority/claim fixture. Only the
+        # request, observation and native launcher are stand-ins; the public
+        # start, batch, capacity decision and replacement admission are real.
+        with mock.patch.dict(os.environ, ReplacementTest.parent_env(self, "parent", "codex"), clear=True), \
+             mock.patch.object(W, "continuation_work_request", return_value={"text": "the raw task"}), \
+             mock.patch.object(W, "join_selected_attempts", side_effect=join), \
+             mock.patch("capacity_auto_resume.arm", return_value=None), \
+             mock.patch("start_receipt.save", side_effect=lambda result, _jobs: result):
+            return W.start_work(self.route, self.path, self.jobs, run=launch)
+
+    @contextlib.contextmanager
+    def _current_capacity(self, headroom):
+        source = "unknown:no-fresh-taps" if headroom is None else "fixture-headroom"
+        report = {"scores": {"claude": headroom, "codex": headroom, "opencode": 0},
+                  "sources": {"claude": source, "codex": source}}
+        # A released quota does not imply fresh headroom. Control both inputs
+        # instead of borrowing the developer's real taps outside the fixture.
+        capacity = R._capacity_reader()
+        with mock.patch("dispatch_capacity_evidence.harness_hold", return_value=None), \
+             mock.patch("dispatch_capacity_evidence.usage_states", return_value={
+                 harness: "unknown" if headroom is None else "ok"
+                 for harness in ("claude", "codex", "opencode")}), \
+             mock.patch.object(R, "_capacity_reader", return_value=capacity), \
+             mock.patch.object(capacity, "capacity_report", return_value=report):
+            yield
+
+    def test_public_start_resumes_released_capacity_once_and_preserves_successful_peer(self):
+        before = self.jobs.read_bytes()
+        peer = self.rows()["att-peer"][0]
+        terminal = self.log_path.read_bytes()
+        launches = []
+        with self._current_capacity(80):
+            result = self._public_start(launches)
+            self.assertEqual(result["state"], "preparing", result)
+            self.assertEqual(len(launches), 1)
+            replacement = next(aid for aid in result["frame_attempts"] if aid != "att-peer")
+            self.assertNotEqual(replacement, "att-source")
+            self.assertEqual(self.rows()[replacement][1]["harness"], "codex")
+            self.assertEqual(self.rows()[replacement][1]["automatic_retry_of"], "att-source")
+            replay = self._public_start(launches)
+        self.assertEqual(replay["frame_attempts"], result["frame_attempts"])
+        self.assertEqual(len(launches), 1)
+        self.assertEqual(len(list((R._directory(self.jobs) / "claims").glob("*.json"))), 1)
+        self.assertEqual(self.rows()["att-peer"][0], peer)
+        self.assertEqual(self.log_path.read_bytes(), terminal)
+        self.assertNotEqual(self.jobs.read_bytes(), before)
+
+    def test_public_start_keeps_pinned_limited_frame_waiting_with_reset_without_claim(self):
+        import route_authority
+        route_authority.record_pin_change(self.route, target="frame", pin={"harness": "claude"},
+            by={"harness": "codex", "session_id": "parent"}, source="fixture", tuples=[], candidates=[])
+        before = self.jobs.read_bytes()
+        hold = {"label": "five-hour", "until_epoch": 4102444800}
+        launches = []
+        with mock.patch("dispatch_capacity_evidence.harness_hold", return_value=hold):
+            result = self._public_start(launches)
+        self.assertEqual((result["state"], result["reason"]),
+                         ("waiting-capacity", "owner-capacity-wait"), result)
+        self.assertEqual(result["retry_at"], "2100-01-01T00:00:00Z")
+        self.assertEqual(result["source_attempt_id"], "att-source")
+        self.assertEqual(launches, [])
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertFalse((R._directory(self.jobs) / "claims").exists())
+
+    def test_passive_batch_keeps_capacity_wait_without_claim_after_limit_clears(self):
+        before = self.jobs.read_bytes()
+        run = mock.Mock(side_effect=AssertionError("passive batch launched a frame"))
+        with self._current_capacity(80):
+            effective, lineage, attention = R.advance_batch(
+                self.jobs, {"att-source", "att-peer"}, run=run)
+        self.assertEqual(effective, {"att-source", "att-peer"})
+        self.assertEqual(lineage, [])
+        self.assertEqual([(item["source_attempt_id"], item["reason"]) for item in attention],
+                         [("att-source", "replacement-capacity-wait")])
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertFalse((R._directory(self.jobs) / "claims").exists())
+        run.assert_not_called()
+
+    def test_public_start_keeps_unknown_headroom_waiting_without_claim(self):
+        before = self.jobs.read_bytes()
+        launches = []
+        with self._current_capacity(None):
+            result = self._public_start(launches)
+        self.assertEqual((result["state"], result["usage_state"]),
+                         ("waiting-capacity", "allocation-usage-gate"), result)
+        self.assertEqual(result["replacement_attention"][0]["capacity_source"], "unknown:no-fresh-taps")
+        self.assertNotIn("retry_at", result)
+        self.assertEqual(launches, [])
+        self.assertEqual(self.jobs.read_bytes(), before)
+        self.assertFalse((R._directory(self.jobs) / "claims").exists())
+
+    def test_closed_row_reuses_exact_capacity_raw_and_successful_peer_without_mutation(self):
+        from review_round_cap import logical_round_records
+        source_fields_before, source_meta_before = self.rows()["att-source"]
+        peer_raw = self.rows()["att-peer"][0]
+        terminal_raw = self.log_path.read_bytes()
+        rounds_before = [meta["attempt_id"] for _, meta in
+                         logical_round_records(list(self.rows().values()), jobs=self.jobs)]
+        self.assertEqual(R.death_kind(*self.rows()["att-source"], jobs=self.jobs), "capacity")
+
+        record = self.claim()
+        self.assertEqual(self.claim(), record)
+        self.assertEqual(record["proof"]["death_kind"], "capacity")
+        self.assertNotIn("profile_transition", record)
+        self.assertEqual(len(list((R._directory(self.jobs) / "claims").glob("*.json"))), 1)
+
+        command = R._command(self.jobs, record, self.rows()["att-source"][1],
+                             R.launch_input(self.jobs, "att-source", self.rows()["att-source"][1]))
+        self.assertTrue(command[1].endswith("utilities/dispatch-owner.py"), command)
+        self.assertEqual(command[command.index("--route-node") + 1], "frame")
+        self.assertEqual(command[command.index("--automatic-retry-of") + 1], "att-source")
+        self.assertNotIn("--adapter", command)
+        self.assertNotIn("--model-profile", command)  # selector reads the sealed top profile and role
+        self.assertEqual(self.route["nodes"][0]["role"], "deep maker")
+        self.assertEqual(self.route["nodes"][0]["model_profile"], "top")
+
+        history, candidate, metadata = self._candidate_input(record)
+        import route_authority as RA
+        self.assertEqual(R.admission(self.jobs, self.jobs.read_text().splitlines(), metadata), record)
+        self.assertTrue(self.path.is_relative_to(self.root))
+        self.assertTrue(self.jobs.is_relative_to(self.root))
+        self.assertTrue(self.log_path.is_relative_to(self.root))
+        self.assertEqual(
+            [(node["kind"], node["unit"], node["worker_type"], node["dispatch_depth"],
+              node["role"], node["model_profile"])
+             for node in self.route["nodes"]],
+            [("map-worker", "plan/frame", "frame", 1, "deep maker", "top")] * 2)
+        self.assertIs(RA._frame_peer_recovery_harness(candidate, history, self.route), True)
+        self.assertIsNone(RA.require_recovery_work(
+            candidate, history, route=self.route, worker_type="frame"))
+        for field, value in (("model_profile", "deep"), ("model_role", "fast reviewer")):
+            changed = {**candidate, "resolved": {**candidate["resolved"], field: value}}
+            with self.subTest(field=field), self.assertRaises(D.DispatchContractError):
+                RA.require_recovery_work(changed, history, route=self.route, worker_type="frame")
+
+        self.assertIs(RA._frame_peer_recovery_harness(
+            {**candidate, "route_id": "rt-unrelated"}, history, self.route), False)
+
+        pin_path = RA.pin_changes_path(self.route)
+        self.assertTrue(pin_path.is_relative_to(self.root))
+        pin_path.parent.mkdir(parents=True, exist_ok=True)
+        pin_path.write_text(json.dumps({
+            "schema": 1, "route_id": self.route["route_id"],
+            "route_hash": self.route["route_hash"], "target": "frame",
+            "pin": {"harness": "claude"}, "tuples": [],
+        }) + "\n", encoding="utf-8")
+        self.assertIs(RA._frame_peer_recovery_harness(candidate, history, self.route), False)
+        pin_path.unlink()
+
+        def helper_with_peer_variant(name, **changes):
+            variant_jobs = self.root / f"jobs-{name}.log"
+            variant_lines = []
+            for attempt_id in ("att-source", "att-peer"):
+                fields, row = self.rows()[attempt_id]
+                fields = list(fields)
+                row = dict(row)
+                if attempt_id == "att-peer":
+                    row.update(changes)
+                fields[5] = ",".join(f"{key}={value}" for key, value in row.items())
+                variant_lines.append("\t".join(fields))
+            variant_jobs.write_text("\n".join(variant_lines) + "\n", encoding="utf-8")
+            return RA._frame_peer_recovery_harness(
+                candidate, {**history, "jobs": str(variant_jobs)}, self.route)
+
+        self.assertIs(helper_with_peer_variant("unsupported-peer", harness="unsupported"), False)
+        self.assertIs(helper_with_peer_variant("unsuccessful-peer", failure_class="fail"), False)
+
+        current = self.rows()
+        source_fields_after, source_meta_after = current["att-source"]
+        self.assertEqual(source_fields_after[:5], source_fields_before[:5])
+        for key, value in source_meta_before.items():
+            self.assertEqual(source_meta_after.get(key), value, key)
+        self.assertLessEqual(set(source_meta_after) - set(source_meta_before), {
+            "replacement_family_id", "replacement_attempt_id", "replacement_claim_digest",
+            "replacement_ordinal"})
+        self.assertEqual(current["att-peer"][0], peer_raw)
+        self.assertEqual(self.log_path.read_bytes(), terminal_raw)
+        self.assertEqual(len(current), 2)  # no peer row or replacement process was registered
+        self.assertEqual([meta["attempt_id"] for _, meta in
+                          logical_round_records(list(current.values()), jobs=self.jobs)], rounds_before)
+
+    def test_source_capacity_hold_yields_only_when_the_existing_selector_picks_the_peer(self):
+        capacity = R._capacity_reader()
+        selected_rows = []
+        real_select = capacity.select
+        def select(*args, **kwargs):
+            selected = real_select(*args, **kwargs)
+            selected_rows.append(selected)
+            return selected
+        with mock.patch("dispatch_capacity_evidence.harness_hold", return_value={"label": "limited"}), \
+             mock.patch("dispatch_capacity_evidence.usage_states",
+                        return_value={"claude": "limited(now)", "codex": "ok", "opencode": "limited"}), \
+             mock.patch("model_config.resolve_config", return_value=({}, "fixture")), \
+             mock.patch("model_profile.resolve_profile_values",
+                        side_effect=lambda harness, _config, profile: {"model": f"{harness}-{profile}"}), \
+             mock.patch.object(R, "_capacity_reader", return_value=capacity), \
+             mock.patch.object(capacity, "capacity_report", return_value={
+                "scores": {"claude": 0, "codex": 80, "opencode": 0}, "sources": {}}), \
+             mock.patch.object(capacity, "select", side_effect=select) as select_call, \
+             mock.patch("dispatch_allocation.attempt_counts", return_value={"claude": 0, "codex": 0,
+                                                                             "opencode": 0}):
+            self.assertIsNone(R._capacity_hold(self.jobs, self.meta, allow_frame_peer=True))
+            self.assertEqual(select_call.call_args.args[1]["claude"], "limited(limited)")
+            self.assertEqual(selected_rows[0][0], "codex")
+            self.assertIsNotNone(R._capacity_hold(self.jobs, self.meta, allow_frame_peer=False))
+
+    def test_wrong_raw_identity_auth_runtime_and_non_capacity_results_are_refused(self):
+        self.assertIsNone(self.kind(reconcile_reason="terminal-invalid:claude-result-auth"))
+        self.assertIsNone(self.kind(note="dead-worker-fail", failure_class="fail"))
+        self.assertIsNone(self.kind(note="dead-worker-blocked", failure_class="blocked"))
+
+        wrong_path = self.root / "frame.att-other.claude.jsonl"
+        self._native_result()
+        self.assertIsNone(self.kind(log_file=str(wrong_path)))
+        for status in (401, 503):
+            self._native_result(status=status)
+            self.assertIsNone(self.kind())
+        self.log_path.write_text("not-json\n", encoding="utf-8")
+        self.assertIsNone(self.kind())
+
+    def test_live_or_unknown_process_proof_never_creates_a_claim(self):
+        for state in ("live", "unverifiable"):
+            with self.subTest(state=state), \
+                 mock.patch.object(D, "attempt_process_quiescence",
+                    return_value=SimpleNamespace(state=state, reason="fixture-" + state)), \
+                 self.assertRaises(D.DispatchContractError):
+                self.claim()
+        self.assertFalse((R._directory(self.jobs) / "claims").exists())
+
+
 class FrameCapacityFlow:
-    """argv -> profile -> register -> spawn claim for one adapter, with the real wrapper parser and
-    profile binding, the real transition reader and the real registration/spawn admission. Only the
-    process spawn is a stand-in. Each adapter's `dispatch-headless.sd45.test.py` runs this once."""
+    """argv -> profile -> route guard -> register -> spawn claim for one adapter, with the real
+    guard CLI and transition reader. Guard transport and process spawn are stand-ins; the existing
+    source-proof fixture is shared in-process. Each adapter's sd45 suite runs this flow."""
 
     def __init__(self, wrapper, harness, case):
         self.wrapper, self.harness, self.case = wrapper, harness, case
@@ -3984,6 +4487,36 @@ class FrameCapacityFlow:
         fx.setUp()
         self.case.addCleanup(fx.doCleanups)
         self.case.addCleanup(fx.tmp.cleanup)
+        # The earlier minimal route never reached the real launch guard. Seal
+        # an actual route and isolate the compiler and guard from the
+        # operator's home, artifact root and canonical registry.
+        env = mock.patch.dict(os.environ, {
+            'AGENT_HOME': str(R.ROOT), 'AGENT_DISPATCH_JOBS': str(fx.jobs),
+            'AGENT_ARTIFACT_ROOT': str(fx.root), 'HEARTING_GATES': 'on',
+        })
+        env.start(); fx.addCleanup(env.stop)
+        subprocess.run(['git', 'init', '-q', '--initial-branch=frame-fixture', str(fx.root)], check=True)
+        subprocess.run(['git', '-C', str(fx.root), '-c', 'user.name=Fixture',
+                        '-c', 'user.email=fixture@example.com', 'commit', '--allow-empty',
+                        '-qm', 'base'], check=True)
+        gate = {'spec_read': {'satisfied': True, 'source': 'fixture'},
+                'drift_verdict': 'within-spec', 'workflow_mode': 'tracked',
+                'artifact_guard': {'satisfied': True, 'source': 'fixture'}}
+        dispatch = {'tuples': [{
+            'parent_harness': 'codex', 'parent_transport': 'headless',
+            'parent_sandbox': 'workspace-write', 'child_harness': self.harness,
+            'launch_authority': 'conductor', 'status': 'supported',
+            'probe_source': 'fixture', 'probe_time': '2026-07-16T00:00:00Z',
+            'failure_class': '', 'checked_worktree': str(fx.root),
+            'failure_scope': 'none', 'codex_command': 'ok', 'retry_on_isolated_worktree': 0,
+        }], 'native_subagent': []}
+        compiled = D._route_module().compile_route(
+            'autopilot-code', 'dev', 'standard', fx.root, fx.root,
+            transport='headless', tracking='tracked',
+            tracked_gate_evidence=gate, dispatch_evidence=dispatch, slug='frame-fixture')
+        fx.route.clear(); fx.route.update(compiled)
+        fx.node = next(node for node in fx.route['nodes'] if node['id'] == 'frame')
+        fx.bind_fixture_route()
         (R._directory(fx.jobs)/'inputs/att-source.json').unlink()
         args = self.args(fx, self.cli(fx, 'att-source', 'top'))
         fx.meta.update(death, model=args.resolved_model_settings['model'],
@@ -3997,13 +4530,44 @@ class FrameCapacityFlow:
                 '--capability-mode', 'dev', '--worker-type', 'frame', '--unit', 'plan/frame',
                 '--dispatch-depth', '1', '--registered-worker', '1', '--route-file', str(fx.path),
                 '--route-id', fx.route['route_id'], '--route-hash', fx.route['route_hash'],
-                '--route-node', 'frame', '--model-role', 'deep maker', '--model-profile', profile, *extra]
+                '--route-node', 'frame', '--model-role', 'deep maker', '--model-profile', profile,
+                '--registry-digest', fx.route['registry_digest'],
+                '--intensity', fx.route['effective_intensity'],
+                '--write-scope', ';'.join(fx.node['write_scope']), *extra]
+
+    def guard(self, fx, args):
+        # Execute the guard CLI with the wrapper's exact argv while sharing
+        # this fixture's existing source-proof mocks. Do not stub its model or
+        # claim validation. Git probes still use real subprocesses.
+        path = R.ROOT / 'utilities/worker-route-guard.py'
+        spec = importlib.util.spec_from_file_location('frame_capacity_guard', path)
+        guard = importlib.util.module_from_spec(spec); spec.loader.exec_module(guard)
+        real_run = subprocess.run
+        def run(command, *positional, **kwargs):
+            if len(command) < 2 or command[1] != str(path):
+                return real_run(command, *positional, **kwargs)
+            output, errors = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, 'argv', command[1:]), \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+                code = guard.main()
+            return subprocess.CompletedProcess(command, code, output.getvalue(), errors.getvalue())
+        # Production has not bound jobs_path at this admission boundary yet.
+        jobs_path = vars(args).pop('jobs_path')
+        try:
+            with mock.patch.object(subprocess, 'run', side_effect=run), \
+                    mock.patch('route_authority.completion_gate', return_value=None):
+                return self.wrapper.validate_route_record(args)
+        finally:
+            args.jobs_path = jobs_path
 
     def args(self, fx, argv):
         args = self.wrapper.parser().parse_args(argv)
         args.replacement_input_argv = list(argv)
         args.jobs_path = Path(args.jobs)
         args.worktree = str(Path(args.worktree).resolve())
+        args.artifact_root = str(fx.root)
+        args.agent_home = R.ROOT
+        args.action = 'start'
         # Read each adapter's shipped whole-file defaults unless this fixture
         # deliberately supplies its own user config; never use the operator's.
         with mock.patch('model_config.user_path', return_value=getattr(fx, 'model_config_path', fx.root/'missing-models.conf')):
@@ -4049,6 +4613,18 @@ class FrameCapacityFlow:
         case.assertEqual(args.resolved_model_settings['profile'], 'deep')
         import model_profile
         case.assertEqual(model_profile.selection_receipt(args)['profile_selection_source'], 'explicit')
+        case.assertNotIn(args.attempt_id, fx.rows())
+        # An explicit foreign registry must not borrow the inherited claim.
+        other_jobs = fx.root / 'other-state/jobs.log'
+        other_jobs.parent.mkdir(); other_jobs.touch()
+        wrong_registry = SimpleNamespace(**vars(args)); wrong_registry.jobs = str(other_jobs)
+        before = fx.jobs.read_bytes()
+        case.assertEqual(self.guard(fx, wrong_registry), 65)
+        case.assertEqual(fx.jobs.read_bytes(), before)
+        case.assertEqual(self.guard(fx, args), 0)
+        case.assertEqual(json.loads(args.route_validation)['status'], 'ok')
+        case.assertEqual(json.loads(fx.path.read_text())['route_hash'], record['route_hash'])
+        case.assertEqual(fx.node['model_profile'], 'top')
         case.assertTrue(self.register(fx, args))
         row = fx.rows()[args.attempt_id][1]
         case.assertEqual((row['model_profile'], row['replacement_claim_digest']), ('deep', R._digest(record)))
@@ -4082,6 +4658,9 @@ class FrameCapacityFlow:
         with case.assertRaises(model_profile.ModelProfileError) as refused:
             model_profile.selection_receipt(args)
         case.assertEqual(refused.exception.reason, 'profile-selection-mismatch')
+        before = fx.jobs.read_bytes()
+        case.assertEqual(self.guard(fx, args), 65)
+        case.assertEqual(fx.jobs.read_bytes(), before)
         with case.assertRaises(D.DispatchContractError) as refused:   # even past the wrapper, the registry says no
             self.register(fx, args)
         case.assertEqual(refused.exception.reason, 'replacement-input-tuple-mismatch')
@@ -4150,6 +4729,23 @@ class NamespaceExtinctDeathProofTest(unittest.TestCase):
         with self.namespace('extinct'), self.assertRaises(D.DispatchContractError) as refused:
             R.death_proof(fields, meta)
         self.assertEqual(refused.exception.reason, 'replacement-not-silent-death')
+
+
+class RegistryRowsTest(unittest.TestCase):
+    """Read-only lookups reuse one parse per registry file generation."""
+
+    def test_an_unchanged_registry_is_not_read_again_and_an_append_is_seen(self):
+        row = lambda aid: f'2026-10-28T00:00:00Z\topen\th\t/w\ts-{aid}\tattempt_id={aid}\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / 'jobs.log'
+            jobs.write_text(row('att-a'), encoding='utf-8')
+            first = R.registry_rows(jobs)
+            self.assertEqual(set(first), {'att-a'})
+            with mock.patch.object(Path, 'read_text', side_effect=AssertionError('re-read')):
+                self.assertIs(R.registry_rows(jobs), first)
+            with jobs.open('a', encoding='utf-8') as handle:
+                handle.write(row('att-b'))
+            self.assertEqual(set(R.registry_rows(jobs)), {'att-a', 'att-b'})
 
 
 if __name__=='__main__':unittest.main()

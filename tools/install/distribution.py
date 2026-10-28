@@ -53,6 +53,7 @@ REQUIRED_RELEASE_FILES = (
     "utilities/compute-hosts",
     "utilities/compute-hosts.py",
     "tools/fleet/fleet.sh",
+    "tools/fleet/fleet-monitor.sh",
     "tools/fleet/fleet2.sh",
     "tools/memory/mem.py",
     "tools/memory/protocol_v2.py",
@@ -62,6 +63,7 @@ REQUIRED_RELEASE_FILES = (
 )
 TOOL_LAUNCHERS = (
     ("fleet", "tools/fleet/fleet.sh"),
+    ("fleet-monitor", "tools/fleet/fleet-monitor.sh"),
     ("fleet2", "tools/fleet/fleet2.sh"),
     ("mem", "tools/memory/mem.py"),
     ("compute-hosts", "utilities/compute-hosts"),
@@ -5080,15 +5082,17 @@ def update(
     channel = state.get("channel", "stable")
     pinned_version = state.get("pinned_version")
     if automatic and channel == "pinned":
-        return {
-            "status": "pinned",
-            "version": state["version"],
-            "release_root": state["release_root"],
-            "archive_sha256": state["archive_sha256"],
-            "runtimes": [],
-            "skipped": {},
-            "session_action": {},
-        }
+        return _refresh_update_timer(
+            {
+                "status": "pinned",
+                "version": state["version"],
+                "release_root": state["release_root"],
+                "archive_sha256": state["archive_sha256"],
+                "runtimes": [],
+                "skipped": {},
+                "session_action": {},
+            }
+        )
     if version is None:
         requested_version = pinned_version if channel == "pinned" else "latest"
     elif version == "latest":
@@ -5099,14 +5103,16 @@ def update(
         requested_version = _validate_version(version)
         channel = "pinned"
         pinned_version = requested_version
-    return _install_or_update(
-        repository=state["repository"],
-        version=requested_version,
-        runtimes=runtimes or _managed_update_runtimes(state),
-        bootstrap=False,
-        channel=channel,
-        pinned_version=pinned_version,
-        force_prune_unproven=force_prune_unproven,
+    return _refresh_update_timer(
+        _install_or_update(
+            repository=state["repository"],
+            version=requested_version,
+            runtimes=runtimes or _managed_update_runtimes(state),
+            bootstrap=False,
+            channel=channel,
+            pinned_version=pinned_version,
+            force_prune_unproven=force_prune_unproven,
+        )
     )
 
 
@@ -5211,6 +5217,26 @@ def _owned_scheduler_state(path: Path, kind: str) -> _LeafState:
     return state
 
 
+def _systemd_timer_body() -> str:
+    # A calendar trigger always has a next elapse, so a user-manager restart
+    # cannot leave this timer stuck in `elapsed` the way a monotonic
+    # OnBootSec= does. Persistent= only applies to OnCalendar triggers and
+    # catches up a day missed while the manager was down. OnUnitActiveSec is
+    # kept because every installed release's ownership proof requires that
+    # exact line (and it still caps a run at 24h after the last one).
+    return (
+        "[Unit]\n"
+        "Description=Check for Hearting updates daily\n\n"
+        "[Timer]\n"
+        "OnCalendar=daily\n"
+        "OnUnitActiveSec=24h\n"
+        "RandomizedDelaySec=2h\n"
+        "Persistent=true\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+
+
 def _write_systemd_units() -> tuple[Path, Path]:
     service, timer = _systemd_paths()
     service_before = _owned_scheduler_state(service, "systemd-service")
@@ -5227,21 +5253,15 @@ def _write_systemd_units() -> tuple[Path, Path]:
         f"{environment}\n"
         f"ExecStart={_systemd_quote(launcher_path())} update --auto\n"
     )
-    timer_body = (
-        "[Unit]\n"
-        "Description=Check for Hearting updates daily\n\n"
-        "[Timer]\n"
-        "OnBootSec=10m\n"
-        "OnUnitActiveSec=24h\n"
-        "RandomizedDelaySec=2h\n"
-        "Persistent=true\n\n"
-        "[Install]\n"
-        "WantedBy=timers.target\n"
-    )
     _atomic_bytes(
         service, service_body.encode("utf-8"), 0o644, expected=service_before
     )
-    _atomic_bytes(timer, timer_body.encode("utf-8"), 0o644, expected=timer_before)
+    _atomic_bytes(
+        timer,
+        _systemd_timer_body().encode("utf-8"),
+        0o644,
+        expected=timer_before,
+    )
     return service, timer
 
 
@@ -5463,15 +5483,28 @@ def enable_auto_update() -> dict:
         service, timer = _write_systemd_units()
         ok_reload, reload_detail = _run_scheduler(["systemctl", "--user", "daemon-reload"])
         ok_enable, enable_detail = _run_scheduler(
-            ["systemctl", "--user", "enable", "--now", timer.name]
+            ["systemctl", "--user", "enable", timer.name]
         )
-        active = ok_reload and ok_enable
+        # `enable --now` does nothing for a unit that is already active, so a
+        # timer left in `elapsed` stays unarmed. Restart re-evaluates the new
+        # trigger set and gives it a next elapse.
+        ok_restart, restart_detail = _run_scheduler(
+            ["systemctl", "--user", "restart", timer.name]
+        )
+        active = ok_reload and ok_enable and ok_restart
+        if not ok_reload:
+            detail = reload_detail
+        elif not ok_enable:
+            detail = enable_detail
+        else:
+            detail = restart_detail
         return {
             "status": "active" if active else "configured-manual",
             "kind": kind,
             "files": [str(service), str(timer)],
-            "detail": enable_detail if not active else "timer enabled",
+            "detail": "timer enabled" if active else detail,
             "reload_detail": reload_detail,
+            "restart_detail": restart_detail,
         }
     if kind == "launch-agent":
         path = _write_launch_agent()
@@ -5490,6 +5523,65 @@ def enable_auto_update() -> dict:
         "files": [],
         "detail": "automatic updates are unsupported; run harness update",
     }
+
+
+def _refresh_systemd_timer() -> dict:
+    """Move an owned, outdated update timer onto the current template.
+
+    The service unit is never rewritten here: its Environment= lines bake the
+    invoking process's environment into the scheduler. A missing or foreign
+    unit pair is left untouched and never fails the update that carries this
+    refresh.
+    """
+
+    service, timer = _systemd_paths()
+    try:
+        service_state = _owned_scheduler_state(service, "systemd-service")
+        timer_state = _owned_scheduler_state(timer, "systemd-timer")
+    except DistributionError as exc:
+        return {"status": "skipped", "kind": "systemd-user", "detail": str(exc)}
+    if service_state.kind == "missing" or timer_state.kind == "missing":
+        return {"status": "absent", "kind": "systemd-user", "files": [str(timer)]}
+    payload = _systemd_timer_body().encode("utf-8")
+    try:
+        current = timer.read_bytes()
+    except OSError as exc:
+        return {"status": "skipped", "kind": "systemd-user", "detail": str(exc)}
+    if current == payload:
+        return {"status": "current", "kind": "systemd-user", "files": [str(timer)]}
+    try:
+        _atomic_bytes(timer, payload, 0o644, expected=timer_state)
+    except (OSError, DistributionError) as exc:
+        return {"status": "skipped", "kind": "systemd-user", "detail": str(exc)}
+    ok_reload, reload_detail = _run_scheduler(["systemctl", "--user", "daemon-reload"])
+    ok_restart, restart_detail = _run_scheduler(
+        ["systemctl", "--user", "try-restart", timer.name]
+    )
+    return {
+        "status": "refreshed" if ok_reload and ok_restart else "configured-manual",
+        "kind": "systemd-user",
+        "files": [str(timer)],
+        "reload_detail": reload_detail,
+        "restart_detail": restart_detail,
+    }
+
+
+def _refresh_update_timer(result: dict) -> dict:
+    if scheduler_kind() != "systemd-user":
+        result["timer_refresh"] = {
+            "status": "not-applicable",
+            "kind": scheduler_kind(),
+        }
+        return result
+    try:
+        result["timer_refresh"] = _refresh_systemd_timer()
+    except Exception as exc:  # a scheduler refresh must not fail an update
+        result["timer_refresh"] = {
+            "status": "skipped",
+            "kind": "systemd-user",
+            "detail": str(exc),
+        }
+    return result
 
 
 def disable_auto_update() -> dict:

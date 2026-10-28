@@ -1,10 +1,12 @@
 """Guard against stale cross-tick projection reuse without a complete input key."""
 
 from types import SimpleNamespace
+import os
+import tempfile
 import unittest
 from unittest import mock
 
-from tools.fleet import projection
+from tools.fleet import projection, route
 from tools.fleet.model import DispatchJob, Session, WorkProjection
 
 
@@ -68,6 +70,57 @@ class ProjectionReuseBoundaryTests(unittest.TestCase):
             (2, 2, 1, 160.0),  # newly registered child row
         ])
         self.assertEqual(report_reader.project_route.call_count, 2)
+
+    def test_gate_marks_are_memoized_per_projection_pass_and_returned_defensively(self):
+        fixture = os.path.join(os.path.dirname(__file__), "fixtures", "route",
+                               "synth_composed_survey.json")
+        record = route.load(fixture)
+        route_id = record["route_id"]
+        scope = route.RoundScope({route_id: record}, {}, ())
+        with mock.patch.object(route, "_route_state_roots", return_value=("/state",)), \
+                mock.patch.object(route, "gate_mark", return_value=None) as gate_mark:
+            token = projection._ROUND_SCOPE.set(scope)
+            try:
+                projection._record_view(record, route_id, [], node_evidence={}, now=100.0)
+                projection._record_view(record, route_id, [], node_evidence={}, now=100.0)
+            finally:
+                projection._ROUND_SCOPE.reset(token)
+            expected = len(record.get("nodes") or ())
+            self.assertEqual(gate_mark.call_count, expected)
+            marks = scope.gate_marks_for(record, route_id)
+            marks["caller-mutation"] = True
+            self.assertNotIn("caller-mutation", scope.gate_marks_for(record, route_id))
+
+            next_pass = route.RoundScope({route_id: record}, {}, ())
+            next_pass.gate_marks_for(record, route_id)
+            self.assertEqual(gate_mark.call_count, expected * 2)
+
+    def test_owner_lifecycle_memo_is_anchor_scoped_and_fresh_next_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            registry = os.path.join(directory, "jobs.log")
+            with open(registry, "w", encoding="utf-8") as handle:
+                handle.write("generation one\n")
+            owner = SimpleNamespace(_registry_path=registry, attempt_id="owner-attempt")
+            anchor = {"route_file": "/routes/one.json", "route_id": "route-one",
+                      "route_hash": "sha256:" + "1" * 64}
+            resolved = ({"route_file": "/routes/one.json", "route_id": "route-one",
+                         "route_hash": anchor["route_hash"]}, "current")
+            with mock.patch.object(projection, "_owner_route_advance_binding",
+                                   return_value=resolved) as lifecycle:
+                scope = route.RoundScope({}, {}, ())
+                first = projection._owner_route_advance_for_pass(owner, anchor, scope)
+                first[0]["route_id"] = "mutated-by-caller"
+                second = projection._owner_route_advance_for_pass(owner, anchor, scope)
+                self.assertEqual(second[0]["route_id"], "route-one")
+                self.assertEqual(lifecycle.call_count, 1)
+
+                other_anchor = dict(anchor, route_id="route-two")
+                projection._owner_route_advance_for_pass(owner, other_anchor, scope)
+                self.assertEqual(lifecycle.call_count, 2)
+
+                next_pass = route.RoundScope({}, {}, ())
+                projection._owner_route_advance_for_pass(owner, anchor, next_pass)
+                self.assertEqual(lifecycle.call_count, 3)
 
 
 if __name__ == "__main__":

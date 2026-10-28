@@ -336,17 +336,25 @@ link, while partial runtime uninstall retains it.
 and rendering core reads Claude Code, Codex, and OpenCode state through separate
 collectors, so the dashboard itself belongs to no single adapter. Individual
 collectors and optional enrichment features may still depend on runtime-specific
-state or providers. The launcher `tools/fleet/fleet.sh` runs from the repository
-directly; to get the one-word `fleet` command, symlink it onto `PATH`:
+state or providers. The public `fleet` launcher opens Explorer; `fleet-monitor`
+keeps the group/process monitor, and `fleet2` remains an Explorer compatibility
+alias for existing scripts. Direct `fleet.py` defaults to the group/process
+monitor. Install the three PATH names with:
 
 ```bash
 export AGENT_HOME="$HOME/hearting"
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$AGENT_HOME/tools/fleet/fleet.sh" "$HOME/.local/bin/fleet"   # needs ~/.local/bin on PATH
+ln -sfn "$AGENT_HOME/tools/fleet/fleet-monitor.sh" "$HOME/.local/bin/fleet-monitor"
+ln -sfn "$AGENT_HOME/tools/fleet/fleet2.sh" "$HOME/.local/bin/fleet2"
 ```
 
-No install step at all still works — run it by path: `bash "$AGENT_HOME/tools/fleet/fleet.sh"`. Zero-dep
-(stdlib python3 + curses); nothing to build.
+No install step at all still works — run `bash "$AGENT_HOME/tools/fleet/fleet.sh"`,
+`bash "$AGENT_HOME/tools/fleet/fleet-monitor.sh"`, or the compatibility
+`bash "$AGENT_HOME/tools/fleet/fleet2.sh"`. `--once` uses the selected screen;
+`--json` keeps its existing schema. A full global uninstall removes only the
+three installer-owned Fleet links and preserves foreign or user-owned entries.
+Zero-dep (stdlib python3 + curses); nothing to build.
 
 Title acquisition is best-effort. The shared refresher reads Claude and Codex
 transcripts and OpenCode transcripts/session data, and writes Fleet-owned sidecars under

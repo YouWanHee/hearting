@@ -114,6 +114,11 @@ make_fixture() {
     > "$root/adapters/opencode/plugins/hearting-guards.js"
   cp "$ROOT/adapters/opencode/plugins/hearting-guards/index.ts" \
     "$root/adapters/opencode/plugins/hearting-guards/index.ts"
+  mkdir -p "$root/adapters/opencode/plugins/hearting-tui-identity" "$root/adapters/opencode/tui"
+  cp "$ROOT/adapters/opencode/plugins/hearting-tui-identity/tui.ts" \
+    "$root/adapters/opencode/plugins/hearting-tui-identity/tui.ts"
+  printf '%s\n' 'export default { id: "hearting.tui-identity", setup() {} }' \
+    > "$root/adapters/opencode/tui/hearting-tui-identity.ts"
 
   git -C "$root" init -q
   git -C "$root" config user.email fixture@example.com
@@ -371,8 +376,20 @@ test -L "$HOME/.config/opencode/agents/demo.md" || fail "OpenCode plural agents 
 test -L "$HOME/.config/opencode/commands/demo.md" || fail "OpenCode plural commands projection missing"
 test -L "$HOME/.config/opencode/plugins/hearting-guards.js" \
   || fail "OpenCode local plugin projection missing"
-test -L "$HOME/.config/opencode/plugins/hearting-guards/index.ts" \
-  || fail "OpenCode V2 package plugin projection missing"
+# OpenCode 2 skips a package whose entry resolves outside the package
+# directory, so the V2 entry is a rendered file importing the active bundle.
+v2_entry="$HOME/.config/opencode/plugins/hearting-guards/index.ts"
+{ test -f "$v2_entry" && test ! -L "$v2_entry"; } \
+  || fail "OpenCode V2 package plugin entry must be a regular file"
+grep -Fq "from \"$(readlink "$HOME/.config/opencode/plugins/hearting-guards.js")\"" "$v2_entry" \
+  || fail "OpenCode V2 package plugin entry must import the activated server export"
+# OpenCode 2 skips a tui.json/cli.json entry that names a plain file; the TUI
+# identity plugin loads as the discovered package's rendered `tui` entry.
+v2_tui_entry="$HOME/.config/opencode/plugins/hearting-tui-identity/tui.ts"
+{ test -f "$v2_tui_entry" && test ! -L "$v2_tui_entry"; } \
+  || fail "OpenCode V2 TUI identity entry must be a regular file"
+grep -Fq "from \"$(readlink "$HOME/.config/opencode/tui/hearting-tui-identity.ts")\"" "$v2_tui_entry" \
+  || fail "OpenCode V2 TUI identity entry must import the activated identity plugin"
 test -L "$HOME/.claude/tools" || fail "Claude tools projection missing"
 test -L "$HOME/.claude/utilities" || fail "Claude utilities projection missing"
 test -L "$HOME/.claude/statusline.sh" || fail "Claude statusline projection missing"
@@ -1268,6 +1285,177 @@ assert settings["env"] == {"USER_FLAG": "keep"}, settings
 assert settings["enabledPlugins"]["foreign@fixture"] is True
 PY
 ok "claude uninstall unmerges managed hooks, statusline, and env while keeping user settings"
+
+# Verify the shipped command template under the default HOME using the same
+# isolated installer used by the rest of this test.
+DEFAULT_TEMPLATE_HOME="$TMP/claude default template home"
+mkdir -p "$DEFAULT_TEMPLATE_HOME"
+(
+  HOME="$DEFAULT_TEMPLATE_HOME"
+  export HOME
+  unset CLAUDE_CONFIG_DIR
+  harness runtime activate --runtime claude --mode linked --source "$ROOT" --json \
+    > "$TMP/claude-template-default-activate.json" \
+    || { cat "$TMP/claude-template-default-activate.json" >&2; fail "default template activation failed"; }
+  harness runtime status --runtime claude --json \
+    > "$TMP/claude-template-default-doctor.json" \
+    || { cat "$TMP/claude-template-default-doctor.json" >&2; fail "default template doctor failed"; }
+  python3 - "$HOME/.claude/settings.json" "$HOME/.claude" \
+    "$TMP/claude-template-default-doctor.json" <<'PY' \
+    || fail "default template settings or health assertions failed"
+import json, os, re, sys
+from pathlib import Path
+settings_path, expected_root, doctor_path = map(Path, sys.argv[1:])
+settings = json.loads(settings_path.read_text(encoding="utf-8"))
+status = json.loads(doctor_path.read_text(encoding="utf-8"))
+assert status["freshness"] == "fresh" and status["config_conflicts"] == [], status
+assert settings["statusLine"]["command"] == "bash $HOME/.claude/statusline.sh"
+prefix = "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+commands = [hook["command"] for groups in settings["hooks"].values()
+            for group in groups for hook in group.get("hooks", [])
+            if isinstance(hook, dict) and isinstance(hook.get("command"), str)]
+managed = [command for command in commands if prefix in command]
+assert sum(command.count(prefix) for command in managed) == 40, len(managed)
+paths = [match.replace(prefix, str(expected_root), 1)
+         for command in managed
+         for match in re.findall(re.escape(prefix) + r'/[^\s"\']+', command)]
+assert len(paths) == 40, paths
+for raw in paths:
+    path = Path(raw)
+    assert path.is_file() and path.is_relative_to(expected_root), path
+PY
+  harness uninstall claude > "$TMP/claude-template-default-uninstall.log" 2>&1 \
+    || { cat "$TMP/claude-template-default-uninstall.log" >&2; fail "default template uninstall failed"; }
+)
+ok "default Claude activation keeps the 40 shipped hook paths healthy under HOME/.claude"
+
+# Custom config roots have no fallback hook files under HOME/.claude. The
+# capture wrappers record resolved argv without running any hook workload.
+CUSTOM_TEMPLATE_HOME="$TMP/claude custom template home"
+CUSTOM_CONFIG_DIR="$TMP/claude custom config"
+mkdir -p "$CUSTOM_TEMPLATE_HOME" "$CUSTOM_CONFIG_DIR"
+python3 - "$CUSTOM_CONFIG_DIR/settings.json" <<'PY'
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({"theme": "custom-user", "hooks": {"PreToolUse": [{"matcher": "*",
+        "hooks": [{"type": "command", "command": "echo custom-user-hook"}]}]}}, handle)
+PY
+(
+  HOME="$CUSTOM_TEMPLATE_HOME"
+  CLAUDE_CONFIG_DIR="$CUSTOM_CONFIG_DIR"
+  export HOME CLAUDE_CONFIG_DIR
+  test ! -e "$HOME/.claude/hooks/run-hook.sh" \
+    || fail "custom-home fixture unexpectedly has default Claude hooks"
+  harness runtime activate --runtime claude --mode linked --source "$ROOT" --json \
+    > "$TMP/claude-template-custom-activate.json" \
+    || { cat "$TMP/claude-template-custom-activate.json" >&2; fail "custom template activation failed"; }
+  harness runtime status --runtime claude --json \
+    > "$TMP/claude-template-custom-doctor.json" \
+    || { cat "$TMP/claude-template-custom-doctor.json" >&2; fail "custom template doctor failed"; }
+  python3 - "$CLAUDE_CONFIG_DIR/settings.json" "$CLAUDE_CONFIG_DIR" \
+    "$TMP/claude-template-custom-doctor.json" <<'PY' \
+    || fail "custom template argv capture or path assertions failed"
+import atexit, json, os, re, shlex, shutil, subprocess, sys, tempfile
+from pathlib import Path
+settings_path, expected_root, doctor_path = map(Path, sys.argv[1:])
+settings = json.loads(settings_path.read_text(encoding="utf-8"))
+status = json.loads(doctor_path.read_text(encoding="utf-8"))
+assert status["freshness"] == "fresh" and status["config_conflicts"] == [], status
+prefix = "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+commands = [hook["command"] for groups in settings["hooks"].values()
+            for group in groups for hook in group.get("hooks", [])
+            if isinstance(hook, dict) and isinstance(hook.get("command"), str)]
+managed = [command for command in commands if prefix in command]
+assert sum(command.count(prefix) for command in managed) == 40, len(managed)
+assert sum("/hooks/" in command for command in managed) == 39
+assert sum("/tools/memory/mem.py" in command for command in managed) == 1
+assert not (Path(os.environ["HOME"]) / ".claude/hooks/run-hook.sh").exists()
+
+capture_dir = Path(tempfile.mkdtemp(prefix="claude argv capture "))
+atexit.register(shutil.rmtree, capture_dir, ignore_errors=True)
+capture_log = capture_dir / "argv.jsonl"
+for name in ("sh", "bash", "python3"):
+    wrapper = capture_dir / name
+    wrapper.write_text(
+        "#!" + sys.executable + "\n"
+        "import json, sys\n"
+        "with open(" + repr(str(capture_log)) + ", 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps({'name': " + repr(name) + ", 'argv': sys.argv[1:]}) + '\\n')\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+base_env = dict(os.environ)
+base_env["PATH"] = str(capture_dir) + os.pathsep + base_env.get("PATH", "")
+for key in ("AGENT_SESSION_ROLE", "AGENT_DISPATCH_CHILD", "AGENT_DISPATCH_DEPTH",
+            "OPENCODE_DISPATCH_SLUG", "FLEET_TITLE_REFRESH", "MEM_DISTILL"):
+    base_env.pop(key, None)
+for command in managed:
+    if command.startswith("sh -c "):
+        parts = shlex.split(command)
+        assert len(parts) == 3 and parts[:2] == ["sh", "-c"], parts
+        result = subprocess.run(["/bin/sh", "-c", parts[2]], env=base_env,
+                                capture_output=True, text=True, timeout=10)
+    else:
+        result = subprocess.run(["/bin/bash", "-c", command], env=base_env,
+                                capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, (command, result.returncode, result.stderr)
+records = [json.loads(line) for line in capture_log.read_text().splitlines()]
+assert len(records) == 40, records
+paths = [record["argv"][0] for record in records]
+for raw in paths:
+    path = Path(raw)
+    assert str(path).startswith(str(expected_root) + os.sep), path
+    assert path.is_file(), path
+    assert ".claude}" not in str(path), path
+assert sum("/hooks/" in raw for raw in paths) == 39, paths
+assert sum("/tools/memory/mem.py" in raw for raw in paths) == 1, paths
+assert sum(raw.endswith("/hooks/run-hook.sh") for raw in paths) == 38, paths
+assert sum(raw.endswith("/hooks/herdr-agent-state.sh") for raw in paths) == 1, paths
+session_start = [hook["command"] for group in settings["hooks"].get("SessionStart", [])
+                 for hook in group.get("hooks", [])]
+canonical = 'bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/herdr-agent-state.sh" session'
+assert session_start.count(canonical) == 1, session_start
+PY
+  harness runtime activate --runtime claude --mode linked --source "$ROOT" --json \
+    > "$TMP/claude-template-custom-repeat.json" \
+    || { cat "$TMP/claude-template-custom-repeat.json" >&2; fail "custom template repeat activation failed"; }
+  python3 - "$CLAUDE_CONFIG_DIR/settings.json" <<'PY' \
+    || fail "custom template repeat assertions failed"
+import json, sys
+settings = json.load(open(sys.argv[1], encoding="utf-8"))
+commands = [hook.get("command") for groups in settings["hooks"].values()
+            for group in groups for hook in group.get("hooks", [])]
+prefix = "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+assert sum(command.count(prefix) for command in commands if isinstance(command, str)) == 40
+canonical = 'bash "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/herdr-agent-state.sh" session'
+assert sum(command == canonical for command in commands) == 1
+assert any(hook.get("command") == "echo custom-user-hook"
+           for group in settings["hooks"]["PreToolUse"] for hook in group.get("hooks", []))
+PY
+  harness uninstall claude > "$TMP/claude-template-custom-uninstall.log" 2>&1 \
+    || { cat "$TMP/claude-template-custom-uninstall.log" >&2; fail "custom template uninstall failed"; }
+  python3 - "$CLAUDE_CONFIG_DIR/settings.json" "$ROOT/adapters/claude/settings.json" <<'PY' \
+    || fail "custom template uninstall assertions failed"
+import json, sys
+settings = json.load(open(sys.argv[1], encoding="utf-8"))
+source = json.load(open(sys.argv[2], encoding="utf-8"))
+normalize = lambda command: command.replace(
+    "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/", "$HOME/.claude/"
+)
+owned = {(event, group.get("matcher"), normalize(hook.get("command", "")))
+         for event, groups in source["hooks"].items() for group in groups
+         for hook in group.get("hooks", [])}
+remaining = {(event, group.get("matcher"), normalize(hook.get("command", "")))
+             for event, groups in settings.get("hooks", {}).items() for group in groups
+             for hook in group.get("hooks", []) if isinstance(hook.get("command"), str)}
+assert not (owned & remaining), owned & remaining
+assert settings["theme"] == "custom-user", settings
+assert settings["hooks"]["PreToolUse"] == [{"matcher": "*", "hooks": [
+    {"type": "command", "command": "echo custom-user-hook"}]}], settings
+PY
+  test ! -e "$HOME/.claude" || fail "custom Claude activation wrote into default HOME/.claude"
+)
+ok "custom Claude activation resolves all 40 paths with spaces, repeats once, and uninstalls both spellings"
 
 # Uninstall must never mutate vendor executable/version bytes on any modeled
 # Claude channel; Hearting never had ingress into any of these paths.

@@ -53,6 +53,25 @@ class ProgressTest(unittest.TestCase):
                       watchdog_max_windows=2, apply=False)
         values.update(kw); return type("Args", (), values)()
 
+    def _stall_metadata(self, attempt=None, *, log_file=None, **extra):
+        attempt = attempt or self.attempt
+        lines = self.jobs.read_text().splitlines()
+        fields = next(line.split("\t") for line in lines
+                      if D.parse_registry_metadata(line.split("\t")[5]).get("attempt_id") == self.attempt)
+        metadata = D.parse_registry_metadata(fields[5])
+        metadata.update(attempt_id=attempt, harness="codex", worker_type="stage",
+                        parent_sid="parent-fixture",
+                        parent_completion_delivery="codex-managed-gateway", **extra)
+        if log_file is not None:
+            metadata["log_file"] = str(log_file)
+        fields[5] = ",".join(f"{key}={value}" for key, value in metadata.items())
+        if attempt != self.attempt:
+            fields[1] = "open"
+            self.jobs.write_text("\n".join(lines + ["\t".join(fields)]) + "\n")
+        else:
+            self.jobs.write_text("\t".join(fields) + "\n")
+        return metadata
+
     def test_sd_open_38_launch_seed_behind_a_later_heartbeat_is_a_floor_not_a_regression(self):
         """#9 root cause (cairn W15a/W15b, six stages): the wrapper seeds `launch`
         at spawn, the worker heartbeats past it, then the launcher's own seed
@@ -76,6 +95,30 @@ class ProgressTest(unittest.TestCase):
         tool=P.heartbeat(self.args(phase="tool",kind="tool",evidence="inspect-failure"),2)
         self.assertEqual(tool["sequence"],test["sequence"]+1)
         self.assertEqual(P.heartbeat(self.args(phase="tool",kind="tool",evidence="inspect-failure"),3),tool)
+
+    def test_supervised_claude_owner_progress_follows_its_announced_transcript(self):
+        from claude_project_dir import encode_project_dir
+        cwd = self.base / "owner-worktree"; cwd.mkdir()
+        runtime_home = self.base / "worker-home"
+        session = "085a89c5-3951-4b87-a9c2-c98cd6e97616"
+        receipt = self.base / "owner.claude.jsonl"
+        receipt.write_text("".join(json.dumps(row) + "\n" for row in (
+            {"type": "dispatch.supervisor.session", "parent_attempt_id": self.attempt,
+             "session_id": session, "cwd": str(cwd)},
+            {"type": "dispatch.supervisor.turn-started"})))
+        transcript = runtime_home / "projects" / encode_project_dir(str(cwd)) / f"{session}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "call-1", "input": {"secret": "x"}}]}}) + "\n")
+        metadata = {"log_file": str(receipt), "runtime_home": str(runtime_home)}
+        first = P.runtime_tool_progress(metadata)
+        self.assertEqual(first, ["claude", "call-1", "tool_use"])
+        with transcript.open("a") as out:
+            out.write(json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "call-1", "content": "private"}]}}) + "\n")
+        self.assertEqual(P.runtime_tool_progress(metadata, first), ["claude", "call-1", "tool_result"])
+        # Without the transcript the receipt log stays the source: no progress is invented.
+        self.assertEqual(P.runtime_tool_progress({"log_file": str(receipt)}, first), first)
 
     def test_native_tool_progress_replaces_per_tool_model_heartbeat(self):
         log=self.base/"worker.jsonl"
@@ -120,16 +163,28 @@ class ProgressTest(unittest.TestCase):
         text=self.jobs.read_text().rstrip()+",parent_sid=thread-fixture,parent_completion_delivery=codex-managed-gateway\n"
         self.jobs.write_text(text)
         P.heartbeat(self.args(), 0)
-        first=P.watchdog(self.args(),10)
-        self.assertEqual(first["action"],"warning")
+        execution=SimpleNamespace(state="active",reason="runtime-command-live",identities=())
+        with mock.patch.object(D,"attempt_execution_observation",return_value=execution), \
+             mock.patch.object(P.supervision,"_attempt_human_wait",return_value=False), \
+             mock.patch("peer_obligations.ensure_normal_runner"):
+            first=P.watchdog(self.args(),10)
+            self.assertEqual(first["action"],"warning")
         original=self.jobs.read_bytes()
-        with mock.patch.object(P,"signal_authoritative_process_group") as signal:
+        with mock.patch.object(D,"attempt_execution_observation",return_value=execution), \
+             mock.patch.object(P.supervision,"_attempt_human_wait",return_value=False), \
+             mock.patch("peer_obligations.ensure_normal_runner"), \
+             mock.patch.object(P,"signal_authoritative_process_group") as signal:
             second=P.watchdog(self.args(apply=True),20)
             again=P.watchdog(self.args(apply=True),30)
         signal.assert_not_called()
         self.assertEqual(second["action"],"no-progress")
         self.assertTrue(second["supervision_notice_ids"],second)
         self.assertEqual(second["supervision_notice_ids"],again["supervision_notice_ids"])
+        notice=P.supervision.pending_delivery.read(self.jobs.parent,"thread-fixture",
+            second["supervision_notice_ids"][0])
+        self.assertEqual(notice["receipt"]["reason"],"attempt-stalled")
+        self.assertEqual(notice["receipt"]["monitored_attempt_ids"],[self.attempt])
+        self.assertEqual(notice["state"],"pending")
         self.assertFalse(second.get("terminal_action"))
         self.assertIsNone(self.proc.poll())
         self.assertEqual(self.jobs.read_bytes(),original)
@@ -141,6 +196,91 @@ class ProgressTest(unittest.TestCase):
         fields[1]="done";fields[5]+=",note=completed-marker,failure_class=pass"
         self.jobs.write_text("\t".join(fields)+"\n")
         self.assertEqual(P.watchdog(self.args(apply=True),32)["terminal_action"],"registry-terminal")
+
+    def test_long_native_command_and_exact_verification_lease_suppress_stall(self):
+        log = self.base / "codex.jsonl"
+        metadata = self._stall_metadata(log_file=log)
+        started = {"type": "item.started", "item": {"id": "cmd-long",
+                   "type": "command_execution", "command": "sleep"}}
+        log.write_text(json.dumps(started) + "\n")
+        execution = D.AttemptExecutionObservation("active", "runtime-command-live")
+        with mock.patch.object(D, "attempt_execution_observation", return_value=execution), \
+             mock.patch.object(P.supervision, "_attempt_human_wait", return_value=False):
+            P.supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=10, row=("open", metadata), worktree=str(self.base))
+            running = P.supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=1000, row=("open", metadata), worktree=str(self.base))
+            self.assertEqual((running["state"], running["reason"]),
+                             ("active", "native-tool-active"))
+            log.write_text(json.dumps({"type": "item.completed", "item": {
+                "id": "cmd-long", "type": "command_execution"}}) + "\n")
+            completed = P.supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=1001, row=("open", metadata), worktree=str(self.base))
+            self.assertEqual(completed["state"], "active")
+            self.assertEqual(completed["quiet_windows"], 0)
+
+            self._verification_lease(self.proc, deadline=2000)
+            lease = P.supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=1200, row=("open", metadata), worktree=str(self.base))
+            self.assertEqual((lease["state"], lease["reason"]),
+                             ("active", "exact-verification-lease"))
+
+    def test_started_native_tool_with_a_live_unclassified_command_remains_active(self):
+        log = self.base / "codex-unclassified.jsonl"
+        metadata = self._stall_metadata(log_file=log)
+        log.write_text(json.dumps({"type": "item.started", "item": {
+            "id": "cmd-exact", "type": "command_execution"}}) + "\n")
+        execution = D.AttemptExecutionObservation(
+            "unknown", "attempt-process-role-unclassified",
+            ((101, "11", "unclassified:bash"),))
+        with mock.patch.object(D, "attempt_execution_observation", return_value=execution), \
+             mock.patch.object(P.supervision, "_attempt_human_wait", return_value=False):
+            observation = P.supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=1000, row=("open", metadata), worktree=str(self.base))
+        self.assertEqual((observation["state"], observation["reason"]),
+                         ("active", "native-tool-process-live"))
+
+    def test_exact_terminal_result_without_route_settlement_is_distinguished(self):
+        log = self.base / "terminal-result.jsonl"
+        metadata = self._stall_metadata(log_file=log)
+        log.write_text(json.dumps({"type": "turn.completed", "exit_code": 0}) + "\n")
+        absent = D.AttemptExecutionObservation("absent", "carrier-only")
+        with mock.patch.object(D, "attempt_execution_observation", return_value=absent), \
+             mock.patch.object(P.supervision, "_attempt_human_wait", return_value=False):
+            observation = P.supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=100, row=("open", metadata), worktree=str(self.base))
+        self.assertEqual((observation["state"], observation["reason"]),
+                         ("stalled", "settlement-unresolved"))
+
+    def test_raised_human_wait_suppresses_absence_but_unverifiable_process_is_check_only(self):
+        metadata = self._stall_metadata()
+        absent = D.AttemptExecutionObservation("absent", "carrier-only")
+        with mock.patch.object(D, "attempt_execution_observation", return_value=absent), \
+             mock.patch.object(P.supervision, "_attempt_human_wait", return_value=True):
+            waiting = P.supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=100, row=("open", metadata), worktree=str(self.base))
+            self.assertEqual((waiting["state"], waiting["reason"]),
+                             ("waiting", "raised-human-gate"))
+        with mock.patch.object(D, "attempt_execution_observation", return_value=absent), \
+             mock.patch.object(P.supervision, "_attempt_human_wait", return_value=False):
+            no_gate = P.supervision.update_attempt_stall_observation(
+                self.jobs, self.attempt, now=101, row=("open", metadata), worktree=str(self.base))
+            self.assertEqual((no_gate["state"], no_gate["reason"]),
+                             ("stalled", "execution-absent"))
+
+        unknown_meta = self._stall_metadata("att-unknown-observer")
+        unknown = D.AttemptExecutionObservation("unknown", "observer-namespace-mismatch")
+        with mock.patch.object(D, "attempt_execution_observation", return_value=unknown), \
+             mock.patch.object(P.supervision, "_attempt_human_wait", return_value=False):
+            first = P.supervision.update_attempt_stall_observation(
+                self.jobs, "att-unknown-observer", now=100, row=("open", unknown_meta),
+                worktree=str(self.base))
+            later = P.supervision.update_attempt_stall_observation(
+                self.jobs, "att-unknown-observer", now=701, row=("open", unknown_meta),
+                worktree=str(self.base))
+        self.assertEqual(first["state"], "observing")
+        self.assertEqual((later["state"], later["execution_reason"]),
+                         ("unknown", "observer-namespace-mismatch"))
 
     def test_closed_row_consumes_portable_receipt_but_cached_observation_cannot(self):
         self.proc.terminate(); self.proc.wait(timeout=5)

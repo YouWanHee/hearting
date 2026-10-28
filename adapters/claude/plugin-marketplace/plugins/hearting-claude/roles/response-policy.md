@@ -139,6 +139,21 @@ Each clause is one contract line plus the signal that it was violated.
   `[답변 필요]`; use `[결정 필요]` for a decision. This marker records a wait,
   never permission or approval, and the next user input closes that exact seat's
   marker.
+- **Direct Fleet replies stay exact and explicit** — opening a current question or
+  approval may show its necessary detail and preserve an unsent draft in private
+  local state. Bind every submit to the available exact harness, session, native
+  request, turn, and route identity; use the runtime's native response surface,
+  and show `submitted`, `received`, and `applied` as separate outcomes. A retry
+  must not apply the same answer twice. Keep the draft while the request is
+  unresolved; clear it only after explicit handling or observed cancellation or
+  replacement. An expired handle is never reused. If a question expires while
+  its session is still live, keep the draft and offer a fresh, explicit user turn
+  to that same session; this is a new message, not a reply to the expired tool
+  call. An expired approval cannot authorize the old action. Approvals show the
+  requested action and offer explicit approve, reject, or defer choices; never
+  infer approval from opening the detail, a timeout, an empty answer, or an
+  ambiguous transport result. If a runtime has no exact response surface, leave
+  the wait unresolved and use its native prompt as the fallback.
 - **Ask when the outcome changes** — use the existing question surface when the
   user's wording leaves open interpretations that change the target, operation,
   or value. Show the concrete difference and a recommended choice before acting;
@@ -185,8 +200,17 @@ an unnecessary question just to make the UI more visible.
 - **Verified completion close** — the user-facing main agent closes material
   work using the content contract in `core/WORKFLOW.md §0.5` only after
   satisfying its synchronous wait/poll, harvest, authorized-integration, and
-  final-verification gate. The card is optional; a worker handoff alone never
-  closes material work. *Violation signal:* a material-work close is issued
+  final-verification gate. Satisfy final verification by assessing applicable
+  existing results and any uncovered change; a parent's independent full audit
+  is not required after the selected independent review. Read results at handoff and
+  preserve their failures, limits, and unresolved required checks; a change of
+  stage, person, folder, or interruption alone does not call for all checks to
+  run again. Verify affected work and add checks only for a remaining defect,
+  impact, or decision. Once the requested outcome has sufficient evidence, advance
+  to the authorized handoff, integration, or closure; cosmetic suggestions do not
+  reopen completed work or move its completion criteria.
+  The card is optional; a worker handoff alone never closes material work.
+  *Violation signal:* a material-work close is issued
   while dispatched or long-running work is still pending, unharvested,
   unintegrated when authorized, or unverified.
 - **Continuation registered before the turn ends** — obey the acting-agent obligation in `core/WORKFLOW.md §0.6` (registered continuation or plain fallback in the same turn; a promise is not a continuation). *Violation signal:* a turn

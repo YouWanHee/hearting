@@ -50,8 +50,8 @@ def _headroom(values) -> float | None:
     return max(0.0, min(100.0, 100.0 - max(used)))
 
 
-def _claude_score(now: float, stale_after: int) -> float | None:
-    """Account-wide headroom: merge every non-stale session's windows.
+def _claude_capacity_reading(now: float, stale_after: int) -> tuple[float | None, dict | None]:
+    """Read Claude headroom and conservative file-freshness context.
 
     A single session file only ever reports the windows it happened to touch,
     so picking one "winning" file (the old behaviour) could report a 51%
@@ -70,10 +70,11 @@ def _claude_score(now: float, stale_after: int) -> float | None:
             key=lambda path: (-path.stat().st_mtime, path.name),
         )
     except OSError:
-        return None
+        return None, None
     latest_used: dict[str, float] = {}
     latest_mtime: dict[str, float] = {}
     window_used: dict[tuple[str, float], float] = {}
+    contributing_mtimes: list[float] = []
     from dispatch_capacity_evidence import _scope_candidates
     current_scopes = _scope_candidates("claude")
     for path in files[:12]:
@@ -113,13 +114,28 @@ def _claude_score(now: float, stale_after: int) -> float | None:
                     continue
                 window = (key, expires)
                 window_used[window] = max(window_used.get(window, used), used)
+                contributing_mtimes.append(mtime)
                 continue
             if key not in latest_mtime or mtime > latest_mtime[key]:
                 latest_mtime[key] = mtime
                 latest_used[key] = used
+                contributing_mtimes.append(mtime)
     if not latest_used and not window_used:
-        return None
-    return _headroom([*latest_used.values(), *window_used.values()])
+        return None, None
+    score = _headroom([*latest_used.values(), *window_used.values()])
+    if score is None or not contributing_mtimes:
+        return score, None
+    return score, {
+        "basis": "file-mtime",
+        "age_seconds": round(max(0.0, now - min(contributing_mtimes)), 1),
+        "stale_after_seconds": stale_after,
+        "observation_time": "unknown",
+    }
+
+
+def _claude_score(now: float, stale_after: int) -> float | None:
+    """Return Claude headroom while preserving the existing score API."""
+    return _claude_capacity_reading(now, stale_after)[0]
 
 
 # Why the last live probe produced no reading, per harness; `_codex_probe` /
@@ -322,11 +338,14 @@ def capacity_report(*, stale_after: int = 3600, now: float | None = None) -> dic
     ``live``, ``cache:<age>s;live=<reason>``, ``rollout;live=<reason>``,
     ``taps``, ``active-limit`` or ``unknown:<reason>`` — the receipt prints it so
     an unknown gauge says why (timeout, http-503, no-auth) instead of nothing.
+    ``freshness`` optionally describes admitted Claude tap file mtimes; an mtime
+    does not establish when usage was observed.
     """
     now = time.time() if now is None else now
     manual = _manual_scores()
     scores: dict[str, float | None] = {}
     sources: dict[str, str] = {}
+    freshness: dict[str, dict] = {}
     if "codex" in manual:
         scores["codex"], sources["codex"] = manual["codex"], "manual"
     else:
@@ -336,8 +355,10 @@ def capacity_report(*, stale_after: int = 3600, now: float | None = None) -> dic
     if "claude" in manual:
         scores["claude"], sources["claude"] = manual["claude"], "manual"
     else:
-        claude = _claude_score(now, stale_after)
+        claude, claude_freshness = _claude_capacity_reading(now, stale_after)
         scores["claude"], sources["claude"] = claude, ("taps" if claude is not None else "unknown:no-fresh-taps")
+        if claude is not None and claude_freshness is not None:
+            freshness["claude"] = claude_freshness
     if "opencode" in manual:
         scores["opencode"], sources["opencode"] = manual["opencode"], "manual"
     else:
@@ -349,7 +370,8 @@ def capacity_report(*, stale_after: int = 3600, now: float | None = None) -> dic
         for harness in active_limits(jobs, now=now):
             scores[harness] = 0.0
             sources[harness] = "active-limit"
-    return {"scores": scores, "sources": sources}
+            freshness.pop(harness, None)
+    return {"scores": scores, "sources": sources, "freshness": freshness}
 
 
 def capacity_scores(*, stale_after: int = 3600, now: float | None = None) -> dict[str, float | None]:
@@ -521,18 +543,16 @@ def is_gated(scores, harness, *, usage_gate_used_percent=90):
     return value is not None and float(value) <= gate_cutoff(usage_gate_used_percent)
 
 
-def gate_release_epoch(harness, source, *, usage_gate_used_percent=90, now=None, stale_after=3600):
-    """When `harness` leaves the `balanced` usage gate, if its gauge says so; else None.
+def window_release_epoch(harness, *, usage_gate_used_percent=100, now=None, stale_after=3600):
+    """The last reset among `harness`'s cached windows at or above the gate, else None.
 
-    The gate holds while a usage window is at or above the gate and lifts when the
-    last such window resets. Only a score read from the shared usage cache (`live`
-    writes through to it, `cache:<age>s` reads it) has those windows: codex
-    `windows` and opencode `rl_windows`, rows `[label, used, reset_epoch]`. A
-    window at the gate without a future reset makes the answer unknown; a time is
-    never guessed.
+    The cache-reading half of `gate_release_epoch`, exported so the hard
+    eligibility reader judges the same rows at 100% instead of parsing them a
+    second time. Codex `windows` and opencode `rl_windows` carry
+    `[label, used, reset_epoch]`; a window at the gate without a future reset
+    makes the answer unknown (a time is never guessed), and a cache older than
+    `stale_after` carries no answer at all.
     """
-    if not isinstance(source, str) or not source.startswith(("live", "cache:")):
-        return None
     cache = _usage_cache()
     if cache is None:
         return None
@@ -553,6 +573,37 @@ def gate_release_epoch(harness, source, *, usage_gate_used_percent=90, now=None,
             return None
         release = reset if release is None else max(release, reset)
     return release
+
+
+def gauge_limit_epoch(harness, *, now=None, stale_after=3600):
+    """When the shared gauge itself says `harness` is out of room, else None.
+
+    Hard-eligibility counterpart of `gate_release_epoch`: the same cached
+    windows, at 100% used instead of the soft gate, with a future reset. A
+    manual `HARNESS_CAPACITY_SCORES` entry replaces the gauge exactly as it does
+    in `capacity_report`, and Claude has no gauge windows here (its limits stay
+    native). No window, a past reset, or a cache older than `stale_after`
+    stays unknown.
+    """
+    if harness not in ("codex", "opencode") or harness in _manual_scores():
+        return None
+    return window_release_epoch(harness, usage_gate_used_percent=100, now=now, stale_after=stale_after)
+
+
+def gate_release_epoch(harness, source, *, usage_gate_used_percent=90, now=None, stale_after=3600):
+    """When `harness` leaves the `balanced` usage gate, if its gauge says so; else None.
+
+    The gate holds while a usage window is at or above the gate and lifts when the
+    last such window resets. Only a score read from the shared usage cache (`live`
+    writes through to it, `cache:<age>s` reads it) has those windows: codex
+    `windows` and opencode `rl_windows`, rows `[label, used, reset_epoch]`. A
+    window at the gate without a future reset makes the answer unknown; a time is
+    never guessed.
+    """
+    if not isinstance(source, str) or not source.startswith(("live", "cache:")):
+        return None
+    return window_release_epoch(harness, usage_gate_used_percent=usage_gate_used_percent,
+                                now=now, stale_after=stale_after)
 
 
 def rank_band(candidates, states, counts, declared_order, scores, *, strategy="capacity-aware", usage_gate_used_percent=90,

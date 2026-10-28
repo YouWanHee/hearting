@@ -108,7 +108,11 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
                 if str(process.get("host") or "") != str(host) or \
                         str(process.get("gpu") if process.get("gpu") is not None else "") != str(idx):
                     continue
-                sid = str(process.get("session_id") or process.get("session") or "")
+                # New records keep the exact source ID separately from the display tag.
+                # Older fixtures already put the short tag in session_id.
+                sid_value = (process.get("session_tag") if "session_tag" in process else
+                             process.get("session_id") or process.get("session"))
+                sid = str(sid_value or "")
                 cwd = str(process.get("cwd") or "")
                 repo = cwd.rstrip("/").rsplit("/", 1)[-1] if cwd else "·"
                 command = short_cmd(str(process.get("command") or "")) or "·"
@@ -165,33 +169,76 @@ def draw_compute(grid: CellGrid, vm, state=None, x=34, y=3):
 
 
 def draw_memory(grid: CellGrid, vm, state=None, x=34, y=3):
-    """Show only bounded memory records already present in the snapshot."""
+    """Show bounded memory journal rows and explicit DB backlog metadata."""
     use = max(0, grid.cols - x - 2)
     records = vm.memory
-    if records is None:
-        grid.put(x + 1, y, "·", "dim")
-        return
     c_time, c_action, c_type, c_record = 14, 21, 32, 55
-    y = _table_head(grid, x, use, y, ((1, "PROJECT"), (c_time, "TIME"), (c_action, "ACTION")) +
-                    (((c_type, "TYPE"),) if c_type else ()) + ((c_record, "RECORD"),))
-    for project_index, project in enumerate(records):
-        if project_index:
-            y = _group_sep(grid, x, use, y)
-        try:
-            name, rows = project
-        except (TypeError, ValueError):
-            continue
-        for row_index, row in enumerate(rows or ()):
-            when, action, kind, text = (tuple(row) + (None,) * 4)[:4]
-            if row_index == 0:
-                grid.put(x + 1, y, clip(str(name), 12), "soft")
-            grid.put(x + c_time, y, "·" if when is None else str(when), "dim")
-            grid.put(x + c_action, y, "+ saved" if action == "saved" else "· changed", "done" if action == "saved" else "dim")
-            if c_type:
-                grid.put(x + c_type, y, "·" if kind is None else str(kind), "dim")
-            grid.put(x + c_record, y, "·" if text is None else clip(str(text), use - c_record),
-                     "soft" if action == "saved" else "now_sub", limit=x + use + 1)
+    if records:
+        y = _table_head(grid, x, use, y, ((1, "PROJECT"), (c_time, "TIME"), (c_action, "ACTION")) +
+                        (((c_type, "TYPE"),) if c_type else ()) + ((c_record, "RECORD"),))
+        for project_index, project in enumerate(records):
+            if project_index:
+                y = _group_sep(grid, x, use, y)
+            try:
+                name, rows = project
+            except (TypeError, ValueError):
+                continue
+            for row_index, row in enumerate(rows or ()):
+                when, action, kind, text = (tuple(row) + (None,) * 4)[:4]
+                if row_index == 0:
+                    grid.put(x + 1, y, clip(str(name), 12), "soft")
+                grid.put(x + c_time, y, "·" if when is None else str(when), "dim")
+                grid.put(x + c_action, y, "+ saved" if action == "saved" else "· changed", "done" if action == "saved" else "dim")
+                if c_type:
+                    grid.put(x + c_type, y, "·" if kind is None else str(kind), "dim")
+                grid.put(x + c_record, y, "·" if text is None else clip(str(text), use - c_record),
+                         "soft" if action == "saved" else "now_sub", limit=x + use + 1)
+                y += 1
+    backlog = (vm.system or {}).get("memory_backlog") if isinstance(vm.system, Mapping) else None
+    if isinstance(backlog, Mapping):
+        grid.put(x, y, "── ", "line")
+        cursor = grid.put(x + 3, y, "BACKLOG", "sect")
+        state_name = str(backlog.get("state") or "unknown")
+        grid.put(cursor + 2, y, state_name, "soft" if state_name == "success" else "dim")
+        y += 1
+        groups = backlog.get("by_repo") if isinstance(backlog.get("by_repo"), Mapping) else {}
+        if state_name != "success":
+            detail = " · showing last good" if backlog.get("stale") else " · count unknown"
+            grid.put(x + 1, y, "database " + state_name + detail, "dim",
+                     limit=x + use + 1)
             y += 1
+        elif not groups:
+            grid.put(x + 1, y, "no active backlog records", "dim", limit=x + use + 1)
+            y += 1
+        opened = state.opened_for("memory:backlog", "") if state is not None else ""
+        for repo, items in sorted(groups.items()):
+            items = tuple(items or ())
+            counts = {name: sum(1 for item in items if item.get("progress") == name)
+                      for name in ("TODO", "DOING", "DONE")}
+            grid.add_hit(y, x, x + use + 1, ("fold", "memory:backlog", str(repo)))
+            marker = "▼" if opened == str(repo) else "▶"
+            grid.put(x + 1, y, marker, "soft")
+            grid.put(x + 3, y, clip(str(repo) + "/", 22), "title_dim")
+            cursor = x + 27
+            for name, key in (("TODO", "lvl_y"), ("DOING", "g_spin_dim"), ("DONE", "done")):
+                cursor = grid.put(cursor, y, f"{name} {counts[name]}", key, limit=x + use)
+                cursor = grid.put(cursor + 1, y, " · ", "dim", limit=x + use) + 1
+            if backlog.get("limited"):
+                grid.put(x + use - 8, y, "more…", "dim", limit=x + use + 1)
+            y += 1
+            if opened != str(repo):
+                continue
+            for item in items:
+                progress = str(item.get("progress") or "TODO")
+                key = {"TODO": "lvl_y", "DOING": "g_spin_dim", "DONE": "done"}.get(progress, "dim")
+                title = clip(str(item.get("title") or "backlog item"), max(1, use - 35))
+                cursor = grid.put(x + 4, y, progress, key, limit=x + use)
+                cursor = grid.put(cursor + 2, y, title, "soft", limit=x + use)
+                record_id = str(item.get("id") or "")
+                if record_id:
+                    grid.put(x + use - min(12, len(record_id)), y,
+                             clip(record_id, 12), "dim", limit=x + use + 1)
+                y += 1
     summary = (vm.system or {}).get("memory_summary") if isinstance(vm.system, Mapping) else None
     if isinstance(summary, Mapping):
         expired_at = summary.get("expired_at")
@@ -284,7 +331,7 @@ def draw_system(grid: CellGrid, vm, state=None, x=34, y=3):
         info = data.get("unregistered_gpu_summary") or {}
         owner = info.get("owner")
         section("unregistered GPU processes",
-                f"{info.get('count', len(extra))}" + (f" · owner [{owner}]" if owner else "") + " · see COMPUTE")
+                f"{info.get('count', len(extra))}" + (f" · owner [{owner}]" if owner else "") + " · see RESOURCES")
         y += 1
         for item in extra[:2]:
             host, index, command, memory, age = (tuple(item) + (None,) * 5)[:5]

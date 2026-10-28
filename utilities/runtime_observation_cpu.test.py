@@ -1232,11 +1232,19 @@ class RuntimeObservationCpuFixture(unittest.TestCase):
                         selected_attempt, "--interval", "1",
                         "--timeout", "600",
                     ])
+                    if terminal_owner:
+                        # A session parent with no live TUI binding ends its
+                        # observer; bind these to this live fixture process so
+                        # the busy-recipient workload stays resident.
+                        args.parent_lifetime = {
+                            "pid": os.getpid(), "pid_start": _proc_stat(os.getpid())["start"],
+                            "session_id": "fixture-parent",
+                            "pid_namespace": dispatch_contract.process_namespace_identity()}
                     duty_id, _record = batch.create(args)
                     duty_ids.append(duty_id)
                     observer_workloads.append({"duty_id": duty_id, "attempt_id": selected_attempt,
                         "phase": "terminal-owner-recipient-busy" if terminal_owner else "live-child-join",
-                        "parent_lifetime": "legacy-unbound" if terminal_owner else "attempt-bound"})
+                        "parent_lifetime": "session-bound" if terminal_owner else "attempt-bound"})
 
                 if not peer_obligations.ensure_normal_runner(
                         state_root, lifecycle_root=source, reconciliation_required=True):

@@ -2,6 +2,7 @@
 import contextlib, errno, fcntl, hashlib, importlib.util, io, json, os, stat, subprocess, sys, tempfile, time, threading, types, unittest
 from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 P=Path(__file__).with_name("dispatch_contract.py")
 ROOT=P.parent.parent
@@ -2276,6 +2277,140 @@ class DispatchContractTest(unittest.TestCase):
    with self.subTest(extra=extra):
     self.assertFalse(D.terminal_attempt_never_started("done",{**base,**extra}))
   self.assertTrue(D.terminal_attempt_never_started("done",base))
+
+ def _respawn_owner_row(self, jobs, attempt, pid="99999999", start="100"):
+  lease=D.supervisor_lease_path(jobs,attempt)
+  extra=(",harness=codex,runtime_sandbox=workspace-write,"
+         "completion_delivery=app-server-supervised,"
+         f"supervisor_lease={D.SUPERVISOR_LEASE_KIND},"
+         f"supervisor_lease_file={lease},supervisor_lease_nonce={'a'*64},"
+         "launch_claimed=1,launch_started=1,launch_lifecycle=detached,"
+         f"pid_scope=namespace-local,pid_ns={D.process_namespace_identity(os.getpid())},"
+         f"pid_observer_ns={D.process_namespace_identity(os.getpid())}")
+  return self.owner_row(attempt,pid,start,extra=extra)
+
+ def test_attempt_identity_lineage_contains_only_exact_pid_start_pairs(self):
+  self.assertEqual(D.attempt_identity_lineage({
+   "pid":"333","pid_start":"30",
+   "owner_identity_lineage":"111:10+222:20+bad+333:x",
+  }), {("111","10"),("222","20"),("333","30")})
+
+ def test_respawn_claim_rechecks_dead_identity_and_publishes_lineage_once(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-owner-respawn"
+   jobs.write_text(self._respawn_owner_row(jobs,attempt)+"\n")
+   children=[]
+   def spawn(gate_fd):
+    child=subprocess.Popen(
+     [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+      "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+      "sleep","60"],pass_fds=(gate_fd,),start_new_session=True)
+    children.append(child)
+    return child
+   try:
+    with mock.patch("route_parent_close.row_requested",return_value=False), \
+         mock.patch("route_authority.owns",return_value=True), \
+         mock.patch.object(D,"attempt_governed_process_quiescence",
+                           return_value=D.ProcessQuiescence("quiescent","gone")), \
+         mock.patch.object(D,"supervisor_lease_is_held",return_value=False):
+     proc,identity=D.spawn_claimed_attempt(
+      jobs,attempt,parent_binding=None,spawn=spawn,respawn_of=("99999999","100"),
+      pre_release=lambda _identity:{"summary_owner":"dispatch-v1"})
+     rows=jobs.read_text().splitlines()
+     self.assertEqual(len(rows),1)
+     meta=D.parse_registry_metadata(rows[0].split("\t",5)[5])
+     self.assertEqual((meta["pid"],meta["pid_start"]),
+                      (str(proc.pid),identity["pid_start"]))
+     self.assertEqual(meta["owner_identity_lineage"],"99999999:100")
+     self.assertEqual(meta["launch_claimed"],"1")
+     self.assertEqual(meta["summary_owner"],"dispatch-v1")
+     self.assertEqual(D.attempt_identity_lineage(meta),
+                      {("99999999","100"),(str(proc.pid),identity["pid_start"])})
+    binding=D.resolve_live_parent_attempt(
+     jobs,parent_slug="owner",repo="/repo",worktree="/wt",expected_attempt_id=attempt)
+    child_attempt="att-owner-respawn-child"
+    child_row=(f"2026-07-23T00:00:01Z\topen\t/repo\t/wt\tchild\t"
+               f"{CURRENT},worker_type=stage,parent=owner,parent_attempt_id={attempt},"
+               f"attempt_id={child_attempt}")
+    self.assertTrue(D.claim_attempt_row(jobs,child_attempt,child_row,launch=False))
+    child=None
+    try:
+     child,_=D.spawn_claimed_attempt(
+      jobs,child_attempt,parent_binding=binding,spawn=self._fence_spawn)
+     child_meta=D.parse_registry_metadata(jobs.read_text().splitlines()[1].split("\t",5)[5])
+     self.assertEqual(child_meta["parent_attempt_id"],attempt)
+    finally:
+     if child is not None and child.poll() is None: child.kill()
+     if child is not None: child.wait()
+   finally:
+    for child in children:
+     if child.poll() is None: child.kill()
+     child.wait()
+
+ def test_respawn_claim_refuses_live_lease_or_changed_identity_before_spawn(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-owner-respawn-refuse"
+   jobs.write_text(self._respawn_owner_row(jobs,attempt)+"\n")
+   spawned=[]
+   spawn=lambda _fd:spawned.append(True)
+   with mock.patch("route_parent_close.row_requested",return_value=False), \
+        mock.patch("route_authority.owns",return_value=True):
+    with mock.patch.object(D,"attempt_governed_process_quiescence",
+                           return_value=D.ProcessQuiescence("live","still-running")), \
+         mock.patch.object(D,"supervisor_lease_is_held",return_value=False):
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D.spawn_claimed_attempt(jobs,attempt,parent_binding=None,spawn=spawn,
+                              respawn_of=("99999999","100"))
+     self.assertEqual(caught.exception.reason,"attempt-respawn-consumer-live")
+    with mock.patch.object(D,"attempt_governed_process_quiescence",
+                           return_value=D.ProcessQuiescence("quiescent","gone")), \
+         mock.patch.object(D,"supervisor_lease_is_held",return_value=True):
+     with self.assertRaises(D.DispatchContractError) as caught:
+      D.spawn_claimed_attempt(jobs,attempt,parent_binding=None,spawn=spawn,
+                              respawn_of=("99999999","100"))
+     self.assertEqual(caught.exception.reason,"attempt-respawn-lease-held")
+   with self.assertRaises(D.DispatchContractError) as caught:
+    D.spawn_claimed_attempt(jobs,attempt,parent_binding=None,spawn=spawn,
+                            respawn_of=("88888888","100"))
+   self.assertEqual(caught.exception.reason,"attempt-respawn-identity-changed")
+   self.assertEqual(spawned,[])
+
+ def test_concurrent_respawn_claims_publish_one_new_identity(self):
+  with tempfile.TemporaryDirectory() as td:
+   jobs=Path(td)/"jobs.log";attempt="att-owner-respawn-race"
+   jobs.write_text(self._respawn_owner_row(jobs,attempt)+"\n")
+   children=[];results=[];errors=[]
+   def spawn(gate_fd):
+    child=subprocess.Popen(
+     [sys.executable,str(Path(__file__).with_name("launch-fence.py")),
+      "--parent-pid",str(os.getpid()),"--gate-fd",str(gate_fd),"--",
+      "sleep","60"],pass_fds=(gate_fd,),start_new_session=True)
+    children.append(child);return child
+   def run():
+    try:
+     results.append(D.spawn_claimed_attempt(
+      jobs,attempt,parent_binding=None,spawn=spawn,respawn_of=("99999999","100")))
+    except D.DispatchContractError as exc:
+     errors.append(exc.reason)
+   try:
+    with mock.patch("route_parent_close.row_requested",return_value=False), \
+         mock.patch("route_authority.owns",return_value=True), \
+         mock.patch.object(D,"attempt_governed_process_quiescence",
+                           return_value=D.ProcessQuiescence("quiescent","gone")), \
+         mock.patch.object(D,"supervisor_lease_is_held",return_value=False):
+     threads=[threading.Thread(target=run) for _ in range(2)]
+     for thread in threads:thread.start()
+     for thread in threads:thread.join(timeout=10)
+    self.assertTrue(all(not thread.is_alive() for thread in threads))
+    self.assertEqual(len(results),1)
+    self.assertEqual(len(children),1)
+    self.assertEqual(len(errors),1)
+    meta=D.parse_registry_metadata(jobs.read_text().splitlines()[0].split("\t",5)[5])
+    self.assertEqual(meta["owner_identity_lineage"],"99999999:100")
+   finally:
+    for child in children:
+     if child.poll() is None:child.kill()
+     child.wait()
 
  def test_claimed_spawn_rechecks_parent_and_publishes_identity_under_lock(self):
   with tempfile.TemporaryDirectory() as td:
@@ -7474,5 +7609,164 @@ class GitOptionalLocksEnvironmentTest(unittest.TestCase):
      before=dict(os.environ)
      self.assertEqual(D.git_optional_locks_env(), {"GIT_OPTIONAL_LOCKS":"0"})
      self.assertEqual(dict(os.environ), before)
+
+class AttemptExecutionObservationTest(unittest.TestCase):
+ def _observe(self, command, *, start="11", actual_start="11", comm="python3"):
+  metadata={"attempt_id":"att-observe","harness":"codex",
+            "pid_observer_ns":D.process_namespace_identity(),
+            "pid_ns":D.process_namespace_identity()}
+  member=D.ProcessGroupObservation("populated",((101,start,"S"),))
+  def read_bytes(path):
+   if str(path)=="/proc/101/cmdline": return command
+   raise FileNotFoundError(path)
+  def read_text(path,encoding=None):
+   if str(path)=="/proc/101/comm": return comm+"\n"
+   raise FileNotFoundError(path)
+  with mock.patch.object(D,"attempt_tagged_descendants",return_value=member), \
+       mock.patch.object(D,"process_start_ticks",return_value=actual_start), \
+       mock.patch.object(D.Path,"read_bytes",read_bytes), \
+       mock.patch.object(D.Path,"read_text",read_text):
+   return D.attempt_execution_observation(metadata)
+
+ def test_exact_runtime_command_is_active_and_registered_carrier_is_absent(self):
+  active=self._observe(b"/usr/bin/codex"+bytes([0])+b"exec"+bytes([0]),comm="codex")
+  self.assertEqual(active.state,"active")
+  self.assertEqual(active.reason,"runtime-command-live")
+  carrier=self._observe(b"/usr/bin/python3"+bytes([0])+b"/tmp/peer-steward.py"+bytes([0]),comm="python3")
+  self.assertEqual((carrier.state,carrier.reason),("absent","carrier-only"))
+  self.assertEqual(carrier.identities,((101,"11","peer-steward.py"),))
+
+ def test_unclassified_role_pid_reuse_and_incomplete_scan_remain_unknown(self):
+  role=self._observe(b"/usr/bin/sleep"+bytes([0]),comm="sleep")
+  self.assertEqual((role.state,role.reason),("unknown","attempt-process-role-unclassified"))
+  reused=self._observe(b"/usr/bin/codex"+bytes([0]),actual_start="12",comm="codex")
+  self.assertEqual((reused.state,reused.reason),("unknown","attempt-process-identity-changed"))
+  with mock.patch.object(D,"attempt_tagged_descendants",
+       return_value=D.ProcessGroupObservation("unverifiable",reason="observer-namespace-mismatch")):
+   self.assertEqual(D.attempt_execution_observation({"attempt_id":"att-observe",
+       "harness":"codex"}).state,"unknown")
+
+ def test_empty_complete_tag_census_is_absent(self):
+  with mock.patch.object(D,"attempt_tagged_descendants",
+       return_value=D.ProcessGroupObservation("empty")):
+   result=D.attempt_execution_observation({"attempt_id":"att-observe","harness":"codex"})
+  self.assertEqual((result.state,result.reason),("absent","attempt-tag-census-empty"))
+
+
+
+
+class ResourceStageMarkerSuccessorTest(unittest.TestCase):
+    """d1 marker currency: an inherited row admits only its current successor owner."""
+
+    def setUp(self):
+        import dispatch_resource_wait as ORD
+        import resource_resume as RESUME
+        import workflow_state as WS
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.jobs = self.base / "dispatch" / "jobs.log"
+        self.jobs.parent.mkdir()
+        self.jobs.write_text("")
+        self.route_id = "rt-marker-successor"
+        self.route_hash = "sha256:marker-successor"
+        self.source_id = "rt-marker-source"
+        self.source_hash = "sha256:marker-source"
+        self.route = {"route_id": self.route_id, "route_hash": self.route_hash,
+                      "artifact_root": str(self.base / ".agent_reports"),
+                      "cwd": str(self.base),
+                      "nodes": [{"id": "full-run", "kind": "resource-runner",
+                                 "outputs": ["run.json"],
+                                 "continuation": {"kind": "supervised"}}]}
+        self.registry = self.base / "runs.json"
+        self.owner_wait = {"parent_attempt_id": "att-old", "session_id": "sid-old",
+                           "route_id": self.source_id, "route_hash": self.source_hash,
+                           "jobs": str(self.jobs)}
+        self.row = {"run_id": "run-1", "route": str(self.base / "source-route.json"),
+                    "route_id": self.source_id, "node": "full-run",
+                    "jobs": str(self.jobs), "resource_policy": "supervised-owner",
+                    "owner_wait": dict(self.owner_wait)}
+        self.registry.write_text(json.dumps({"schema_version": 1, "runs": {"run-1": self.row}}))
+        self.armed = {"route_id": self.source_id, "route_hash": self.source_hash,
+                      "route_file": str(self.base / "source-route.json"),
+                      "node": "full-run", "predecessor_kind": "resource",
+                      "predecessor_id": "run-1", "resource_registry": str(self.registry),
+                      "artifact_base": str(self.base / "cycle"),
+                      "declared_outputs": ["run.json"], "jobs": str(self.jobs),
+                      "successor_external": True, "successors": ["run-verify"],
+                      "resource_binding": ORD.resource_legacy_body_digest(self.row)}
+        self.ledger = WS.WorkflowLedger(self.route_id, self.route_hash, jobs=self.jobs)
+        (self.ledger.root / "armed").mkdir(parents=True)
+        (self.ledger.root / "armed" / "full-run.json").write_text(json.dumps(self.armed))
+        self.identity = "resource-identity-fixture"
+        self.output = self.base / "cycle" / "run.json"
+        self.marker_path = self.base / "completion" / "full-run.json"
+        self.marker_path.parent.mkdir(parents=True)
+        self.marker_doc = {"sequence": 1, "resource_execution_identity": self.identity,
+                           "evidence": {"path": str(self.output)}}
+        self.marker_path.write_text(json.dumps(self.marker_doc))
+        self.evidence = {
+            "resource_execution_identity": self.identity, "identity": self.identity,
+            "resource_sha256": RESUME.row_digest(self.row),
+            "owner_attempt_id": "att-old", "owner_session_id": "sid-old",
+            "owner_successor_start": True,
+        }
+        self.ledger._append({"at": WS.now_iso(), "route_id": self.route_id,
+                             "route_hash": self.route_hash, "node": "full-run",
+                             "state": "STAGE_SUCCEEDED", "evidence": self.evidence})
+
+    def holder(self, inherited):
+        origin = {"route_file": self.row["route"], "route_id": self.source_id,
+                  "route_hash": self.source_hash}
+        if inherited:
+            return {"route_file": str(self.base / "successor-route.json"),
+                    "route_id": self.route_id, "route_hash": self.route_hash,
+                    "inherited": True, "origin": origin, "chain": []}
+        return {"route_file": self.row["route"], "route_id": self.route_id,
+                "route_hash": self.route_hash, "inherited": False,
+                "origin": origin, "chain": []}
+
+    def binding(self, route_id=None, route_hash=None):
+        return types.SimpleNamespace(route_id=route_id or self.route_id,
+                                     route_hash=route_hash or self.route_hash,
+                                     route_file=str(self.base / "successor-route.json"))
+
+    def current(self, evidence, holder, binding):
+        import dispatch_resource_wait as ORD
+        import owner_route_binding as OWNER
+        self.ledger._append({"at": self.ledger.journal()[-1]["at"], "route_id": self.route_id,
+                             "route_hash": self.route_hash, "node": "full-run",
+                             "state": "STAGE_SUCCEEDED", "evidence": evidence})
+        node = self.route["nodes"][0]
+        with mock.patch.object(ORD, "resource_holder", return_value=holder), \
+                mock.patch.object(OWNER, "resolve_owner_route_lifecycle",
+                                  return_value=(binding, "owner-route-launch-binding")):
+            return D._resource_stage_marker_current(
+                self.route, node, self.marker_doc, self.marker_path, str(self.jobs))
+
+    def test_resource_stage_marker_current_accepts_successor_owner_admission(self):
+        evidence = {**self.evidence, "owner_attempt_id": "att-successor",
+                    "owner_session_id": "sid-successor"}
+        self.assertIsNone(self.current(evidence, self.holder(True), self.binding()))
+        unrelated = self.current(
+            {**evidence, "owner_attempt_id": "att-outsider"},
+            self.holder(True), self.binding(self.source_id, self.source_hash))
+        self.assertEqual(unrelated.state, "resource-stage-not-current")
+
+    def test_resource_stage_marker_current_keeps_non_inherited_exactness(self):
+        row = {**self.row, "parent_attempt_id": "att-owner",
+               "owner_wait": {"parent_attempt_id": "att-owner", "session_id": "sid-owner",
+                              "route_id": self.route_id, "route_hash": self.route_hash,
+                              "jobs": str(self.jobs)}}
+        self.registry.write_text(json.dumps({"schema_version": 1, "runs": {"run-1": row}}))
+        evidence = {**self.evidence, "owner_attempt_id": "att-owner",
+                    "owner_session_id": "sid-owner",
+                    "resource_sha256": __import__("resource_resume").row_digest(row)}
+        self.assertIsNone(self.current(evidence, self.holder(False), self.binding()))
+        self.assertEqual(self.current(
+            {**evidence, "owner_attempt_id": "att-other"},
+            self.holder(False), self.binding()).state, "resource-stage-not-current")
+
 
 if __name__=="__main__": unittest.main()

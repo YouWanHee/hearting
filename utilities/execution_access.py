@@ -822,6 +822,12 @@ def _topology_registry():
 def compute_execution_scope(route: Mapping[str, object], *, node: str | None = None,
                             owner: bool = True) -> bool:
     """Resolve compute access from each sealed node's registered origin stage."""
+    return execution_need_scope(route, "compute-hosts", node=node, owner=owner)
+
+
+def execution_need_scope(route: Mapping[str, object], need: str, *, node: str | None = None,
+                         owner: bool = True) -> bool:
+    """Whether a selected sealed node's registered origin part declares `execution_needs[need]`."""
     try:
         loaded = _topology_registry()
         if loaded is None:
@@ -853,7 +859,7 @@ def compute_execution_scope(route: Mapping[str, object], *, node: str | None = N
             found = topology.part_row(registry, identity)
         except (KeyError, TypeError, ValueError):
             found = None
-        if found and "compute-hosts" in (found.get("execution_needs") or []):
+        if found and need in (found.get("execution_needs") or []):
             return True
     return False
 

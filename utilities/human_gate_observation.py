@@ -432,7 +432,7 @@ def pending_human_waits(route, *, jobs, outcome=None):
 
 
 def read_answer_waits(*, jobs_paths, sessions=(), now=None):
-    """Project current answer waits from existing sources without changing them.
+    """Project current and folded older answer waits without changing sources.
 
     A damaged or partial registry is reported as unknown and is never used to
     prove that an owner has no successor. The existing owner-input reader may
@@ -473,8 +473,8 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
             except (TypeError, ValueError, OverflowError):
                 return float(fallback)
 
-    # S1 stores only exact identity and timing. Native question text is private
-    # to the runtime and is never recovered from a prompt or sidecar.
+    # S1 stores exact identity, timing, and optional native request refs only.
+    # Native question text is private to the runtime and never recovered from prose.
     try:
         project_root = str(Path(__file__).resolve().parents[1])
         if project_root not in sys.path:
@@ -510,13 +510,16 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                     now=instant)
                 if not record:
                     continue
-                add({"id": "S1:" + harness + ":" + sid + ":" + str(int(record["waiting_since"] * 1000)),
-                     "source": "S1",
-                     "kind": record["kind"], "question": None, "choices": [],
-                     "recommendation": None, "route_id": None, "route_hash": None,
-                     "attempt_id": None, "gate_id": None, "since": record["waiting_since"],
-                     "owner": {"harness": harness, "session_id": sid},
-                     "attribution": "exact"})
+                item = {"id": "S1:" + harness + ":" + sid + ":" + str(int(record["waiting_since"] * 1000)),
+                        "source": "S1",
+                        "kind": record["kind"], "question": None, "choices": [],
+                        "recommendation": None, "route_id": None, "route_hash": None,
+                        "attempt_id": None, "gate_id": None, "since": record["waiting_since"],
+                        "owner": {"harness": harness, "session_id": sid},
+                        "attribution": "exact"}
+                item.update({key: record[key] for key in ("request_id", "turn_id", "item_id")
+                             if key in record})
+                add(item)
     except Exception as exc:
         health.append({"source": "S1", "state": "unknown", "reason": type(exc).__name__})
 
@@ -641,7 +644,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                         health.append({"source": "S2", "route_id": route_id,
                                        "state": "unknown", "reason": "invalid-timestamp"})
                         continue
-                    if instant - route_activity > 8 * 86400:
+                    if route_activity > instant:
                         continue
                     try:
                         # The route row is already a narrow candidate; full lineage
@@ -651,6 +654,10 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                                                                route_id, route_digest)
                         if route_record is None:
                             continue
+                        # The loader's private schema tag is not covered by the
+                        # sealed route hash; pending_human_waits must see sealed bytes.
+                        route_record = {name: value for name, value in route_record.items()
+                                        if name != "_fleet_schema_status"}
                         for wait in pending_human_waits(route_record, jobs=path, outcome=outcome):
                             if meta is None:
                                 meta = row.completion_metadata()
@@ -665,7 +672,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
                                     pass
                             since = float(wait["waiting_since"])
                             age = instant - since
-                            if age < 0 or age > 7 * 86400:
+                            if age < 0:
                                 continue
                             stale = age > 72 * 3600
                             question, choices, recommendation = (
@@ -693,7 +700,7 @@ def read_answer_waits(*, jobs_paths, sessions=(), now=None):
     for item in items:
         try:
             old = instant - float(item.get("since", instant))
-            if old < 0 or old > 7 * 86400:
+            if old < 0 or (item.get("source") == "S3" and old > 7 * 86400):
                 continue
             item["stale"] = old >= 72 * 3600
         except (TypeError, ValueError, OverflowError):

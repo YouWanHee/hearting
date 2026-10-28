@@ -1583,6 +1583,65 @@ class TestResourceLifecycle(WorkflowFixture):
         self.assertEqual(payload["parent_attempt_id"], "att-fixture")
 
 
+    def test_inherit_resource_watch_copies_source_bytes_once(self):
+        source = {"route_id": "rt-inherit-source", "route_hash": "sha256:source",
+                  "artifact_root": str(self.base), "nodes": [{"id": "full-run"}]}
+        successor = {"route_id": "rt-inherit-successor", "route_hash": "sha256:successor",
+                     "artifact_root": str(self.base),
+                     "continuation_contract_version": 1,
+                     "reason": "owner-pin-handoff:att-old:claude",
+                     "source_route_id": source["route_id"],
+                     "source_route_hash": source["route_hash"],
+                     "nodes": [{"id": "full-run"}]}
+        registry = self.base / "runs.json"
+        registry.write_text(json.dumps({"schema_version": 1, "runs": {}}))
+        jobs_path = self.base / "jobs.log"
+        jobs_path.write_text("")
+        armed = {"route_id": source["route_id"], "route_hash": source["route_hash"],
+                 "route_file": str(self.base / "source-route.json"), "node": "full-run",
+                 "predecessor_kind": "resource", "predecessor_id": "run-1",
+                 "resource_registry": str(registry), "jobs": str(jobs_path),
+                 "successor_external": True, "successors": ["run-verify"]}
+        source_ledger = SUP.ledger_for(source, str(jobs_path))
+        SUP.armed_dir(source_ledger).mkdir(parents=True, exist_ok=True)
+        source_path = SUP.armed_dir(source_ledger) / "full-run.json"
+        source_path.write_text(json.dumps(armed))
+        source_bytes = source_path.read_bytes()
+        holder = {"inherited": True, "route_id": successor["route_id"],
+                  "route_hash": successor["route_hash"],
+                  "route_file": str(self.base / "successor-route.json"),
+                  "origin": {"route_file": armed["route_file"],
+                             "route_id": source["route_id"],
+                             "route_hash": source["route_hash"]},
+                  "chain": [{"route_id": successor["route_id"],
+                             "route_hash": successor["route_hash"],
+                             "route_file": str(self.base / "successor-route.json"),
+                             "owner_attempt_id": "att-old"}]}
+        ledger = SUP.ledger_for(successor, str(jobs_path))
+        self.assertTrue(SUP.inherit_resource_watch(successor, ledger, armed, holder))
+        target = SUP.armed_dir(ledger) / "full-run.json"
+        self.assertEqual(target.read_bytes(), source_bytes)
+        self.assertEqual(source_path.read_bytes(), source_bytes)
+        self.assertFalse(SUP.inherit_resource_watch(successor, ledger, armed, holder))
+        arm_entries = [entry for entry in ledger.journal()
+                       if entry.get("actor") == "arm" and entry.get("node") == "full-run"]
+        self.assertEqual(len(arm_entries), 1, arm_entries)
+        inherited = (arm_entries[0].get("evidence") or {}).get("inherited_watch") or {}
+        self.assertEqual(inherited.get("source_route_id"), source["route_id"])
+        self.assertEqual(inherited.get("source_owner_attempt_id"), "att-old")
+        self.assertEqual(inherited.get("watch_sha256"),
+                         hashlib.sha256(source_bytes).hexdigest())
+        self.assertEqual(source_path.read_bytes(), source_bytes)
+
+        conflict_route = {**successor, "route_id": "rt-inherit-conflict",
+                          "route_hash": "sha256:conflict"}
+        conflict_ledger = SUP.ledger_for(conflict_route, str(jobs_path))
+        SUP.armed_dir(conflict_ledger).mkdir(parents=True, exist_ok=True)
+        (SUP.armed_dir(conflict_ledger) / "full-run.json").write_text(
+            json.dumps({**armed, "successor_external": False}))
+        with self.assertRaisesRegex(SUP.SupervisorError, "resource-watch-binding-conflict"):
+            SUP.inherit_resource_watch(conflict_route, conflict_ledger, armed, holder)
+
 # ---------------------------------------------------------------------------
 # F. the graph contract itself, and the BC_ResNet_tf regression
 # ---------------------------------------------------------------------------
@@ -1756,6 +1815,40 @@ class TestSealedRoutes(unittest.TestCase):
             self.assertEqual(direct["workflow_contract"]["terminal_nodes"], ["inline"])
             self.assertEqual(direct["workflow_contract"]["continuations"], {})
             ROUTE.verify_route(direct, td)
+
+
+class OwnerInputIdentityLineageTest(unittest.TestCase):
+    def test_pinned_resource_owner_accepts_attempt_lineage_only(self):
+        jobs = "/tmp/workflow-owner-lineage/jobs.log"
+        parent = SimpleNamespace(status="open", metadata={
+            "attempt_id": "att-owner", "pid": "555", "pid_start": "300",
+            "owner_identity_lineage": "444:200+333:100",
+        })
+        input_module = SimpleNamespace(
+            _target=lambda _jobs, _attempt: (parent, "target"),
+            supervisor_lease_is_held=lambda *_args: True,
+        )
+        value = {"target": "target", "thread_id": "thread-1", "requests": []}
+        route = {"route_id": "rt-owner", "route_hash": "sha256:owner"}
+        armed = {"jobs": jobs, "route_id": "rt-owner", "route_hash": "sha256:owner"}
+        # The row names its sealed route file; an unreadable address is an
+        # unobserved holder, never a current one.
+        route_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(route_dir.cleanup)
+        route_file = Path(route_dir.name) / "rt-owner.json"
+        route_file.write_text(json.dumps(route), encoding="utf-8")
+        resource = {"route": str(route_file), "node": "full-run", "run_id": "run-1",
+                    "parent_attempt_id": "att-owner", "owner_wait": {
+            "session_id": "thread-1", "route_id": "rt-owner", "route_hash": "sha256:owner",
+            "jobs": str(Path(jobs).resolve()), "parent_attempt_id": "att-owner",
+            "owner_pid": 444, "owner_start": "200",
+        }}
+        self.assertTrue(SUP._owner_input_matches_locked(
+            route, armed, resource, "att-owner", "thread-1", value, input_module))
+        resource["owner_wait"]["owner_pid"] = 222
+        resource["owner_wait"]["owner_start"] = "99"
+        self.assertFalse(SUP._owner_input_matches_locked(
+            route, armed, resource, "att-owner", "thread-1", value, input_module))
 
 
 class TestCapabilityIntegration(WorkflowFixture):
@@ -3728,6 +3821,196 @@ class TestRegisteredEvidenceDeferredCompletion(unittest.TestCase):
         self.assertTrue(evidence["succeeded"])
 
 
+class SelectedGateReleaseBindingTest(WorkflowFixture):
+    GATE = "frame-review"
+
+    def _blocked(self, *, route_id="rt-selected-release", release_authority=None,
+                 interview=None, artifact=None):
+        route, path = self.two_stage_route(
+            continuation={"kind": "human-gate", "gate": self.GATE},
+            human_gate=self.GATE, route_id=route_id)
+        if release_authority:
+            route["human_gate_bindings"][0]["release_authority"] = release_authority
+            path.write_text(json.dumps(route, indent=2), encoding="utf-8")
+        jobs, _session, _attempt = self.owner_registry(route_id=route_id)
+        artifact = (interview if interview is not None else
+                    artifact if artifact is not None else "selected-gate-artifact.md")
+        with contextlib.redirect_stdout(io.StringIO()):
+            SUP.main(["gate", "--route", str(path), "--gate", self.GATE,
+                      "--block", "--jobs", str(jobs), "--artifact", str(artifact)])
+        return route, path, jobs
+
+    def _args(self, route, path, jobs, decision, request_id, *, epoch=1,
+              route_hash=None, answers=None, actor="fixture-user"):
+        argv = ["release", "--route", str(path), "--gate", self.GATE,
+                "--decision", decision, "--jobs", str(jobs),
+                "--expected-route-hash", route_hash or route["route_hash"],
+                "--expected-gate-epoch", str(epoch), "--request-id", request_id]
+        if actor is not None:
+            argv.extend(["--actor", actor])
+        if answers is not None:
+            argv.extend(["--answers", str(answers)])
+        return argv
+
+    def _release(self, *args, **kwargs):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = SUP.main(self._args(*args, **kwargs))
+        return code, json.loads(output.getvalue())
+
+    def test_current_proceed_revise_and_stop_return_bound_receipts(self):
+        expected_states = {
+            "proceed": "RUNNING",
+            "revise": "FAILED_RETRYABLE",
+            "stop": "CANCELLED",
+        }
+        for decision, state in expected_states.items():
+            with self.subTest(decision=decision):
+                route_id = f"rt-selected-{decision}"
+                route, path, jobs = self._blocked(route_id=route_id)
+                request_id = f"action-{decision}-01"
+                code, payload = self._release(route, path, jobs, decision, request_id)
+                self.assertEqual(code, 0)
+                self.assertEqual(
+                    (payload["route_id"], payload["route_hash"], payload["gate"],
+                     payload["gate_epoch"], payload["request_id"], payload["decision"],
+                     payload["workflow_state"]),
+                    (route["route_id"], route["route_hash"], self.GATE, 1,
+                     request_id, decision, state),
+                )
+                self.assertNotIn("answers", payload)
+                ledger = SUP.ledger_for(route, jobs)
+                self.assertEqual(ledger.state()["workflow_state"], state)
+                release_event = next(
+                    entry for entry in ledger.journal()
+                    if (entry.get("evidence") or {}).get("selected_request_id") == request_id)
+                release_evidence = release_event["evidence"]
+                self.assertEqual(
+                    (release_evidence["route_hash"], release_evidence["released_gate"],
+                     release_evidence["gate_epoch"], release_evidence["decision"]),
+                    (route["route_hash"], self.GATE, 1, decision),
+                )
+                if decision == "proceed":
+                    self.assertEqual(len(ledger.claims()), 1)
+                else:
+                    self.assertEqual(ledger.claims(), {})
+                sidecar = json.loads(
+                    SUP.gate_release_sidecar_path(path).read_text(encoding="utf-8"))
+                row = sidecar["gate_releases"][-1]
+                self.assertEqual(
+                    (row["route_id"], row["request_id"], row["gate_epoch"],
+                     row["receipt"]["decision"]),
+                    (route["route_id"], request_id, 1, decision),
+                )
+
+    def test_duplicate_recovers_the_receipt_without_another_transition_or_claim(self):
+        route, path, jobs = self._blocked()
+        request_id = "selected-action-replay"
+        args = self._args(route, path, jobs, "proceed", request_id)
+        first_output = io.StringIO()
+        with contextlib.redirect_stdout(first_output):
+            self.assertEqual(SUP.main(args), 0)
+        first = json.loads(first_output.getvalue())
+        ledger = SUP.ledger_for(route, jobs)
+        journal_length = len(ledger.journal())
+        claims = ledger.claims()
+
+        replay_output = io.StringIO()
+        with contextlib.redirect_stdout(replay_output):
+            self.assertEqual(SUP.main(args), 0)
+        replay = json.loads(replay_output.getvalue())
+        self.assertTrue(replay["recovered"])
+        for key in ("route_id", "route_hash", "gate", "gate_epoch", "request_id",
+                    "decision", "workflow_state", "successors"):
+            self.assertEqual(replay[key], first[key])
+        self.assertEqual(len(ledger.journal()), journal_length)
+        self.assertEqual(ledger.claims(), claims)
+
+        with self.assertRaisesRegex(SUP.SupervisorError, "request-id-reused"):
+            SUP.main(self._args(route, path, jobs, "stop", request_id))
+        self.assertEqual(len(ledger.journal()), journal_length)
+        self.assertEqual(ledger.claims(), claims)
+
+    def test_old_epoch_is_refused_after_same_gate_and_artifact_are_raised_again(self):
+        artifact = "same-review-artifact.md"
+        route, path, jobs = self._blocked(artifact=artifact, route_id="rt-selected-reraise")
+        # Re-raise the exact gate with the same artifact path after a real revise release.
+        first_request = "selected-action-old-raise"
+        self._release(route, path, jobs, "revise", first_request)
+        ledger = SUP.ledger_for(route, jobs)
+        with ledger.lock():
+            ledger.set_workflow_state("READY", evidence={"retry": "frame"}, actor="retry")
+        with contextlib.redirect_stdout(io.StringIO()):
+            SUP.main(["gate", "--route", str(path), "--gate", self.GATE,
+                      "--block", "--jobs", str(jobs), "--artifact", artifact])
+        resolution = WS.human_gate_resolution(ledger.journal(), self.GATE)
+        self.assertEqual((resolution["status"], resolution["epoch"]), ("blocked", 2))
+        before = len(ledger.journal())
+        with self.assertRaisesRegex(SUP.SupervisorError, "stale-gate-epoch"):
+            SUP.main(self._args(route, path, jobs, "proceed", first_request, epoch=1))
+        self.assertEqual(len(ledger.journal()), before)
+        self.assertEqual(ledger.state()["workflow_state"], "BLOCKED_HUMAN_GATE")
+        self.assertEqual(ledger.claims(), {})
+
+    def test_wrong_route_hash_and_partial_binding_do_not_release(self):
+        route, path, jobs = self._blocked(route_id="rt-selected-wrong-hash")
+        ledger = SUP.ledger_for(route, jobs)
+        with self.assertRaisesRegex(SUP.SupervisorError, "route-mismatch"):
+            SUP.main(self._args(route, path, jobs, "proceed", "selected-action-wrong-route",
+                                route_hash="sha256:other"))
+        with self.assertRaisesRegex(SUP.SupervisorError, "binding-incomplete"):
+            SUP.main(["release", "--route", str(path), "--gate", self.GATE,
+                      "--decision", "proceed", "--expected-route-hash", route["route_hash"]])
+        self.assertEqual(ledger.state()["workflow_state"], "BLOCKED_HUMAN_GATE")
+        self.assertEqual(ledger.claims(), {})
+
+    def test_matching_references_do_not_bypass_depth0_authority(self):
+        route, path, jobs = self._blocked(
+            route_id="rt-selected-depth0", release_authority="depth-0")
+        ledger = SUP.ledger_for(route, jobs)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_REGISTERED_WORKER": "1"}):
+            with self.assertRaisesRegex(SUP.SupervisorError, "gate-release-authority-refused"):
+                SUP.main(self._args(route, path, jobs, "proceed", "selected-action-headless",
+                                    actor=None))
+        self.assertEqual(ledger.state()["workflow_state"], "BLOCKED_HUMAN_GATE")
+        self.assertEqual(ledger.claims(), {})
+
+    def test_bound_release_still_requires_valid_current_interview_answers(self):
+        route, path = self.two_stage_route(
+            continuation={"kind": "human-gate", "gate": self.GATE},
+            human_gate=self.GATE, route_id="rt-selected-interview")
+        interview_path, interview = TestGateSubjectNotCaller._interview(
+            self, route_id=route["route_id"])
+        route, path, jobs = self._blocked(
+            route_id=route["route_id"], interview=interview_path)
+        ledger = SUP.ledger_for(route, jobs)
+        request_id = "selected-action-interview"
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-required"):
+            SUP.main(self._args(route, path, jobs, "proceed", request_id))
+
+        answers_path, answers = TestGateSubjectNotCaller._answers(self, interview)
+        invalid = copy.deepcopy(answers)
+        invalid["answers"]["q-scope"]["choice"] = 99
+        answers_path.write_text(json.dumps(invalid), encoding="utf-8")
+        with self.assertRaisesRegex(SUP.SupervisorError, "interview-answers-invalid"):
+            SUP.main(self._args(route, path, jobs, "proceed", request_id,
+                                answers=answers_path))
+        self.assertEqual(ledger.state()["workflow_state"], "BLOCKED_HUMAN_GATE")
+        self.assertEqual(ledger.claims(), {})
+
+        answers_path.write_text(json.dumps(answers), encoding="utf-8")
+        output = io.StringIO()
+        with mock.patch.object(SUP, "owner_continuation", return_value=None), \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(SUP.main(self._args(route, path, jobs, "proceed", request_id,
+                                                 answers=answers_path)), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual((payload["actor_kind"], payload["answers_recorded"]), ("user", 1))
+        self.assertNotIn("answers", payload)
+        resolution = WS.human_gate_resolution(ledger.journal(), self.GATE)
+        self.assertEqual(resolution["answers"]["answers"]["q-scope"]["choice"], 1)
+
+
 class TestReleaseOwnerContinuation(WorkflowFixture):
     """A person's proceed starts one continuation owner only for an owner parked at that gate."""
     GATE = "full-run-authorization"
@@ -4277,6 +4560,68 @@ class TestComputePollObservationBoundary(WorkflowFixture):
         self.assertEqual(state["row_started_at"], rows["row_started_at"])
         self.assertIsNotNone(public)
         self.assertEqual(public["rows"][0]["clock_scope"], "row")
+
+    def test_supervisor_poll_observes_rootless_run_bound_admission_without_progress(self):
+        import resource_progress
+        route, path, jobs, registry, ledger, armed = self.compute_fixture()
+        artifact = self.base / "artifact-rootless"
+        artifact.mkdir()
+        proc = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
+        def stop_process():
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        self.addCleanup(stop_process)
+        identity = SUP.RR.proc_identity(proc.pid)
+        identity_deadline = time.monotonic() + 5
+        while identity is None and time.monotonic() < identity_deadline:
+            time.sleep(0.005)
+            identity = SUP.RR.proc_identity(proc.pid)
+        self.assertIsNotNone(identity)
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        row = data["runs"]["fixture-resource"]
+        row.pop("execution", None)
+        row.pop("compute_run_id", None)
+        row.pop("compute_host", None)
+        row.pop("output_dir", None)
+        started = time.time() - 7200
+        row.update(**identity, status="running", started_at=started,
+            artifact_root=str(artifact), planned_seconds=3600,
+            route_id=route["route_id"], node="run", route=str(path.resolve()),
+            jobs=str(jobs.resolve()))
+        data["runs"]["fixture-resource"] = row
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        bundle = self.base / "unfamiliar-bundle"
+        bundle.mkdir()
+        (bundle / "execution.json").write_text(json.dumps({
+            "run_id": "fixture-resource", "started_at": started}))
+        (bundle / "decision.json").write_text(json.dumps({
+            "admitted": False, "snapshot": {"t": time.time()},
+            "reasons": ["capacity"]}))
+        armed["resource_binding"] = __import__("dispatch_resource_wait").resource_body_digest(row)
+        (ledger.root / "armed" / "run.json").write_text(json.dumps(armed), encoding="utf-8")
+        runtime = self.base / "runtime-rootless"
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs),
+                                          "AGENT_RUNTIME_DIR": str(runtime),
+                                          "AGENT_ARTIFACT_ROOT": str(artifact)}), \
+                mock.patch.object(resource_progress, "collect", return_value=None), \
+                mock.patch.object(resource_progress, "remote_candidates", return_value=[]):
+            SUP.poll_once(route, ledger)
+            state_path = resource_progress._observation_state_path(
+                row, registry, "run", create=False)
+            state = resource_progress._read_observation_state(state_path)
+            public = resource_progress.read_public_run_record(artifact, row["run_id"])
+        self.assertIsNone(proc.poll())
+        self.assertEqual(state["observation"]["admission"]["state"], "waiting")
+        self.assertIsNone(state["observation"]["reached"])
+        self.assertIsNone(state["observation"]["eta_seconds"])
+        self.assertEqual(public["admission"]["state"], "waiting")
+        self.assertIsNone(public["output_dir"])
+        self.assertEqual(public["rows"][0]["admission"]["denied_samples"], 1)
 
     def test_supervisor_registry_caller_keeps_missing_arm_birth_unknown(self):
         import resource_progress

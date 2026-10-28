@@ -24,6 +24,8 @@ formula. Cumulative total_token_usage is NOT context occupancy — it double-cou
 A per-tick cache (cwd → newest rollout path) is built from cheap line-1 reads of all rollouts
 (≈200 files); the expensive last-token-count parse touches only a 64 KB tail of the matched file.
 """
+import contextlib
+import contextvars
 import glob
 import json
 import os
@@ -72,6 +74,7 @@ _TURN_CONTEXT_CACHE_MAX = 512
 _TURN_CONTEXT_CACHE = OrderedDict()
 _TURN_CONTEXT_CACHE_EVICTIONS = 0
 _SUMMARY_BOUNDARY_SCAN = 1 << 20
+_TCP_UNKNOWN = object()
 _SYNTHETIC_NATIVE_TITLE_RE = re.compile(
     r"^(?:agents\.md\s*[-—:]\s*)?codex adapter bootstrap$", re.IGNORECASE
 )
@@ -90,6 +93,21 @@ class DaemonIdentityObservation:
         """Discard both snapshots after any identity evidence changes."""
         self.initial_scan.clear()
         self.recheck_scan.clear()
+
+
+_DAEMON_IDENTITY_SCOPE = contextvars.ContextVar("codex_daemon_identity_scope", default=None)
+
+
+@contextlib.contextmanager
+def daemon_identity_read_scope():
+    """Share live listener evidence only within one collection pass."""
+    active = _DAEMON_IDENTITY_SCOPE.get()
+    token = _DAEMON_IDENTITY_SCOPE.set(
+        active if active is not None else DaemonIdentityObservation())
+    try:
+        yield _DAEMON_IDENTITY_SCOPE.get()
+    finally:
+        _DAEMON_IDENTITY_SCOPE.reset(token)
 
 
 @dataclass
@@ -1094,6 +1112,33 @@ def _is_subagent(meta):
     )
 
 
+def _rollout_fd_paths(pid):
+    """``(paths, partial)``: the rollout files this process holds open, as realpaths.
+
+    A rollout is a ``…/sessions/…/rollout-*-<sid>.jsonl`` shape (``_sid``). ``partial``
+    is True when some fd link could not be read for a reason other than the fd closing
+    under us, so ``paths`` may miss a file. An unreadable fd directory raises OSError.
+    """
+    names = os.listdir("/proc/%s/fd" % pid)
+    sessions_marker = os.sep + "sessions" + os.sep
+    paths = []
+    partial = False
+    for name in names:
+        try:
+            path = os.readlink("/proc/%s/fd/%s" % (pid, name))
+            if path.endswith(" (deleted)"):
+                path = path[:-10]
+        except FileNotFoundError:
+            continue
+        except OSError:
+            partial = True
+            continue
+        real = os.path.realpath(path)
+        if sessions_marker in real and _sid(real):
+            paths.append(real)
+    return paths, partial
+
+
 def _proc_rollout(pid, cwd, home):
     """Return the rollout open by this process, preferring root/user over subagent.
 
@@ -1107,21 +1152,11 @@ def _proc_rollout(pid, cwd, home):
     candidates = []
     unmatched = []
     try:
-        names = os.listdir("/proc/%s/fd" % pid)
+        paths, _partial = _rollout_fd_paths(pid)
     except OSError:
         return None
-    sessions_marker = os.sep + "sessions" + os.sep
     wanted_cwd = os.path.realpath(cwd)
-    for name in names:
-        try:
-            path = os.readlink("/proc/%s/fd/%s" % (pid, name))
-            if path.endswith(" (deleted)"):
-                path = path[:-10]
-        except OSError:
-            continue
-        real = os.path.realpath(path)
-        if sessions_marker not in real or not _sid(real):
-            continue
+    for real in paths:
         meta = _rollout_meta(real)
         if os.path.realpath(meta.get("cwd") or "") != wanted_cwd:
             unmatched.append(real)
@@ -1145,6 +1180,44 @@ def _proc_rollout(pid, cwd, home):
     return None
 
 
+
+
+def open_rollout_sessions(pids=None):
+    """``{"complete": bool, "open": frozenset(session ids)}`` for the live Codex processes,
+    or None when the process table cannot be listed.
+
+    ``open`` holds the sid of every rollout a same-UID, non-zombie ``codex`` process has
+    open: the one proof that a Codex thread is still held by a running app-server or TUI.
+    ``complete`` is True only when every such process's fd table was fully read and the
+    caller sits in the initial PID namespace; otherwise an absent sid proves nothing.
+    ``pids`` restricts the walk (tests pass fixture pids)."""
+    from . import procscan
+    if pids is None:
+        try:
+            pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+        except OSError:
+            return None
+    complete = procscan.initial_pid_namespace()
+    held = set()
+    uid = os.geteuid()
+    for pid in pids:
+        try:
+            if os.stat("/proc/%s" % pid).st_uid != uid:
+                continue
+        except OSError:
+            continue
+        if procscan._comm_of(pid) != "codex" or procscan.is_terminal_state(pid):
+            continue
+        try:
+            paths, partial = _rollout_fd_paths(pid)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            complete = False
+            continue
+        complete = complete and not partial
+        held.update(sid for sid in map(_sid, paths) if sid)
+    return {"complete": complete, "open": frozenset(held)}
 
 
 def _control_socket(environ):
@@ -1406,6 +1479,30 @@ def _socket_owners_by_inode():
     return owners
 
 
+def _proc_net_tcp_rows(path):
+    """The data rows of one ``/proc/net/tcp*`` table as field lists, or None if unreadable."""
+    try:
+        with open(path, encoding="ascii", errors="strict") as handle:
+            return [row.split() for row in handle.read().splitlines()[1:]]
+    except (OSError, UnicodeError):
+        return None
+
+
+def _tcp_connections():
+    """``[(state, local, remote, inode)]`` across IPv4 and IPv6 TCP, or None if either table
+    is unreadable or malformed. Addresses stay the kernel's ``hexaddr:hexport`` strings."""
+    out = []
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        rows = _proc_net_tcp_rows(path)
+        if rows is None:
+            return None
+        for fields in rows:
+            if len(fields) < 10:
+                return None
+            out.append((fields[3], fields[1], fields[2], fields[9]))
+    return out
+
+
 def _tcp_listener_snapshot(port, scan=None):
     """Return the exact IPv4 LISTEN inode and same-UID owner sets, or unknown.
 
@@ -1413,21 +1510,38 @@ def _tcp_listener_snapshot(port, scan=None):
     snapshots together reuse a single walk of every process instead of one walk
     per port. A caller re-observing passes a fresh one.
     """
-    inodes = set()
-    try:
-        with open("/proc/net/tcp", encoding="ascii", errors="strict") as handle:
-            rows = handle.read().splitlines()[1:]
-    except (OSError, UnicodeError):
+    ports = scan.setdefault("ports", {}) if scan is not None else None
+    if ports is not None and port in ports:
+        return ports[port]
+    table = scan.get("tcp_table") if scan is not None else None
+    if table is None:
+        rows = _proc_net_tcp_rows("/proc/net/tcp")
+        if rows is None:
+            table = _TCP_UNKNOWN
+        else:
+            parsed = {}
+            for fields in rows:
+                try:
+                    if fields[3] == "0A":
+                        row_port = int(fields[1].rsplit(":", 1)[1], 16)
+                        parsed.setdefault(row_port, set()).add(fields[9])
+                except (IndexError, ValueError):
+                    parsed = _TCP_UNKNOWN
+                    break
+            table = (_TCP_UNKNOWN if parsed is _TCP_UNKNOWN else
+                     {row_port: frozenset(inodes) for row_port, inodes in parsed.items()})
+        if scan is not None:
+            scan["tcp_table"] = table
+    if table is _TCP_UNKNOWN:
+        if ports is not None:
+            ports[port] = None
         return None
-    for row in rows:
-        fields = row.split()
-        try:
-            if fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:
-                inodes.add(fields[9])
-        except (IndexError, ValueError):
-            return None
+    inodes = table.get(port, frozenset())
     if not inodes:
-        return frozenset(), frozenset()
+        result = (frozenset(), frozenset())
+        if ports is not None:
+            ports[port] = result
+        return result
     if scan is not None and "owners" in scan:
         by_inode = scan["owners"]
     else:
@@ -1435,11 +1549,15 @@ def _tcp_listener_snapshot(port, scan=None):
         if scan is not None:
             scan["owners"] = by_inode
     if by_inode is None:
-        return None
-    owners = set()
-    for inode in inodes:
-        owners |= by_inode.get(inode, set())
-    return frozenset(inodes), frozenset(owners)
+        result = None
+    else:
+        owners = set()
+        for inode in inodes:
+            owners |= by_inode.get(inode, set())
+        result = frozenset(inodes), frozenset(owners)
+    if ports is not None:
+        ports[port] = result
+    return result
 
 
 def _daemon_endpoint_current(origins):
@@ -1574,6 +1692,8 @@ def session_id_of_process(pid, live_codex=None, *, observation=None):
         return None                     # procscan lists only `codex` itself as a runtime
     if procscan.invocation_mode("codex", procscan._read_argv(pid)) != "session":
         return None
+    if observation is None:
+        observation = _DAEMON_IDENTITY_SCOPE.get()
     return _daemon_session_for_process(pid, initial_env, observation=observation)
 
 

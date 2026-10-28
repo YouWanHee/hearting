@@ -137,6 +137,11 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
         a_again = DISPATCH_NODE.admit_round(self.route, review, self.jobs,
             reviewed_evidence=str(a), record_auto_revisions=False)
         self.assertEqual((a_again.budget.state, a_again.budget.verdict_rounds), ("exhausted", 2))
+        before = self.jobs.read_bytes()
+        with self.assertRaises(DC.DispatchContractError) as exhausted:
+            self._claim_document_review("att-plan-A3", reviewed_evidence=a)
+        self.assertEqual(exhausted.exception.reason, "reviewed-evidence-revision-not-admitted")
+        self.assertEqual(self.jobs.read_bytes(), before)
         completion = ROUTE_WRITER.completion_dir(self.route["route_id"], jobs=self.jobs)
         self.assertEqual(SUBJECT.marker_currency(self.route, review, marker_a1, completion,
                                                  jobs=self.jobs),
@@ -241,6 +246,21 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
             ("superseded", "completion-review-source-stale"))
         self.assertIsNone(DC.completion_marker_gate(
             str(self.route_file), "test", "start", self.agent_home, self.jobs))
+
+        # Registration must use the same full subject as normal admission:
+        # unchanged plan bytes plus changed consumed checklist, after two old
+        # verdicts, is the first review of this subject at the unchanged cap.
+        current = DISPATCH_NODE.admit_round(
+            self.route, review, self.jobs, record_auto_revisions=False)
+        self.assertEqual((current.budget.state, current.budget.verdict_rounds,
+                          current.budget.cap, current.budget.round_kind),
+                         ("admit", 0, 2, "first"))
+        self.assertTrue(self._claim_document_review("att-plan-check-progress"))
+        registered = self._row_metadata("att-plan-check-progress")
+        self.assertEqual(INPUT.read_binding(self.jobs, registered)["sha256"],
+                         candidate_b["sha256"])
+        self.assertEqual(SUBJECT.read_binding(self.jobs, registered)["subject_digest"],
+                         current.source_subject_digest)
 
     def test_handoff_consumer_requires_both_critic_group_completions(self):
         visual = {"id": "visual-verify", "kind": "review-worker", "depends_on": [],
@@ -752,6 +772,33 @@ class SourceSubjectIntegrationTest(unittest.TestCase):
             "route_node": node["id"], "route_file": str(self.route_file),
             "registry_digest": self.route["registry_digest"],
         }
+
+    def _claim_document_review(self, attempt_id, *, reviewed_evidence=None):
+        import review_input as INPUT
+
+        admission = DISPATCH_NODE.admit_round(
+            self.route, self.review_node, self.jobs,
+            reviewed_evidence=str(reviewed_evidence) if reviewed_evidence is not None else None,
+            record_auto_revisions=False)
+        self.assertIsNotNone(admission.source_subject_digest)
+        candidate = INPUT.resolve_input(
+            self.route, self.review_node, self.jobs, reviewed_evidence)
+        metadata = self._metadata(self.review_node, attempt_id, "review")
+        metadata.update({
+            "capability": "autopilot-code", "capability_mode": "debug",
+            "qa": "standard", "intensity": "standard", "unit": self.review_node["unit"],
+            "write_scope": "_internal/reviews/plan-check/**",
+            "completion_gate": self.review_node["completion_gate"],
+            "artifact_root": str(self.artifact_root), "log_file": str(self.base / "worker.log"),
+            "launch_home": str(self.agent_home), "launch_authority": "conductor",
+            "launch_fence": "registry-v1",
+        })
+        metadata[INPUT.KEY] = INPUT.seal_binding(self.jobs, metadata, candidate)
+        row = "\t".join(("fixture", "open", str(self.repo), str(self.repo), attempt_id,
+                         ",".join(f"{key}={value}" for key, value in metadata.items())))
+        with mock.patch.dict(os.environ, {
+                "AGENT_REVIEW_SOURCE_SUBJECT_DIGEST": admission.source_subject_digest}):
+            return DC.claim_attempt_row(self.jobs, attempt_id, row, launch=False)
 
     def complete_node(self, node_id, attempt_id, evidence_text):
         node = self.get_node(node_id)

@@ -2,11 +2,13 @@
 
 import re
 
+from . import tables
 from .output import cell_width
 from .tables import _clip, repo_rule_label
+from .style import steward_flag_key
 
 STAGE_HUES = ("l", "c", "g", "y", "m")          # blue · cyan · green · yellow · magenta
-LANE_HEAD_LEFT, LANE_HEAD_RIGHT = "◀", "▶"
+LANE_HEAD_LEFT, LANE_HEAD_RIGHT = "◂", "▸"
 STATE_MARKS = {"working": ("⠏", "spin"), "active": ("⠏", "spin"), "idle": ("●", "idle"),
                "blocked": ("●", "blocked"), "failed": ("✕", "dead"), "done": ("✓", "done"),
                "dead": ("✕", "dead")}
@@ -30,12 +32,12 @@ def _card_height(owners, extra):
     return 3 + len(extra) + (1 + len(owners) if owners else 0)
 
 
-def _stage_mark(index, state):
+def _stage_mark(index, state, lit=True):
     hue = STAGE_HUES[index % len(STAGE_HUES)]
     if state == "done":
         return "✓", (hue, 0, 1)
     if state == "active":
-        return "●", (hue, 1, 0)
+        return "●", (hue, 1, 0) if lit else (hue, 0, 1)
     if state == "failed":
         return "✕", "lvl_r"
     return "·", (hue, 0, 1)
@@ -70,7 +72,7 @@ def _draw_card(grid, session, tag, bx, by, box_w, right, border, extra, owners):
     xx = put(xx, by, tag, "steward" if steward else "text")
     xx = put(xx, by, "]", "tag_b")
     if steward:
-        xx = put(xx + 1, by, "⚑", "steward")
+        xx = put(xx + 1, by, "⚑", steward_flag_key(session, lit=bool(getattr(grid, "beat", 1))))
     xx = put(xx, by, " ", "branch_s")
     xx = put(xx, by, harness, "hb_" + harness)
     put(xx, by, " ", "branch_s")
@@ -102,10 +104,14 @@ def _draw_card(grid, session, tag, bx, by, box_w, right, border, extra, owners):
             put(bx + 4, yy, _clip(str(owner.get("label") or ""), strip_x - bx - 5), "title_dim")
             xx = strip_x
             for index, stage in enumerate(stages):
-                glyph, key = _stage_mark(index, str(stage.get("state") or ""))
+                glyph, key = _stage_mark(index, str(stage.get("state") or ""),
+                                        lit=bool(getattr(grid, "beat", 1)))
                 xx = put(xx, yy, glyph, key)
             done = sum(str(stage.get("state")) == "done" for stage in stages)
             put(xx + 1, yy, f"{done}/{len(stages)}", "dim")
+            if tables.route_is_history(owner):
+                # A finished owner line recedes; the card border and its live neighbours do not.
+                tables._recede_row(grid, yy, bx + 2, br)
             yy += 1
 
 
@@ -140,15 +146,81 @@ def _link_when(links, upper, lower):
     return None
 
 
+def _clear_text(seat):
+    """The recent-clear label a seat puts on its card's bottom border, if it has one."""
+    recent = re.search(r"· (\S+) ago$", str(seat[3])) if len(seat) > 3 else None
+    if recent and str(seat[2]).isdigit():
+        return f"◂ gen {int(seat[2]) - 1} · {recent.group(1)}"
+    return None
+
+
+def _lane_cells(edges, boxes, right):
+    """Screen cells a side lane and its two labels occupy, from the same geometry it draws with."""
+    cells = set()
+    links = tuple(edges.get("links", ()))
+    for lane in edges.get("side_lanes", ()):
+        if len(lane) < 2:
+            continue
+        upper, lower = str(lane[0]), str(lane[1])
+        top, bottom = boxes.get(upper), boxes.get(lower)
+        if (not top or not bottom or top[4] != bottom[4] or top[2] != bottom[2]
+                or top[3] >= bottom[1]):
+            continue
+        ux, uy, edge, ub = top[0], top[1], top[2], top[3]
+        fy = bottom[1]
+        for yy in range(uy + 1, fy + 3):
+            for xx in range(edge, edge + 6):
+                cells.add((xx, yy))
+        label_right = min(right, top[2])
+        for row, (src, dst) in enumerate(((upper, lower), (lower, upper))):
+            sent = _link_when(links, src, dst)
+            if sent:
+                text = f"[{src}]→[{dst}] {sent[0]} {sent[1]}"
+                for xx in range(ux + 2, min(label_right, ux + 2 + cell_width(text))):
+                    cells.add((xx, ub + 1 + row))
+    return cells
+
+
+def _cross_occupancy(boxes, frames, lane_cells):
+    """Cells a cross line may not paint over: every card, every frame border, every side lane."""
+    cells = set(lane_cells)
+    for box in boxes.values():
+        for yy in range(box[1], box[3] + 1):
+            for xx in range(box[0], box[2] + 1):
+                cells.add((xx, yy))
+    for fx0, fy0, fx1, fy1 in frames.values():
+        for xx in range(fx0, fx1 + 1):
+            cells.add((xx, fy0))
+            cells.add((xx, fy1))
+        for yy in range(fy0, fy1 + 1):
+            cells.add((fx0, yy))
+            cells.add((fx1, yy))
+    return cells
+
+
+def _footer_start(box, clear):
+    """Where text may start on a card's bottom border without covering the clear marker."""
+    start = box[0] + 2
+    if clear:
+        start = max(start, box[0] + 1 + cell_width(clear))
+    return start
+
+
 def _draw_side_lanes(grid, edges, boxes, right):
-    """Stacked pairs join round their right side, one lane each way, labelled under the upper card."""
+    """Stacked pairs join round their right side, one lane each way, labelled under the upper card.
+
+    Every card meets its lanes on its two first inner rows: the arriving head sits beside the
+    title row and the leaving tail leaves from the gauge row, so a lane never lands on a
+    corner, a divider or another card whatever height the cards have.
+    """
     links = tuple(edges.get("links", ()))
     for lane in edges.get("side_lanes", ()):
         if len(lane) < 2:
             continue
         upper, lower = str(lane[0]), str(lane[1])
         top, tail = boxes.get(upper), boxes.get(lower)
-        if not top or not tail or top[4] != tail[4] or top[1] >= tail[1]:
+        if (not top or not tail or top[4] != tail[4] or top[2] != tail[2]
+                or top[3] >= tail[1]):
             continue
         ux, uy, edge, ub = top[0], top[1], top[2], top[3]
         fy = tail[1]
@@ -157,31 +229,40 @@ def _draw_side_lanes(grid, edges, boxes, right):
         def put(px, py, text, key="branch_s"):
             grid.put(px, py, text, key, limit=right)
 
-        put(edge, uy + 2, "├", top[5])
+        put(edge, uy + 2, "├", top[5])                 # upper → lower
         put(edge + 1, uy + 2, "──")
         put(first, uy + 2, "┐")
-        for yy in range(uy + 3, fy + 2):
+        for yy in range(uy + 3, fy + 1):
             put(first, yy, "│")
-        put(first, fy + 2, "┘")
-        put(edge + 2, fy + 2, "─")
-        put(edge + 1, fy + 2, LANE_HEAD_LEFT, "soft")
-        put(edge, fy + 3, "├", tail[6])
-        put(edge + 1, fy + 3, "────")
-        put(second, fy + 3, "┘")
-        for yy in range(uy + 2, fy + 3):
+        put(first, fy + 1, "┘")
+        put(edge + 2, fy + 1, "─")
+        put(edge + 1, fy + 1, LANE_HEAD_LEFT, "soft")
+        put(edge, fy + 2, "├", tail[5])                # lower → upper
+        put(edge + 1, fy + 2, "────")
+        put(second, fy + 2, "┘")
+        for yy in range(uy + 2, fy + 2):
             put(second, yy, "│")
         put(second, uy + 1, "┐")
         put(edge + 2, uy + 1, "───")
         put(edge + 1, uy + 1, LANE_HEAD_LEFT, "soft")
+        label_right = min(right, top[2])
         for row, (src, dst) in enumerate(((upper, lower), (lower, upper))):
             sent = _link_when(links, src, dst)
             if sent:
                 _segments(grid, ux + 2, ub + 1 + row,
-                          [(f"[{src}]→[{dst}] ", "dim"), (sent[0], "soft"), (f" {sent[1]}", "dim")], right)
+                          [(f"[{src}]→[{dst}] ", "dim"), (sent[0], "soft"), (f" {sent[1]}", "dim")],
+                          label_right)
 
 
-def _draw_cross_links(grid, edges, boxes, frames, right):
-    """A line between two frames that sit side by side, else a ``→[tag]`` badge on the sender."""
+def _draw_cross_links(grid, edges, boxes, frames, right, clear_of):
+    """A line between two frames that sit side by side, else a ``→[tag]`` badge on the sender.
+
+    A line may only use empty cells: the side-lane gutter, another card or a third frame's border
+    turns it into the existing badge. Both ends stay on the card borders they belong to, and the
+    badge starts after the clear marker so the two never paint over each other.
+    """
+    lane_cells = _lane_cells(edges, boxes, right)
+    occupied = _cross_occupancy(boxes, frames, lane_cells)
     for edge in edges.get("cross", ()):
         if len(edge) < 2:
             continue
@@ -193,7 +274,15 @@ def _draw_cross_links(grid, edges, boxes, frames, right):
         sx0, sy0, sx1, sy1 = a[:4]
         dx0, dy0, _dx1, dy1 = b[:4]
         ly = max(sy0, dy0) + 2
-        if sx1 < dx0 and sy0 < ly < sy1 and dy0 < ly < dy1:
+        drawable = (sx1 + 1 < dx0 and sy0 < ly < sy1 and dy0 < ly < dy1
+                    and (len(a) < 8 or a[7] != ly) and (len(b) < 8 or b[7] != ly)
+                    and (sx1, ly) not in lane_cells)
+        if drawable:
+            allowed = {(sx1, ly), (frames[a[4]][2], ly), (frames[b[4]][0], ly)}
+            drawable = (all((xx, ly) not in lane_cells for xx in range(sx1, dx0))
+                        and all((xx, ly) not in occupied or (xx, ly) in allowed
+                                for xx in range(sx1, dx0)))
+        if drawable:
             grid.put(sx1, ly, "├", a[5], limit=right)
             for xx in range(sx1 + 1, dx0 - 1):
                 grid.put(xx, ly, "─", "branch_s", limit=right)
@@ -205,22 +294,24 @@ def _draw_cross_links(grid, edges, boxes, frames, right):
             if frames[b[4]][0] - frames[a[4]][2] - 3 >= label_width:
                 _segments(grid, frames[a[4]][2] + 2, ly - 1, label, right)
             else:
-                _segments(grid, sx0 + 2, sy1, [(" steer", "soft"), (" " + when + " ", "dim")], right)
+                _segments(grid, _footer_start(a, clear_of.get(src)), sy1,
+                          [(" steer", "soft"), (" " + when + " ", "dim")], min(right, sx1))
         else:
-            _segments(grid, sx0 + 2, sy1, [(" →", "soft"), (f"[{dst}]", "text"), (" steer", "soft"),
-                                           (" " + when + " ", "dim")], right)
+            _segments(grid, _footer_start(a, clear_of.get(src)), sy1,
+                      [(" →", "soft"), (f"[{dst}]", "text"), (" steer", "soft"),
+                       (" " + when + " ", "dim")], min(right, sx1))
 
 
-def _draw_markers(grid, vm, edges, boxes, frames, right):
+def _draw_markers(grid, vm, edges, boxes, frames, right, clear_of):
     """A recent clear on a seat marks its card's bottom border; a steward's watch marks its frame."""
     session_by_tag = {str(item.get("tag")): item for item in vm.sessions}
     for seat in vm.seats or ():
         tag = str(seat[0])
         box = boxes.get(tag)
-        recent = re.search(r"· (\S+) ago$", str(seat[3])) if len(seat) > 3 else None
-        if box and recent and str(seat[2]).isdigit():
+        text = clear_of.get(tag)
+        if box and text:
             harness = str(session_by_tag.get(tag, {}).get("harness") or "claude")
-            grid.put(box[0] + 1, box[3], f"◂ gen {int(seat[2]) - 1} · {recent.group(1)}", "hb_" + harness,
+            grid.put(box[0] + 1, box[3], text, "hb_" + harness,
                      limit=min(right, box[2] + 1))
     for marker in edges.get("watches", ()):
         frame = frames.get(str(marker.get("repo")))
@@ -236,6 +327,7 @@ def _draw_links_compact(grid, vm, state, links, opened, x, y, use, right, bottom
     for link in links:
         if y + 1 >= bottom:
             grid.put(x + 2, bottom - 1, f"… {len(links)} links", "dim", limit=right)
+            _mark_page_incomplete(grid)
             return
         frm, to, kind, when, note = link[:5]
         start0, start1 = x + 2, x + 20
@@ -255,6 +347,23 @@ def _draw_links_compact(grid, vm, state, links, opened, x, y, use, right, bottom
         y += 1
 
 
+
+
+def _row_width(col_gaps, members, box_width):
+    """Frame width for one row of columns: a trailing side lane keeps its gutter inside."""
+    inner = 2 + sum(box_width + col_gaps[ci] for ci in members)
+    return inner + 1 if col_gaps[members[-1]] > 2 else inner - col_gaps[members[-1]] + 2
+
+
+def _wrap_columns(col_gaps, box_width, use):
+    """Split column indexes into the fewest rows that fit ``use``, balanced across rows."""
+    count = len(col_gaps)
+    for rows in range(1, count + 1):
+        per_row = -(-count // rows)
+        chunks = [list(range(start, min(count, start + per_row))) for start in range(0, count, per_row)]
+        if all(_row_width(col_gaps, chunk, box_width) <= use for chunk in chunks):
+            return chunks
+    return [[index] for index in range(count)]
 
 
 def draw_peers(grid, vm, state, x=34, y=3):
@@ -280,6 +389,11 @@ def draw_peers(grid, vm, state, x=34, y=3):
     frame_gap, column_gap, lane_gap, stack_gap = 3, 2, 6, 2
     owners_of = {tag: tuple(card.get("owners", ())) for tag, card in cards.items()}
     extra_of = {tag: _extra_lines(item, questions) for tag, item in session_by_tag.items()}
+    clear_of = {}
+    for seat in vm.seats or ():
+        text = _clear_text(seat)
+        if text:
+            clear_of[str(seat[0])] = text
 
     def height_of(tag):
         return _card_height(owners_of.get(tag, ()), extra_of[tag])
@@ -294,31 +408,24 @@ def draw_peers(grid, vm, state, x=34, y=3):
                                     for pair in edges.get("side_lanes", ())
                                     for i in range(max(0, len(col) - 1))) else column_gap
                     for col in cols]
-        has_lane = col_gaps[-1] == lane_gap
-        dx = 2
-        col_x = []
-        for gap in col_gaps:
-            col_x.append(dx)
-            dx += box_width + gap
-        frame_width = dx + 1 if has_lane else dx - column_gap + 2
-        if frame_width > use and len(cols) > 1:
-            cols = [tuple(tag for col in cols for tag in col)]
-            has_lane = any(tuple(pair) == tuple(cols[0][i:i + 2])
-                           for pair in edges.get("side_lanes", ())
-                           for i in range(max(0, len(cols[0]) - 1)))
-            col_gaps = [lane_gap if has_lane else column_gap]
-            frame_width = 2 + box_width + col_gaps[0] + (1 if has_lane else -column_gap + 2)
-            col_x = [2]
-        row_count = max(map(len, cols))
-        row_height = [max(height_of(col[row]) + 1
-                          for col in cols if row < len(col)) for row in range(row_count)]
-        positions = {}
-        for ci, col in enumerate(cols):
-            yy = 1
-            for ri, tag in enumerate(col):
-                positions[tag] = (col_x[ci], yy, height_of(tag))
-                yy += row_height[ri] + stack_gap
-        frame_height = 1 + sum(row_height) + stack_gap * (row_count - 1) + 1
+        # Wrap the columns into as many rows as the pane width needs; each row keeps the
+        # columns' own order and a stacked pair stays one column with its side lanes.
+        grid_rows = _wrap_columns(col_gaps, box_width, use)
+        positions, frame_width, yy = {}, 0, 1
+        for members in grid_rows:
+            frame_width = max(frame_width, _row_width(col_gaps, members, box_width))
+            depth = max(len(cols[ci]) for ci in members)
+            row_height = [max(height_of(cols[ci][row]) + 1 for ci in members if row < len(cols[ci]))
+                          for row in range(depth)]
+            dx = 2
+            for ci in members:
+                cy = yy
+                for ri, tag in enumerate(cols[ci]):
+                    positions[tag] = (dx, cy, height_of(tag))
+                    cy += row_height[ri] + stack_gap
+                dx += box_width + col_gaps[ci]
+            yy += sum(row_height) + stack_gap * depth
+        frame_height = yy - stack_gap + 1
         layouts[str(repo)] = {"repo": str(repo), "columns": cols, "positions": positions,
                               "width": frame_width, "height": frame_height, "col_gaps": col_gaps}
 
@@ -407,22 +514,33 @@ def draw_peers(grid, vm, state, x=34, y=3):
                 border = ("hb_" if selected else "h_") + harness
                 _draw_card(grid, session, tag, bx, by, box_width, right, border,
                            extra_of[tag], owners_of.get(tag, ()))
+                # The last field is the owner divider row; cross lines must not land on it.
+                divider = by + 3 + len(extra_of[tag]) if owners_of.get(tag) else None
                 session_boxes[tag] = (bx, by, bx + box_width - 1, by + card_h, repo, "h_" + harness,
-                                      "hb_" + harness)
+                                      "hb_" + harness, divider)
                 for hit_y in range(by, by + card_h + 1):
                     grid.add_hit(hit_y, bx, min(right, bx + box_width), ("fold", "pfocus:" + state.view, tag))
         cursor_y += band_h + 1
 
     _draw_side_lanes(grid, edges, session_boxes, right)
-    _draw_cross_links(grid, edges, session_boxes, frame_boxes, right)
-    _draw_markers(grid, vm, edges, session_boxes, frame_boxes, right)
+    _draw_cross_links(grid, edges, session_boxes, frame_boxes, right, clear_of)
+    _draw_markers(grid, vm, edges, session_boxes, frame_boxes, right, clear_of)
 
     y = cursor_y
+    if not placements:
+        # Keep the same single row between the empty peer graph and LINKS as the
+        # populated graph path leaves after its last repository frame.
+        y += 1
     links = tuple(edges.get("links", ()))
     if opened:
         links = tuple(link for link in links
                       if any(isinstance(end, (list, tuple)) and str(end[0]) == opened for end in link[:2]))
-    if use < 75:
+    if links:
+        report_end = getattr(grid, "report_natural_page_end", None)
+        if report_end is not None:
+            last_row = y + (2 + 2 * len(links) - 1 if use < 75 else 2 + len(links) - 1)
+            report_end(last_row)
+    if use < 75 and links:
         if y + 2 < bottom:
             _draw_links_compact(grid, vm, state, links, opened, x, y, use, right, bottom)
         return
@@ -448,10 +566,15 @@ def _draw_links(grid, state, session_by_tag, links, opened, x, y, use, right):
         grid.put(x + off, y, label, "head", tint=234, limit=right)
     y += 1
     room = grid.rows - 6 - y
+    if getattr(grid, "complete_page", False):
+        # The natural-end repaint uses the row otherwise reserved between the
+        # renderer's internal limit and the shared bottom probe.
+        room += 1
     shown = links if len(links) <= room else links[:max(0, room - 1)]
     if len(shown) < len(links):
         more = len(links) - len(shown)
         grid.put(x + 3, y + len(shown), f"… {more} more link{'' if more == 1 else 's'}", "dim", limit=right)
+        _mark_page_incomplete(grid)
 
     def endpoint(px, py, value, limit):
         if isinstance(value, (tuple, list)) and value:
@@ -478,3 +601,9 @@ def _draw_links(grid, state, session_by_tag, links, opened, x, y, use, right):
         grid.put(x + 51, y, str(when), "dim", limit=right)
         grid.put(x + 64, y, _clip(str(note), max(0, use - 64)), "now_sub", limit=right)
         y += 1
+
+
+def _mark_page_incomplete(grid):
+    mark = getattr(grid, "mark_page_incomplete", None)
+    if mark is not None:
+        mark()

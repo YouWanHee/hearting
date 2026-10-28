@@ -440,6 +440,7 @@ def validate_revision_admission(jobs, metadata, binding):
     if is_spec_review_node(node):
         return
     module = _route_module()
+    from review_source_subject import annotate_rows, read_binding as read_subject
     try:
         lines = Path(jobs).read_text().splitlines()
         lineage = module.review_lineage_routes(route, node["id"])
@@ -447,8 +448,13 @@ def validate_revision_admission(jobs, metadata, binding):
         rows = [(fields[1], meta) for fields, meta in
                 module.review_round_records(lines, route_ids, node["id"], jobs=jobs)
                 if meta.get("attempt_id") != metadata["attempt_id"]]
+        subject = read_subject(jobs, metadata, required=False)
+        if subject is not None:
+            rows = annotate_rows(jobs, rows, route=route, node=node,
+                                 family=subject.get("family", "source"))
         revisions = module._dependency_revisions(route, node, jobs, reviewed_input=binding)
-        budget = module.REVIEW_ROUND_CAP.round_budget(route, node, rows, revisions=revisions)
+        budget = module.REVIEW_ROUND_CAP.round_budget(route, node, rows, revisions=revisions,
+            source_subject_digest=subject["subject_digest"] if subject is not None else None)
     except (ValueError, OSError) as exc:
         raise DC.DispatchContractError("reviewed-evidence-revision-unproven", str(exc)) from exc
     if budget.state != "admit":

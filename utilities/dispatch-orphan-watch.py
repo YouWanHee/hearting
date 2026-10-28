@@ -51,6 +51,19 @@ def attempt_record(
     try:
         import dispatch_registry_cache
         with dispatch_registry_cache.registry_read_scope():
+            view = dispatch_registry_cache.current_registry_view(jobs)
+            if view._prefix_reuse_eligible:
+                # Index lookup keeps the first-match meaning of the text scan
+                # below without parsing or copying every row of a large registry.
+                records = view.completion_attempt_records(attempt_id)
+                if records:
+                    fields = records[0].fields
+                    meta = parse_registry_metadata(fields[5])
+                    return (fields[1], meta) if meta.get("attempt_id") == attempt_id else (None, {})
+                for fields, meta in view.select_rows(attempt_id=attempt_id):
+                    if meta.get("attempt_id") == attempt_id:
+                        return fields[1], parse_registry_metadata(fields[5])
+                return None, {}
             lines = dispatch_registry_cache.registry_text_lines(jobs)
             if lines is None:
                 lines = jobs.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -184,8 +197,8 @@ def _finish_recovery(args) -> bool:
     A failed cleanup hands the exact obligation to the existing parent queue;
     preserving supervisor state makes a failed handback recoverable on restart.
     """
-    from dispatch_supervision import _rows, _pending, materialize
-    rows = _rows(Path(args.jobs))
+    from dispatch_supervision import _owned_rows, _pending, materialize
+    rows = _owned_rows(Path(args.jobs), args.attempt_id)
     owned = {args.attempt_id} if args.attempt_id in rows else set()
     for aid in rows:
         if rows[aid][1].get("parent_attempt_id") == args.attempt_id:
@@ -243,7 +256,8 @@ def recover_waiting_continuation(args) -> bool | None:
     attempts = {child.attempt_id for child in children} - set(state.delivered_attempt_ids)
     if not attempts:
         return None
-    while _pending(_rows(Path(args.jobs)), sorted(attempts), Path(args.jobs)):
+    while _pending(_rows(Path(args.jobs), attempts, require_unique=True),
+                   sorted(attempts), Path(args.jobs)):
         _status, current = attempt_record(args.jobs, args.attempt_id)
         if _status not in OPEN | {"done"} or route_parent_close.row_requested(current, args.jobs):
             return None
@@ -379,18 +393,19 @@ def watch(args) -> int:
 
 
 def _resume_batch_duties(jobs) -> None:
-    """Reconnect observers for retained registered batches after a restart.
+    """Ask the shared runner to reconnect retained registered batch observers.
 
-    Lock-guarded and bounded: duties already observed are skipped, completed
-    duties are never replayed, and the original assignment is never relaunched.
-    Every failure is swallowed; the next cycle retries.
+    The runner owns the lock-guarded, bounded pass: duties already observed are
+    skipped, completed duties are never replayed, and the original assignment is
+    never relaunched. This watcher only wakes it; every failure is swallowed and
+    the next cycle retries.
     """
     try:
         import dispatch_batch_obligations as batch_obligations
     except Exception:
         return
     try:
-        batch_obligations.ensure_observers(jobs)
+        batch_obligations.request_runner(jobs)
     except Exception:
         pass
 

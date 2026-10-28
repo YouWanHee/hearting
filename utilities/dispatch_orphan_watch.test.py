@@ -389,5 +389,204 @@ class IdleOwnerWatchTest(unittest.TestCase):
         self.assertEqual((self.reads.call_count, self.judged.call_count), (1, 1))
 
 
+class SharedRunnerWakeTest(unittest.TestCase):
+    """The watcher wakes the shared runner; it never runs the global observer sweep."""
+
+    def setUp(self):
+        self.watch = load_watch_module()
+        self.jobs = Path("/unused/jobs.log")
+
+    def test_resume_duties_request_the_runner_and_never_sweep_observers(self):
+        import dispatch_batch_obligations as obligations
+        with mock.patch.object(obligations, "ensure_observers",
+                               side_effect=AssertionError("global sweep")) as sweep, \
+             mock.patch.object(obligations, "request_runner", return_value=True) as request:
+            self.watch._resume_batch_duties(self.jobs)
+        request.assert_called_once_with(self.jobs)
+        sweep.assert_not_called()
+
+    def test_resume_duties_swallow_a_failed_wake(self):
+        import dispatch_batch_obligations as obligations
+        with mock.patch.object(obligations, "request_runner", side_effect=RuntimeError("boom")):
+            self.watch._resume_batch_duties(self.jobs)
+
+    def test_main_wakes_the_runner_once_per_cycle_without_a_sweep(self):
+        import dispatch_batch_obligations as obligations
+        argv = ["--jobs", str(self.jobs), "--agent-home", "/unused", "--attempt-id", "att-x",
+                "--pid", "4242", "--pid-start", "1"]
+        with mock.patch.object(obligations, "ensure_observers",
+                               side_effect=AssertionError("global sweep")), \
+             mock.patch.object(obligations, "request_runner", return_value=False) as request, \
+             mock.patch.object(self.watch, "watch", return_value=0), \
+             mock.patch.object(self.watch, "attempt_record", return_value=(None, {})), \
+             mock.patch("route_parent_close.row_requested", return_value=False):
+            self.assertEqual(self.watch.main(argv), 0)
+        request.assert_called_once()
+
+
+class AttemptRecordIndexTest(unittest.TestCase):
+    """The index lookup answers like the first-match text scan it replaced."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.jobs = Path(self.temp.name) / "jobs.log"
+        self.watch = load_watch_module()
+
+    @staticmethod
+    def line(attempt, status="open", extra=""):
+        return (f"2026-07-19T00:00:00Z\t{status}\t/r\t/w\towner\t"
+                f"attempt_schema_version=2,attempt_id={attempt}{extra}")
+
+    def text_scan(self, attempt):
+        for text in self.jobs.read_text(encoding="utf-8", errors="replace").splitlines():
+            if attempt not in text:
+                continue
+            fields = text.split("\t")
+            if len(fields) == 6:
+                meta = self.watch.parse_registry_metadata(fields[5])
+                if meta.get("attempt_id") == attempt:
+                    return fields[1], meta
+        return None, {}
+
+    def check(self, attempt):
+        self.assertEqual(self.watch.attempt_record(self.jobs, attempt), self.text_scan(attempt))
+
+    def test_rows_missing_duplicate_tail_and_rewrite_match_the_text_scan(self):
+        rows = [self.line(f"att-{i}") for i in range(30)]
+        # A duplicate attempt (an abnormal file shape): the first row wins.
+        rows += [self.line("att-dup", "open", ",marker=first"), self.line("att-dup", "done", ",marker=second")]
+        self.jobs.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        for attempt in ("att-0", "att-29", "att-dup", "att-absent"):
+            self.check(attempt)
+        self.assertEqual(self.watch.attempt_record(self.jobs, "att-dup")[0], "open")
+        # A row only in the partial (unterminated) tail.
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write(self.line("att-tail", "running"))
+        self.check("att-tail")
+        self.assertEqual(self.watch.attempt_record(self.jobs, "att-tail")[0], "running")
+        # An atomic rewrite replacing a row in place shows the new status.
+        replacement = self.jobs.with_suffix(".next")
+        replacement.write_text("\n".join(
+            self.line("att-3", "done", ",note=rewritten") if i == 3 else row for i, row in enumerate(rows)
+        ) + "\n", encoding="utf-8")
+        replacement.replace(self.jobs)
+        self.check("att-3")
+        self.assertEqual(self.watch.attempt_record(self.jobs, "att-3")[0], "done")
+
+    def test_unreadable_registry_is_unknown(self):
+        self.assertEqual(self.watch.attempt_record(self.jobs, "att-0"), (None, {}))
+
+    def test_noncanonical_separators_use_the_text_path(self):
+        self.jobs.write_text(self.line("att-a") + "\x0b\n" + self.line("att-b", "done") + "\n",
+                             encoding="utf-8")
+        self.check("att-b")
+
+
+class WatchLifetimeTest(unittest.TestCase):
+    """A watcher lives while its owner lives and follows the owner out; nothing else ends it."""
+
+    class Stop(Exception):
+        pass
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.jobs = Path(self.temp.name) / "jobs.log"
+        self.watch = load_watch_module()
+        self.args = SimpleNamespace(jobs=self.jobs, attempt_id="att-life", pid=4242,
+                                    pid_start="1", interval=0.01)
+        patches = [
+            mock.patch("route_parent_close.row_requested", return_value=False),
+            mock.patch.object(self.watch, "recover_waiting_continuation", return_value=None),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def write(self, status):
+        self.jobs.write_text(
+            f"2026-07-19T00:00:00Z\t{status}\t/r\t/w\towner\t"
+            "attempt_schema_version=2,dispatch_depth=1,worker_type=owner,attempt_id=att-life\n",
+            encoding="utf-8")
+
+    def sleeper(self, rounds):
+        count = []
+
+        def sleep(_seconds):
+            count.append(1)
+            if len(count) >= rounds:
+                raise self.Stop()
+        return sleep
+
+    def test_closed_row_with_live_owner_waits_then_follows_the_owner_out(self):
+        self.write("done")
+        owner_alive = [True]
+
+        def sleep(_seconds):
+            sleeps.append(1)
+            if len(sleeps) == 5:
+                owner_alive[0] = False
+
+        sleeps = []
+        with mock.patch.object(self.watch, "process_start",
+                               side_effect=lambda _pid: "1" if owner_alive[0] else None), \
+             mock.patch.object(self.watch.time, "sleep", side_effect=sleep), \
+             mock.patch.object(self.watch, "reconcile_orphan_cascade", return_value=0) as cascade:
+            self.assertEqual(self.watch.watch(self.args), 0)
+        self.assertEqual(len(sleeps), 5, "waited exactly while the owner was alive")
+        cascade.assert_called_once_with(self.args)
+
+    def test_open_row_with_live_owner_is_never_ended_by_the_watcher(self):
+        self.write("open")
+        with mock.patch.object(self.watch, "process_start", return_value="1"), \
+             mock.patch.object(self.watch.time, "sleep", side_effect=self.sleeper(50)), \
+             mock.patch.object(self.watch, "reconcile_exact_exit") as exited, \
+             mock.patch.object(self.watch, "reconcile_orphan_cascade") as cascade:
+            with self.assertRaises(self.Stop):
+                self.watch.watch(self.args)
+        exited.assert_not_called()
+        cascade.assert_not_called()
+
+    def test_open_row_with_exited_quiescent_owner_reconciles_the_exit(self):
+        self.write("open")
+        quiescent = SimpleNamespace(process_state="quiescent")
+        with mock.patch.object(self.watch, "process_start", return_value=None), \
+             mock.patch.object(self.watch, "observed_owner_lifecycle",
+                               return_value=(quiescent, "", {})), \
+             mock.patch.object(self.watch, "reconcile_exact_exit", return_value=0) as exited:
+            self.assertEqual(self.watch.watch(self.args), 0)
+        exited.assert_called_once_with(self.args)
+
+    def test_finish_recovery_reads_only_the_owner_and_its_children(self):
+        self.jobs.write_text(
+            "".join(f"2026-07-19T00:00:00Z\tdone\t/r\t/w\tx\tattempt_schema_version=2,attempt_id=att-o{i}\n"
+                    for i in range(25))
+            + "2026-07-19T00:00:00Z\tdone\t/r\t/w\towner\tattempt_schema_version=2,attempt_id=att-life\n"
+            + "2026-07-19T00:00:00Z\tdone\t/r\t/w\tchild\t"
+              "attempt_schema_version=2,attempt_id=att-kid,parent_attempt_id=att-life\n",
+            encoding="utf-8")
+        import dispatch_supervision
+        seen = {}
+
+        def pending(rows, owned, *_args, **_kwargs):
+            seen.update(rows=set(rows), owned=set(owned))
+            return False
+
+        with mock.patch.object(dispatch_supervision, "_pending", side_effect=pending), \
+             mock.patch.object(self.watch, "_remove_supervisor_state") as removed:
+            self.assertTrue(self.watch._finish_recovery(self.args))
+        self.assertEqual(seen["rows"], {"att-life", "att-kid"})
+        self.assertEqual(seen["owned"], {"att-life", "att-kid"})
+        removed.assert_called_once()
+
+    def test_finish_recovery_refuses_a_registry_with_duplicate_attempts(self):
+        row_text = "2026-07-19T00:00:00Z\tdone\t/r\t/w\tx\tattempt_schema_version=2,attempt_id=att-dup\n"
+        self.jobs.write_text(row_text * 2, encoding="utf-8")
+        import dispatch_supervision
+        with self.assertRaises(dispatch_supervision.SupervisionError):
+            self.watch._finish_recovery(self.args)
+
+
 if __name__ == "__main__":
     unittest.main()

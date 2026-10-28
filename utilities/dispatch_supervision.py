@@ -7,11 +7,16 @@ The existing pending-delivery queue owns a notice until a carrier accepts it.
 from __future__ import annotations
 
 import hashlib
+import glob
+import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shlex
+import sys
+import tempfile
 import time
 from typing import Callable, Iterable
 
@@ -20,8 +25,12 @@ from dispatch_receipt_identity import receipt_digest
 from dispatch_registry_cache import registry_view
 import dispatch_pending_delivery as pending_delivery
 
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 KIND = "supervision"
-REASONS = frozenset({"owner-input-undelivered", "no-progress", "process-unverifiable", "join-deadline", "supervisor-exited", "join-observer-failed", "terminal-evidence-conflict", "workflow-completion-pending", "closure-blocked", "watch-deadline", "receiver-unavailable", "answer-awaiting-parent", "parent-session-ended"})
+REASONS = frozenset({"owner-input-undelivered", "no-progress", "attempt-stalled", "process-unverifiable", "join-deadline", "supervisor-exited", "join-observer-failed", "terminal-evidence-conflict", "workflow-completion-pending", "closure-blocked", "watch-deadline", "receiver-unavailable", "answer-awaiting-parent", "parent-session-ended"})
 # Another session answered a BLOCKED owner; only the route's parent launches the continuation.
 ANSWER_AWAITING_PARENT = "answer-awaiting-parent"
 
@@ -32,6 +41,612 @@ class SupervisionError(ValueError):
 
 class StopWaiting(RuntimeError):
     """Abort a managed wait without recording a delivery notice or row change."""
+
+
+def scoped_file_signature(metadata, worktree=""):
+    """Bounded signature of declared write-scope paths; never reads file prose."""
+    entries = []
+    roots = []
+    for raw_root in (worktree, metadata.get("artifact_root", "")):
+        root = Path(raw_root)
+        if root.is_absolute() and root not in roots:
+            roots.append(root)
+    declared = metadata.get("write_scope", "").split(";")
+    route_file = Path(metadata.get("route_file", ""))
+    if route_file.is_absolute() and route_file.is_file():
+        cycle_root = route_file.parent.parent if route_file.parent.name == "_internal" else route_file.parent
+        if cycle_root not in roots:
+            roots.append(cycle_root)
+        try:
+            route = json.loads(route_file.read_text(encoding="utf-8"))
+            node = next((item for item in route.get("nodes", [])
+                         if item.get("id") == metadata.get("route_node")), {})
+            declared.extend(str(item) for item in node.get("outputs", []))
+        except (OSError, TypeError, ValueError):
+            pass
+    for raw in declared:
+        raw = raw.strip()
+        if not raw:
+            continue
+        relative = not Path(raw).is_absolute()
+        if relative and ".." in Path(raw).parts:
+            continue
+        patterns = [raw] if not relative else [str(root / raw) for root in roots]
+        for pattern in patterns:
+            candidates = glob.iglob(pattern, recursive=True) if glob.has_magic(pattern) else iter((pattern,))
+            for candidate in candidates:
+                item = Path(candidate)
+                nested = item.rglob("*") if item.is_dir() and not glob.has_magic(pattern) else (item,)
+                for item in nested:
+                    if not item.is_file():
+                        continue
+                    if relative:
+                        try:
+                            resolved = item.resolve(strict=False)
+                            if not any(_inside_root(resolved, root) for root in roots):
+                                continue
+                        except OSError:
+                            continue
+                    try:
+                        stat = item.stat()
+                    except OSError:
+                        continue
+                    entries.append((str(item), stat.st_size, stat.st_mtime_ns))
+                    if len(entries) >= 256:
+                        break
+                if len(entries) >= 256:
+                    break
+            if len(entries) >= 256:
+                break
+        if len(entries) >= 256:
+            break
+    if not entries:
+        return ""
+    return hashlib.sha256(json.dumps(sorted(entries), separators=(",", ":")).encode()).hexdigest()
+
+
+def _inside_root(path, root):
+    try:
+        path.relative_to(root.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def _tool_event_source(metadata, log_path):
+    """The file that carries the owner's tool rows.
+
+    A supervised Claude owner's attempt log is a receipt log with control rows
+    only; it announces the child session whose own transcript has the tool
+    rows. The summary follower already resolves that transcript the same way.
+    """
+    try:
+        from dispatch_summary import announced_session, session_transcript
+        decided, announced = announced_session(log_path)
+        if (not decided or not isinstance(announced, dict) or announced.get("invalid")
+                or announced.get("runtime")):
+            return log_path
+        runtime_home = metadata.get("runtime_home") or None
+        return session_transcript(announced, runtime_home=runtime_home) or log_path
+    except (ImportError, OSError, ValueError, TypeError):
+        return log_path
+
+
+def runtime_tool_progress(metadata, previous=None):
+    """Read only the latest bounded native tool identity, never transcript prose."""
+    latest = previous or None
+    raw_path = metadata.get("log_file", "")
+    if not raw_path or not Path(raw_path).is_absolute():
+        return latest
+    try:
+        with _tool_event_source(metadata, Path(raw_path)).open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            start = max(0, handle.tell() - 262144)
+            handle.seek(start)
+            if start:
+                handle.readline()
+            lines = handle.read(262144).splitlines()
+    except OSError:
+        return latest
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind, item = event.get("type"), event.get("item")
+        if kind in {"item.started", "item.completed"} and isinstance(item, dict):
+            if item.get("type") in {"command_execution", "file_change", "mcp_tool_call", "web_search"} and item.get("id"):
+                latest = ["codex", str(item["id"])[:256], kind]
+        if kind in {"assistant", "user"} and isinstance(event.get("message"), dict):
+            content = event["message"].get("content")
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict):
+                    continue
+                block_type = block.get("type")
+                identity = block.get("id") if block_type == "tool_use" else block.get("tool_use_id")
+                if block_type in {"tool_use", "tool_result"} and identity:
+                    latest = ["claude", str(identity)[:256], block_type]
+        part = event.get("part")
+        if kind == "tool_use" and isinstance(part, dict) and part.get("type") == "tool":
+            state = part.get("state")
+            status = state.get("status") if isinstance(state, dict) else None
+            identity = part.get("callID") or part.get("id")
+            if identity and status in {"pending", "running", "completed", "error"}:
+                latest = ["opencode", str(identity)[:256], status]
+    return latest
+
+
+def verification_process_digest(pid):
+    """Hash the exact live argv without trusting the lease's copied command."""
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes().rstrip(b"\0")
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    return hashlib.sha256(raw).hexdigest()
+
+
+def verification_lease(jobs, attempt_id, route_id, route_node, now):
+    """Return one exact live runtime verification lease, else ``None``."""
+    from dispatch_contract import dispatch_state_root, process_start_ticks, process_state
+    path = (dispatch_state_root(jobs) / "verification-leases"
+            / f"{attempt_id.replace('/', '_')}.json")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    digest, pid, pgid, deadline = (value.get("command_digest"), value.get("pid"),
+                                   value.get("pgid"), value.get("deadline"))
+    if (value.get("schema_version") != 1 or value.get("attempt_id") != attempt_id
+            or value.get("route_id") != route_id or value.get("route_node") != route_node
+            or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(pid, int) or not isinstance(pgid, int) or pid <= 0 or pgid != pid
+            or not isinstance(deadline, (int, float)) or deadline < now
+            or process_start_ticks(pid) != str(value.get("pid_start") or "")
+            or process_state(pid) == "Z" or verification_process_digest(pid) != digest):
+        return None
+    try:
+        if os.getpgid(pid) != pgid:
+            return None
+    except OSError:
+        return None
+    return value
+
+
+def _observation_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _observation_read(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _observation_write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _attempt_human_wait(metadata, jobs):
+    route_file = metadata.get("owner_route_file") or metadata.get("route_file") or ""
+    if not route_file:
+        return None
+    path = Path(route_file)
+    if not path.is_absolute() or path.is_symlink():
+        return None
+    try:
+        route = json.loads(path.read_text(encoding="utf-8"))
+        expected = metadata.get("owner_route_id") or metadata.get("route_id")
+        expected_hash = metadata.get("owner_route_hash") or metadata.get("route_hash")
+        if (route.get("route_id") != expected
+                or (expected_hash and route.get("route_hash") != expected_hash)):
+            return None
+        from human_gate_observation import pending_human_waits
+        return bool(pending_human_waits(route, jobs=jobs))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return None
+
+
+def _safe_receipt_text(value, limit=2048):
+    if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 for char in value):
+        return ""
+    return value
+
+
+def _route_needs_attention(metadata, jobs, now):
+    """Read a recent needs-attention receipt from its exact effective parent."""
+    try:
+        route_file = metadata.get("owner_route_file") or metadata.get("route_file") or ""
+        route_path = Path(route_file)
+        expected_route_id = metadata.get("owner_route_id") or metadata.get("route_id")
+        expected_route_hash = metadata.get("owner_route_hash") or metadata.get("route_hash")
+        if (not route_path.is_absolute() or route_path.is_symlink() or not route_path.is_file()
+                or not expected_route_id or not expected_route_hash):
+            return None
+        route = json.loads(route_path.read_text(encoding="utf-8"))
+        from route_identity import route_hash
+        if (route.get("route_id") != expected_route_id
+                or route.get("route_hash") != expected_route_hash
+                or route_hash(route) != expected_route_hash):
+            return None
+        route_node = metadata.get("route_node")
+        if (route_node and route_node != "_owner"
+                and not any(item.get("id") == route_node
+                            for item in route.get("nodes", []) if isinstance(item, dict))):
+            return None
+        from dispatch_seat_handover import effective_parent, effective_parent_harness
+        parent = effective_parent(metadata, jobs)
+        harness = effective_parent_harness(metadata, jobs)
+        if not parent or harness not in {"claude", "codex", "opencode"}:
+            return None
+        key = hashlib.sha256(f"{harness}\0{parent}".encode()).hexdigest()
+        path = Path(jobs).resolve(strict=False).parent / "start-receipts" / f"{key}.json"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 4_000_000:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if (value.get("schema") != "start_receipt_v1"
+                or value.get("harness") != harness or value.get("session_id") != parent):
+            return None
+        saved_at = value.get("saved_at")
+        if type(saved_at) not in {int, float} or not math.isfinite(saved_at) or not 0 <= now - saved_at <= 3600:
+            return None
+        receipt = value.get("receipt")
+        if (not isinstance(receipt, dict) or receipt.get("state") != "needs-attention"
+                or receipt.get("route_id") != expected_route_id
+                or (receipt.get("route_hash") and receipt["route_hash"] != expected_route_hash)):
+            return None
+        bound_attempt = receipt.get("owner_attempt_id") or receipt.get("attempt_id")
+        allowed_attempts = {metadata.get("attempt_id"), metadata.get("parent_attempt_id"),
+                            metadata.get("owner_attempt_id")}
+        allowed_attempts.discard(None)
+        if bound_attempt and bound_attempt not in allowed_attempts:
+            return None
+        reason = _safe_receipt_text(receipt.get("reason"), 128)
+        action = _safe_receipt_text(receipt.get("required_action"), 128)
+        if not reason:
+            return None
+        command_kind = next((key.removesuffix("_command")
+                             for key in ("recovery_command", "resume_command", "parent_next_command")
+                             if _safe_receipt_text(receipt.get(key), 2048)), "")
+        command = _safe_receipt_text(receipt.get(command_kind + "_command"), 2048) if command_kind else ""
+        return {"reason": reason, "required_action": action,
+                "command": command, "command_kind": command_kind,
+                "next_step": _safe_receipt_text(receipt.get("next_step"), 512),
+                "gate": _safe_receipt_text(receipt.get("gate"), 128),
+                "parent_harness": harness, "parent_session_id": parent}
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, RuntimeError):
+        return None
+
+
+def _runtime_tool_active(event):
+    if not isinstance(event, list) or len(event) != 3:
+        return False
+    harness, _identity, state = event
+    return ((harness == "codex" and state == "item.started")
+            or (harness == "claude" and state == "tool_use")
+            or (harness == "opencode" and state in {"pending", "running"}))
+
+
+def update_attempt_stall_observation(jobs, attempt_id, *, now=None,
+                                     progress_window_seconds=300.0,
+                                     max_quiet_windows=2, persist=True, worktree=None,
+                                     row=None):
+    """Update one advisory observation without invoking watchdog terminal policy."""
+    from dispatch_contract import (
+        attempt_execution_observation, dispatch_state_root,
+    )
+    from tools.fleet.model import ATTEMPT_CLASSIFIER_SOURCE, deterministic_progress_fingerprint
+    jobs = Path(jobs).resolve(strict=True)
+    now = time.time() if now is None else float(now)
+    if row is None:
+        rows = _rows(jobs, {attempt_id})
+        row = rows.get(attempt_id)
+    if not row:
+        return None
+    status, metadata = row
+    if status not in {"open", "running"}:
+        return None
+    route_id = metadata.get("owner_route_id") or metadata.get("route_id") or ""
+    route_node = metadata.get("route_node") or ("_owner" if metadata.get("worker_type") == "owner" else "")
+    if not route_id or not route_node:
+        return {"state": "unknown", "reason": "route-binding-unavailable",
+                "attempt_id": attempt_id, "route_id": route_id, "route_node": route_node}
+    state_root = dispatch_state_root(jobs)
+    name = attempt_id.replace("/", "_")
+    heartbeat_path = state_root / "heartbeats" / f"{name}.json"
+    watchdog_path = state_root / "watchdog" / f"{name}.json"
+    lock_path = state_root / "watchdog" / f"{name}.lock"
+    hb = _observation_read(heartbeat_path)
+    fd = _observation_lock(lock_path) if persist else None
+    try:
+        state = _observation_read(watchdog_path)
+        tool_event = runtime_tool_progress(metadata, state.get("runtime_tool_event"))
+        lease = verification_lease(jobs, attempt_id, route_id, route_node, now)
+        fingerprint = deterministic_progress_fingerprint({
+            "attempt_id": attempt_id, "route_id": route_id, "route_node": route_node,
+            "heartbeat": hb or None, "tool": tool_event,
+            "registry_transition": {"status": status, "note": metadata.get("note", "")},
+            "file_signature": scoped_file_signature(
+                metadata, worktree if worktree is not None else metadata.get("_stall_worktree", "")),
+            "artifact_signature": metadata.get("artifact_sha256") or None,
+            "background_verification": ({
+                "command_digest": lease.get("command_digest"), "pid": lease.get("pid"),
+                "pid_start": lease.get("pid_start"), "deadline": lease.get("deadline"),
+            } if lease else None),
+        })
+        same_binding = (state.get("schema_version") == 1
+                        and state.get("attempt_id") == attempt_id
+                        and state.get("route_id") == route_id
+                        and state.get("route_node") == route_node)
+        try:
+            last_progress = float(state.get("last_progress_at")) if same_binding else now
+            last_window = float(state.get("last_window_at", last_progress)) if same_binding else now
+            quiet = max(0, int(state.get("quiet_windows", 0))) if same_binding else 0
+        except (TypeError, ValueError, OverflowError):
+            last_progress, last_window, quiet = now, now, 0
+            same_binding = False
+        if not same_binding:
+            try:
+                baseline = float(hb.get("updated_at"))
+                if not math.isfinite(baseline):
+                    baseline = now
+            except (TypeError, ValueError, OverflowError):
+                baseline = now
+            last_progress = last_window = baseline
+            quiet = 0
+        elif fingerprint != state.get("fingerprint"):
+            last_progress, last_window, quiet = now, now, 0
+        else:
+            elapsed_windows = max(0, int((now - last_window) // max(1.0, progress_window_seconds)))
+            if elapsed_windows:
+                quiet += elapsed_windows
+                last_window += elapsed_windows * max(1.0, progress_window_seconds)
+        if lease:
+            last_progress = last_window = now
+            quiet = 0
+
+        execution = attempt_execution_observation(metadata)
+        human_wait = _attempt_human_wait(metadata, jobs)
+        route_attention = _route_needs_attention(metadata, jobs, now)
+        resource_wait = (metadata.get("worker_type") == "resource"
+                         or metadata.get("resource_run_id")
+                         or metadata.get("resource_id"))
+        tool_active = _runtime_tool_active(tool_event)
+        if human_wait is None:
+            observation_state, reason = "unknown", "human-gate-observation-unverifiable"
+        elif human_wait:
+            observation_state, reason = "waiting", "raised-human-gate"
+        elif route_attention:
+            observation_state, reason = "stalled", "route-needs-attention"
+        elif resource_wait:
+            observation_state, reason = "waiting", "resource-watch-owns-progress"
+        elif lease:
+            observation_state, reason = "active", "exact-verification-lease"
+        elif execution.state == "absent":
+            if tool_active:
+                observation_state, reason = "unknown", "runtime-tool-active-process-absent"
+            else:
+                from codex_dispatch_terminal import terminal_envelope_observed
+                if terminal_envelope_observed(metadata.get("log_file")):
+                    observation_state, reason = "stalled", "settlement-unresolved"
+                else:
+                    observation_state, reason = "stalled", "execution-absent"
+        elif (execution.state == "unknown" and tool_active
+              and any(len(identity) >= 3 and str(identity[2]).startswith("unclassified:")
+                      for identity in execution.identities)):
+            observation_state, reason = "active", "native-tool-process-live"
+        elif execution.state == "unknown":
+            observation_state, reason = "unknown", execution.reason or "execution-unverifiable"
+        elif tool_active:
+            observation_state, reason = "active", "native-tool-active"
+        elif quiet >= max_quiet_windows:
+            observation_state, reason = "stalled", "no-comparable-progress"
+        else:
+            observation_state, reason = "active", "within-progress-window"
+
+        prior = state.get("stall_observation") if isinstance(state.get("stall_observation"), dict) else {}
+        unknown_since = (prior.get("unknown_since") if prior.get("state") in {"observing", "unknown"}
+                         and prior.get("reason") == reason else now)
+        if observation_state == "unknown":
+            try:
+                persisted_unknown_since = float(unknown_since)
+            except (TypeError, ValueError):
+                persisted_unknown_since = now
+            if now - persisted_unknown_since < progress_window_seconds * max_quiet_windows:
+                unresolved_state = "observing"
+            else:
+                unresolved_state = "unknown"
+        else:
+            persisted_unknown_since = None
+            unresolved_state = observation_state
+        if unresolved_state in {"stalled", "unknown"}:
+            if prior.get("state") in {"stalled", "unknown"} and prior.get("episode_id"):
+                episode_id = prior["episode_id"]
+                first_observed_at = prior.get("first_observed_at", now)
+            else:
+                episode_seed = json.dumps([attempt_id, route_id, route_node, now,
+                                           last_progress, unresolved_state], separators=(",", ":"))
+                episode_id = "stall-" + hashlib.sha256(episode_seed.encode()).hexdigest()[:32]
+                first_observed_at = now
+        else:
+            episode_id = prior.get("episode_id", "")
+            first_observed_at = prior.get("first_observed_at", now)
+        observation = {
+            "schema_version": 1, "attempt_id": attempt_id,
+            "route_id": route_id, "route_node": route_node,
+            "state": unresolved_state, "reason": reason,
+            "execution_state": execution.state, "execution_reason": execution.reason,
+            "execution_identities": [list(item) for item in execution.identities],
+            "route_attention": route_attention,
+            "progress_fingerprint": fingerprint,
+            "last_progress_at": last_progress, "quiet_windows": quiet,
+            "observed_at": now, "first_observed_at": first_observed_at,
+            "unknown_since": persisted_unknown_since, "episode_id": episode_id,
+        }
+        state.update({"schema_version": 1, "attempt_id": attempt_id,
+                      "route_id": route_id, "route_node": route_node,
+                      "classifier_source": ATTEMPT_CLASSIFIER_SOURCE,
+                      "fingerprint": fingerprint, "runtime_tool_event": tool_event,
+                      "last_progress_at": last_progress, "last_window_at": last_window,
+                      "quiet_windows": quiet, "warning": int(quiet >= 1),
+                      "observed_at": now, "stall_observation": observation})
+        if persist and _observation_changed(_observation_read(watchdog_path), state):
+            _observation_write(watchdog_path, state)
+        if unresolved_state not in {"stalled", "unknown"}:
+            return observation
+        return observation
+    finally:
+        if fd is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _observation_changed(before, after):
+    """Ignore observation timestamps when deciding whether durable state changed."""
+    old = dict(before)
+    new = dict(after)
+    old.pop("observed_at", None)
+    new.pop("observed_at", None)
+    old_stall = dict(old.get("stall_observation") or {})
+    new_stall = dict(new.get("stall_observation") or {})
+    old_stall.pop("observed_at", None)
+    new_stall.pop("observed_at", None)
+    if old_stall:
+        old["stall_observation"] = old_stall
+    if new_stall:
+        new["stall_observation"] = new_stall
+    return old != new
+
+
+def _open_attempt_rows(jobs):
+    jobs = Path(jobs).resolve(strict=False)
+    if not jobs.is_file():
+        return []
+    view = registry_view(jobs)
+    result = []
+    seen = set()
+    for record in view.records:
+        if record.status not in {"open", "running"}:
+            continue
+        metadata = record.completion_metadata()
+        attempt_id = metadata.get("attempt_id", "")
+        if (not attempt_id or attempt_id in seen
+                or not metadata.get("parent_sid")
+                or not metadata.get("parent_completion_delivery")
+                or not (metadata.get("owner_route_id") or metadata.get("route_id"))):
+            continue
+        if len(record.fields) > 3:
+            metadata["_stall_worktree"] = record.fields[3]
+        seen.add(attempt_id)
+        result.append((record.status, metadata))
+    return result
+
+
+def has_unowned_stall_observation(jobs):
+    """Read-only runner wake predicate for unresolved open attempt observations."""
+    try:
+        return bool(stall_observer_signature(jobs))
+    except (OSError, ValueError, RuntimeError):
+        return True
+
+
+def stall_observer_signature(jobs):
+    """Return exact unresolved observation identities without writing state."""
+    from dispatch_contract import process_table_scan_scope
+    values = []
+    rows = _open_attempt_rows(jobs)
+    with process_table_scan_scope():
+        for status, metadata in rows:
+            attempt_id = metadata.get("attempt_id", "")
+            observation = update_attempt_stall_observation(
+                jobs, attempt_id, persist=False, row=(status, metadata))
+            if observation and observation.get("state") in {"stalled", "unknown"}:
+                values.append((attempt_id, observation.get("state"),
+                               observation.get("episode_id", "")))
+    return tuple(sorted(values))
+
+
+def update_open_attempt_stall_observations(jobs):
+    """Advance the existing bounded observer pass and retain exact stall notices."""
+    from dispatch_contract import process_table_scan_scope
+    jobs = Path(jobs).resolve(strict=True)
+    records = []
+    with process_table_scan_scope():
+        for status, metadata in _open_attempt_rows(jobs):
+            attempt_id = metadata.get("attempt_id", "")
+            observation = update_attempt_stall_observation(
+                jobs, attempt_id, persist=True, row=(status, metadata))
+            if not observation or observation.get("state") not in {"stalled", "unknown"}:
+                continue
+            try:
+                records.extend(materialize(jobs, {attempt_id}, reason="attempt-stalled"))
+            except (OSError, ValueError, RuntimeError, SupervisionError):
+                # The row and advisory observation stay open for the next normal pass.
+                continue
+    return records
+
+
+def _attach_stall_delivery(jobs, attempt_id, record):
+    """Bind the read-only Fleet projection to the exact retained delivery."""
+    from dispatch_contract import dispatch_state_root
+    receipt = record.get("receipt") if isinstance(record, dict) else None
+    recipient = receipt.get("recipient_thread_id") if isinstance(receipt, dict) else None
+    monitored = receipt.get("monitored_attempt_ids") if isinstance(receipt, dict) else None
+    delivery_id = record.get("delivery_id") if isinstance(record, dict) else None
+    digest = record.get("receipt_digest") if isinstance(record, dict) else None
+    recipient_digest = record.get("recipient_digest") if isinstance(record, dict) else None
+    if (not isinstance(receipt, dict)
+            or not isinstance(monitored, list) or attempt_id not in monitored
+            or not receipt.get("owner_attempt_id") or not recipient
+            or delivery_id != receipt.get("pending_delivery_id")
+            or digest != receipt_digest(receipt)
+            or recipient_digest != pending_delivery.recipient_digest(recipient)):
+        return
+    name = attempt_id.replace("/", "_")
+    path = dispatch_state_root(jobs) / "watchdog" / f"{name}.json"
+    lock_path = path.with_suffix(".lock")
+    fd = _observation_lock(lock_path)
+    try:
+        state = _observation_read(path)
+        observation = state.get("stall_observation")
+        if (not isinstance(observation, dict)
+                or observation.get("attempt_id") != attempt_id):
+            return
+        observation.update({
+            "delivery_id": delivery_id,
+            "notice_digest": digest,
+            "delivery_owner_attempt_id": receipt["owner_attempt_id"],
+            "delivery_recipient_thread_id": recipient,
+            "delivery_recipient_digest": recipient_digest,
+            "delivery_recipient_kind": record.get("recipient_kind"),
+            "obligation_revision": receipt.get("obligation_revision"),
+        })
+        state["stall_observation"] = observation
+        _observation_write(path, state)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def join_process_error(returncode: int, receipt: object, parent_attempt_id: str) -> str:
@@ -47,8 +662,13 @@ def join_process_error(returncode: int, receipt: object, parent_attempt_id: str)
     return f"join-process-contract-failed:exit={returncode}:reason={reason}"
 
 
-def _rows(jobs: Path, attempts: Iterable[str] | None = None) -> dict:
+def _rows(jobs: Path, attempts: Iterable[str] | None = None, *,
+          require_unique: bool = False) -> dict:
     view = registry_view(Path(jobs))
+    if require_unique and view.has_duplicate_attempts:
+        # The registry-wide duplicate refusal of an unfiltered read, kept for
+        # callers that now look up only the attempts they own.
+        raise SupervisionError("supervision-attempt-ambiguous")
     rows = {}
     if attempts is None:
         selected = ((record, record.completion_metadata()) for record in view.records)
@@ -76,10 +696,21 @@ def _rows(jobs: Path, attempts: Iterable[str] | None = None) -> dict:
     for record, meta in selected:
         aid = meta.get("attempt_id")
         if aid:
+            if len(record.fields) > 3:
+                meta["_stall_worktree"] = record.fields[3]
             if aid in rows:
                 raise SupervisionError("supervision-attempt-ambiguous")
             rows[aid] = (record.status, meta)
     return rows
+
+
+def _owned_rows(jobs: Path, attempt_id: str) -> dict:
+    """Rows of one owner and its direct children, without parsing the registry."""
+    view = registry_view(Path(jobs))
+    ids = {attempt_id} | {meta.get("attempt_id") for meta in
+                          (record.completion_metadata() for record in view.completion_children(attempt_id))
+                          if meta.get("attempt_id")}
+    return _rows(jobs, ids, require_unique=True)
 
 
 def _root(rows: dict, attempt: str) -> str:
@@ -97,14 +728,63 @@ def _root(rows: dict, attempt: str) -> str:
 def _awaiting_answers(jobs: Path, aid: str) -> list[str]:
     """The kept answers of a BLOCKED owner whose continuation has not launched yet."""
     from dispatch_owner_input import blocked_owner_answers
-    from dispatch_replacement import _replacement_in_flight, _rows as replacement_rows
+    from dispatch_replacement import _replacement_in_flight, registry_rows
     answers = blocked_owner_answers(jobs, aid)
     if not answers:
         return []
-    rows = replacement_rows(Path(jobs).read_text(encoding="utf-8").splitlines())
+    rows = registry_rows(jobs)
     if aid in rows and _replacement_in_flight(jobs, rows, rows[aid][1]):
         return []
     return [item["id"] for item in answers]
+
+
+def _attempt_stall_superseded(jobs: Path, aid: str, metadata: dict) -> bool:
+    """A claimed replacement or linked retry owns the route's live attempt now."""
+    from dispatch_replacement import (
+        _plain_retry_successor, _replacement_in_flight, registry_rows,
+    )
+    try:
+        rows = registry_rows(jobs)
+    except (OSError, UnicodeError, ValueError):
+        return True
+    if aid not in rows:
+        return True
+    if _replacement_in_flight(jobs, rows, metadata) or _plain_retry_successor(rows, aid):
+        return True
+    if any(candidate.get("replacement_original_attempt_id") == aid
+           and fields[1] in {"open", "running", "done"}
+           for fields, candidate in rows.values()):
+        return True
+    marker_path = metadata.get("completion_marker", "")
+    route_file = metadata.get("owner_route_file") or metadata.get("route_file") or ""
+    if marker_path and route_file:
+        marker_file, route_path = Path(marker_path), Path(route_file)
+        if (not marker_file.is_absolute() or not route_path.is_absolute()
+                or marker_file.is_symlink() or route_path.is_symlink()):
+            return False
+        try:
+            route = json.loads(route_path.read_text(encoding="utf-8"))
+            node_id = metadata.get("route_node") or "_owner"
+            node = next(item for item in route.get("nodes", []) if item.get("id") == node_id)
+            marker = json.loads(marker_file.read_text(encoding="utf-8"))
+            from dispatch_contract import completion_marker_is_current
+            if (marker.get("attempt_id") == aid
+                    and completion_marker_is_current(route, node, marker_file, marker, jobs=jobs)):
+                return True
+        except (OSError, UnicodeError, ValueError, TypeError, StopIteration):
+            pass
+    return False
+
+
+def _settlement_decision(status: str, meta: dict):
+    from dispatch_contract import observed_attempt_liveness
+    from codex_dispatch_terminal import terminal_envelope_observed
+    proof = observed_attempt_liveness(status, meta,
+        terminal_envelope=terminal_envelope_observed(meta.get("log_file")),
+        terminal_receipt_gate=True)
+    decision = decide_attempt(status, meta, process_state=proof.process_state,
+                              process_reason=proof.process_reason)
+    return proof, decision
 
 
 def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
@@ -117,6 +797,16 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
         return any(unresolved(jobs, aid) for aid in attempts)
     if reason == ANSWER_AWAITING_PARENT:
         return any(_awaiting_answers(jobs, aid) for aid in attempts)
+    if reason == "attempt-stalled":
+        for aid in attempts:
+            metadata = (rows.get(aid) or (None, {}))[1]
+            if _attempt_stall_superseded(jobs, aid, metadata):
+                continue
+            status = update_attempt_stall_observation(jobs, aid, persist=False,
+                                                       row=rows.get(aid))
+            if status and status.get("state") in {"stalled", "unknown"}:
+                return True
+        return False
     if reason == "no-progress":
         from dispatch_replacement import parent_resume_obligation
         for aid in attempts:
@@ -125,8 +815,6 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
             if parent_resume_obligation(jobs, aid, route_id=route_id) is not None:
                 return True
         return False
-    from dispatch_contract import observed_attempt_liveness
-    from codex_dispatch_terminal import terminal_envelope_observed
     for aid in attempts:
         if aid not in rows:
             raise SupervisionError("supervision-attempt-missing")
@@ -136,13 +824,7 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
         # unknown, or conflicting execution.
         from dispatch_notice_state import route_obligation_closed
         route_closed = reason == "supervisor-exited" and route_obligation_closed(meta, jobs)
-        from dispatch_contract import observed_attempt_liveness
-        from codex_dispatch_terminal import terminal_envelope_observed
-        proof = observed_attempt_liveness(status, meta,
-            terminal_envelope=terminal_envelope_observed(meta.get("log_file")),
-            terminal_receipt_gate=True)
-        decision = decide_attempt(status, meta, process_state=proof.process_state,
-                                  process_reason=proof.process_reason)
+        _proof, decision = _settlement_decision(status, meta)
         if decision.action in {"wait", "recover", "reconcile", "inspect-conflict"}:
             return True
         # A supervisor-exited notice may be only a lagging route-settlement
@@ -164,6 +846,20 @@ def _obligation_revision(rows: dict, attempts: list[str], reason: str, jobs=None
     if reason == ANSWER_AWAITING_PARENT:
         return hashlib.sha256(json.dumps([(aid, _awaiting_answers(jobs, aid))
                                           for aid in attempts]).encode()).hexdigest()
+    if reason == "attempt-stalled":
+        values = []
+        for aid in attempts:
+            observation = update_attempt_stall_observation(
+                jobs, aid, persist=False, row=rows.get(aid))
+            if observation is None:
+                values.append((aid, "missing", "", ""))
+            else:
+                state = observation.get("state", "unknown")
+                values.append((aid, state, observation.get("episode_id", ""),
+                               "" if state in {"stalled", "unknown"}
+                               else observation.get("progress_fingerprint", "")))
+        return hashlib.sha256(json.dumps(values, sort_keys=True,
+            separators=(",", ":")).encode()).hexdigest()
     if reason != "terminal-evidence-conflict":
         return ""
     value = [(aid, terminal_conflict_digest(rows[aid][1])) for aid in attempts]
@@ -208,6 +904,16 @@ def materialize(jobs: Path, attempts: set[str], *, reason: str) -> list[dict]:
             route_node=meta.get("route_node") or "supervision",
             receipt=receipt, receipt_digest=receipt_digest(receipt),
             row_revisions={owner: "supervision:" + key})
+        if reason == "attempt-stalled":
+            for monitored_attempt in receipt["monitored_attempt_ids"]:
+                _attach_stall_delivery(jobs, monitored_attempt, record)
+            try:
+                from peer_obligations import retain_registered_notice
+                retain_registered_notice(jobs, record)
+            except (OSError, ValueError, RuntimeError):
+                # The canonical pending record remains discoverable on the next
+                # normal observation pass if retention is temporarily unavailable.
+                pass
         results.append(record)
     return results
 
@@ -562,6 +1268,71 @@ def render_text(receipt: dict, *, continued: dict | None = None) -> str:
     completed = _cleanup_only_result(receipt)
     if completed is not None:
         return _cleanup_only_text(receipt, completed)
+    if receipt["reason"] == "attempt-stalled":
+        rows = _rows(Path(receipt["job_registry"]),
+                     set(receipt["monitored_attempt_ids"]) | {receipt["owner_attempt_id"]})
+        messages = []
+        route_commands = []
+        for aid in receipt["monitored_attempt_ids"]:
+            status, metadata = rows.get(aid, ("unknown", {}))
+            observation = update_attempt_stall_observation(
+                Path(receipt["job_registry"]), aid, persist=False,
+                row=(status, metadata) if metadata else None)
+            route_id = metadata.get("owner_route_id") or metadata.get("route_id") or "unknown-route"
+            route_node = metadata.get("route_node") or ("_owner" if metadata.get("worker_type") == "owner" else "unknown-node")
+            route_attention = observation.get("route_attention") if observation else None
+            if isinstance(route_attention, dict):
+                reason = route_attention.get("reason") or "needs-attention"
+                action = route_attention.get("required_action") or "inspect-recovery"
+                command = route_attention.get("command") or ""
+                gate = route_attention.get("gate")
+                detail = f"; gate={gate}" if gate else ""
+                if command:
+                    route_commands.append((route_attention.get("command_kind") or "recovery", command))
+                if reason == "work-parent-recovery-required":
+                    authority = " This is a current-parent authority handoff, not human approval."
+                elif reason.startswith("human-gate-"):
+                    authority = " This gate state is distinct from parent authority and an active human wait."
+                else:
+                    authority = ""
+                messages.append(f"{route_id}/{route_node} attempt {aid}: route needs attention; "
+                                f"reason={reason}; required_action={action}{detail}.{authority}")
+                continue
+            if not observation or observation.get("state") == "unknown":
+                messages.append(f"{route_id}/{route_node} attempt {aid}: execution or progress is unverified; "
+                                "do not infer that it ended")
+            elif observation.get("reason") == "execution-absent":
+                messages.append(f"{route_id}/{route_node} attempt {aid}: no exact runtime/command process "
+                                "is present; a carrier may still be alive")
+            elif observation.get("reason") == "settlement-unresolved":
+                messages.append(f"{route_id}/{route_node} attempt {aid}: the exact runtime result is present, "
+                                "but route settlement or its completion marker remains pending")
+            else:
+                try:
+                    quiet = max(0, int(observation.get("quiet_windows", 0)))
+                except (TypeError, ValueError, OverflowError):
+                    quiet = 0
+                last = observation.get("last_progress_at")
+                try:
+                    age = max(0, int(time.time() - float(last))) if last is not None else None
+                except (TypeError, ValueError, OverflowError):
+                    age = None
+                duration = f"; last comparable progress {age}s ago" if age is not None else ""
+                messages.append(f"{route_id}/{route_node} attempt {aid}: no comparable progress for "
+                                f"{quiet} watchdog windows{duration}")
+        if route_commands:
+            kind, command = route_commands[0]
+            next_command = f"Existing next-command for the current parent ({kind}): {command}. "
+            next_command += "The route's existing authority and gate checks still apply."
+        else:
+            aid = receipt["monitored_attempt_ids"][0]
+            command = shlex.join(["python3", str(Path(__file__).resolve().parents[1]
+                                                    / "utilities/dispatch-registry.py"),
+                                  "reconcile", "--jobs", receipt["job_registry"],
+                                  "--attempt", aid])
+            next_command = "Read-only next command: " + command + "."
+        return ("Needs attention: " + "; ".join(messages) + ". This notice did not start, retry, "
+                "signal, approve, release a gate, or close the attempt. " + next_command)
     if receipt["reason"] == ANSWER_AWAITING_PARENT:
         if continued:
             return ("Another session answered owner " + receipt["owner_attempt_id"] + ", which ended BLOCKED; "
@@ -811,5 +1582,30 @@ def wait_for_child_settlement(*, jobs: Path, attempts: set[str],
             time.sleep(1.0)
         return {"state": "timeout"}
 
+    def held_by_conflict() -> str:
+        """End the wait only when every remaining child is a settled, unreviewed conflict.
+
+        Open, live, or recoverable work keeps the wait; a closed and quiescent
+        child that only a person's review can change would otherwise hold this
+        supervisor, and its watchers, forever.
+        """
+        from dispatch_contract import PARENT_EXTINCTION_TERMINAL_STATUSES
+        rows = _rows(jobs, attempts)
+        held = False
+        for aid in sorted(attempts):
+            if aid not in rows:
+                return ""
+            if not _pending({aid: rows[aid]}, [aid], jobs):
+                continue
+            status, meta = rows[aid]
+            proof, decision = _settlement_decision(status, meta)
+            if (decision.action != "inspect-conflict"
+                    or status not in PARENT_EXTINCTION_TERMINAL_STATUSES
+                    or proof.process_state != "quiescent"):
+                return ""
+            held = True
+        return "terminal-evidence-conflict" if held else ""
+
     wait_for_batch(join=observe, attempts=attempts, jobs=jobs,
-                   parent_attempt_id=parent_attempt_id, emit=emit)
+                   parent_attempt_id=parent_attempt_id, emit=emit,
+                   stop_check=held_by_conflict)

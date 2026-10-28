@@ -38,6 +38,12 @@ class IdleObserverTests(unittest.TestCase):
         self.pane_patch = mock.patch.object(pane_ownership, "verified_pane", side_effect=lambda pane, *a, **kw: pane or "")
         self.pane_patch.start()
         self.addCleanup(self.pane_patch.stop)
+        # These idle-policy fixtures supply a synthetic pane. A real Codex
+        # parent must not turn that fixture into an unrelated caller proof.
+        self.caller_patch = mock.patch.object(pane_ownership, "_caller_runtime",
+                                               return_value=(None, False))
+        self.caller_patch.start()
+        self.addCleanup(self.caller_patch.stop)
         self.started = []
 
     def transcript(self, sid: str, tokens: int | None):
@@ -464,8 +470,9 @@ class IdleObserverTests(unittest.TestCase):
              mock.patch.object(clear, "_run_idle_card_request") as request, \
              mock.patch.object(runner, "start_detached", return_value=12345), \
              mock.patch.object(handover, "collect_snapshot_bindings", return_value=[]), \
-             mock.patch.object(st, "resolve_seat", side_effect=lambda harness, cwd=None, *a, **kw:
-                               st.Seat("pane", st._digest("pane", self.pane), self.pane, harness, "")):
+             mock.patch.object(st, "resolve_seat", side_effect=lambda harness, cwd=None, env=None, sid=None, *a, **kw:
+                               st.session_seat(st.Seat("pane", st._digest("pane", self.pane),
+                                                       self.pane, harness, ""), harness, sid or "")):
             request_text = {"text": ""}
 
             def send_once(path, nonce, pane):
@@ -520,7 +527,7 @@ class IdleObserverTests(unittest.TestCase):
             request.assert_called_once()
             settled = clear.read_reservation(seat.key)
             self.assertEqual(settled["continued"]["kind"], "status-only")
-            self.assertEqual(settled["continued"]["status_prompt_seq"], 2)
+            self.assertEqual(settled["continued"]["status_prompt_seq"], 1)
             self.assertFalse(clear.idle_clear_armed(seat, "claude", "sid-B"))
 
             successor_payload = {"hook_event_name": "Stop", "session_id": "sid-B", "cwd": str(self.cwd),

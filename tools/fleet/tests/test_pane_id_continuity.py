@@ -30,6 +30,11 @@ class PaneContinuityTest(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state")})
         env.start()
         self.addCleanup(env.stop)
+        # These fixtures key panes from their env alone, whatever herdr runs on the host;
+        # endpoint discovery is covered by EndpointDiscoveryTest.
+        discovery = mock.patch.object(session_tidy, "_herdr_endpoint_socket", return_value="")
+        discovery.start()
+        self.addCleanup(discovery.stop)
 
     def record(self, harness, sid, pane="w:p", cwd=None, source="resume", now=100):
         seat = session_tidy._pane_seat_of(pane)
@@ -396,6 +401,270 @@ class PaneContinuityTest(unittest.TestCase):
                  mock.patch.object(herdr_projection.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run:
                 herdr_projection._report(harness, "current", "w:p", True, session_seq=100, session_start_source="resume")
                 self.assertEqual(run.call_args_list[0].args[0][-4:], ["--seq", "100", "--session-start-source", "resume"])
+
+
+# Fixture data only: the socket herdr reported on the host where e8 (w18:p7) lost its history.
+FIXTURE_SOCKET = "/home/Uihyeop/.config/herdr/herdr.sock"
+E8_KEY = "cd408b2b164213cb18a8"         # (FIXTURE_SOCKET, w18:p7): the seat e8's own hooks wrote
+E8_LEGACY_KEY = "d0be643a697d29c02ff6"  # endpoint-free w18:p7: what a viewer outside herdr used to read
+E8_SIDS = ("7dcee068-0000-4000-8000-000000000001", "bbf14dfc-0000-4000-8000-000000000002",
+           "5ed20fe8-499b-4490-a87f-f492612948cf")
+
+
+class EndpointDiscoveryTest(unittest.TestCase):
+    """A pane seat key is a function of (endpoint socket, pane id), not of the reader being in herdr."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.repo = self.root / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        self.status_file = self.root / "status.json"
+        self.agents_file = self.root / "agents.json"
+        self.calls_file = self.root / "herdr-calls.txt"
+        fake = self.root / "fake-herdr"
+        fake.write_text("#!/bin/sh\n"
+                        f'echo "$@" >> "{self.calls_file}"\n'
+                        'case "$*" in\n'
+                        f'  *"status server"*) cat "{self.status_file}" ;;\n'
+                        f'  *"agent list"*) cat "{self.agents_file}" ;;\n'
+                        "esac\n", encoding="utf-8")
+        fake.chmod(0o755)
+        executable = mock.patch.object(session_tidy, "_herdr_executable", return_value=str(fake))
+        executable.start()
+        self.addCleanup(executable.stop)
+        session_tidy._HERDR_ENDPOINT_SOCKETS.clear()
+        self.addCleanup(session_tidy._HERDR_ENDPOINT_SOCKETS.clear)
+
+    def process_env(self, **extra):
+        """A process environment with no inherited Herdr values unless named here."""
+        env = {"XDG_STATE_HOME": str(self.root / "state"), "HOME": str(self.root / "home"),
+               "PATH": os.environ.get("PATH") or "/usr/bin:/bin", **extra}
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def status(self, **answer):
+        self.status_file.write_text(json.dumps(answer), encoding="utf-8")
+
+    def calls(self):
+        return self.calls_file.read_text(encoding="utf-8").splitlines() if self.calls_file.exists() else []
+
+    def record(self, seat, harness, sid, event="start", **kwargs):
+        with session_tidy.seat_lock(seat.key):
+            return session_tidy.record_event(seat, harness, sid, event, cwd=str(self.repo), **kwargs)
+
+    def book(self, pane, key, sid, status="reserved"):
+        import session_tidy_clear
+        now = session_tidy.now_epoch()
+        session_tidy_clear._write_reservation({
+            "schema": 1, "nonce": "n" + key[:6], "status": status, "created": now - 30,
+            "deadline": now + 500, "harness": "codex", "sid": sid, "cwd": str(self.repo),
+            "seat": {"kind": "pane", "key": key, "pane": pane, "harness": "codex", "project_key": ""},
+            "card_generation": 1, "prompt_seq": 1})
+
+    def test_t1_viewer_outside_herdr_keys_the_pane_by_the_socket_herdr_reports(self):
+        self.status(running=True, socket=FIXTURE_SOCKET, session=None)
+        with self.process_env():
+            seats = [session_tidy._pane_seat_of("w18:p7") for _ in range(3)]
+            endpoint = session_tidy._endpoint_scope()
+        self.assertEqual([seat.key for seat in seats], [E8_KEY] * 3)
+        self.assertEqual(endpoint, session_tidy._endpoint_scope({"HERDR_SOCKET_PATH": FIXTURE_SOCKET}))
+        self.assertEqual((seats[0].endpoint, seats[0].socket_path), (endpoint, FIXTURE_SOCKET))
+        self.assertNotIn("socket_path", seats[0].as_dict())
+        self.assertEqual(self.calls(), ["status server --json"])
+
+    def test_t2_named_session_uses_its_socket_only_while_herdr_runs_it_under_that_name(self):
+        named = str(self.root / "left.sock")
+        by_socket = session_tidy._digest("herdr-endpoint", "socket", os.path.realpath(named))
+        by_name = session_tidy._digest("herdr-endpoint", "session", "left")
+        for answer, expected in (({"running": True, "socket": named, "session": "left"}, by_socket),
+                                 ({"running": False, "socket": named, "session": "left"}, by_name),
+                                 ({"running": True, "socket": named, "session": "other"}, by_name),
+                                 ({"running": True, "socket": named, "session": None}, by_name),
+                                 ({"running": True, "socket": "", "session": "left"}, by_name)):
+            with self.subTest(answer=answer):
+                session_tidy._HERDR_ENDPOINT_SOCKETS.clear()
+                self.calls_file.unlink(missing_ok=True)
+                self.status(**answer)
+                with self.process_env(AGENT_HERDR_SESSION="left"):
+                    self.assertEqual(session_tidy._endpoint_scope(), expected)
+                    seat = session_tidy._pane_seat_of("w:p")
+                self.assertEqual(seat.key, session_tidy._digest("pane", expected, "w:p"))
+                self.assertEqual(seat.socket_path, named if expected == by_socket else "")
+                self.assertEqual(self.calls(), ["--session left status server --json"])
+        # The default server is null, "" or "default" in herdr's answer, never another name.
+        for name, expected in ((None, E8_KEY), ("", E8_KEY), ("default", E8_KEY), ("left", E8_LEGACY_KEY)):
+            with self.subTest(default_session=name):
+                session_tidy._HERDR_ENDPOINT_SOCKETS.clear()
+                self.status(running=True, socket=FIXTURE_SOCKET, session=name)
+                with self.process_env():
+                    self.assertEqual(session_tidy._pane_seat_of("w18:p7").key, expected)
+
+    def test_t3_missing_or_unreadable_herdr_keeps_the_old_key_and_is_asked_again_after_60s(self):
+        with mock.patch.object(session_tidy, "_herdr_executable", return_value=None) as missing, \
+                self.process_env():
+            self.assertEqual(session_tidy._endpoint_scope(), "")
+            seat = session_tidy._pane_seat_of("w18:p7")
+            self.assertEqual((seat.key, seat.socket_path), (E8_LEGACY_KEY, ""))
+        self.assertEqual(missing.call_count, 1)
+
+        session_tidy._HERDR_ENDPOINT_SOCKETS.clear()
+        self.status_file.write_text("not json", encoding="utf-8")
+        with self.process_env():
+            for _ in range(3):
+                self.assertEqual(session_tidy._pane_seat_of("w18:p7").key, E8_LEGACY_KEY)
+            self.assertEqual(self.calls(), ["status server --json"])
+            # herdr answers later: a miss older than the retry window is asked once more.
+            self.status(running=True, socket=FIXTURE_SOCKET, session=None)
+            found, asked = session_tidy._HERDR_ENDPOINT_SOCKETS[""]
+            session_tidy._HERDR_ENDPOINT_SOCKETS[""] = (found, asked - session_tidy.HERDR_ENDPOINT_RETRY_SEC - 1)
+            self.assertEqual(session_tidy._pane_seat_of("w18:p7").key, E8_KEY)
+            self.assertEqual(session_tidy._pane_seat_of("w18:p7").key, E8_KEY)
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_t4_an_inherited_socket_or_pane_is_used_without_asking_herdr(self):
+        self.status(running=True, socket=FIXTURE_SOCKET, session=None)
+        inherited = str(self.root / "inherited.sock")
+        with self.process_env(HERDR_SOCKET_PATH=inherited, AGENT_HERDR_SESSION="left"):
+            seat = session_tidy._pane_seat_of("w18:p7")
+        endpoint = session_tidy._digest("herdr-endpoint", "socket", os.path.realpath(inherited))
+        self.assertEqual((seat.endpoint, seat.socket_path), (endpoint, inherited))
+        # A pane process keys from its env as that pane's own hooks do.
+        with self.process_env(HERDR_PANE_ID="w18:p7"):
+            seat = session_tidy._pane_seat_of("w18:p7")
+        self.assertEqual((seat.key, seat.socket_path), (E8_LEGACY_KEY, ""))
+        self.assertEqual(self.calls(), [])
+
+    def test_t5_explicit_env_keeps_writer_and_lock_keys_even_when_herdr_answers(self):
+        self.status(running=True, socket=FIXTURE_SOCKET, session=None)
+        with self.process_env(HERDR_PANE_ID="w18:p7"):
+            self.assertEqual(session_tidy._endpoint_scope({}), "")
+            self.assertEqual(session_tidy._endpoint_scope(os.environ), "")
+            self.assertEqual(session_tidy._endpoint_scope({"AGENT_HERDR_SESSION": "left"}),
+                             session_tidy._digest("herdr-endpoint", "session", "left"))
+            with mock.patch("pane_ownership.verified_pane", side_effect=lambda pane, *_a, **_k: pane):
+                live = session_tidy.resolve_seat("claude", str(self.repo), sid="writer-sid")
+            self.assertEqual((live.kind, live.key, live.endpoint), ("pane", E8_LEGACY_KEY, ""))
+        self.assertEqual(self.calls(), [])
+
+    def test_t6_e8_shaped_history_reaches_a_viewer_outside_herdr(self):
+        from fleet.explorer import focus, nav
+        from fleet.explorer.types import FocusKey, FocusRequest
+        old, middle, current = E8_SIDS
+        transcripts = {}
+        for sid in E8_SIDS:
+            transcripts[sid] = self.root / f"{sid}.jsonl"
+            transcripts[sid].write_text('{"type":"message"}\n', encoding="utf-8")
+        writer = {"HERDR_SOCKET_PATH": FIXTURE_SOCKET, "HERDR_PANE_ID": "w18:p7"}
+        with self.process_env(**writer):
+            seat = session_tidy._pane_seat_of("w18:p7", endpoint=session_tidy._endpoint_scope(writer),
+                                              socket_path=FIXTURE_SOCKET)
+            self.assertEqual(seat.key, E8_KEY)
+
+            def card(sid, body, now):
+                with session_tidy.seat_lock(seat.key):
+                    session_tidy.write_card(seat, "claude", sid, body, cwd=str(self.repo), now=now)
+
+            self.record(seat, "claude", old, source="startup", transcript=str(transcripts[old]), now=100)
+            card(old, "# 7dcee068 첫 카드", 110)
+            self.record(seat, "claude", old, "compact", now=150)
+            self.record(seat, "claude", old, source="compact", transcript=str(transcripts[old]), now=151)
+            card(old, "# 7dcee068 compact 뒤 카드", 160)
+            self.record(seat, "claude", middle, source="clear", transcript=str(transcripts[middle]), now=200)
+            card(middle, "# bbf14dfc 정리 전 카드", 210)
+            self.record(seat, "claude", current, source="clear", transcript=str(transcripts[current]), now=300)
+            with session_tidy.seat_lock(seat.key):
+                session_tidy._append_ledger_entry(seat, {"ts": 301, "harness": "claude", "sid": current,
+                                                         "event": "handover", "from": middle, "source": "clear"})
+        self.assertEqual(self.calls(), [])
+
+        session = {"session_id": current, "harness": "claude", "cwd": str(self.repo)}
+        with self.process_env():
+            self.status(running=True, socket=FIXTURE_SOCKET, session=None)
+            entries, pane, health = focus.read_seat_history(session, "claude", current, pane="w18:p7")
+            chain = nav.generation_chain(entries, "claude", current)
+            with mock.patch.object(focus, "read_pane_map", return_value={current: "w18:p7"}):
+                aux = focus.collect_aux(FocusRequest(FocusKey("*", "seats"), 1, 0, (f"claude:{current}",)),
+                                        snapshot={"sessions": [session]})
+        self.assertEqual((health.state, pane), ("success", "w18:p7"))
+        self.assertEqual([(entry["sid"], entry["source"], entry["current"]) for entry in entries],
+                         [(old, "compact", False), (middle, "clear", False), (current, "clear", True)])
+        self.assertEqual(entries[-1]["relation"], "confirmed")
+        self.assertEqual([(item["sid"], item["kind"]) for item in chain],
+                         [(old, "new"), (old, "cont"), (middle, "new"), (current, "new")])
+        self.assertEqual(aux.health.state, "success")
+        self.assertEqual([entry["sid"] for entry in aux.source_records["seats"][f"claude:{current}"]],
+                         [old, middle, current])
+        self.assertEqual(self.calls(), ["status server --json"])
+
+        # Without herdr's answer the viewer still reads the endpoint-free key, which e8 never wrote.
+        session_tidy._HERDR_ENDPOINT_SOCKETS.clear()
+        with self.process_env(), mock.patch.object(session_tidy, "_herdr_executable", return_value=None):
+            entries, _pane, _health = focus.read_seat_history(session, "claude", current, pane="w18:p7")
+        self.assertEqual(entries, ())
+
+    def test_t7_legacy_ledger_is_read_only_for_its_exact_session_and_never_merged(self):
+        self.status(running=True, socket=FIXTURE_SOCKET, session=None)
+        with self.process_env():
+            current = session_tidy._pane_seat_of("w:p")
+            legacy = session_tidy.Seat("pane", session_tidy._digest("pane", "w:p"), "w:p", "claude")
+            self.assertTrue(current.endpoint)
+            self.record(current, "claude", "endpoint-now", source="startup", now=500)
+            self.record(legacy, "claude", "legacy-old", source="startup", now=100)
+            self.record(legacy, "claude", "legacy-now", source="clear", now=200)
+            with session_tidy.seat_lock(legacy.key):
+                session_tidy._append_ledger_entry(legacy, {"ts": 201, "harness": "claude", "sid": "legacy-now",
+                                                           "event": "handover", "from": "legacy-old",
+                                                           "source": "clear"})
+            state = self.root / "state"
+            before = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
+
+            def sids(seat, **kwargs):
+                return [row["sid"] for row in session_tidy.seat_lineage(seat, **kwargs)]
+
+            # The asked session lives only in the legacy ledger: that ledger alone is read.
+            self.assertEqual(sids(current, harness="claude", sid="legacy-now"), ["legacy-now", "legacy-old"])
+            self.assertEqual(sids(session_tidy.session_seat(current, "claude", "legacy-now")),
+                             ["legacy-now", "legacy-old"])
+            self.assertEqual(session_tidy.seat_lineage(current, harness="claude", sid="legacy-now")[0]["relation"],
+                             "confirmed")
+            # The endpoint ledger knows the session, or nobody does (pane id reuse): no legacy rows.
+            self.assertEqual(sids(current, harness="claude", sid="endpoint-now"), ["endpoint-now"])
+            self.assertEqual(sids(current, harness="claude", sid="reused-elsewhere"), ["endpoint-now"])
+            # Another harness, or no session at all, never falls back.
+            self.assertEqual(sids(current, harness="codex", sid="legacy-now"), [])
+            self.assertEqual(sids(current), ["endpoint-now"])
+            after = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
+        self.assertEqual(before, after)
+
+    def test_t8_codex_pane_lookup_reads_the_legacy_ledger_and_booking_after_the_normalized_key(self):
+        self.status(running=True, socket=FIXTURE_SOCKET, session=None)
+
+        def agent(pane, sid, cwd):
+            return {"agent": "codex", "pane_id": pane, "cwd": str(cwd), "foreground_cwd": str(cwd),
+                    "agent_session": {"kind": "id", "source": "herdr:codex", "value": sid}}
+
+        elsewhere = self.root / "elsewhere"
+        self.agents_file.write_text(json.dumps({"result": {"agents": [
+            agent("w:p1", "t-old", self.repo), agent("w:p2", "t-x", elsewhere)]}}), encoding="utf-8")
+        with self.process_env():
+            legacy = session_tidy.Seat("pane", session_tidy._digest("pane", "w:p1"), "w:p1", "codex")
+            normalized = session_tidy._pane_seat_of("w:p2")
+            self.assertNotEqual(normalized.key, session_tidy._digest("pane", "w:p2"))
+            self.assertEqual(session_tidy.codex_pane_for_session("t-B"), "")
+            # A socket-less Codex hook kept writing w:p1 under the endpoint-free key.
+            self.record(legacy, "codex", "t-B", "prompt")
+            self.assertEqual(session_tidy.codex_pane_for_session("t-B"), "w:p1")
+            self.record(normalized, "codex", "t-C", "prompt")
+            self.assertEqual(session_tidy.codex_pane_for_session("t-C"), "w:p2")
+            self.assertEqual(session_tidy.codex_pane_for_session("t-unknown"), "")
+
+            # The first hook after a clear: the waiting booking under the legacy key is found ...
+            self.book("w:p1", legacy.key, "t-old")
+            self.assertEqual(session_tidy.codex_pane_for_session("t-new", str(self.repo), "clear"), "w:p1")
+            # ... only while the normalized key holds no booking of its own.
+            self.book("w:p1", session_tidy._pane_seat_of("w:p1").key, "t-old", status="cleared")
+            self.assertEqual(session_tidy.codex_pane_for_session("t-new", str(self.repo), "clear"), "")
 
 
 if __name__ == "__main__":

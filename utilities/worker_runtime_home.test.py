@@ -37,6 +37,62 @@ class WorkerHomes(unittest.TestCase):
             for name in ('dispatch_allocation', 'claude_credential_recovery')
         }
 
+    def test_recorded_codex_environment_reads_home_without_refreshing_it(self):
+        native_home = self.base / '.codex'
+        native_home.mkdir()
+        (native_home / 'config.toml').write_text(
+            'model = "gpt-test"\n[agents]\ncustom = false\n', encoding='utf-8')
+        (native_home / 'hooks.json').write_text('{"hooks": []}\n', encoding='utf-8')
+        home_environment = self.base / 'account-home'
+        home_environment.mkdir()
+        destination = self.base / 'worker-home'
+        identity = 'att-recorded-home'
+        built = prepare_worker_home(
+            ROOT, 'codex', 'owner', identity,
+            env={**self.env, 'HOME': str(home_environment), 'CODEX_HOME': str(native_home)},
+            destination=destination,
+        )
+
+        def snapshot():
+            result = {}
+            for path in sorted(destination.rglob('*')):
+                rel = str(path.relative_to(destination))
+                if path.is_symlink():
+                    result[rel] = ('link', os.readlink(path))
+                elif path.is_file():
+                    result[rel] = ('file', path.read_bytes())
+            return result
+
+        before = snapshot()
+        recovered = worker_runtime_home.recorded_codex_worker_environment(
+            ROOT, destination, identity)
+        after = snapshot()
+        self.assertEqual(recovered['HOME'], str(home_environment))
+        for key, value in built.items():
+            self.assertEqual(recovered[key], value, key)
+        self.assertEqual(after, before)
+
+    def test_legacy_codex_home_without_exact_home_provenance_fails_closed(self):
+        native_home = self.base / 'custom-codex-home'
+        native_home.mkdir()
+        (native_home / 'config.toml').write_text('model = "gpt-test"\n', encoding='utf-8')
+        destination = self.base / 'legacy-worker-home'
+        identity = 'att-legacy-home'
+        prepare_worker_home(
+            ROOT, 'codex', 'owner', identity,
+            env={**self.env, 'HOME': str(self.base / 'account-home'),
+                 'CODEX_HOME': str(native_home)},
+            destination=destination,
+        )
+        manifest_path = destination / 'worker-home.json'
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        manifest.pop('codex_config_home')
+        manifest.pop('home_environment')
+        manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'home-path-unavailable'):
+            worker_runtime_home.recorded_codex_worker_environment(
+                ROOT, destination, identity)
+
     def test_v2_launch_binding_keeps_native_xdg_store(self):
         root, builder = self._minimal_packaged_builder()
         home = self.base / 'v2-home'
@@ -346,11 +402,70 @@ class WorkerHomes(unittest.TestCase):
             self.assertEqual((home / 'agent-config/models.conf').read_text(), 'user-model-policy')
             args = codex_worker_arguments(env)
             self.assertIn('features.plugins=false', args)
-            self.assertIn('features.multi_agent=false', args)
+            if typ == 'owner':
+                self.assertNotIn('features.multi_agent=false', args)
+                self.assertNotIn('agents.enabled=false', args)
+            else:
+                self.assertIn('features.multi_agent=false', args)
+                self.assertIn('agents.enabled=false', args)
             self.assertIn('features.default_mode_request_user_input=false', args)
             self.assertIn('mcp_servers={"external"={"command"="true","enabled"=false}}', args)
             self.assertTrue(any('test-skill' in arg for arg in args))
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.source.iterdir() if p.is_file()})
+
+    def test_codex_owner_retains_native_policy_without_main_agent_catalog(self):
+        (self.source / 'agents').mkdir()
+        helper = self.source / 'agents/general-purpose.toml'
+        helper.write_text('name="general-purpose"\nmodel="user-selected-model"\n')
+        (self.source / 'agents/unrelated.toml').write_text('name="unrelated"\n')
+        (self.source / 'config.toml').write_text(
+            '[features]\nmulti_agent=true\n[agents]\nenabled=true\nmax_threads=2\n'
+            'default_subagent_model="user-native-model"\ndefault_subagent_reasoning_effort="medium"\n'
+            '[agents.unrelated]\nconfig_file="unrelated.toml"\n')
+        env = prepare_worker_home(ROOT, 'codex', 'owner', 'native-fallback',
+                                  env={**self.env, 'CODEX_HOME': str(self.source)})
+        home = Path(env['CODEX_HOME'])
+        self.assertFalse((home / 'agents').exists())
+        self.assertEqual(helper.read_text(), 'name="general-purpose"\nmodel="user-selected-model"\n')
+        self.assertFalse((home / 'agents/unrelated.toml').exists())
+        self.assertFalse((home / 'agents/deep.toml').exists())  # withheld/missing stays missing
+        self.assertFalse((home / 'plugins').exists())
+        self.assertEqual((home / 'config.toml').resolve(), self.source / 'config.toml')
+        self.assertNotIn('features.multi_agent=false', codex_worker_arguments(env))
+        self.assertNotIn('agents.enabled=false', codex_worker_arguments(env))
+        native = next(v for v in json.loads(env['HEARTING_CODEX_WORKER_OVERRIDES'])
+                      if v.startswith('agents='))
+        override = self.base / 'native-override.toml'
+        override.write_text(native)
+        agents = worker_runtime_home._builder.read_worker_toml(override)['agents']
+        self.assertTrue(agents['enabled'])
+        self.assertEqual(agents['max_threads'], 2)
+        self.assertEqual(agents['default_subagent_model'], 'user-native-model')
+        self.assertEqual(agents['default_subagent_reasoning_effort'], 'medium')
+        self.assertNotIn('general-purpose', agents)
+        self.assertNotIn('unrelated', agents)
+        # Nested owner projection also keeps native policy and masks the catalog.
+        nested = prepare_worker_home(ROOT, 'codex', 'owner', 'nested-native-fallback',
+                                     env={**self.env, **env})
+        self.assertFalse((Path(nested['CODEX_HOME']) / 'agents').exists())
+        self.assertNotIn('features.multi_agent=false', codex_worker_arguments(nested))
+
+    def test_codex_owner_preserves_explicit_native_disablement_and_user_bytes(self):
+        config = self.source / 'config.toml'
+        original = '[features]\nmulti_agent=false\n[agents]\nenabled=false\n'
+        config.write_text(original)
+        env = prepare_worker_home(ROOT, 'codex', 'owner', 'native-disabled',
+                                  env={**self.env, 'CODEX_HOME': str(self.source)})
+        self.assertEqual((Path(env['CODEX_HOME']) / 'config.toml').read_text(), original)
+        self.assertEqual(config.read_text(), original)
+        args = codex_worker_arguments(env)
+        self.assertNotIn('features.multi_agent=true', args)
+        self.assertNotIn('agents.enabled=true', args)
+        native = next(v for v in json.loads(env['HEARTING_CODEX_WORKER_OVERRIDES'])
+                      if v.startswith('agents='))
+        override = self.base / 'native-disabled-override.toml'
+        override.write_text(native)
+        self.assertFalse(worker_runtime_home._builder.read_worker_toml(override)['agents']['enabled'])
 
     def test_nested_codex_owner_uses_plugin_feature_override_and_is_destination(self):
         (self.source / 'auth.json').write_text('{}')
@@ -982,6 +1097,54 @@ class WorkerHomes(unittest.TestCase):
         home = Path(env['CLAUDE_CONFIG_DIR'])
         self.assertIn('profiles/code-report.yaml', (home / 'CLAUDE.md').read_text())
         self.assertEqual(json.loads((home / 'settings.json').read_text())['permissions']['deny'], ['Read(secret)'])
+
+    def test_claude_worker_root_resolves_hook_links_and_skips_memory_injection(self):
+        import re
+        import shlex
+
+        source_hooks = self.source / 'hooks'
+        source_hooks.symlink_to(ROOT / 'adapters/claude/hooks', target_is_directory=True)
+        (self.source / 'settings.json').write_bytes(
+            (ROOT / 'adapters/claude/settings.json').read_bytes()
+        )
+        source_env = {
+            **self.env, 'HOME': str(self.base), 'CLAUDE_CONFIG_DIR': str(self.source),
+            'AGENT_HOME': str(ROOT),
+        }
+        worker_env = prepare_worker_home(
+            ROOT, 'claude', 'stage', 'custom-config-hook-root',
+            env=source_env,
+            destination=self.base / 'worker-home',
+        )
+        home = Path(worker_env['CLAUDE_CONFIG_DIR'])
+        self.assertEqual((home / 'hooks').resolve(), source_hooks.resolve())
+        self.assertEqual({**source_env, **worker_env}['AGENT_HOME'], str(ROOT))
+
+        settings = json.loads((home / 'settings.json').read_text(encoding='utf-8'))
+        hook_commands = [hook['command'] for groups in settings['hooks'].values()
+                         for group in groups for hook in group.get('hooks', [])]
+        hook_root = '${CLAUDE_CONFIG_DIR:-$HOME/.claude}'
+        hook_paths = [match for command in hook_commands
+                      for match in re.findall(
+                          re.escape(hook_root) + r'/hooks/[^\s"\']+', command
+                      )]
+        self.assertEqual(len(hook_paths), 39)
+        for token in hook_paths:
+            path = Path(token.replace(hook_root, str(home), 1))
+            self.assertTrue(path.is_file(), path)
+            self.assertEqual(path.resolve(), (source_hooks / path.name).resolve())
+
+        memory_commands = [command for command in hook_commands if 'tools/memory/mem.py' in command]
+        self.assertEqual(len(memory_commands), 1)
+        argv = shlex.split(memory_commands[0])
+        self.assertEqual(argv[:2], ['sh', '-c'])
+        self.assertFalse((home / 'tools/memory/mem.py').exists())
+        result = subprocess.run(
+            ['/bin/sh', '-c', argv[2]],
+            env={**os.environ, **source_env, **worker_env, 'AGENT_SESSION_ROLE': 'worker'},
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, '', ''))
 
     def test_opencode_isolation_keeps_the_user_inventory_through_descendants(self):
         config = self.base / 'user-config'

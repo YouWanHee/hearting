@@ -910,7 +910,7 @@ def bind_pending_recipient(ref, recipient, *, process_proof=None):
                 or recipient.get("pane_id") != original.get("pane_id")):
             return None
         expected = pending_first_input_process(row)
-        if (expected is None or not first_input_process_matches(expected, process_proof)):
+        if expected is None or not first_input_process_matches(expected, process_proof):
             return None
         bound = row.get("bound_to")
         proposed = {"harness": recipient["harness"], "session_id": recipient["session_id"],
@@ -919,6 +919,28 @@ def bind_pending_recipient(ref, recipient, *, process_proof=None):
                                      for key in ("harness", "session_id", "pane_id")):
             return None
         updated = dict(row, bound_to=proposed)
+        context = row.get("handoff")
+        if isinstance(context, dict):
+            if not _first_input_process_is_current(expected, recipient.get("session_id")):
+                return None
+            successor = context.get("successor")
+            requester = context.get("requester")
+            if isinstance(successor, dict) and isinstance(requester, dict):
+                foreground = successor.get("foreground") or {}
+                if ((successor.get("harness"), successor.get("pane"))
+                        == (proposed["harness"], proposed["pane_id"])
+                        and successor.get("session_id") in (None, "", "-", proposed["session_id"])
+                        and (requester.get("harness"), requester.get("pane"), requester.get("server"))
+                            == (successor.get("harness"), successor.get("pane"), successor.get("server"))
+                        and requester.get("session_id") in (None, "", "-", proposed["session_id"])
+                        and (foreground.get("pid"), str(foreground.get("start") or ""))
+                            == (expected["pid"], expected["start"])):
+                    updated_context = dict(context)
+                    updated_successor = dict(successor, session_id=proposed["session_id"])
+                    updated_requester = dict(requester, session_id=proposed["session_id"])
+                    updated_context["successor"] = updated_successor
+                    updated_context["requester"] = updated_requester
+                    updated["handoff"] = updated_context
         _save_pending(updated)
         return updated
 
@@ -2650,6 +2672,8 @@ def receiver_guidance(text="", recipient=None, *, cwd=None):
         # validator below remains authoritative for context, seat, and lifetime.
         context = row.get("handoff")
         original_from, original_to = row.get("from"), row.get("to")
+        pane_bound = _valid_pane_bound_endpoint(original_to)
+        current_recipient = pending_delivery_recipient(row)
         predecessor = context.get("predecessor") if isinstance(context, dict) else None
         successor = context.get("successor") if isinstance(context, dict) else None
         requester = context.get("requester") if isinstance(context, dict) else None
@@ -2660,13 +2684,17 @@ def receiver_guidance(text="", recipient=None, *, cwd=None):
                 or not isinstance(successor, dict)
                 or not isinstance(requester, dict)
                 or not _valid_transfer_endpoint(original_from)
-                or not _valid_transfer_endpoint(original_to)
-                or (original_to.get("harness"), original_to.get("session_id"))
+                or not (_valid_transfer_endpoint(original_to) or pane_bound)
+                or not isinstance(current_recipient, dict)
+                or not _valid_transfer_endpoint(current_recipient)
+                or (current_recipient.get("harness"), current_recipient.get("session_id"))
                    != (recipient["harness"], recipient["session_id"])
                 or (predecessor.get("harness"), predecessor.get("session_id"))
                    != (original_from.get("harness"), original_from.get("session_id"))
                 or (successor.get("harness"), successor.get("session_id"))
                    != (recipient["harness"], recipient["session_id"])
+                or (pane_bound and (successor.get("pane") != original_to.get("pane_id")
+                                    or current_recipient.get("pane_id") != original_to.get("pane_id")))
                 or (requester.get("harness"), requester.get("session_id"))
                    != (successor.get("harness"), successor.get("session_id"))):
             return guidance
@@ -3252,17 +3280,100 @@ def steward_marker_path(harness, session_id):
     return peer_state_root() / "peer-steward" / str(harness or "unknown") / f"{safe or 'unknown'}.json"
 
 
+def _fleet_steward():
+    """``fleet.collectors.steward`` (the repository supervision count), or ``None``."""
+    try:
+        tools = str(Path(__file__).resolve().parents[1] / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        from fleet.collectors import steward
+        return steward
+    except Exception:
+        return None
+
+
+@contextlib.contextmanager
+def _steward_grant_lock(wait=10.0):
+    """Serializes the repository census with the marker write across seats. Always taken
+    inside the seat lock; a lock still held after ``wait`` seconds raises
+    ``BlockingIOError``."""
+    directory = peer_state_root() / "peer-steward"
+    directory.mkdir(parents=True, exist_ok=True)
+    fd = os.open(directory / "grant.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _steward_check(name, *args, **kwargs):
+    """Best-effort call into ``steward_check`` (the periodic check schedule). A missing
+    module or any failure there never fails a grant or a release."""
+    try:
+        import steward_check
+        return getattr(steward_check, name)(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _has_explicit_self_entry(marker):
+    try:
+        return any(t.get("source") == "explicit" and t.get("kind") == "explicit"
+                   and t.get("harness") == "unknown" and t.get("name") == "-"
+                   and t.get("session_id") is None and not t.get("pane")
+                   for t in steward_evidence_targets(marker))
+    except Exception:
+        return False
+
+
+def format_steward_limited(result):
+    """One line for a refused grant: ``steward=limited repo=<name> holders=<a,b> limit=<n>``."""
+    names = []
+    for holder in result.get("holders") or ():
+        names.append(holder.get("name") or
+                     f"{holder.get('harness') or 'unknown'}:{str(holder.get('session_id') or '-')[:8]}")
+    return (f"steward=limited repo={result.get('repository') or '-'} "
+            f"holders={','.join(names) or '-'} limit={result.get('limit')}")
+
+
 def mark_steward(harness, session_id, to, kind, ts, source=None):
+    """Bool form of :func:`grant_steward`: True when a marker entry was written."""
+    return grant_steward(harness, session_id, to, kind, ts, source)["written"]
+
+
+def grant_steward(harness, session_id, to, kind, ts, source=None, *, target_cwd=None):
     """Raise (or extend) the session's steward marker with one evidence entry.
 
     ``source`` is required and says why the entry counts (`explicit` | `watch` |
-    `start`); anything else — including a missing source — is refused: returns False
-    and writes nothing, so no send path can raise the flag by accident again. Every
-    entry carries its ``source`` so the reader can show the grounds."""
+    `start`); anything else — including a missing source — is refused and writes
+    nothing, so no send path can raise the flag by accident again. Every entry carries
+    its ``source`` so the reader can show the grounds.
+
+    A session that is not yet a supervisor of its repository is granted only while the
+    repository has fewer than ``steward.max_supervisors_per_repo`` counted supervisors;
+    the census and the write run under one grant lock so concurrent grants cannot pass
+    the limit together. Returns ``{"status": granted|extended|limited|refused|
+    unavailable, "written", "repository", "holders", "limit", "reason"}``."""
+    result = {"status": "refused", "written": False, "repository": None, "holders": [],
+              "limit": None, "reason": None}
     if not session_id or source not in _STEWARD_SOURCES:
-        return False
+        return result
+    seat = None
     path = steward_marker_path(harness, session_id)
-    def write_locked():
+
+    def write_locked(repository=None):
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(path, encoding="utf-8") as fh:
@@ -3275,6 +3386,8 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
         data.setdefault("generation", os.urandom(16).hex())
         if seat is not None:
             data["seat_key"] = seat.key
+        if repository:
+            data["repository"] = repository
         targets = data.get("targets")
         if not isinstance(targets, dict):
             targets = {}
@@ -3326,17 +3439,75 @@ def mark_steward(harness, session_id, to, kind, ts, source=None):
         # destructive-ok: reason=atomic publish of the rewritten steward marker (tmp → final); boundary=<dispatch-state-root>/peer-steward/<harness>/<sid>.json
         os.replace(tmp, path)
         return True
+
+    def decide_and_write():
+        try:
+            with _steward_grant_lock():
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        marker = json.load(fh)
+                except Exception:
+                    marker = None
+                if isinstance(marker, dict) and _has_explicit_self_entry(marker):
+                    result["status"] = "extended"
+                    result["written"] = write_locked()
+                    return
+                fleet = _fleet_steward()
+                if fleet is None:
+                    result.update(status="unavailable", reason="census-unavailable")
+                    return
+                try:
+                    rows = fleet._projection_sessions()
+                    repository = fleet.repository_for_session(harness, session_id, sessions=rows)
+                    if repository is None:
+                        result.update(status="granted", reason="repository-unknown")
+                        result["written"] = write_locked()
+                        return
+                    result["repository"] = Path(repository).parent.name
+                    if source in ("watch", "start") and target_cwd:
+                        target_repository = fleet._repository_key(target_cwd)
+                        if target_repository and target_repository != repository:
+                            result.update(status="granted", reason="foreign-target")
+                            result["written"] = write_locked()
+                            return
+                    supervision = fleet.repo_supervision(repository_key=repository, sessions=rows)
+                except Exception as exc:
+                    result.update(status="unavailable", reason=f"census-failed:{type(exc).__name__}")
+                    return
+                result["limit"] = supervision["limit"]
+                held = [h for h in supervision["holders"]
+                        if (h["harness"], h["session_id"]) == (str(harness).lower(), session_id)]
+                if held:
+                    result["status"] = "extended"
+                elif supervision["counted"] >= supervision["limit"]:
+                    result["status"] = "limited"
+                    result["holders"] = [{"harness": h["harness"], "session_id": h["session_id"],
+                                          "name": h.get("name")}
+                                         for h in supervision["holders"] if h["counted"]]
+                    return
+                else:
+                    result["status"] = "granted"
+                result["written"] = write_locked(repository)
+        except BlockingIOError:
+            result.update(status="unavailable", reason="grant-lock-timeout", written=False)
+
     try:
         # Serialize role creation with same-seat clear adoption and release.
         import dispatch_seat_handover as handover
         import session_tidy as tidy
         seat = handover.pane_seat(os.environ, harness, session_id)
         if seat is None:
-            return write_locked()
-        with tidy.seat_lock(seat.key):
-            return write_locked()
-    except Exception:
-        return False
+            decide_and_write()
+        else:
+            with tidy.seat_lock(seat.key):
+                decide_and_write()
+    except Exception as exc:
+        result.update(status="unavailable", written=False,
+                      reason=result["reason"] or f"error:{type(exc).__name__}")
+        return result
+    if result["status"] in ("granted", "extended") and result["written"]:
+        _steward_check("register", harness, session_id, ensure_runner=False)
+    return result
 
 
 def steward_evidence_targets(marker):
@@ -3380,7 +3551,8 @@ def _iter_marker_files(base):
     except OSError:
         return
     for hdir in harness_dirs:
-        if not hdir.is_dir():
+        # `obligations/` is the duty store that shares this directory, not a harness.
+        if not hdir.is_dir() or hdir.name == "obligations":
             continue
         for f in sorted(hdir.glob("*.json")):
             try:
@@ -3634,6 +3806,9 @@ def cmd_release(args):
             result = "released"
         except FileNotFoundError:
             result = "released" if generations_by_seat else "not-marked"
+        if result == "released":
+            _steward_check("settle_session", args.harness, args.session_id,
+                           reason="role-released")
         print(result)
     except FileNotFoundError:
         print("not-marked")

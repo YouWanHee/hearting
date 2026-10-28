@@ -331,6 +331,32 @@ def _comm_of(pid):
         return None
 
 
+# The kernel-fixed inode of the initial PID namespace. A caller in any other one (a
+# container, a sandbox) sees only part of the process table, so an absence it observes
+# proves nothing.
+_INITIAL_PID_NAMESPACE = "pid:[4026531836]"
+
+
+def initial_pid_namespace():
+    """True when this process runs in the initial PID namespace; unreadable is False."""
+    try:
+        return os.readlink("/proc/self/ns/pid") == _INITIAL_PID_NAMESPACE
+    except OSError:
+        return False
+
+
+def boot_time():
+    """Kernel boot time (epoch seconds) from /proc/stat, or None."""
+    try:
+        with open("/proc/stat", encoding="ascii", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def provenance(pid, max_depth=6):
     """Best-effort launcher lineage: 'herdr' | 'terminal' | 'vscode' | 'worker' | None.
 
@@ -1013,6 +1039,15 @@ def scan(harness_filter=None):
                                    attempt_id=env.get("AGENT_DISPATCH_ATTEMPT_ID") or None)
                         if proc_start is not None else None),
         )
+        # A registered owner has a route binding, but no stage node. Preserve
+        # the wrapper's complete/partial tuple for the existing fail-closed
+        # owner resolver, including when its runtime session id is unobserved.
+        # These observation-only attributes do not extend Session's JSON shape.
+        for field in ("owner_route_file", "owner_route_id", "owner_route_hash"):
+            value = env.get("AGENT_" + field.upper())
+            if value:
+                setattr(sess, field, value)
+        sess._dispatch_depth = env.get("AGENT_DISPATCH_DEPTH")
         # Shared process snapshot for targeted output-writer correlation. These
         # private references are excluded from public dataclass serialization.
         sess._proc_tree = tree

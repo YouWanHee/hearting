@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# fleet-monitor.sh — current-terminal launcher for the group/process monitor.
+#   Default: run directly in the current full-size terminal, inside or outside tmux.
+#   --window: open in a free cell of the caller's Herdr or tmux tab, focus unchanged
+#             (utilities/pane.py); without one, run directly.
+#   Keyboard scrolling is the default; mouse toggles are opt-in via `tmux set -g mouse on`.
+#   The public `fleet-monitor` command uses this screen. Pass all fleet.py options
+#   through unchanged; only --window is consumed here.
+set -euo pipefail
+
+# Resolve the real script location when invoked through a symlink.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+FLEET_PY="$SCRIPT_DIR/fleet.py"
+HARNESS_ROOT=$(cd -P "$SCRIPT_DIR/../.." && pwd)
+if [ -f "$HARNESS_ROOT/core/CORE.md" ]; then
+  # The launcher owns source identity. Mutable dispatch state continues to
+  # follow an inherited AGENT_DISPATCH_JOBS or each row's registry path.
+  export AGENT_HOME="$HARNESS_ROOT"
+fi
+
+# Bytecode beside an immutable release would break "byte-identical to the release
+# it was built from"; keep the cache, put it in state (same rule as harness.sh).
+if [ -z "${PYTHONPYCACHEPREFIX:-}" ] && [ -z "${PYTHONDONTWRITEBYTECODE:-}" ]; then
+  _state_root=${HARNESS_STATE_ROOT:-${XDG_STATE_HOME:+$XDG_STATE_HOME/hearting}}
+  if [ -z "$_state_root" ] && [ -n "${HOME:-}" ]; then
+    _state_root=$HOME/.local/state/hearting
+  fi
+  if [ -n "$_state_root" ]; then
+    export PYTHONPYCACHEPREFIX="$_state_root/pycache"
+  fi
+  unset _state_root
+fi
+
+# FLEET_PYTHON overrides interpreter discovery. On Windows the `python`/`python3`
+# on PATH are the WindowsApps app-execution aliases (a pymanager stub that can
+# crash with "Internal error 0x00000001"); the launcher points FLEET_PYTHON at a
+# real python.exe to bypass it.
+PY=${FLEET_PYTHON:-$(command -v python3 || command -v python || true)}
+if [ -z "$PY" ]; then echo "fleet: python3 is required." >&2; exit 1; fi
+if [ ! -f "$FLEET_PY" ]; then echo "fleet: fleet.py was not found ($FLEET_PY)." >&2; exit 1; fi
+
+# Remove --window exactly once before routing because fleet.py does not accept it.
+want_window=0
+ARGS=()
+for a in "$@"; do
+  if [ "$a" = "--window" ]; then
+    want_window=1
+  else
+    ARGS+=("$a")
+  fi
+done
+
+# Snapshot and JSON modes need no terminal launcher.
+direct=0
+for a in ${ARGS[@]+"${ARGS[@]}"}; do case "$a" in --once|--json) direct=1 ;; esac; done
+
+run_direct() { exec "$PY" "$FLEET_PY" "$@"; }
+
+# Curses renders the persistent key guide; no pre-launch scroll notice is needed.
+
+if [ "$direct" = "1" ]; then
+  run_direct ${ARGS[@]+"${ARGS[@]}"}
+fi
+
+if [ "$want_window" = "1" ]; then
+  # The shared pane opener prints one JSON line and exits 0 when it opened the
+  # pane or found no surface; only then is the answer read. Nothing is retried.
+  if opened=$("$PY" "$HARNESS_ROOT/utilities/pane.py" open --title fleet -- \
+      "$PY" "$FLEET_PY" ${ARGS[@]+"${ARGS[@]}"}); then
+    where=$(printf '%s' "$opened" | "$PY" -c 'import json, sys
+r = json.load(sys.stdin)
+print(r["surface"] + " pane " + r["pane"] if r.get("pane") else "")' 2>/dev/null || true)
+    if [ -n "$where" ]; then
+      echo "fleet: opened in $where." >&2
+      exit 0
+    fi
+    echo "fleet: no Herdr or tmux pane to open; running in the current terminal." >&2
+  else
+    echo "fleet: the pane did not open; running in the current terminal." >&2
+  fi
+  run_direct ${ARGS[@]+"${ARGS[@]}"}
+fi
+
+# Default: run directly in the current full-size terminal.
+run_direct ${ARGS[@]+"${ARGS[@]}"}

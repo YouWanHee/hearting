@@ -81,6 +81,7 @@ _PATHS_SPEC.loader.exec_module(INSTALL_PATHS)
 # from a hook inherits.
 _HERDR_SESSION = os.environ.get("AGENT_HERDR_SESSION") or None
 _RETIRE_FOLLOWUP_COMPLETE = set()
+_HANDOFF_ACCEPTANCE_REPLAYED = set()
 
 
 def _herdr_argv(*args):
@@ -419,8 +420,8 @@ def _prompt_inventory_panes(agents):
             and isinstance(agent.get("pane_id"), str) and agent["pane_id"]}
 
 
-def _prompt_candidate_snapshot():
-    """Join the complete selected-endpoint pane census to herdr's agent list."""
+def _prompt_candidate_snapshot(target, *, wanted_tag=None):
+    """Discover address candidates before proving their exact native identities."""
     agents, inventory_error = _prompt_agent_inventory()
     census = herdr_observation.pane_census(session=_HERDR_SESSION)
     endpoint = herdr_observation.endpoint_name(_HERDR_SESSION)
@@ -483,33 +484,75 @@ def _prompt_candidate_snapshot():
             continue
         row = listed[0]
         census_session = item.get("agent_session")
+        census_sid, census_error = None, None
         if census_session is not None:
             if (not isinstance(census_session, dict)
                     or census_session.get("kind") not in (None, "id")):
-                unknown_panes.add(pane)
-                unknown_reason = unknown_reason or "pane-census-malformed"
-                continue
-            census_sid = peer_message.usable_session_id(census_session.get("value"))
-            if census_session.get("value") not in (None, "", "-") and not census_sid:
-                unknown_panes.add(pane)
-                unknown_reason = unknown_reason or "pane-census-malformed"
-                continue
-            if census_sid and row.get("session_id") and census_sid != row["session_id"]:
-                unknown_panes.add(pane)
-                unknown_reason = unknown_reason or "target-identity-changed"
-                continue
-        else:
-            census_sid = None
+                census_error = "pane-census-malformed"
+            else:
+                census_sid = peer_message.usable_session_id(census_session.get("value"))
+                if census_session.get("value") not in (None, "", "-") and not census_sid:
+                    census_error = "pane-census-malformed"
+
+        # Names, selected-pane metadata, and shared tags locate candidates. They
+        # do not establish identity; only matching panes reach native proof.
+        observed = _retire_target(pane)
+        observed_ident = (observed[1] if isinstance(observed, tuple)
+                          and len(observed) > 1 and isinstance(observed[1], dict) else {})
+        observed_sid = peer_message.usable_session_id(observed_ident.get("session_id"))
+        sid_hints = list(dict.fromkeys(
+            sid for sid in (census_sid, row.get("session_id"), observed_sid) if sid))
+        name_values = [row.get("name"), observed_ident.get("name"),
+                       item.get("display_agent"), item.get("title"),
+                       item.get("terminal_title_stripped")]
+        names = {value for value in name_values
+                 if isinstance(value, str) and value and value != "-"}
+        for sid_hint in sid_hints:
+            try:
+                registry_name = _from_name(harness, sid_hint)
+            except Exception:
+                registry_name = None
+            if isinstance(registry_name, str) and registry_name and registry_name != "-":
+                names.add(registry_name)
+
+        name_match = target in names
+        name_unresolved = not names and not sid_hints
+        tag_match, tag_unresolved = False, False
+        if wanted_tag is not None:
+            if not sid_hints:
+                tag_unresolved = True
+            for sid_hint in sid_hints:
+                current_tag, tag_error = _prompt_fleet_tag(
+                    harness, sid_hint, pane=pane,
+                    cwd=item.get("cwd") or item.get("foreground_cwd"))
+                if tag_error:
+                    tag_unresolved = True
+                elif current_tag == wanted_tag:
+                    tag_match = True
+        if (not name_match and not name_unresolved
+                and not tag_match and not tag_unresolved):
+            continue
+
+        if census_error:
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or census_error
+            continue
+        if (census_sid and row.get("session_id")
+                and census_sid != row["session_id"]):
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "target-identity-changed"
+            continue
         if row["harness"] != harness:
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or "target-identity-changed"
             continue
-        if row.get("session_id") and census_sid and row["session_id"] != census_sid:
+        expected_sid = census_sid or row.get("session_id") or observed_sid
+        if (observed_ident.get("harness") not in (None, harness)
+                or observed_ident.get("pane") not in (None, pane)
+                or (expected_sid and observed_sid and expected_sid != observed_sid)):
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or "target-identity-changed"
             continue
-        expected_sid = census_sid or row.get("session_id")
-        observed = _retire_target(pane)
         candidate, reason = _prompt_current_candidate(
             pane, expected_harness=harness, expected_sid=expected_sid,
             require_process_session=True, target_observation=observed)
@@ -517,19 +560,28 @@ def _prompt_candidate_snapshot():
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or reason or "target-identity-unverified"
             continue
-        names = {value for value in (row.get("name"), candidate.get("name"),
-                 item.get("display_agent"), item.get("title"),
-                 item.get("terminal_title_stripped"))
-                 if isinstance(value, str) and value and value != "-"}
+        if isinstance(candidate.get("name"), str) and candidate["name"] != "-":
+            names.add(candidate["name"])
         try:
             registry_name = _from_name(harness, candidate["session_id"])
         except Exception:
             registry_name = None
         if isinstance(registry_name, str) and registry_name and registry_name != "-":
             names.add(registry_name)
+        name_match = name_match or target in names
         if not names:
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or "target-name-observation-unavailable"
+            continue
+        if wanted_tag is not None and (tag_match or tag_unresolved):
+            current_tag, tag_error = _prompt_fleet_tag(
+                candidate["harness"], candidate["session_id"], pane=candidate["pane"],
+                cwd=item.get("cwd") or item.get("foreground_cwd"))
+            if tag_error or current_tag != wanted_tag:
+                unknown_panes.add(pane)
+                unknown_reason = unknown_reason or tag_error or "target-identity-changed"
+                continue
+        elif not name_match:
             continue
         row_cwd = item.get("cwd") or item.get("foreground_cwd")
         rows.append({**candidate, "names": names, "cwd": row_cwd,
@@ -568,10 +620,11 @@ def _resolve_prompt_target(target):
         candidate, reason = _prompt_current_candidate(target)
         return (candidate, None, [target]) if candidate else (None, reason, [target])
 
-    rows, snapshot_error, unknown_panes = _prompt_candidate_snapshot()
+    wanted_tag = tag_match.group(1).lower() if is_tag else None
+    rows, snapshot_error, unknown_panes = _prompt_candidate_snapshot(
+        target, wanted_tag=wanted_tag)
     if rows is None:
         return None, snapshot_error or "target-observation-unavailable", unknown_panes
-    wanted_tag = tag_match.group(1).lower() if is_tag else None
     matches = {}
     uncertain = set(unknown_panes)
     uncertainty_reason = snapshot_error
@@ -796,7 +849,33 @@ def _interpret_payload(payload, target):
     }, 0, None
 
 
-def _mark_observed(to_harness, to_session_id, to_name, from_identity=None, *, pane=None):
+def _payload_cwd(payload):
+    """The target agent's cwd from a herdr payload, or None."""
+    try:
+        cwd = payload["result"]["agent"].get("cwd")
+    except (KeyError, TypeError, AttributeError):
+        return None
+    return cwd if isinstance(cwd, str) and cwd else None
+
+
+def _print_steward_limited(result):
+    """A refused steward grant never fails the command that asked for it; it only says so."""
+    if isinstance(result, dict) and result.get("status") == "limited":
+        print(peer_message.format_steward_limited(result), file=sys.stderr)
+
+
+def _ensure_steward_runner(result):
+    """A written grant carries a steward-check duty; the shared runner advances it with
+    no later input, so start it now instead of waiting for the next lifecycle event."""
+    if isinstance(result, dict) and result.get("written"):
+        try:
+            peer_obligations.ensure_normal_runner()
+        except Exception:
+            pass
+
+
+def _mark_observed(to_harness, to_session_id, to_name, from_identity=None, *, pane=None,
+                   target_cwd=None):
     """F-100c-2 — the ONE place `source=watch` steward evidence is written: after
     herdr answered about a real target (`wait` returned a typed state other than
     agent-not-found, or `watch` armed its watcher). The `kind=watch` ledger row itself
@@ -810,8 +889,10 @@ def _mark_observed(to_harness, to_session_id, to_name, from_identity=None, *, pa
           "session_id": sid,
           "name": to_name if isinstance(to_name, str) and to_name and to_name != "-" else None,
           "pane": pane if isinstance(pane, str) and pane and pane != "-" else None}
-    return peer_message.mark_steward(from_harness, from_sid, to, "watch", _utc_now(),
-                                     source="watch")
+    result = peer_message.grant_steward(from_harness, from_sid, to, "watch", _utc_now(),
+                                        source="watch", target_cwd=target_cwd)
+    _print_steward_limited(result)
+    return result
 
 
 def cmd_wait(args):
@@ -837,7 +918,7 @@ def cmd_wait(args):
                          _t_name if _t_name and _t_name != "-" else target)
         _mark_observed(agent["harness"] if agent["harness"] != "-" else t_harness,
                        agent["session_id"] if agent["session_id"] != "-" else t_sid,
-                       resolved_name, pane=agent["pane"])
+                       resolved_name, pane=agent["pane"], target_cwd=_payload_cwd(payload))
     print(_typed_line(state, agent["harness"], agent["session_id"], agent["name"], agent["pane"]))
     return code
 
@@ -1314,9 +1395,10 @@ def _mark_seat_successor(pane, beside, kind, session_id):
         pass
 
 
-def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=None, recheck=None, wait=None):
-    """After `retire` proved the predecessor exited: when this session runs in the pane started
-    beside the predecessor, its routes become this session's, across harnesses
+def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=None, recheck=None, wait=None,
+                   retain_mark=False):
+    """Transfer to the exact successor; physical retirement settles separately.
+    The pane started beside the predecessor inherits its routes across harnesses
     (`dispatch_seat_handover.record_retire_handover`). Returns the receipt value, or None when
     this is not a seat change (the receipt then stays as it was); it never fails the retire."""
     pane = requester.get("pane") if requester is not None else _caller_pane()
@@ -1325,7 +1407,8 @@ def _seat_handover(ident, own_sid, own_harness, *, requester=None, accepted_at=N
     try:
         with _seat_successor_lock(pane, wait=wait):
             return _seat_handover_locked(ident, own_sid, own_harness, pane,
-                                         requester=requester, accepted_at=accepted_at, recheck=recheck)
+                                         requester=requester, accepted_at=accepted_at, recheck=recheck,
+                                         retain_mark=retain_mark)
     except OSError:
         return "error"
 
@@ -1337,8 +1420,87 @@ def _source_before_acceptance(source, accepted_at, *times):
             and all(v <= accepted_at for v in values[1:]))
 
 
+def _legacy_requester_projection(duty, *, expected_pane=None):
+    """Resolve an old empty requester pane from one exact pre-acceptance mark."""
+    global _HERDR_SESSION
+    import opencode_session_runtime as native
+    intent = duty.get("intent") or {}
+    requester = intent.get("requester")
+    identity = intent.get("identity") or {}
+    if not isinstance(requester, dict) or not requester:
+        return None
+    pane = requester.get("pane")
+    if isinstance(pane, str) and pane not in {"", "-"}:
+        if expected_pane is None or pane == expected_pane:
+            return requester
+        return None
+    sid, harness = requester.get("session_id"), requester.get("harness")
+    server = requester.get("server")
+    accepted_at = duty.get("accepted_at")
+    predecessor_pane = identity.get("pane")
+    if (not isinstance(sid, str) or not sid or sid == "-"
+            or harness not in _RETIRE_ACTIONS
+            or not isinstance(server, str) or not server
+            or not isinstance(predecessor_pane, str) or not predecessor_pane
+            or not isinstance(accepted_at, (int, float)) or isinstance(accepted_at, bool)):
+        return None
+    root = peer_message.peer_state_root() / "seat-successors"
+    candidates = []
+    try:
+        paths = sorted(root.glob("*.json"))
+    except OSError:
+        return None
+    for path in paths:
+        try:
+            record = native._read_native_record(path)
+            if record is None:
+                continue
+            mark = json.loads(record["raw"])
+        except (OSError, ValueError, TypeError, native.OpenCodeTransportError):
+            continue
+        candidate_pane = mark.get("pane") if isinstance(mark, dict) else None
+        successor = mark.get("successor") if isinstance(mark, dict) else None
+        if (not isinstance(candidate_pane, str) or not candidate_pane
+                or _seat_successor_path(candidate_pane) != path
+                or type(mark.get("schema")) is not int or mark.get("schema") != 1
+                or mark.get("beside") != predecessor_pane
+                or mark.get("server", "default") != server
+                or not isinstance(successor, dict)
+                or successor.get("harness") != harness
+                or successor.get("session_id") not in (None, "", sid)):
+            continue
+        candidates.append((candidate_pane, record, mark))
+    if len(candidates) != 1:
+        return None
+    candidate_pane, record, mark = candidates[0]
+    if (expected_pane is not None and candidate_pane != expected_pane
+            or not _source_before_acceptance(record["source"], accepted_at, mark.get("at"))):
+        return None
+
+    old_server = _HERDR_SESSION
+    _HERDR_SESSION = None if server == "default" else server
+    try:
+        observed = _retire_target(candidate_pane, server=server)
+        pane_info = _retire_pane_info(candidate_pane, server=server)
+        current, reason = _prompt_current_candidate(
+            candidate_pane, expected_harness=harness, expected_sid=sid,
+            require_process_session=True, target_observation=observed,
+            pane_info=pane_info)
+        if (current is None or reason
+                or current.get("pane") != candidate_pane
+                or current.get("harness") != harness
+                or current.get("session_id") != sid
+                or (current.get("_identity") or {}).get("server", server) != server):
+            return None
+    finally:
+        _HERDR_SESSION = old_server
+    projected = dict(requester)
+    projected.update(pane=candidate_pane, server=server)
+    return projected
+
+
 def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, accepted_at=None,
-                          recheck=None):
+                          recheck=None, retain_mark=False):
     from opencode_session_runtime import _read_native_record, OpenCodeTransportError
     path = _seat_successor_path(pane)
     try:
@@ -1369,20 +1531,35 @@ def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, 
                 or ident.get("server", "default") != server
                 or not _source_before_acceptance(record["source"], accepted_at, mark.get("at"))):
             return "skipped:successor-unverified"
+    if retain_mark:
+        current, reason = _prompt_current_candidate(
+            pane, expected_harness=own_harness, expected_sid=own_sid,
+            require_process_session=True)
+        if (reason or current is None or current.get("pane") != pane
+                or current.get("harness") != own_harness
+                or current.get("session_id") != own_sid):
+            return "skipped:successor-unverified"
     try:
         import dispatch_seat_handover as handover
         booked = {}
         if requester is not None:
             import session_tidy
-            booked["successor_seat"] = session_tidy._pane_seat_of(pane)
+            seat_env = _herdr_env_for_server(server)
+            booked["successor_seat"] = session_tidy._pane_seat_of(
+                pane, endpoint=session_tidy._endpoint_scope(seat_env),
+                socket_path=seat_env.get("HERDR_SOCKET_PATH", ""))
         if _read_native_record(path) != record or (recheck is not None and not recheck()):
             return "skipped:predecessor-unverified"
         row = handover.record_retire_handover(
             ident["session_id"], ident["harness"], own_sid, own_harness, env=os.environ, **booked)
-    except Exception:  # noqa: BLE001 - the retire itself already succeeded
+    except Exception as exc:  # noqa: BLE001 - the retire itself already succeeded
+        # Nothing was recorded because the registry could not be read, so this
+        # is not the verified-empty "none": keep the receipt unresolved.
+        if getattr(exc, "reason", "") == "registry-unreadable":
+            return "skipped:registry-unreadable"
         return "error"
     try:
-        if row is not None and _read_native_record(path) == record:
+        if row is not None and not retain_mark and _read_native_record(path) == record:
             path.unlink()
     except (OSError, OpenCodeTransportError):
         pass
@@ -1484,8 +1661,13 @@ def _retire_handover(duty, *, wait=None):
     """Consume only the accepted retirement's original succession, on any observer."""
     intent = duty.get("intent") or {}
     requester = intent.get("requester")
+    projected_legacy = False
+    legacy_blank_pane = (isinstance(requester, dict) and bool(requester)
+                         and requester.get("pane") in (None, "", "-"))
     try:
-        if not isinstance(requester, dict) or not requester:
+        if legacy_blank_pane:
+            own_sid, own_harness = requester.get("session_id"), requester.get("harness")
+        elif not isinstance(requester, dict) or not requester:
             requester = None
             own_sid, own_harness = _current_session_identity()
         else:
@@ -1496,10 +1678,57 @@ def _retire_handover(duty, *, wait=None):
     if resolved is None:
         return None
     identity, evidence = resolved
+    if legacy_blank_pane:
+        projected = _legacy_requester_projection(duty)
+        if projected is None:
+            # No successor mark is a normal no-handover case when the
+            # predecessor currently owns no registered route. Keep the
+            # retained duty unresolved only when that same shared authority
+            # reader still finds work it cannot safely bind to a pane.
+            try:
+                import dispatch_seat_handover as handover
+                jobs = handover._default_jobs()
+                if not jobs or not Path(jobs).is_file():
+                    return "skipped:successor-unverified"
+                from dispatch_registry_cache import registry_view
+                registry_view(Path(jobs))
+                if handover._handover_candidates(
+                        identity.get("harness", ""), identity.get("session_id", ""), jobs):
+                    return "skipped:successor-unverified"
+                return None
+            except (OSError, ValueError, TypeError, RuntimeError):
+                return "skipped:successor-unverified"
+        requester = projected
+        own_sid, own_harness = requester.get("session_id"), requester.get("harness")
+        projected_legacy = True
+    def recheck():
+        if evidence and _retire_predecessor(duty) != resolved:
+            return False
+        if projected_legacy:
+            return _legacy_requester_projection(
+                duty, expected_pane=requester.get("pane")) == requester
+        return True
     return _seat_handover(identity, own_sid, own_harness, requester=requester,
                           accepted_at=duty.get("accepted_at"),
-                          recheck=(lambda: _retire_predecessor(duty) == resolved) if evidence else None,
-                          wait=wait)
+                          recheck=recheck if evidence or projected_legacy else None,
+                          wait=wait, retain_mark=(duty.get("state") != "complete"
+                              and (duty.get("observation") or {}).get("phase", "waiting") == "waiting"
+                              and _retire_subject_state(duty) != "gone"))
+
+
+def _retire_cutover(duty):
+    """Move a proven successor's parent duties before deciding whether to exit.
+
+    A valid mark with no eligible route is still a confirmed succession. Its
+    past notification uncertainty is not an executor in the retiring pane.
+    The normal input projection continues to protect native turns and actual
+    registered executors; delivery records and their ACKs remain untouched.
+    """
+    try:
+        result = _retire_handover(duty, wait=0)
+    except Exception:
+        return False
+    return isinstance(result, str) and (result == "none" or result.isdecimal())
 
 
 def _observed_start_agent(args, deadline=None, wait=False):
@@ -1553,10 +1782,12 @@ def _mark_started(args, sid, mode):
             summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
             to_session_id=sid)
     from_sid, from_harness = _current_session_identity()
-    peer_message.mark_steward(
+    result = peer_message.grant_steward(
         from_harness, from_sid,
         {"harness": args.kind, "session_id": sid, "name": args.name, "pane": args.pane},
-        "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start")
+        "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
+        target_cwd=getattr(args, "cwd", None))
+    _print_steward_limited(result)
 
 
 def _placement_result(*argv):
@@ -1687,7 +1918,7 @@ def _start_in_pane(args):
         # still runs inside the workspace claim cmd_start holds.
         opened = terminal_surface.open_pane(
             near=terminal_surface.Near(_herdr_surface(), pane=None if workspace else args.beside,
-                                       workspace=workspace),
+                                       workspace=workspace, same_tab=not workspace),
             cwd=pane_cwd)
         if opened.pane is None:
             reason = opened.notes[0] if opened.notes else "pane-layout-unavailable"
@@ -2123,6 +2354,21 @@ def _handoff_lifetime_valid(foreground):
             and not isinstance(start, bool) and str(start).isdigit() and int(start) > 0)
 
 
+def _retire_requester_matches(duty, requester):
+    """Match only the same requester, projecting an old blank pane from its mark."""
+    saved = (duty.get("intent") or {}).get("requester")
+    if not isinstance(saved, dict) or not isinstance(requester, dict):
+        return False
+    if saved == requester:
+        return True
+    if ((saved.get("session_id"), saved.get("harness"), saved.get("server"))
+            != (requester.get("session_id"), requester.get("harness"), requester.get("server"))
+            or saved.get("pane") not in (None, "", "-")):
+        return False
+    projected = _legacy_requester_projection(duty, expected_pane=requester.get("pane"))
+    return projected == requester
+
+
 def reserve_handoff_retire(target, exact, requester):
     """Reserve in the existing store; never execute exit from acceptance."""
     store = peer_obligations.ObligationStore()
@@ -2131,7 +2377,7 @@ def reserve_handoff_retire(target, exact, requester):
         if all((d["intent"].get("identity") or {}).get(k) == exact.get(k)
                 for k in ("server", "pane", "harness", "session_id"))]
     if matches:
-        if len(matches) != 1 or matches[0]["intent"].get("requester") != requester:
+        if len(matches) != 1 or not _retire_requester_matches(matches[0], requester):
             raise ValueError("handoff-retire-requester-conflict")
         duty = matches[0]
     else:
@@ -2237,6 +2483,29 @@ def _resume_retire_obligation(duty, store, *, read_context=None,
             return
         followup_key = (str(store.root.resolve(strict=False)), duty.get("id", ""))
         if observation.get("terminal_followup") == "complete":
+            # Older versions could finish a blank-pane requester's terminal
+            # follow-up without reaching its successor mark. Re-read that same
+            # retained duty so an installed runner can repair the missed ledger
+            # row; an absent, changed, or ambiguous mark still grants nothing.
+            try:
+                handover = _retire_handover(duty, wait=0)
+            except Exception:
+                return
+            if handover in (None, "", "none", "error") or (
+                    isinstance(handover, str) and handover.startswith("skipped:")):
+                _RETIRE_FOLLOWUP_COMPLETE.add(followup_key)
+                return
+            if not _retire_followup_ready(duty, ident, "completed-retire", handover):
+                return
+            latest = store.get(duty["id"]) or duty
+            latest_observation = dict(latest.get("observation") or {})
+            if latest_observation.get("terminal_followup_result") != str(handover):
+                latest_observation.update(terminal_followup="complete",
+                                          terminal_followup_result=str(handover))
+                try:
+                    store.update(duty["id"], observation=latest_observation)
+                except (OSError, ValueError, RuntimeError):
+                    return
             _RETIRE_FOLLOWUP_COMPLETE.add(followup_key)
             return
         try:
@@ -2294,6 +2563,7 @@ def _resume_retire_obligation(duty, store, *, read_context=None,
     old_server = _HERDR_SESSION
     _HERDR_SESSION = None if server == "default" else server
     try:
+        cutover = _retire_cutover(duty)
         subject = _retire_subject_state(duty)
         if subject == "gone":
             _complete_gone_retire(store, duty)
@@ -2314,6 +2584,7 @@ def _resume_retire_obligation(duty, store, *, read_context=None,
         readiness = _pane_readiness(target, state,
                                     expected_harness=ident["harness"],
                                     expected_sid=observed["session_id"],
+                                    purpose="input" if cutover else "completion",
                                     read_context=read_context)
         if readiness.state != "ready":
             store.update(duty["id"], state="unknown" if readiness.state == "unknown" else "pending",
@@ -2383,12 +2654,12 @@ def cmd_retire(args):
         # lifetime and its successor. Never borrow another requester's duty.
         own_sid, own_harness = _current_session_identity()
         own_pane = _caller_pane()
+        current_requester = {"session_id": own_sid, "harness": own_harness,
+                             "pane": own_pane, "server": _HERDR_SESSION or "default"}
         matches = [row for row in store.list(states=peer_obligations._PENDING_STATES | {"complete"},
                                              kinds={"retire"})
                    if row["intent"].get("target") == target
-                   and row["intent"].get("requester") == {
-                       "session_id": own_sid, "harness": own_harness,
-                       "pane": own_pane, "server": _HERDR_SESSION or "default"}]
+                   and _retire_requester_matches(row, current_requester)]
         if own_sid and own_pane and len(matches) == 1:
             saved = matches[0]
             if saved.get("state") == "complete" and saved.get("result") in {"normal-exit", "target-already-gone"}:
@@ -2433,6 +2704,7 @@ def cmd_retire(args):
     phase = (duty.get("observation") or {}).get("phase", "waiting")
     if phase != "waiting":
         return finish("retire-already-pending", pending=True)
+    cutover = _retire_cutover(duty)
     subject = _retire_subject_state(duty)
     if subject == "gone":
         if _complete_gone_retire(store, duty):
@@ -2449,7 +2721,8 @@ def cmd_retire(args):
     if reason or retire_state not in {"idle", "done"}:
         return finish(reason or f"agent-{retire_state}-{state_source}", pending=True)
     readiness = _pane_readiness(target, state, expected_harness=harness,
-                                expected_sid=ident["session_id"])
+                                expected_sid=ident["session_id"],
+                                purpose="input" if cutover else "completion")
     if readiness.state != "ready":
         return finish(readiness.reason, pending=True)
     identity = _retire_foreground(pane, harness)
@@ -3793,7 +4066,8 @@ def cmd_watch(args):
     # receipt, ledger and native wait; it remains the operator's accepted text.
     if _herdr_missing():
         return _unavailable("herdr-not-found")
-    state, agent, _code, reason = _interpret_payload(_run_herdr_get(target), target)
+    watch_payload = _run_herdr_get(target)
+    state, agent, _code, reason = _interpret_payload(watch_payload, target)
     if state == "agent-not-found":
         print(_typed_line("agent-not-found", "-", "-", target, "-"))
         return 2
@@ -4162,7 +4436,8 @@ def cmd_watch(args):
         # The watcher is armed on a target herdr resolved above: steward evidence.
         resolved_name = agent["name"] if agent["name"] != "-" else target
         _mark_observed(agent["harness"], agent["session_id"], resolved_name,
-                       from_identity=(steward_sid, steward_harness), pane=agent["pane"])
+                       from_identity=(steward_sid, steward_harness), pane=agent["pane"],
+                       target_cwd=_payload_cwd(watch_payload))
     finally:
         if claim_fd is not None:
             os.close(claim_fd)
@@ -6582,22 +6857,29 @@ def _resume_message_obligation(duty, store, *, read_context=None):
         if not accepted.get("read_and_accepted"):
             checkpoint(state="pending", observation={"reason": "awaiting-agent-acceptance"})
             return
-        if not accepted.get("settled"):
-            import session_tidy as tidy
-            import session_tidy_runner as runner
-            context = row.get("handoff") or {}
-            successor = context.get("successor") or {}
-            global _HERDR_SESSION
-            old_server = _HERDR_SESSION
-            _HERDR_SESSION = None if successor.get("server") == "default" else successor.get("server")
-            try:
-                runner.accept_handoff(ref, (tidy.Seat("pane", "accepted-transfer", successor["pane"]),
-                    successor["harness"], successor["session_id"]), steward=sys.modules[__name__])
-            except (OSError, ValueError, KeyError):
-                checkpoint(state="pending", observation={"reason": "handoff-acceptance-unsettled"})
+        import session_tidy_runner as runner
+        context = row.get("handoff") or {}
+        successor = context.get("successor") or {}
+        global _HERDR_SESSION
+        old_server = _HERDR_SESSION
+        _HERDR_SESSION = None if successor.get("server") == "default" else successor.get("server")
+        try:
+            # Even old settled=true rows are replayed through the existing
+            # ledger writer; this repairs acceptance-before-ledger crashes
+            # without asking the current pane to reassert the same identity.
+            runner.resume_handoff_acceptance(ref, steward=sys.modules[__name__])
+        except (OSError, ValueError, KeyError, TypeError):
+            if duty.get("state") == "complete":
                 return
-            finally:
-                _HERDR_SESSION = old_server
+            checkpoint(state="pending", observation={"reason": "handoff-acceptance-unsettled"})
+            return
+        finally:
+            _HERDR_SESSION = old_server
+        _HANDOFF_ACCEPTANCE_REPLAYED.add((str(store.root.resolve(strict=False)), duty_id))
+        if len(_HANDOFF_ACCEPTANCE_REPLAYED) > 4096:
+            _HANDOFF_ACCEPTANCE_REPLAYED.clear()
+        if duty.get("state") == "complete":
+            return
         checkpoint(state="complete", result="accepted", delivery="scheduled", cleanup="complete",
                    observation={"ref": ref, "reason": "handoff-acceptance-settled"})
         return
@@ -7460,6 +7742,16 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                     jobs.parent, storage_recipient, member_id, claimed, claim_owner, jobs=jobs)):
                 release_members()
                 return
+            member_receipt = (stored_member.get("receipt") or {})
+            stall_notice = (member_receipt.get("kind") == "supervision"
+                            and member_receipt.get("reason") == "attempt-stalled")
+            if stall_notice:
+                from dispatch_supervision import notice_is_current
+                if not notice_is_current(stored_member):
+                    for acquired in claimed_members:
+                        pending.release_claim(jobs.parent, storage_recipient,
+                            acquired["delivery_id"], claim_owner=claim_owner)
+                    return
             attempt_ids = list(stored_member.get("attempt_ids") or [])
             if not attempt_ids and member_id == delivery_id:
                 attempt_ids = [row.attempt_id]
@@ -7468,9 +7760,14 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                                    for aid in attempt_ids])
             seed_notice = bool(notice_id and len(claimed_members) == 1
                                and member_id == delivery_id)
-            matching_rows = [candidate for candidate in matching_rows
-                             if candidate is not None and candidate.status == "done"
-                             and (seed_notice or candidate.metadata.get("delivery_id") == member_id)]
+            if stall_notice:
+                matching_rows = [candidate for candidate in matching_rows
+                    if candidate is not None and candidate.status in {"open", "running"}
+                    and candidate.attempt_id == member_receipt.get("owner_attempt_id")]
+            else:
+                matching_rows = [candidate for candidate in matching_rows
+                    if candidate is not None and candidate.status == "done"
+                    and (seed_notice or candidate.metadata.get("delivery_id") == member_id)]
             if len(matching_rows) != 1:
                 release_members()
                 return
@@ -7566,6 +7863,20 @@ def _resume_registered_obligation(duty, store, *, read_context=None):
                 *[item for member in transfer_members for item in (
                     "--ref", member["duty_id"], "--ref", member["attempt_id"],
                     "--ref", member["delivery_id"]) ]])
+            from dispatch_supervision import notice_is_current
+            for member in transfer_members:
+                receipt = (member["record"].get("receipt") or {})
+                if receipt.get("kind") == "supervision" and receipt.get("reason") == "attempt-stalled":
+                    latest_row = current_attempt_row(jobs, member["attempt_id"],
+                                                     read_context=read_context)
+                    if (not notice_is_current(member["record"]) or latest_row is None
+                            or latest_row.status not in {"open", "running"}
+                            or effective_parent(latest_row.metadata, jobs,
+                                                read_context=read_context) != recipient_sid):
+                        for pending_member in transfer_members:
+                            pending.release_claim(jobs.parent, storage_recipient,
+                                pending_member["delivery_id"], claim_owner=claim_owner)
+                        return
             code = cmd_prompt(args, expected_recipient=(recipient_harness, recipient_sid),
                               on_prepared=bind_transfer, producer_binding=producer_binding)
         current = [pending.read(jobs.parent, storage_recipient, member["delivery_id"])
@@ -7992,11 +8303,84 @@ def _publish_watch_readiness(store, snapshot, *, read_context, incarnation):
 def _runner_duties(store, duties=None):
     if duties is None:
         duties = store.list()
-    return [duty for duty in duties
-            if (duty.get("intent", {}).get("kind") in {"message", "retire", "registered-batch",
-                                                         "session-notice", "run-notice",
-                                                         shared_readiness.DUTY_KIND}
-                or duty.get("id", "").startswith(("message-", "delay-")))]
+    selected = [duty for duty in duties
+                if (duty.get("intent", {}).get("kind") in {"message", "retire", "registered-batch",
+                                                             "session-notice", "run-notice", "steward-check",
+                                                             shared_readiness.DUTY_KIND}
+                    or duty.get("id", "").startswith(("message-", "delay-")))]
+    seen = {duty.get("id") for duty in selected}
+    root = str(store.root.resolve(strict=False))
+    for duty in store.list(states={"complete"}, kinds={"message"}, cached_terminal=True):
+        intent = duty.get("intent") or {}
+        key = (root, duty.get("id", ""))
+        if (duty.get("id") in seen or key in _HANDOFF_ACCEPTANCE_REPLAYED
+                or not intent.get("handoff_acceptance")):
+            continue
+        ref = intent.get("ref")
+        if not isinstance(ref, str) or not ref:
+            continue
+        try:
+            row = peer_message._read_pending(ref)
+            acceptance = (row or {}).get("acceptance") or {}
+            import session_tidy_runner as tidy_runner
+            context, predecessor, _successor, _requester, target = \
+                tidy_runner._handoff_context(row, peer=peer_message)
+            retire_id = acceptance.get("retire_id")
+            retire = store.get(retire_id) if isinstance(retire_id, str) else None
+            retired_identity = ((retire or {}).get("intent") or {}).get("identity") or {}
+            if (acceptance.get("read_and_accepted") is not True
+                    or not isinstance(retire, dict)
+                    or (retire.get("intent") or {}).get("kind") != "retire"
+                    or retire.get("state") in {"cancelled", "failed"}
+                    or (retired_identity.get("server"), retired_identity.get("pane"),
+                        retired_identity.get("harness"), retired_identity.get("session_id"))
+                       != (predecessor.get("server"), predecessor.get("pane"),
+                           predecessor.get("harness"), predecessor.get("session_id"))
+                    or (retire.get("intent") or {}).get("target") != target
+                    or context.get("target") != target):
+                continue
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        selected.append(duty)
+        seen.add(duty.get("id"))
+    return selected
+
+
+def _settled_handoff_acceptance_duties(store):
+    """Recover prior-release accepted handoffs once when the retained runner starts."""
+    selected = []
+    for duty in store.list(states={"complete"}, kinds={"message"}, cached_terminal=False):
+        intent = duty.get("intent") or {}
+        if not intent.get("handoff_acceptance"):
+            continue
+        ref = intent.get("ref")
+        if not isinstance(ref, str) or not ref:
+            continue
+        try:
+            row = peer_message._read_pending(ref)
+            acceptance = (row or {}).get("acceptance") or {}
+            retire_id = acceptance.get("retire_id")
+            retire = store.get(retire_id) if isinstance(retire_id, str) else None
+            import session_tidy_runner as tidy_runner
+            context, predecessor, _successor, _requester, target = \
+                tidy_runner._handoff_context(row, peer=peer_message)
+            retired_identity = ((retire or {}).get("intent") or {}).get("identity") or {}
+            if (acceptance.get("read_and_accepted") is not True
+                    or acceptance.get("settled") is not True
+                    or not isinstance(retire, dict)
+                    or (retire.get("intent") or {}).get("kind") != "retire"
+                    or retire.get("state") in {"cancelled", "failed"}
+                    or (retired_identity.get("server"), retired_identity.get("pane"),
+                        retired_identity.get("harness"), retired_identity.get("session_id"))
+                       != (predecessor.get("server"), predecessor.get("pane"),
+                           predecessor.get("harness"), predecessor.get("session_id"))
+                    or (retire.get("intent") or {}).get("target") != target
+                    or context.get("target") != target):
+                continue
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        selected.append(duty)
+    return selected
 
 
 def _runner_duty_signature(duties):
@@ -8148,11 +8532,17 @@ def _obligation_retry_fingerprint(duty):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _steward_check_module():
+    """The periodic steward-check schedule (lazy: a missing module only disables it)."""
+    import importlib
+    return importlib.import_module("steward_check")
+
+
 def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state=None,
                            notice_selection=None, runner_incarnation=None):
     """Advance only the accepted duties owned by this runner."""
     if duties is None:
-        duties = store.list()
+        duties = _runner_duties(store, store.list())
     retry_state = {} if retry_state is None else retry_state
     notice_duties = []
     for duty in duties:
@@ -8184,6 +8574,8 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
                             persist_followup=True)
             elif kind == "registered-batch":
                 _resume_registered_obligation(duty, store, read_context=read_context)
+            elif kind == "steward-check":
+                _steward_check_module().advance(duty, store)
         except Exception:
             try:
                 store.update(duty["id"], observer_error="observer-unavailable")
@@ -8222,6 +8614,8 @@ def _discover_session_notice_duties(store, *, read_context=None):
     """Recover usable old notices; False keeps partial discovery with this runner."""
     import dispatch_pending_delivery as pending
     import session_notice
+    from harness_capabilities import HARNESSES, parent_completion
+    from session_tidy import _handover_origin
     from peer_read_context import PeerReadContext
     from dispatch_seat_handover import (_registered_parent_harness,
                                         lineage_graph, record_recipient)
@@ -8231,7 +8625,14 @@ def _discover_session_notice_duties(store, *, read_context=None):
     candidates = set()
     read_context = read_context or PeerReadContext(registry_append_only=True)
     try:
-        candidates.update(lineage_graph(read_context=read_context).ledger_keys)
+        graph = lineage_graph(read_context=read_context)
+        candidates.update(graph.ledger_keys)
+        for rows in graph.ledger_rows.values():
+            for row in rows:
+                if row.get("event") == "handover" and row.get("source") == "retire":
+                    origin = _handover_origin(row)
+                    if origin is not None:
+                        candidates.add(origin)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         # Unavailable authority cannot authorize notices or abandon the runner's
         # other accepted work. Retry discovery on its next ordinary pass.
@@ -8250,7 +8651,7 @@ def _discover_session_notice_duties(store, *, read_context=None):
         pass  # Route-free notices do not require a jobs registry.
     except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         observed = False
-    for harness, storage_sid in candidates:
+    for storage_sid in sorted({sid for _harness, sid in candidates}):
         entries = []
         try:
             directory = pending.record_directory(state_root, storage_sid)
@@ -8292,6 +8693,13 @@ def _discover_session_notice_duties(store, *, read_context=None):
                 if kind != "notice":
                     continue
                 session_notice.validate_pending_record(record)
+                # A legacy retire names only the predecessor SID; the original
+                # carrier, not the successor's harness, identifies this record.
+                harness = next((name for name in HARNESSES
+                                if parent_completion(name).get("carrier") == record.get("recipient_kind")), None)
+                if harness is None:
+                    observed = False
+                    continue
                 if record_recipient(record, storage_sid, harness=harness) is None:
                     observed = False
                     continue
@@ -8676,6 +9084,12 @@ def cmd_obligation_runner(args):
                         "runner_incarnation": runner_incarnation, "last_group": None}
     settlement_context = dispatch_batch_obligations.OwnerSettlementReadContext()
     duty_retry_state = {}
+    terminal_handoff_scan = True
+    terminal_handoff_duties = []
+    try:
+        _steward_check_module().reconcile_all(store)
+    except Exception:
+        pass
     while True:
         start_readiness_worker()
         if not _runner_lock_current(store, args.lock_fd):
@@ -8692,6 +9106,16 @@ def cmd_obligation_runner(args):
         read_context = PeerReadContext(registry_append_only=True)
         notice_discovery_observed = _discover_session_notice_duties(store, read_context=read_context)
         duties = store.list()
+        if (terminal_handoff_scan
+                and any((duty.get("intent") or {}).get("kind") == "retire"
+                         for duty in duties)):
+            terminal_handoff_duties = _settled_handoff_acceptance_duties(store)
+        terminal_handoff_scan = False
+        for duty in terminal_handoff_duties:
+            replay_key = (str(store.root.resolve(strict=False)), duty.get("id", ""))
+            if replay_key not in _HANDOFF_ACCEPTANCE_REPLAYED:
+                duties.append(duty)
+        duties = _runner_duties(store, duties)
         observation_context = ObservationContext()
         _reconcile_obligations(store, duties, read_context=read_context,
                                retry_state=duty_retry_state,
@@ -8861,6 +9285,10 @@ def cmd_ensure_obligations(_args):
     if lock_fd is None:
         return 0
     try:
+        try:
+            _steward_check_module().reconcile_self(store)
+        except Exception:
+            pass
         try:
             lifecycle_root = getattr(_args, "lifecycle_root", None)
             peer_obligations.ensure_normal_runner(
@@ -10055,10 +10483,22 @@ def cmd_steward(args):
         return 1
     if args.state == "on":
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        ok = peer_message.mark_steward(harness, sid, {"harness": "unknown", "name": "-"},
-                                       "explicit", ts, source="explicit")
+        result = peer_message.grant_steward(harness, sid, {"harness": "unknown", "name": "-"},
+                                            "explicit", ts, source="explicit")
+        if result["status"] == "limited":
+            print(peer_message.format_steward_limited(result))
+            return 1
+        ok = result["written"]
+        _ensure_steward_runner(result)
         print(f"steward={'on' if ok else 'unchanged'} harness={harness} session_id={sid}")
         return 0 if ok else 1
+    if args.state == "check":
+        try:
+            check_module = _steward_check_module()
+        except ImportError:
+            print("steward-check=unavailable reason=module-missing")
+            return 1
+        return check_module.cmd_check(harness, sid)
     rc = peer_message.cmd_release(peer_message.argparse.Namespace(harness=harness, session_id=sid))
     print(f"steward=off harness={harness} session_id={sid}")
     return rc
@@ -10181,7 +10621,7 @@ def build_parser():
     p_continue.set_defaults(func=cmd_continue)
 
     p_mode = sub.add_parser("steward")
-    p_mode.add_argument("state", choices=("on", "off"))
+    p_mode.add_argument("state", choices=("on", "off", "check"))
     p_mode.set_defaults(func=cmd_steward)
 
     return parser

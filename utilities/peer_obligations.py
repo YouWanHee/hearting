@@ -36,7 +36,7 @@ _SAFE_ID = re.compile(r"[A-Za-z0-9._-]{1,160}\Z")
 _MAX_RECORD_BYTES = 128 * 1024
 _PENDING_STATES = frozenset({"pending", "unknown", "delivery-pending", "cleanup-pending"})
 _DUTY_KINDS = frozenset({"watch", "message", "retire", "registered-batch", "session-notice", "run-notice",
-                         "readiness-observation"})
+                         "readiness-observation", "steward-check"})
 _RUNNERS: list[subprocess.Popen] = []
 _DISTRIBUTION_MODULES = {}
 _MESSAGE_RECEIVER_PROVENANCE = "validated-peer-ref-receiver-v1"
@@ -328,18 +328,42 @@ def _process_holds_flock(pid: int, lock_path: Path, fd_number: str) -> bool:
     return False
 
 
+def _find_held_lock_fd(pid: int, lock_path: Path) -> str | None:
+    """Return the only fd of ``pid`` that holds ``lock_path``'s flock, else None."""
+    try:
+        info = lock_path.stat()
+        held = []
+        for entry in os.listdir(f"/proc/{pid}/fd"):
+            if not entry.isdecimal():
+                continue
+            try:
+                observed = os.stat(f"/proc/{pid}/fd/{entry}")
+            except OSError:
+                continue
+            if ((observed.st_dev, observed.st_ino) == (info.st_dev, info.st_ino)
+                    and _process_holds_flock(pid, lock_path, entry)):
+                held.append(entry)
+    except (OSError, ValueError, TypeError):
+        return None
+    return held[0] if len(held) == 1 else None
+
+
 def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | Path,
                              relative_script: str | Path, required_arguments: Iterable[str],
                              service_current: str | Path, *, lock_fd_option: str,
                              root=None, timeout: float = 2.0,
                              exact_arguments: bool = False,
                              argument_variants: Iterable[Iterable[str]] = (),
-                             service_current_option: str = "--service-current"):
+                             service_current_option: str = "--service-current",
+                             replace_checkout: bool = False):
     """Stop one exact old observer after proving its same-install duty lock.
 
     Returns ``current`` for an already-current observer, ``replaced`` after
     that exact process exits, and ``False`` when any part of the proof is
-    unavailable. No duty data is changed here.
+    unavailable. No duty data is changed here. A caller may set
+    ``replace_checkout`` to also replace an observer that runs from a
+    development checkout (never reported current); otherwise such a process
+    is left alone.
     """
     if pid_start is not None and (
             not isinstance(pid_start, str) or not pid_start.isdecimal()):
@@ -392,12 +416,25 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                     return None
                 script = Path(argv[1]).resolve(strict=True)
                 source_root = script.parent.parent
-                if (script != source_root / relative or _release_root(
-                        source_root, _service_layout(code_root)[2]) is None):
-                    return None
-                source_layout = _service_layout(source_root)
                 target_layout = _service_layout(code_root)
-                if (source_layout is None or target_layout is None
+                if script != source_root / relative or target_layout is None:
+                    return None
+                dev_checkout = False
+                if _release_root(source_root, target_layout[2]) is None:
+                    # A development checkout is never a managed release; it is
+                    # only ever replaced (legacy), never accepted as current.
+                    # Another install's release stays foreign.
+                    if (not replace_checkout
+                            or source_root.parent == target_layout[2]
+                            or (source_root / "RELEASE_VERSION").exists()
+                            or not all((source_root / marker).is_file() for marker in (
+                                "utilities/peer_obligations.py", "core/CORE.md"))):
+                        return None
+                    dev_checkout = True
+                    source_layout = target_layout
+                else:
+                    source_layout = _service_layout(source_root)
+                if (source_layout is None
                         or source_layout[1] != target_layout[1]
                         or source_layout[2] != target_layout[2]
                         or source_layout[3] != target_layout[3]):
@@ -424,6 +461,11 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                     if duty_arguments not in expected_variants:
                         return None
                     lock_fd_number = control_values.get(lock_fd_option)
+                    if lock_fd_number is None:
+                        # Early observers open their own lease and never
+                        # advertised its descriptor; find the single fd that
+                        # holds this exact duty lock.
+                        lock_fd_number = _find_held_lock_fd(pid, lock)
                     if lock_fd_number is None or not lock_fd_number.isdecimal():
                         return None
                     observed_binding = control_values.get(service_current_option)
@@ -449,10 +491,17 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                         if not raw:
                             return None
                         env_root = Path(raw).expanduser().resolve(strict=True)
+                        if dev_checkout and env_root == source_root:
+                            continue
                         env_layout = _service_layout(env_root)
                         if env_layout is None or env_layout[1:] != source_layout[1:]:
                             return None
-                    if "HARNESS_DATA_ROOT" in env:
+                    # A checkout run (often under a fixture HOME) is bound to
+                    # this install only by the exact duty lease it holds,
+                    # which is proven below; its own data root is not.
+                    if dev_checkout:
+                        observed_data_root = None
+                    elif "HARNESS_DATA_ROOT" in env:
                         raw = env["HARNESS_DATA_ROOT"]
                         if not raw:
                             return None
@@ -468,7 +517,8 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                             return None
                         observed_data_root = (
                             Path(home).expanduser() / ".local" / "share" / "hearting")
-                    if (not observed_data_root.is_absolute()
+                    if observed_data_root is not None and (
+                            not observed_data_root.is_absolute()
                             or Path(os.path.abspath(os.fspath(observed_data_root)))
                             != source_layout[1]):
                         return None
@@ -483,7 +533,7 @@ def replace_managed_observer(pid: int, pid_start: str | None, lock_path: str | P
                     return None
                 if held_path != lock or not _process_holds_flock(pid, lock, lock_fd_number):
                     return None
-                if source_root == target_root:
+                if source_root == target_root and not dev_checkout:
                     return ("current", None)
                 return ("legacy", None)
 
@@ -932,7 +982,9 @@ def retain_registered_notice(jobs, record):
     jobs = Path(jobs).resolve(strict=True)
     receipt = record.get("receipt") or {}
     if (receipt.get("kind") != supervision.KIND
-            or receipt.get("reason") not in {supervision.ANSWER_AWAITING_PARENT, "no-progress"}):
+            or receipt.get("reason") not in {
+                supervision.ANSWER_AWAITING_PARENT, "no-progress", "attempt-stalled",
+            }):
         return False
     row = current_attempt_row(jobs, receipt.get("owner_attempt_id", ""))
     if row is None:
@@ -1016,11 +1068,14 @@ def _ordinary_notice_target(identity, carrier):
     from dispatch_seat_handover import _notice_recipient_binding
     import session_notice
     try:
-        harness = identity.get("recipient_harness")
-        storage = identity.get("storage_recipient")
+        lineage = identity.get("lineage")
+        if not isinstance(lineage, dict):
+            return None
+        harness = identity.get("recipient_harness", lineage.get("harness"))
+        storage = identity.get("storage_recipient", lineage.get("session_id"))
         jobs = Path(identity.get("jobs", ""))
         if (not jobs.is_absolute() or jobs.is_symlink() or not storage
-                or identity.get("recipient_session_id") != storage
+                or identity.get("recipient_session_id", lineage.get("session_id")) != storage
                 or parent_completion(harness).get("carrier") != carrier):
             return None
         if not isinstance(identity.get("lineage"), dict):

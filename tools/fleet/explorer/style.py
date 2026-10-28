@@ -15,7 +15,9 @@ KEY_ALIASES = {
     "colhead": "section_head", "sect": "section_head",
     "lvl_g": "grp_live", "lvl_y": "g_idle", "lvl_r": "g_dead",
     "lvl_r_flat": "g_blocked", "chip_on": "hearting_name", "eff_medium": "branch_s",
-    "fam_opus": "hb_claude", "fam_gpt": "g_idle", "bold": "section_head", "code": "hb_opencode", "tool": "g_work",
+    # `fam_*` model keys pass through unchanged: one key per family keeps every viewer
+    # on the same hue. A local alias here is how Sol/Astra/Luna once shared one yellow.
+    "bold": "section_head", "code": "hb_opencode", "tool": "g_work",
 }
 
 REFERENCE_STYLES = {
@@ -32,6 +34,26 @@ REFERENCE_STYLES = {
 }
 
 
+# A FINISHED route row (dead or done) recedes one rung on the SAME palette: every value
+# here is an existing key, so one state keeps one weight on every screen. Prefix pairs
+# (`fam_*→famd_*`, `eff_*→effd_*`, `hb_*→h_*`) cover the families; the explicit entries
+# are the tabled keys a route row actually paints. A key absent here is already dim and
+# stays put — a bright gap is allowed to remain, a new colour is not invented.
+RECEDE_KEYS = {
+    "loc_repo": "name_dim",              # titles and soft body
+    "branch_s": "dim",                   # plain-weight separators
+    "section_head": "name_dim",          # defensive: headers stay outside the row
+    "tag_steward": "tag_dim",            # a finished steward tag loses the pink emphasis
+    "g_work": "g_work_off", "grp_live": "g_work_off",
+    "g_idle": "lvl_y_dim", "lvl_y": "lvl_y_dim", "stg3_on": "lvl_y_dim",
+    "g_spin": "g_spin_dim",
+    "g_dead": "lvl_r_dim", "lvl_r": "lvl_r_dim", "lvl_r_flat": "lvl_r_dim",
+    "g_blocked": "lvl_r_dim", "g_blocked_chip": "lvl_r_dim",
+}
+
+_HARNESS_DIM = {"claude": "h_claude", "codex": "h_codex", "opencode": "version_release"}
+
+
 def normalize_style(key=None, tint=None):
     if key is None:
         return None, tint
@@ -45,3 +67,27 @@ def normalize_style(key=None, tint=None):
 
 def style_for(key, tint=None):
     return normalize_style(key, tint)
+
+
+def steward_flag_key(session, lit=True):
+    """Pulse the existing live supervisor role independently of its model turn."""
+    if session.get("steward") and session.get("state") not in ("dead", "stale") and not lit:
+        return "tag_steward_dim"
+    return "tag_steward"
+
+
+def recede_key(key):
+    """The dim rung of one painted key: the glyph, tint and hue family keep their meaning."""
+    canonical, _tint = normalize_style(key)
+    if canonical is None:
+        return None
+    mapped = RECEDE_KEYS.get(canonical)
+    if mapped is not None:
+        return mapped
+    if canonical.startswith("hb_"):
+        return _HARNESS_DIM.get(canonical[3:], "dim")
+    if canonical.startswith("fam_"):
+        return "famd_" + canonical[4:]
+    if canonical.startswith("eff_"):
+        return "effd_" + canonical[4:]
+    return canonical

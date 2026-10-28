@@ -172,7 +172,7 @@ or executable environment is absent, and compose it separately after approval.
 The resource runner continues to enforce route verification, hash-bound smoke
 attestation, config provenance, the governor, and its `supervised` continuation.
 
-For a failed resource run, use `<manifest_run_id>__a<N>` (N starts at 1) on the same route; reusing the previous run ID with a new owner conflicts with its existing watch binding (`resource-watch-binding-conflict`). When a completed `compute-hosts` run is offered instead, pass its id once to the existing `resource-runner start --compute-run <run-id>` surface. The runtime accepts only exact same-route and sealed-contract evidence, a zero exit, declared outputs, and a fresh remote quiescence observation. The handoff creates the next `__aN` resource row and preserves the failed row; it does not start a payload or replace independent `run-verify` judgment. A run id alone is not evidence.
+For a failed resource run, use `<manifest_run_id>__a<N>` (N starts at 1) on the same route; reusing the previous run ID with a new owner conflicts with its existing watch binding (`resource-watch-binding-conflict`). When a completed `compute-hosts` run is offered instead, pass its id once to the existing `resource-runner start --compute-run <run-id>` surface. The runtime accepts only same-route (or its verified owner-pin-handoff successor) and sealed-contract evidence, a zero exit, declared outputs, and a fresh remote quiescence observation. The handoff creates the next `__aN` resource row and preserves the failed row; it does not start a payload or replace independent `run-verify` judgment. A run id alone is not evidence.
 `compute-hosts run` resolves the selected devices to host GPU indices and sets `CUDA_VISIBLE_DEVICES` to those indices (for example `0`), so owner scaffolds must not require that value to be a GPU UUID. Explicit `CUDA_VISIBLE_DEVICES=` or `CUDA_VISIBLE_DEVICES=-1` selects CPU-only execution without GPU admission.
 
 This replaced a graph whose last node was the training process itself. On
@@ -200,6 +200,40 @@ without a plan it is two hours, then every 12 hours. Known metrics, rules, basel
 and time budgets are optional. Missing sources or ETA stay explicit and do not
 interrupt a run or change exit, sentinel, verification, or approval state. Notices
 carry the run id and stable public run-record path when available.
+
+Admission is another optional observation axis, independent of metric progress.
+The shared observer can use bounded records tied to exact run provenance when
+the output root is absent; evidence must also match an exact row when it is
+row-specific, and ambiguous evidence remains unknown. Public records and notices
+can summarize valid, denied and unknown admission samples, their observed sample
+ratio, freshness, and bounded reasons. A sample ratio is not a duration or a
+compute-time ratio; without explicit measured wait boundaries, wait duration
+stays unknown. Admission does not imply resumed work or supply a progress counter.
+
+Stagnation is based on strict increases in the same comparable counter or metric
+stream. Repeated fresh samples at the same value refresh observation age but do
+not reset the last-increase clock. The existing two-hour advisory can describe
+time since the last increase, or time since the first comparable observation
+when no increase has been observed. No progress signal means stagnation and ETA
+are unknown. A new run, row, or source generation starts a new comparison. Do not
+subtract admission samples or spans from elapsed time, or infer a rate or ETA
+from them. Existing lifecycle, optional-failure, recipient, and delivery-receipt
+semantics remain authoritative.
+
+The normal observer may additionally receive bounded optional `source_bindings`
+metadata for an independently written raw counter. A binding names its exact
+target run and row separately from the writer identity, source path, timestamp
+and counter JSON pointers, comparison eligibility, and bounded proof files with
+exact assertions. The common reader revalidates the proof on later polls and
+reattachment, and resumes legacy cursors without a manual recovery step. Partial
+listing/time slices continue on later polls; unrelated sibling changes leave a
+still-valid target binding intact. Public observation preserves the raw
+name, value, scope, source, writer, target, timestamp, and freshness. A
+non-comparable shared-results counter never supplies canonical progress, unit,
+total, rate, ETA, stagnation, or completion. Invalid or stale proof makes that
+source unknown while the existing lifecycle and outbox authority remains in
+force.
+
 For matrix plans, the default is to queue each completed row's decision-metric
 evaluation on the existing approved queue while the next row trains, then update
 the leaderboard artifact; successive halving is a default option for many rows.
@@ -260,6 +294,21 @@ completes the resource stage after its evidence is rechecked. The same rule
 applies when code borrows `full-run`. `full-run` carries
 the declared mark `start_approval: full-run`; it is data for the route card and
 the frame catalog, not a gate.
+
+`autopilot-lab:host-run` is the GPU-free counterpart: a shareable optional part
+(`setup` and `eval` graphs, also `autopilot-code`) for a long measurement, benchmark,
+browser test or memory-capped command. It is the same detached `supervised`
+resource-runner (`_kernel/resource`, `resource-exit`) but declares
+`execution_needs: host-process`, so it takes no GPU lease, no compute-hosts scope, no
+smoke or config attestation and no `start_approval`. Name it in the graph after the
+preparing stage and before the model verify/report successor, for example
+`--graph plan,plan-check,execute,autopilot-lab:host-run,impl-review,test,report`; the
+successor, never the resource exit, completes the stage. Its payload command owns the
+memory cap (`systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0 …`). On a
+Codex owner only that node's controller-built payload runs as a host process without
+OS file or network enforcement; the owner and model children stay `workspace-write`
+(see `docs/lab-execution-access.md`). It differs from `smoke`, `full-run` and
+`eval-run`, which keep the hash-bound attestation and provenance requirements.
 
 ### Eval execution topology (`standard+`)
 

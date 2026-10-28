@@ -392,6 +392,8 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "detected_by",
     "failure_class",
     "process_exit",
+    "quota_model_scope",
+    "quota_window",
     "reconcile_reason",
     "reset",
     "terminal_event",
@@ -987,6 +989,15 @@ class ProcessGroupObservation:
     state: str
     members: tuple[tuple[int, str, str], ...] = ()
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class AttemptExecutionObservation:
+    """Execution-only evidence, kept separate from governed cleanup liveness."""
+
+    state: str  # active / absent / unknown
+    reason: str = ""
+    identities: tuple[tuple[int, str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -3640,6 +3651,87 @@ def attempt_tagged_descendants(
     return ProcessGroupObservation("empty")
 
 
+_ATTEMPT_RUNTIME_NAMES = {"claude": "claude", "codex": "codex", "opencode": "opencode"}
+_ATTEMPT_INTERPRETERS = {"python", "node", "nodejs", "bun"}
+_ATTEMPT_CARRIER_SCRIPTS = frozenset({
+    "codex-managed-completion.py", "dispatch-attempt-ready.py",
+    "dispatch-orphan-watch.py", "dispatch-progress.py", "dispatch-reap-watch.py",
+    "dispatch-session-sweep.py", "dispatch-owner-rewake.py", "peer-steward.py",
+})
+
+
+def attempt_execution_observation(metadata: dict[str, str]) -> AttemptExecutionObservation:
+    """Separate a surviving dispatch carrier from the attempt's runtime.
+
+    The complete exact attempt tag census remains the authority for absence.
+    Every positive identity is rechecked by PID and start time while its
+    bounded command identity is read. Known carrier scripts count as helpers;
+    an unclassified process, PID reuse, access failure, or partial census is
+    unknown. The result is advisory input only and never narrows cleanup's
+    process set.
+    """
+
+    attempt_id = metadata.get("attempt_id", "")
+    harness = metadata.get("harness", "")
+    if not attempt_id or harness not in _ATTEMPT_RUNTIME_NAMES:
+        return AttemptExecutionObservation("unknown", "attempt-or-harness-unbound")
+    tagged = attempt_tagged_descendants(metadata)
+    if tagged.state == "unverifiable":
+        return AttemptExecutionObservation("unknown", tagged.reason)
+    if tagged.state == "empty":
+        return AttemptExecutionObservation("absent", "attempt-tag-census-empty")
+
+    active = []
+    helpers = []
+    unclassified = []
+    uncertain = tagged.reason
+    for pid, expected_start, _state in tagged.members:
+        if process_start_ticks(pid) != expected_start:
+            uncertain = uncertain or "attempt-process-identity-changed"
+            continue
+        proc = Path("/proc") / str(pid)
+        try:
+            raw = (proc / "cmdline").read_bytes()[:8192]
+            comm = (proc / "comm").read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            uncertain = uncertain or "attempt-process-disappeared-during-observation"
+            continue
+        except OSError as exc:
+            uncertain = uncertain or f"attempt-command-unreadable:{exc.errno or 'error'}"
+            continue
+        if process_start_ticks(pid) != expected_start:
+            uncertain = uncertain or "attempt-process-identity-changed"
+            continue
+        argv = [os.fsdecode(part) for part in raw.rstrip(b"\0").split(b"\0") if part]
+        if not argv:
+            uncertain = uncertain or "attempt-command-empty"
+            continue
+        first = Path(argv[0]).name.lower()
+        is_runtime = first == harness
+        if (not is_runtime and first in _ATTEMPT_INTERPRETERS and len(argv) > 1):
+            is_runtime = Path(argv[1]).name.lower() == harness
+        if is_runtime or comm.lower() == harness:
+            active.append((pid, expected_start, harness))
+            continue
+        script = next((Path(arg).name for arg in argv[1:3]
+                       if Path(arg).name in _ATTEMPT_CARRIER_SCRIPTS), "")
+        if script:
+            helpers.append((pid, expected_start, script))
+            continue
+        unclassified.append((pid, expected_start,
+                             "unclassified:" + (comm or first)[:96]))
+        uncertain = uncertain or "attempt-process-role-unclassified"
+
+    if active:
+        return AttemptExecutionObservation("active", "runtime-command-live", tuple(active))
+    if uncertain:
+        return AttemptExecutionObservation("unknown", uncertain,
+                                           tuple((*helpers, *unclassified)))
+    if helpers:
+        return AttemptExecutionObservation("absent", "carrier-only", tuple(helpers))
+    return AttemptExecutionObservation("unknown", "attempt-execution-unclassified")
+
+
 def _foreground_reap_receipt(metadata: dict[str, str]) -> bool:
     raw_pid = metadata.get("pid", "")
     raw_group = metadata.get("pgid", "")
@@ -4318,6 +4410,22 @@ def attempt_governed_process_quiescence(
     """
 
     return _attempt_process_quiescence_impl(metadata)
+
+
+def attempt_identity_lineage(metadata: Mapping[str, str]) -> set[tuple[str, str]]:
+    """Return exact current and predecessor PID/start identities for one attempt."""
+    identities: set[tuple[str, str]] = set()
+    current_pid, current_start = str(metadata.get("pid", "")), str(metadata.get("pid_start", ""))
+    if current_pid.isdigit() and current_start.isdigit():
+        identities.add((current_pid, current_start))
+    raw = metadata.get("owner_identity_lineage", "")
+    if not isinstance(raw, str):
+        return identities
+    for entry in raw.split("+"):
+        pid, separator, start = entry.partition(":")
+        if separator and pid.isdigit() and start.isdigit():
+            identities.add((pid, start))
+    return identities
 
 
 def _attempt_process_quiescence_impl(metadata: dict[str, str]) -> ProcessQuiescence:
@@ -5331,14 +5439,14 @@ def spawn_claimed_attempt(
     preclaim: Callable[[list[str]], None] | None = None,
     pre_release: Callable[[dict[str, str]], dict[str, str] | None] | None = None,
     post_claim: Callable[[dict[str, str]], dict[str, str] | PostClaimAdmission | None] | None = None,
+    respawn_of: tuple[str, str] | None = None,
 ) -> tuple[subprocess.Popen, dict[str, str]]:
     """Claim one registered attempt while publishing its fenced process.
 
-    The row stays ``launch_claimed=0`` until a complete fenced PID identity is
-    ready. The same registry replacement publishes the identity and transitions
-    the claim to 1. A launcher killed before spawn therefore leaves a retryable
-    registered row, while a launcher killed after spawn leaves either a blocked
-    fence or a fully attributable process group. ``pre_release`` may attach a
+    A new row stays ``launch_claimed=0`` until a complete fenced PID identity is
+    ready. A same-attempt Codex respawn instead requires the exact prior identity,
+    a quiescent governed process and a free supervisor lease, then atomically
+    republishes the identity with its predecessor lineage. ``pre_release`` may attach a
     bounded observer to that exact identity; its metadata is committed in the
     same replacement and any failure aborts the still-fenced worker.
     ``post_claim`` is the narrow jobs-unlocked producer-admission seam. Its
@@ -5369,10 +5477,28 @@ def spawn_claimed_attempt(
             raise DispatchContractError("cancelled-by-parent")
         if child_fields[1] not in {"open", "running"}:
             raise DispatchContractError("attempt-not-open", attempt_id)
-        if child_meta.get("launch_claimed") == "1":
-            raise DispatchContractError("attempt-launch-already-claimed", attempt_id)
-        if child_meta.get("launch_claimed") != "0":
-            raise DispatchContractError("attempt-launch-claim-invalid", attempt_id)
+        if respawn_of is None:
+            if child_meta.get("launch_claimed") == "1":
+                raise DispatchContractError("attempt-launch-already-claimed", attempt_id)
+            if child_meta.get("launch_claimed") != "0":
+                raise DispatchContractError("attempt-launch-claim-invalid", attempt_id)
+        else:
+            expected_identity = (str(respawn_of[0]), str(respawn_of[1]))
+            if (parent_binding is not None or child_meta.get("worker_type") != "owner"
+                    or child_meta.get("dispatch_depth") != "1"
+                    or child_meta.get("harness") != "codex"
+                    or child_meta.get("launch_claimed") != "1"
+                    or child_meta.get("launch_started") != "1"
+                    or (child_meta.get("pid", ""), child_meta.get("pid_start", ""))
+                       != expected_identity):
+                raise DispatchContractError("attempt-respawn-identity-changed", attempt_id)
+            governed = attempt_governed_process_quiescence(child_meta)
+            if governed.state != "quiescent":
+                reason = ("attempt-respawn-consumer-live" if governed.state == "live"
+                          else "attempt-respawn-consumer-unverifiable")
+                raise DispatchContractError(reason, governed.reason)
+            if supervisor_lease_is_held(jobs, child_meta):
+                raise DispatchContractError("attempt-respawn-lease-held", attempt_id)
 
         if parent_binding is not None:
             parent_matches = []
@@ -5419,17 +5545,18 @@ def spawn_claimed_attempt(
                     "parent-attempt-not-live", parent_binding.attempt_id
                 )
 
-        from dispatch_replacement import admission as replacement_admission
-        replacement_admission(jobs, lines, child_meta)
-        from review_input import validate_launch as validate_review_input
-        validate_review_input(jobs, child_meta)
-        from review_source_subject import SourceSubjectError, validate_attempt as validate_review_subject
-        try:
-            validate_review_subject(jobs, child_fields, child_meta)
-        except SourceSubjectError as exc:
-            raise DispatchContractError(exc.reason, exc.detail) from exc
-        if preclaim is not None:
-            preclaim(lines)
+        if respawn_of is None:
+            from dispatch_replacement import admission as replacement_admission
+            replacement_admission(jobs, lines, child_meta)
+            from review_input import validate_launch as validate_review_input
+            validate_review_input(jobs, child_meta)
+            from review_source_subject import SourceSubjectError, validate_attempt as validate_review_subject
+            try:
+                validate_review_subject(jobs, child_fields, child_meta)
+            except SourceSubjectError as exc:
+                raise DispatchContractError(exc.reason, exc.detail) from exc
+            if preclaim is not None:
+                preclaim(lines)
 
         gate_read, gate_write = os.pipe()
         try:
@@ -5533,26 +5660,38 @@ def spawn_claimed_attempt(
                             if key != "resolved_model"}
                 new_meta = {key: value for key, value in fresh_meta.items()
                             if key != "resolved_model"}
+                expected_claim = "0" if respawn_of is None else "1"
+                identity_matches = (fresh_meta.get("pid", ""), fresh_meta.get("pid_start", "")) == (
+                    str(respawn_of[0]), str(respawn_of[1])) if respawn_of is not None else True
                 if (fresh_fields[1] not in {"open", "running"}
                         or fresh_fields[2:5] != child_fields[2:5]
                         or fresh_meta.get("attempt_id") != attempt_id
-                        or fresh_meta.get("launch_claimed") != "0"
-                        or new_meta != old_meta):
+                        or fresh_meta.get("launch_claimed") != expected_claim
+                        or not identity_matches or new_meta != old_meta):
                     changed_reason = "attempt-pre-release-identity-changed"
                 else:
                     import route_parent_close
                     if route_parent_close.row_requested(fresh_meta, jobs):
                         changed_reason = "cancelled-by-parent"
                     else:
-                        try:
-                            replacement_admission(jobs, fresh_lines, fresh_meta)
-                            validate_review_input(jobs, fresh_meta)
-                            validate_review_subject(jobs, fresh_fields, fresh_meta)
-                        except SourceSubjectError as exc:
-                            changed_reason, changed_detail = exc.reason, exc.detail
-                        except DispatchContractError as exc:
-                            changed_reason, changed_detail = exc.reason, exc.detail
+                        if respawn_of is not None:
+                            governed = attempt_governed_process_quiescence(fresh_meta)
+                            if governed.state != "quiescent":
+                                changed_reason = ("attempt-respawn-consumer-live" if governed.state == "live"
+                                                  else "attempt-respawn-consumer-unverifiable")
+                                changed_detail = governed.reason
+                            elif supervisor_lease_is_held(jobs, fresh_meta):
+                                changed_reason = "attempt-respawn-lease-held"
                         else:
+                            try:
+                                replacement_admission(jobs, fresh_lines, fresh_meta)
+                                validate_review_input(jobs, fresh_meta)
+                                validate_review_subject(jobs, fresh_fields, fresh_meta)
+                            except SourceSubjectError as exc:
+                                changed_reason, changed_detail = exc.reason, exc.detail
+                            except DispatchContractError as exc:
+                                changed_reason, changed_detail = exc.reason, exc.detail
+                        if changed_reason == "attempt-pre-release-row-not-unique":
                             if parent_binding is not None:
                                 parent_matches = []
                                 for line in fresh_lines:
@@ -5618,6 +5757,20 @@ def spawn_claimed_attempt(
             )
         identity.update(provided_metadata)
         identity.update(observer_metadata)
+        if respawn_of is not None:
+            lineage: list[str] = []
+            raw_lineage = child_meta.get("owner_identity_lineage", "")
+            for entry in raw_lineage.split("+") if isinstance(raw_lineage, str) else ():
+                pid, separator, start = entry.partition(":")
+                if separator and pid.isdigit() and start.isdigit():
+                    value = f"{pid}:{start}"
+                    if value not in lineage:
+                        lineage.append(value)
+            previous_pid, previous_start = str(respawn_of[0]), str(respawn_of[1])
+            previous = f"{previous_pid}:{previous_start}"
+            if previous not in lineage:
+                lineage.append(previous)
+            identity["owner_identity_lineage"] = "+".join(lineage)
         try:
             replace_keys = {*identity, "launch_claimed"}
             parts = [
@@ -8474,6 +8627,12 @@ def _marker_link_current(
     node_id = str(node["id"])
     evidence_record = marker.get("evidence") or {}
 
+    if "retained_review" in marker:
+        from retained_review_completion import verify_marker
+        verify_marker(route, node, marker, marker_path,
+                      historical=marker_path.name != f"{node['id']}.json")
+        return True
+
     if "reviewer_disposition" in marker:
         review_self_disposition_origin(route, node, marker, marker_path)
         return True
@@ -8643,13 +8802,18 @@ def _resource_stage_marker_current(route, node, marker, marker_path, jobs):
             current_digest = RESOURCE_RESUME.row_digest(row)
         except (ImportError, KeyError, TypeError, ValueError):
             return GateCurrency("resource-stage-not-current", "completion-marker-missing")
-        owner_id = (row.get("owner_wait") or {}).get("parent_attempt_id")
+        owner_wait = row.get("owner_wait") or {}
         output = __import__("resource_run_evidence").paths(armed).get("runtime_output")
+        responsibility = __import__("dispatch_resource_wait").current_responsibility(
+            row, route=route, owner_attempt_id=evidence.get("owner_attempt_id"),
+            session_id=evidence.get("owner_session_id") or owner_wait.get("session_id"),
+            jobs=str(jobs_path) if jobs_path else str(owner_wait.get("jobs") or ""),
+            historical=True)
         if (stage.get("state") != "STAGE_SUCCEEDED"
+                or responsibility is None
                 or evidence.get("resource_execution_identity") != resource_identity
                 or evidence.get("identity") != resource_identity
                 or evidence.get("resource_sha256") != current_digest
-                or evidence.get("owner_attempt_id") != owner_id
                 or not (evidence.get("owner_successor_start") is True
                         or evidence.get("owner_terminal_settlement") is True)
                 or marker.get("evidence", {}).get("path") != output):
@@ -8891,6 +9055,10 @@ def evidence_currency(
                                     route_state_next_action(reason, str(node.get("id")), None, node)
                                     if state == "superseded" else None)
     evidence_record = marker.get("evidence")
+    from codex_dispatch_terminal import artifact_declared_verdict
+    if (isinstance(evidence_record, dict) and not owner_closure_shape(marker)
+            and artifact_declared_verdict(Path(str(evidence_record.get("path", "")))) in {"BLOCKED", "FAIL"}):
+        return GateCurrency("integrity-broken:identity-mismatch", "completion-evidence-verdict-not-pass")
     if not isinstance(evidence_record, dict):
         return GateCurrency("integrity-broken:identity-mismatch", "completion-marker-evidence-missing")
     evidence_path_str = str(evidence_record.get("path") or "")
@@ -10317,6 +10485,10 @@ def row_is_subsession(metadata: dict[str, str]) -> bool:
 
 
 def _marker_bound_row_verdict(metadata: dict[str, str]) -> str:
+    from dispatch_attempt_policy import readable_result
+    result = readable_result(metadata)
+    if result:
+        return result
     failure_class = metadata.get("failure_class", "").lower()
     if verdict_pass(metadata) or success_note(metadata):
         return "PASS"
@@ -10384,6 +10556,15 @@ def _marker_bound_prepare_marker_proof(
     evidence_path = Path(str(evidence_record.get("path", "")))
     history_path = marker_path.parent / f"{metadata.get('route_node', '')}.{marker.get('sequence', 0)}.json"
     dependency_paths = [route_path, evidence_path, history_path]
+    if "retained_review" in marker:
+        try:
+            from retained_review_completion import verify_marker
+            recovery = verify_marker(route, nodes[0], marker, marker_path)
+            record = marker["retained_review"]
+            dependency_paths.extend(Path(e["path"]) for e in recovery["dependencies"])
+            dependency_paths.append(Path(record["jobs"]))
+        except (IndexError, KeyError, OSError, TypeError, ValueError):
+            return None
     if "reviewer_disposition" in marker:
         try:
             _, origin_path = review_self_disposition_origin(route, nodes[0], marker, marker_path)
@@ -10435,6 +10616,8 @@ def _marker_bound_prepare_marker_proof(
             marker_path.parent
             / f"{metadata.get('route_node', '')}.{safe_attempt}.attempt.json"
         )
+    if "retained_review" in marker:
+        dependency_paths = list(dict.fromkeys(dependency_paths))
     dependency_bytes: list[tuple[Path, bytes]] = []
     try:
         for dependency_path in dependency_paths:
@@ -10499,7 +10682,7 @@ def _marker_bound_current_marker(
         return None, ""
     if marker != proof.marker:
         return None, ""
-    if "reviewer_disposition" in marker:
+    if "reviewer_disposition" in marker or "retained_review" in marker:
         try:
             if any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest
                    for path, digest in proof.immutable_file_digests):
@@ -10811,6 +10994,42 @@ def recover_unstarted_attempt(jobs: Path, attempt_id: str) -> bool:
         return True
 
 
+def _retry_parent_matches(source, candidate, jobs, lines) -> bool:
+    """An existing owner replacement may continue its predecessor's child.
+
+    Called under the registry lock. These existing lineage and route readers
+    take no locks and preserve the original owner/child rows.
+    """
+    previous, current = source.get("parent_attempt_id"), candidate.get("parent_attempt_id")
+    if previous == current:
+        return True
+    if not jobs or not previous or not current:
+        return False
+    if any(row.get("dispatch_depth") != "2" for row in (source, candidate)):
+        return False
+    route = (source.get("route_id"), source.get("route_hash"))
+    if (not all(route) or not source.get("route_node")
+            or route != (candidate.get("route_id"), candidate.get("route_hash"))):
+        return False
+    from dispatch_replacement import _rows, effective_attempts
+    from owner_route_binding import OwnerRouteBindingError, resolve_owner_route_lifecycle
+    rows = _rows(lines)
+    try:
+        for parent in (previous, current):
+            owner = rows.get(parent, (None, {}))[1]
+            if (owner.get("worker_type") != "owner" or owner.get("dispatch_depth") != "1"
+                    or owner.get("registered_worker") != "1"):
+                return False
+            binding, _ = resolve_owner_route_lifecycle(
+                jobs, owner_attempt_id=parent, registry_rows=list(rows.values()))
+            if binding is None or (binding.route_id, binding.route_hash) != route:
+                return False
+        effective, lineage = effective_attempts(jobs, {previous})
+    except (OSError, OwnerRouteBindingError):
+        return False
+    return effective == {current} and bool(lineage)
+
+
 def _automatic_retry_admission(lines: list[str], metadata: dict[str, str], *, jobs: Path | None = None) -> None:
     """The jobs lock arbitrates retries against the committed predecessor.
 
@@ -10865,7 +11084,8 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str], *, jo
                 or metadata.get("replacement_family_id") != family):
             raise DispatchContractError("automatic-replacement-exhausted", prior)
         return
-    if any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node", "parent_attempt_id")):
+    if (any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node"))
+            or not _retry_parent_matches(source, metadata, jobs, lines)):
         raise DispatchContractError("retry-predecessor-binding-mismatch", prior)
     proof = attempt_process_quiescence(source, terminal_receipt=status in {"done", "killed", "cancelled"})
     decision = decide_attempt(status, source, process_state=proof.state, process_reason=proof.reason)
@@ -11455,9 +11675,14 @@ def resolve_terminal_conflict(
 ) -> dict[str, str]:
     """Record an explicit review of an exact conflict, preserving its result.
 
-    This never selects a different verdict. A changed conflict or live process
-    invalidates the disposition; its caller must inspect the current evidence.
+    Ordinary conflict review never selects a different verdict. A legacy
+    non-PASS publication instead uses the evidence-bound retained-review
+    recovery, preserving both original judgments. Changed or live evidence
+    invalidates either disposition.
     """
+    import retained_review_completion as retained
+    if retained.candidate(jobs, attempt_id):
+        return retained.apply(jobs, attempt_id, expected_row_sha256=expected_row_sha256, review=review)
     review_bytes = review.read_bytes()
     if not review.is_absolute() or review.is_symlink() or not review_bytes.strip():
         raise DispatchContractError("terminal-conflict-review-required")

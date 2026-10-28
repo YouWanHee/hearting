@@ -168,10 +168,30 @@ class ComputeRunAdoptionTest(unittest.TestCase):
                       route_closed=False, binding_conflict=False, replay=False,
                       interrupt_before_arm=False, late_conflict=None,
                       real_compute=False, mutate_outputs_before_replay=False,
-                      missing_outputs_hash=False):
+                      missing_outputs_hash=False, lineage=False, route_free=False):
         import contextlib
         import resource_run_registry as RR
         import dispatch_resource_wait as OWNER_RESOURCE
+        # Current resource bindings retain the digest of the legacy reader's
+        # projection. A placeholder used by the original fixture no longer
+        # represents an armed row and masks the adoption/refusal paths below.
+        source_file = self.root / "source-route.json"
+        source = {"route_id": "rt-source", "route_hash": "sha256:source",
+                  "artifact_root": str(self.root), "cwd": str(self.root), "nodes": []}
+        if lineage or route_free:
+            if lineage:
+                source_file.write_text(json.dumps(source))
+                for document in (self.provenance, self.parent_contract):
+                    document.update(route_id=source["route_id"],
+                                    route_hash=source["route_hash"],
+                                    route_file=str(source_file))
+                self.original["route"] = str(source_file)
+                self.registry.write_text(json.dumps({"schema_version": 1,
+                                                     "runs": {"full-run": self.original}}))
+            else:
+                for document in (self.provenance, self.parent_contract):
+                    document.update(route_id=None, route_hash=None, route_file=None)
+        self.armed["resource_binding"] = OWNER_RESOURCE.resource_legacy_body_digest(self.original)
         fake_ledger = SimpleNamespace(lock=contextlib.nullcontext,
                                       root=self.workflow,
                                       state=lambda: ({"workflow_state": "CANCELLED",
@@ -311,6 +331,10 @@ class ComputeRunAdoptionTest(unittest.TestCase):
                                          "AGENT_DISPATCH_COMPLETION_MODE": "supervised",
                                          **({"COMPUTE_HOSTS_CONFIG": str(self.compute_config)}
                                             if real_compute else {})}, clear=False),
+            mock.patch.object(OWNER_RESOURCE, "compute_holder", side_effect=self._holder(
+                lineage, route_free, source)),
+            mock.patch.object(OWNER_RESOURCE, "resource_holder", side_effect=self._holder(
+                lineage, route_free, source)),
         ]
         entered = [patcher.start() for patcher in patches]
         self.addCleanup(lambda: [patcher.stop() for patcher in reversed(patches)])
@@ -328,6 +352,14 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         arm_runner.side_effect = run_arm
         args = SimpleNamespace(jobs=str(self.jobs), parent_attempt_id="att-owner")
         with mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+            if route_free:
+                with self.assertRaises(SystemExit) as refused:
+                    R.adopt_compute_run(self.registry, args, self.route,
+                                        self.route_file, "compute-1")
+                self.assertEqual(refused.exception.code, 65)
+                self.assertIn("resource-compute-route-mismatch",
+                              refused.exception.resource_message)
+                return json.loads(self.registry.read_text())["runs"]
             if interrupt_before_arm:
                 with self.assertRaises(SystemExit) as interrupted:
                     R.adopt_compute_run(self.registry, args, self.route, self.route_file, "compute-1")
@@ -355,6 +387,61 @@ class ComputeRunAdoptionTest(unittest.TestCase):
         if real_compute:
             self.assertGreaterEqual(self.remote_call.call_count, 1)
         return json.loads(self.registry.read_text())["runs"]
+
+    def _holder(self, lineage, route_free, source):
+        def holder(document=None, **_kwargs):
+            if route_free:
+                return {"route_id": None, "route_hash": None, "route_file": None,
+                        "inherited": False,
+                        "origin": {"route_id": None, "route_hash": None, "route_file": None},
+                        "chain": []}
+            if lineage:
+                return {"route_id": self.route["route_id"],
+                        "route_hash": self.route["route_hash"],
+                        "route_file": str(self.route_file), "inherited": True,
+                        "origin": {"route_id": source["route_id"],
+                                   "route_hash": source["route_hash"],
+                                   "route_file": str(self.root / "source-route.json")},
+                        "chain": [{"route_id": self.route["route_id"],
+                                   "route_hash": self.route["route_hash"],
+                                   "route_file": str(self.route_file),
+                                   "owner_attempt_id": "att-original"}]}
+            # Like the real holder: a run no handoff moved has the address its
+            # own record names as its origin.
+            recorded = (document or {}).get("route") or (document or {}).get("route_file")
+            return {"route_id": self.route["route_id"],
+                    "route_hash": self.route["route_hash"],
+                    "route_file": str(self.route_file), "inherited": False,
+                    "origin": {"route_id": self.route["route_id"],
+                               "route_hash": self.route["route_hash"],
+                               "route_file": recorded or str(self.route_file)},
+                    "chain": []}
+        return holder
+
+    def test_adopt_compute_run_follows_pin_handoff_lineage(self):
+        runs = self._run_adoption(lineage=True)
+        adopted = runs["full-run__a1"]
+        self.assertEqual(adopted["execution"]["kind"], "compute-hosts")
+        self.assertEqual(adopted["execution"]["run_id"], "compute-1")
+        self.assertEqual(adopted["route"], str(self.route_file.resolve()))
+        self.assertEqual(adopted["parent_attempt_id"], "att-owner")
+
+    def test_adopt_compute_run_without_handoff_still_compares_the_current_route_file(self):
+        # A run no handoff moved is bound to this route's own file: a row that
+        # names another file under the same id/hash is not adopted.
+        self.original["route"] = str(self.root / "another-route.json")
+        self.registry.write_text(json.dumps({"schema_version": 1,
+                                             "runs": {"full-run": self.original}}))
+        with self.assertRaises(SystemExit) as refused:
+            self._run_adoption()
+        self.assertEqual(refused.exception.code, 65)
+        self.assertIn("resource-compute-binding-conflict", refused.exception.resource_message)
+        self.assertIn("resource.route", refused.exception.resource_message)
+
+    def test_adopt_compute_run_refuses_route_free_provenance(self):
+        runs = self._run_adoption(route_free=True)
+        self.assertEqual(list(runs), ["full-run"], "route-free provenance is never adopted")
+        self.assertEqual(runs["full-run"], self.original)
 
     def test_same_contract_adopts_one_retry_without_payload_spawn(self):
         runs = self._run_adoption()
@@ -652,6 +739,27 @@ class TestRunner(unittest.TestCase):
                 self.assertFalse(startup_marker.exists(), "wrapper sourced BASH_ENV before the release fence")
                 self.assertEqual(json.loads(result_path.read_text()),
                                  {"args": ["payload-arg"], "stdin": "", "bash_env": str(startup)})
+
+    def test_cleanup_stops_only_its_exact_supervisor(self):
+        watch = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"], env=CLEAN_ENV)
+        try:
+            supervision = R.launched_identity(watch)
+            self.assertIsNotNone(supervision)
+            run = {"supervision": {**supervision, "starttime": "0"}}
+            self.registry.write_text(json.dumps({"runs": {"observer": run}}))
+            self._stop_started_runs()
+            self.assertIsNone(watch.poll(), "cleanup stopped a mismatched process identity")
+
+            run["supervision"] = supervision
+            self.registry.write_text(json.dumps({"runs": {"observer": run}}))
+            self._stop_started_runs()
+            self.assertEqual(watch.poll(), -signal.SIGTERM,
+                             "cleanup returned before its observer exited")
+        finally:
+            if watch.poll() is None:
+                watch.terminate()
+            watch.wait(timeout=3)
 
     def test_resource_run_probe_attributes_both_gpu_spawn_paths_to_route_parent(self):
         harness = textwrap.dedent(r"""
@@ -984,6 +1092,169 @@ class TestRunner(unittest.TestCase):
             foreign={**running,"pid_namespace":"pid:[foreign]"}
             self.assertEqual(R.classify_identity(foreign)[0],"stale")
             self.assertEqual(R.classify_identity(foreign)[2],"process-namespace-mismatch")
+
+    def _host_route(self):
+        """A real lab eval route that borrowed the GPU-free host part (the catalog is the only source)."""
+        prompt = self.base / "host-request.txt"
+        prompt.write_text("Run the registered GPU-free measurement and check its result.\n")
+        result = subprocess.run([sys.executable, str(ROUTER), "compose", "--capability", "autopilot-lab",
+            "--capability-mode", "eval", "--shape", "staged", "--graph", "host-run,metrics",
+            "--slug", "host-fixture", "--cwd", str(self.repo), "--artifact-root", str(self.artifacts),
+            "--dispatch-evidence", str(self.base / "dispatch-evidence.json"), "--parent-harness", "codex",
+            "--spec-read", "not-applicable", "--unassigned", "--prompt-file", str(prompt)],
+            env=CLEAN_ENV, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        route = json.loads(result.stdout)
+        self.host_path = self.artifacts / ".runtime/routes" / (route["route_id"] + ".json")
+        self.assertTrue(self.host_path.is_file())
+        self.host_jobs = self.base / "host-state/jobs.log"
+        self.host_jobs.parent.mkdir()
+        self.host_jobs.write_text("")
+        return json.loads(self.host_path.read_text())
+
+    def _host_env(self):
+        # The fixture must prove the node itself has no GPU lease, so nothing here hides CUDA devices.
+        return {key: value for key, value in {**CLEAN_ENV, "AGENT_HOME": str(ROOT),
+                "AGENT_RESOURCE_RUN_INDEX": str(self.index)}.items() if key != "CUDA_VISIBLE_DEVICES"}
+
+    def test_host_run_starts_a_cpu_payload_without_smoke_or_gpu_lease(self):
+        route = self._host_route()
+        self.assertEqual([node["id"] for node in route["nodes"]], ["host-run", "metrics"])
+        payload = ["--", sys.executable, "-c", f"from pathlib import Path; Path({str(self.launch)!r}).write_text('cpu')"]
+        base = ["--registry", str(self.registry), "start", "--run-id", "host-case", "--cwd", str(self.repo),
+                "--log", str(self.log), "--route", str(self.host_path), "--node", "host-run",
+                "--jobs", str(self.host_jobs)]
+        started = subprocess.run([sys.executable, str(RUNNER), *base, *payload],
+                                 env=self._host_env(), text=True, capture_output=True, timeout=60)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        row = json.loads(self.registry.read_text())["runs"]["host-case"]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and R.read_sentinel(row["sentinel"]) is None:
+            time.sleep(.05)
+        self.assertEqual(R.read_sentinel(row["sentinel"]), 0)
+        self.assertEqual(self.launch.read_text(), "cpu")
+        self.assertEqual(row["node"], "host-run")
+        for key in ("gpu_lease", "gpus", "smoke_attestation", "config_ref"):
+            self.assertNotIn(key, row)
+        # The same runner still refuses a training node that carries no attestation.
+        unattested = self.cli(*self.start_args(smoke=None, run_id="unattested"))
+        self.assertNotEqual(unattested.returncode, 0)
+        self.assertIn("hash-bound smoke attestation required", unattested.stderr)
+        self.assertNotIn("unattested", json.loads(self.registry.read_text())["runs"])
+
+    def test_host_run_start_refuses_a_strict_request_and_a_stale_attestation_still_applies(self):
+        self._host_route()
+        request = self.base / "strict-request.json"
+        request.write_text(json.dumps({"schema_version": 1, "writable_roots": [], "read_roots": [],
+            "network": {"required": False, "reason": "", "hosts": []},
+            "enforcement_required": "os-sandbox", "justification": {}}))
+        argv = [sys.executable, str(RUNNER), "--registry", str(self.registry), "start", "--run-id", "strict",
+                "--cwd", str(self.repo), "--log", str(self.log), "--route", str(self.host_path),
+                "--node", "host-run", "--jobs", str(self.host_jobs), "--", sys.executable, "-c",
+                f"from pathlib import Path; Path({str(self.launch)!r}).write_text('x')"]
+        refused = subprocess.run(argv, env={**self._host_env(),
+            "AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(request)}, text=True, capture_output=True, timeout=60)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("execution-access-enforcement-unavailable:host-process-payload", refused.stderr)
+        self.assertFalse(self.registry.exists())
+        self.assertFalse(self.log.exists())
+        self.assertFalse(self.launch.exists())
+        # A supplied attestation keeps its verification even on the host node.
+        stale = subprocess.run([*argv[:-4], "--smoke-attestation", str(self.base / "absent.json"), *argv[-4:]],
+                               env=self._host_env(), text=True, capture_output=True, timeout=60)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertFalse(self.launch.exists())
+
+    def test_controller_admission_releases_a_host_payload_once_without_smoke(self):
+        import artifact_producer
+        route = self._host_route()
+        jobs = self.host_jobs
+        args = SimpleNamespace(jobs=str(jobs), run_id="host-owner", node="host-run")
+        body = {"run_id": args.run_id, "cwd": str(self.repo), "log": str(self.log),
+            "command": [sys.executable, "-c", f"from pathlib import Path; Path({str(self.launch)!r}).write_text('once')"],
+            "route": str(self.host_path), "node": "host-run", "status": "launching", "sentinel": str(self.log) + ".exit",
+            "jobs": str(jobs), "parent_attempt_id": "att-parent", "resource_policy": "supervised-owner",
+            "owner_wait": {"session_id": "same-native", "launch_scope": "codex-owner-controller"},
+            "launch_request": {"smoke_attestation": None, "smoke_attestation_sha256": None,
+                               "config_manifest": None, "config_manifest_sha256": None}}
+        real_popen = subprocess.Popen
+        watch = mock.Mock(pid=os.getpid())
+        watch.poll.return_value = None
+        payloads = []
+        def launch(argv, **kwargs):
+            if "watch" in argv:
+                os.write(kwargs["pass_fds"][0], b"ready\n")
+                return watch
+            proc = real_popen(argv, **kwargs)
+            payloads.append(proc)
+            return proc
+        sealed = {key: route[key] for key in ("route_id", "route_hash")}
+        gpu_probe = mock.patch.object(R.gpu_leases, "resource_admission",
+                                      wraps=R.gpu_leases.resource_admission)
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(jobs)}), \
+             mock.patch.object(artifact_producer, "prepare_route_artifact_env",
+                               return_value={"AGENT_ARTIFACT_OUTPUT_DIR": str(self.base)}), \
+             mock.patch.object(R, "register_registry"), mock.patch.object(R.subprocess, "run"), \
+             mock.patch("sys.stdout"), mock.patch.object(R.subprocess, "Popen", side_effect=launch) as spawn, \
+             gpu_probe as admission:
+            R.start_verified(self.registry, args, {**route, **sealed}, self.host_path, dict(body))
+            queued = json.loads(self.registry.read_text())["runs"][args.run_id]
+            self.assertEqual((queued["launch_state"], spawn.call_count), ("queued", 0))
+            identity = {**R.proc_identity(os.getpid()), "pid_namespace": os.readlink("/proc/self/ns/pid")}
+            admission_ctl = SimpleNamespace(expected=queued, identity=identity, command=body["command"],
+                sandbox={"mode": "danger-full-access", "enforcement": "none"}, guard=contextlib.nullcontext,
+                registry=str(self.registry))
+            with mock.patch.object(R, "verify_launch_input"):
+                R.main(R.controller_argv(self.registry, queued), controller=admission_ctl)
+            payloads[0].wait(timeout=5)
+            self.assertEqual(len(payloads), 1)
+            self.assertEqual(self.launch.read_text(), "once")
+            running = json.loads(self.registry.read_text())["runs"][args.run_id]
+            self.assertEqual((running["launch_state"], running["payload_sandbox"]["enforcement"]),
+                             ("started", "none"))
+            self.assertNotIn("gpu_lease", running)
+            self.assertEqual(R.read_sentinel(running["sentinel"]), 0)
+            for call in admission.call_args_list:
+                self.assertIs(call.kwargs["gpu_scoped"], False)
+
+    def test_controller_start_refuses_a_strict_request_queued_after_intent_and_settles(self):
+        route = self._host_route()
+        request = self.base / "late-strict-request.json"
+        request.write_text(json.dumps({"schema_version": 1, "writable_roots": [], "read_roots": [],
+            "network": {"required": False, "reason": "", "hosts": []},
+            "enforcement_required": "os-sandbox", "justification": {}}))
+        args = SimpleNamespace(jobs=str(self.host_jobs), run_id="host-late", node="host-run")
+        body = {"run_id": args.run_id, "cwd": str(self.repo), "log": str(self.log),
+            "command": [sys.executable, "-c", f"from pathlib import Path; Path({str(self.launch)!r}).write_text('x')"],
+            "route": str(self.host_path), "node": "host-run", "status": "launching", "sentinel": str(self.log) + ".exit",
+            "jobs": str(self.host_jobs), "parent_attempt_id": "att-parent", "resource_policy": "supervised-owner",
+            "owner_wait": {"session_id": "same-native", "launch_scope": "codex-owner-controller"},
+            "launch_request": {"smoke_attestation": None, "smoke_attestation_sha256": None,
+                               "config_manifest": None, "config_manifest_sha256": None}}
+        sealed = {key: route[key] for key in ("route_id", "route_hash")}
+        with mock.patch.dict(os.environ, {"AGENT_DISPATCH_JOBS": str(self.host_jobs)}), \
+             mock.patch.object(R, "register_registry"), mock.patch.object(R.subprocess, "run"), \
+             mock.patch("sys.stdout"), mock.patch.object(R.subprocess, "Popen") as spawn:
+            R.start_verified(self.registry, args, {**route, **sealed}, self.host_path, dict(body))
+            queued = json.loads(self.registry.read_text())["runs"][args.run_id]
+            ctl = SimpleNamespace(expected=queued, registry=str(self.registry), guard=contextlib.nullcontext,
+                identity={**R.proc_identity(os.getpid()), "pid_namespace": os.readlink("/proc/self/ns/pid")},
+                command=body["command"], sandbox={"mode": "danger-full-access", "enforcement": "none"})
+            seen = []
+            def settle(controller, error):
+                seen.append(error)
+                return None
+            with mock.patch.dict(os.environ, {"AGENT_DISPATCH_EXECUTION_ACCESS_FILE": str(request)}), \
+                 mock.patch.object(R, "settle_queued_validation_failure", side_effect=settle):
+                with self.assertRaises(SystemExit):
+                    R.main(R.controller_argv(self.registry, queued), controller=ctl)
+        # The runner start check, not the command builder, refuses it: the failure reaches the
+        # runner's pre-release settle hook (stubbed here) and no payload was launched.
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].code, 65)
+        self.assertEqual(seen[0].resource_message, "execution-access-enforcement-unavailable:host-process-payload")
+        spawn.assert_not_called()
+        self.assertFalse(self.launch.exists())
 
     def test_gpu_launch_refusal_preserves_failure_and_cpu_bridge_retry_starts_once(self):
         import artifact_producer
@@ -1345,8 +1616,8 @@ class TestRunner(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        # Runs after (LIFO) nothing else and before the directory removal: a
-        # started run still writing its log made that removal fail in CI.
+        # Stop payloads and their separate workflow observers before removing
+        # the directory: either can still be writing after the payload exits.
         self.addCleanup(self._stop_started_runs)
         self.base = Path(self.temp.name)
         self.repo = self.base / "repo"
@@ -1451,6 +1722,22 @@ class TestRunner(unittest.TestCase):
                 except OSError:
                     break
                 time.sleep(0.02)
+        for run in runs.values():
+            supervision = run.get("supervision") if isinstance(run, dict) else None
+            if not R.RESOURCE_RESUME.supervisor_alive(supervision):
+                continue
+            pid = int(supervision["pid"])
+            if pid <= 1 or pid == os.getpid():
+                continue  # fixtures may deliberately record this test process
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            deadline = time.monotonic() + 3
+            while R.RESOURCE_RESUME.supervisor_alive(supervision) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(R.RESOURCE_RESUME.supervisor_alive(supervision),
+                             f"fixture workflow observer {pid} did not stop")
 
     def cli(self, *args, cwd=None, pass_fds=(), input=None, extra_env=None):
         return subprocess.run([

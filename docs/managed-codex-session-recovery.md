@@ -2,7 +2,28 @@
 
 This document records the upstream App Server protocol and Hearting's bounded
 headless delivery evidence. It does not promise an interactive Codex launcher
-or automatic recovery of a user-facing main session.
+or automatic recovery of a user-facing main session. The one automatic step for
+a live main is the transient-capacity continuation below.
+
+## Transient capacity continuation
+
+Codex ends a turn on `serverOverloaded` ("Selected model is at capacity") when
+the server sends no Retry-After, and on `responseTooManyFailedAttempts` (429 or
+503) after its own stream retries. The rollout records the end as
+`task_complete.error.codex_error_info`, `thread/turns/list` shows the turn as
+`failed` with `codexErrorInfo`, and no Stop hook runs.
+
+The Codex prompt hook starts `utilities/codex_capacity_resume.py` for each main
+turn. That observer reads only the turn's own end. After such a failure it waits
+1, 2, 4, 8 or 16 minutes by how many continuations in a row made no progress,
+then re-checks the app server: the failed turn is still the latest, the native
+queue is empty, and no question or approval is waiting. Only then does it add
+one continuation to the same thread through `thread/queue/add`, with a client ID
+derived from the failed turn. It passes no model or settings, so the queued turn
+runs on what the thread has selected now. A usage limit, auth error, interrupt,
+or any newer turn leaves the thread alone. The last decision per thread is in
+`$HARNESS_STATE_ROOT/codex-capacity-resume/<thread>.json` (default
+`~/.local/state/hearting/`).
 
 ## Evidence boundary
 

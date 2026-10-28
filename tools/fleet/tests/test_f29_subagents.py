@@ -839,17 +839,24 @@ class CodexSubagentTest(unittest.TestCase):
         codex_session = Session(harness="codex", pid=1, cwd="/codex")
         claude_session = Session(harness="claude", pid=2, cwd="/claude")
         tick = codex._CodexTick("/default", {}, {})
-        with mock.patch.object(
-            fleet_collectors.procscan, "scan",
-            return_value=[codex_session, claude_session],
-        ), mock.patch.object(codex, "prepare_tick", return_value=tick), \
-             mock.patch.object(codex, "enrich") as codex_enrich, \
-             mock.patch.object(claude, "enrich") as claude_enrich, \
-             mock.patch("fleet.collectors.usage_api.account_usage", return_value=None), \
-             mock.patch.object(codex, "account_usage", return_value=None), \
-             mock.patch("fleet.collectors.liveness.classify", return_value="working"), \
-             mock.patch("fleet.collectors.dispatch.collect", return_value=[]):
-            fleet_collectors.collect_all()
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = os.path.join(tmp, "jobs.log")
+            open(jobs, "w").close()
+            with mock.patch.dict(os.environ, {
+                "AGENT_DISPATCH_JOBS": jobs,
+                "AGENT_RESOURCE_RUN_INDEX": os.path.join(
+                    tmp, "resource-runs.index.json"),
+            }), mock.patch.object(
+                fleet_collectors.procscan, "scan",
+                return_value=[codex_session, claude_session],
+            ), mock.patch.object(codex, "prepare_tick", return_value=tick), \
+                 mock.patch.object(codex, "enrich") as codex_enrich, \
+                 mock.patch.object(claude, "enrich") as claude_enrich, \
+                 mock.patch("fleet.collectors.usage_api.account_usage", return_value=None), \
+                 mock.patch.object(codex, "account_usage", return_value=None), \
+                 mock.patch("fleet.collectors.liveness.classify", return_value="working"), \
+                 mock.patch("fleet.collectors.dispatch.collect", return_value=[]):
+                fleet_collectors.collect_all()
         codex_enrich.assert_called_once_with(codex_session, tick=tick)
         claude_enrich.assert_called_once_with(claude_session, tick={2: None})
 

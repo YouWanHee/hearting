@@ -194,6 +194,24 @@ proj() { mkdir -p "$TMP/proj/$1"; printf '%s' "$TMP/proj/$1"; }
 write_card() { # harness sid project mark
   python3 "$TIDY" card --harness "$1" --session-id "$2" --cwd "$3" --text "$4" >/dev/null
 }
+confirm_successor() { # harness predecessor successor project
+  python3 - "$ROOT" "$1" "$2" "$3" "$4" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / "utilities"))
+import session_tidy as st
+harness, predecessor, successor, cwd = sys.argv[2:]
+seat = st.seat_for_project(harness, st.project_key_for(cwd))
+seat = st.session_seat(seat, harness, successor)
+now = st.now_epoch()
+with st.session_state_lock(seat):
+    st.record_event(seat, harness, successor, "start", source="clear", cwd=cwd, now=now)
+    st._append_ledger_entry(seat, {
+        "ts": now + 0.001, "harness": harness, "sid": successor, "event": "handover",
+        "from": {"harness": harness, "sid": predecessor}, "source": "clear",
+    })
+PY
+}
 claude_hook() { # event sid project [source] [prompt]
   local event=$1 sid=$2 cwd=$3 source=${4:-} prompt=${5-hello}
   python3 - "$event" "$sid" "$cwd" "$source" "$prompt" <<'PY' | "$CLAUDE_HOOK"
@@ -220,6 +238,7 @@ has() { grep -Fq -- "$2" "$1"; }
 # ---- Claude ------------------------------------------------------------------
 P=$(proj claude-basic)
 write_card claude author-A "$P" "CARD-MARK-claude01"
+confirm_successor claude author-A claude-B "$P"
 claude_hook SessionStart claude-B "$P" startup > "$TMP/c1.out"
 context_of "$TMP/c1.out" > "$TMP/c1.ctx"
 if has "$TMP/c1.ctx" CARD-MARK-claude01 && grep -Fq '"hookEventName": "SessionStart"' "$TMP/c1.out"; then
@@ -250,12 +269,14 @@ claude_hook UserPromptSubmit claude-N "$P" > "$TMP/c5b.out"
 
 P=$(proj claude-worker)
 write_card claude author-A "$P" "CARD-MARK-worker"
+confirm_successor claude author-A claude-W "$P"
 python3 - "$P" > "$TMP/w.payload" <<'PY'
 import json, sys
 print(json.dumps({"hook_event_name": "SessionStart", "session_id": "claude-W", "cwd": sys.argv[1]}))
 PY
 AGENT_SESSION_ROLE=worker "$CLAUDE_HOOK" < "$TMP/w.payload" > "$TMP/w1.out"
 AGENT_DISPATCH_DEPTH=2 "$CLAUDE_HOOK" < "$TMP/w.payload" > "$TMP/w2.out"
+confirm_successor claude author-A claude-M "$P"
 claude_hook SessionStart claude-M "$P" startup > "$TMP/w3.out"
 if [ ! -s "$TMP/w1.out" ] && [ ! -s "$TMP/w2.out" ] && context_of "$TMP/w3.out" | grep -Fq CARD-MARK-worker; then
   ok "claude: a worker receives nothing and does not consume the card"
@@ -264,6 +285,7 @@ else bad "claude: worker must not receive or consume the card"; fi
 # Short/empty prompt, no memory tool, zero candidates: the card still arrives.
 P=$(proj claude-empty)
 write_card claude author-A "$P" "CARD-MARK-claude03"
+confirm_successor claude author-A claude-E "$P"
 rm -rf "$MEM_STORE"
 claude_hook UserPromptSubmit claude-E "$P" "" "" > "$TMP/c6.out"
 if context_of "$TMP/c6.out" | grep -Fq CARD-MARK-claude03 \
@@ -272,6 +294,7 @@ if context_of "$TMP/c6.out" | grep -Fq CARD-MARK-claude03 \
 else bad "claude: empty prompt must deliver the card"; fi
 P=$(proj claude-nomem)
 write_card claude author-A "$P" "CARD-MARK-claude04"
+confirm_successor claude author-A claude-F "$P"
 if MEM_PY=/nonexistent/mem.py claude_hook UserPromptSubmit claude-F "$P" "" "ok" > "$TMP/c7.out" \
   && context_of "$TMP/c7.out" | grep -Fq CARD-MARK-claude04; then
   ok "claude: a missing memory tool does not block the card"
@@ -319,6 +342,7 @@ PY
 
 P=$(proj codex-start)
 write_card codex author-A "$P" "CARD-MARK-codex01"
+confirm_successor codex author-A codex-B "$P"
 codex_run "$CODEX_START" SessionStart codex-B "$P" startup > "$TMP/x1.out"   # CODEX_SESSION_MEMORY_INJECT unset
 if context_of "$TMP/x1.out" | grep -Fq CARD-MARK-codex01; then
   ok "codex SessionStart: the card arrives with CODEX_SESSION_MEMORY_INJECT off"
@@ -330,6 +354,7 @@ context_of "$TMP/x1b.out" | grep -Fq CARD-MARK-codex01 \
 
 P=$(proj codex-start-on)
 write_card codex author-A "$P" "CARD-MARK-codex02"
+confirm_successor codex author-A codex-C "$P"
 if CODEX_SESSION_MEMORY_INJECT=1 codex_run "$CODEX_START" SessionStart codex-C "$P" startup > "$TMP/x2.out" \
   && context_of "$TMP/x2.out" | grep -Fq CARD-MARK-codex02; then
   ok "codex SessionStart: the card arrives with the memory opt-in on too"
@@ -337,6 +362,7 @@ else bad "codex SessionStart: card with opt-in on"; fi
 
 P=$(proj codex-prompt)
 write_card codex author-A "$P" "CARD-MARK-codex03"
+confirm_successor codex author-A codex-D "$P"
 codex_run "$CODEX_PROMPT" UserPromptSubmit codex-D "$P" "" "" > "$TMP/x3.out"    # empty prompt, no candidates
 if context_of "$TMP/x3.out" | grep -Fq CARD-MARK-codex03 \
   && grep -Fq '"hookEventName": "UserPromptSubmit"' "$TMP/x3.out"; then
@@ -356,8 +382,10 @@ context_of "$TMP/x4.out" | grep -Fq CARD-MARK-codex04 \
 
 P=$(proj codex-worker)
 write_card codex author-A "$P" "CARD-MARK-codex05"
+confirm_successor codex author-A codex-W "$P"
 AGENT_SESSION_ROLE=worker codex_run "$CODEX_START" SessionStart codex-W "$P" startup > "$TMP/x5.out"
 AGENT_SESSION_ROLE=worker codex_run "$CODEX_PROMPT" UserPromptSubmit codex-W "$P" "" "hi" > "$TMP/x5b.out"
+confirm_successor codex author-A codex-M "$P"
 codex_run "$CODEX_PROMPT" UserPromptSubmit codex-M "$P" "" "hi" > "$TMP/x5c.out"
 if [ ! -s "$TMP/x5.out" ] && [ ! -s "$TMP/x5b.out" ] && context_of "$TMP/x5c.out" | grep -Fq CARD-MARK-codex05; then
   ok "codex: a worker receives nothing and does not consume the card"
@@ -371,6 +399,7 @@ else bad "codex: worker must not receive or consume the card"; fi
 P=$(proj opencode)
 write_card opencode author-A "$P" "CARD-MARK-open01"
 write_card opencode op-A "$P" "CARD-MARK-open02"   # newest card; authored by op-A
+confirm_successor opencode op-A op-B "$P"
 if node --input-type=module > "$TMP/o1.out" 2> "$TMP/o1.err" <<EOF
 import { AgentHarnessGuards } from "$PLUGIN"
 import { execFileSync } from "node:child_process"
@@ -418,6 +447,7 @@ else bad "opencode plugin card scenario failed [err=$(head -c 400 "$TMP/o1.err")
 
 P=$(proj opencode-empty)
 write_card opencode author-A "$P" "CARD-MARK-open03"
+confirm_successor opencode author-A op-E "$P"
 if [ "${OPENCODE_NODE_CHILD_BLOCKED:-0}" = 1 ]; then
   ok "opencode: empty-prompt Node check skipped (sandbox returned EPERM)"
 elif node --input-type=module > "$TMP/o2.out" 2> "$TMP/o2.err" <<EOF

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -17,16 +18,119 @@ import session_tidy
 from terminal_surface import HerdrSurface, Near, open_pane
 
 
+def _named_seat(args):
+    """The seat a caller already named with ``--seat-key``; never re-resolved here."""
+    key = getattr(args, "seat_key", "") or ""
+    if not key:
+        return None
+    harness = getattr(args, "harness", None) or ""
+    sid = getattr(args, "session_id", None) or ""
+    seat = session_tidy.Seat("pane", key, getattr(args, "pane", "") or "", harness or "codex", "",
+                             endpoint=getattr(args, "endpoint", "") or "",
+                             socket_path=getattr(args, "socket_path", "") or "")
+    return session_tidy.session_seat(seat, harness, sid) if harness and sid else seat
+
+
+def _herdr_pane_for_session(harness, sid):
+    """``(pane, agent)`` of the one herdr pane whose live agent session is exactly ``sid``."""
+    executable = session_tidy._herdr_executable()
+    if not executable or not sid:
+        return "", ""
+    command = [executable]
+    server = (os.environ.get("AGENT_HERDR_SESSION") or "").strip()
+    if server:
+        command += ["--session", server]
+    command += ["agent", "list"]
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                              timeout=session_tidy.HERDR_LOOKUP_TIMEOUT_SEC, check=False)
+        agents = (json.loads(done.stdout or "").get("result") or {}).get("agents")
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return "", ""
+    if not isinstance(agents, list):
+        return "", ""
+    found = {(str(agent["pane_id"]), str(agent.get("agent") or "")) for agent in agents
+             if isinstance(agent, dict) and agent.get("pane_id")
+             and session_tidy._agent_session(agent) == sid
+             and (not harness or agent.get("agent") == harness)}
+    return next(iter(found)) if len(found) == 1 else ("", "")
+
+
+def _leads_with(seat, harness, sid):
+    """The seat's ledger has this exact session as its current generation."""
+    rows = session_tidy.seat_lineage(seat)
+    return bool(rows) and (rows[0].get("harness"), rows[0].get("sid")) == (harness, sid)
+
+
+def _named_target(harness, sid):
+    """Resolve another session named by ``--session-id``; never the caller's own seat.
+
+    Its exact herdr pane comes first, then its exact native-session ledger. The
+    caller's pane, ``HERDR_ACTIVE_PANE_ID`` and cwd are not evidence of it.
+    """
+    pane, agent = _herdr_pane_for_session(harness, sid)
+    if pane:
+        seat = session_tidy.session_seat(session_tidy._pane_seat_of(pane), agent, sid)
+        if _leads_with(seat, agent, sid):
+            return seat, pane, seat.socket_path
+    found = []
+    for name in ([harness] if harness else session_tidy.HARNESSES):
+        key = session_tidy._native_session_key(name, sid)
+        if not key:
+            continue
+        # The native-session ledger is its own physical file: one exact session.
+        seat = session_tidy.session_seat(session_tidy.Seat("project", key, harness=name), name, sid)
+        if _leads_with(seat, name, sid):
+            found.append(seat)
+    if len(found) == 1:
+        return found[0], "", ""
+    return None, "", ""
+
+
+def _caller_placement():
+    """The caller's own herdr pane and socket: a named target's viewer opens there.
+
+    The target's pane only locates its ledger; splitting it would change another
+    session's layout where the person who asked is not looking.
+    """
+    pane = (os.environ.get("HERDR_PANE_ID") or "").strip()
+    socket = (os.environ.get("HERDR_SOCKET_PATH") or "").strip()
+    return (pane, socket) if pane and socket else ("", "")
+
+
 def _identity(args):
+    named = _named_seat(args)
+    if named is not None:
+        return (named, *_caller_placement())
+    harness = getattr(args, "harness", None)
+    sid = getattr(args, "session_id", None) or ""
+    if sid and sid != session_tidy.session_from_env(harness)[1]:
+        # Another session (or a caller whose own id is unknown) is a target, not
+        # this process: its inherited pane would show the caller's conversation.
+        seat, target_pane, _socket = _named_target(harness, sid)
+        if seat is None or not target_pane:
+            return seat, "", ""      # an exact native ledger is read through local output
+        return (seat, *_caller_placement())
+    resolved = session_tidy.resolve_caller(
+        args.harness, args.session_id, os.getcwd(), project=False)
+    if resolved:
+        seat, harness, sid = resolved
+        if harness in session_tidy.HARNESSES and sid and not sid.startswith("unknown-"):
+            seat = session_tidy.session_seat(seat, harness, sid)
+            if seat.kind == "pane":
+                return seat, seat.pane, seat.socket_path
+            return seat, "", ""
+    if args.session_id:
+        return None, "", ""
+
+    # A keybinding without any native identity keeps its read-only active-pane
+    # behavior. It cannot override a native caller selected above.
     pane = (os.environ.get("HERDR_ACTIVE_PANE_ID") or os.environ.get("HERDR_PANE_ID") or "").strip()
     socket = os.environ.get("HERDR_SOCKET_PATH", "")
     if pane and socket:
         endpoint = session_tidy._endpoint_scope({"HERDR_SOCKET_PATH": socket})
         seat = session_tidy._pane_seat_of(pane, endpoint=endpoint, socket_path=socket)
         return seat, pane, socket
-    resolved = session_tidy.resolve_caller(args.harness, args.session_id, os.getcwd())
-    if resolved:
-        return resolved[0], "", ""
     return None, "", ""
 
 
@@ -55,8 +159,16 @@ def _show(text):
 
 
 def _view(args):
-    seat = session_tidy.Seat("pane", args.seat_key, args.pane, "codex", "",
-                             endpoint=args.endpoint, socket_path=args.socket_path)
+    # The opener already resolved the seat; this pane's own env names a different one.
+    seat = _named_seat(args)
+    if seat is None and args.harness and args.session_id:
+        seat = session_tidy.session_seat(
+            session_tidy.resolve_seat(args.harness, os.getcwd(), sid=args.session_id,
+                                      project=False),
+            args.harness, args.session_id)
+    elif seat is None:
+        seat = session_tidy.Seat("pane", args.seat_key, args.pane, "codex", "",
+                                 endpoint=args.endpoint, socket_path=args.socket_path)
     rows = session_tidy.seat_lineage(seat)
     return _display(rows, args.generation, args.stdout, clear_before_prompt=True)
 
@@ -164,9 +276,15 @@ def main(argv=None):
         return 0
     if pane:
         endpoint = seat.endpoint
+        # The seat names its own pane and socket; `pane` is only where the viewer opens.
         argv = ["exec", sys.executable, str(Path(__file__).resolve()), "--in-pane", "--seat-key", seat.key,
-                "--pane", pane, "--endpoint", endpoint, "--socket-path", socket,
+                "--pane", seat.pane or pane, "--endpoint", endpoint,
+                "--socket-path", seat.socket_path or socket,
                 "--generation", str(args.generation)]
+        named_harness, named_sid = session_tidy.session_identity(seat)
+        if named_harness and named_sid:
+            # The viewer pane rebuilds this exact logical seat from its key.
+            argv += ["--harness", named_harness, "--session-id", named_sid]
         active_cwd = os.environ.get("HERDR_ACTIVE_PANE_CWD") or os.getcwd()
         def runner(command):
             env = os.environ.copy()

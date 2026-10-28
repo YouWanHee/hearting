@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SD-160 old sealed routes: exact registry bridge and common lifecycle gates.
+"""SD-160 old sealed routes: content-addressed snapshot bridge and lifecycle gates.
 
 Fixtures were emitted by capability-route.py and topologies.json from 63a92974,
 using compose_route(autopilot-code/dev, staged, standard|strong), all eight base
@@ -253,6 +253,96 @@ class LegacyRouteCompatibilityTest(unittest.TestCase):
                 self.reseal(route)
                 with mock.patch.dict(os.environ, {'HEARTING_GATES': 'on'}):
                     with self.assertRaises(ValueError): R.verify_route(route)
+
+    def test_snapshot_files_match_their_content_addressed_names(self):
+        for digest in (R.SD160_REGISTRY_DIGEST, R.SD160_UNIT_CATALOG_DIGEST):
+            path=R._sd160_snapshot_path(digest)
+            self.assertTrue(path.is_file(), path)
+            if digest == R.SD160_REGISTRY_DIGEST:
+                value=json.loads(path.read_text(encoding="utf-8"))
+                actual=R.TOPO.registry_digest(value)
+            else:
+                blocks=json.loads(path.read_text(encoding="utf-8"))
+                actual=R._unit_blocks_digest(blocks)
+            self.assertEqual(actual,digest)
+
+    def test_corrupt_snapshot_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            target=Path(td)
+            for source in R.SD160_SNAPSHOT_DIR.glob("*.json"):
+                (target/source.name).write_bytes(source.read_bytes())
+            registry_path=target/R._sd160_snapshot_path(R.SD160_REGISTRY_DIGEST).name
+            registry=json.loads(registry_path.read_text(encoding="utf-8"))
+            registry["corrupted_snapshot_value"]={"changed":True}
+            registry_path.write_text(json.dumps(registry),encoding="utf-8")
+            _,_,route=self.fixture("standard")
+            with mock.patch.object(R,"SD160_SNAPSHOT_DIR",target), mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}):
+                with self.assertRaises(ValueError): R.verify_route(route)
+
+    def test_unknown_sealed_snapshot_digest_is_refused(self):
+        _,_,route=self.fixture("standard")
+        route["registry_digest"]="sha256:"+"0"*64; self.reseal(route)
+        with mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}):
+            with self.assertRaisesRegex(ValueError,"registry"): R.verify_route(route)
+        self.assertEqual(self.jobs.read_text(),"")
+
+    def test_current_registry_and_units_do_not_affect_snapshot_verification(self):
+        registry=copy.deepcopy(R.TOPO.load_registry())
+        registry["part_catalog"]["parts"]["unrelated:test"]={"summary":"added"}
+        registry["unrelated_current_edit"]={"value":True}
+        _,_,route=self.fixture("standard")
+        with mock.patch.object(R.TOPO,"load_registry",return_value=registry), \
+             mock.patch.object(R,"unit_catalog_digest",side_effect=AssertionError("current units read")), \
+             mock.patch.dict(os.environ,{"HEARTING_GATES":"on"}):
+            R.verify_route(route)
+        self.assertEqual(self.jobs.read_text(),"")
+
+    def test_original_unit_digest_graph_tampering_still_reaches_validation(self):
+        _,_,original=self.fixture('strong')
+        mutations=(
+            ('route role',lambda r:r['nodes'][0].__setitem__('role','invented'),False),
+            ('embedded recipe profile',lambda r:next(n for n in r['composed_recipe']['standard_plus']['nodes'] if n['id']=='plan').__setitem__('model_profile','light'),True),
+            ('embedded recipe role',lambda r:next(n for n in r['composed_recipe']['standard_plus']['nodes'] if n['id']=='plan').__setitem__('role','invented'),True),
+            ('realized leg count',lambda r:next(n for n in r['nodes'] if n.get('parallel_group')=='plan').__setitem__('parallel_leg_count',7),True),
+            ('embedded group width',lambda r:next(g for g in r['composed_recipe']['standard_plus']['parallel_groups'] if g['id']=='impl-review')['width_by_intensity'].__setitem__('strong',7),True),
+        )
+        for label,mutate,recipe_expected in mutations:
+            route=copy.deepcopy(original); mutate(route); self.reseal(route)
+            with self.subTest(graph=label), mock.patch.object(R.TOPO,'_validate_recipe',wraps=R.TOPO._validate_recipe) as validate, mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+                with self.assertRaises(ValueError): R.verify_route(route)
+                if recipe_expected: validate.assert_called()
+
+    def test_historical_unit_view_is_scoped_and_persona_version_never_enters(self):
+        import contextvars
+        topo=R.TOPO
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
+        _,_,route=self.fixture('standard')
+        with mock.patch.object(topo,'_validate_recipe',side_effect=RuntimeError('validator failure')), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+            with self.assertRaisesRegex(RuntimeError,'validator failure'): R.verify_route(route)
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
+        observed=[]; real=topo._validate_recipe
+        def inspect(*args,**kwargs):
+            observed.append(topo._unit_frontmatter('editorial/report')['role'])
+            return real(*args,**kwargs)
+        _,_,route=self.fixture('standard')
+        with mock.patch.object(topo,'_validate_recipe',side_effect=inspect), mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}): R.verify_route(route)
+        self.assertEqual(observed,['fast writer'])
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
+        fields={'editorial/report':dict(topo._unit_frontmatter('editorial/report'),role='fast writer')}
+        independent=contextvars.Context()
+        with topo._unit_contract_view(fields):
+            returned=topo._unit_frontmatter('editorial/report'); returned['role']='changed'
+            self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'fast writer')
+            self.assertEqual(independent.run(topo._unit_frontmatter,'editorial/report')['role'],'deep editor')
+            with topo._unit_contract_view({'editorial/report':dict(returned,role='nested')}):
+                self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'nested')
+            self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'fast writer')
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
+        route=copy.deepcopy(self.fixture('standard')[2]); route['persona_independence_contract_version']=1; self.reseal(route)
+        with mock.patch.object(R,'_load_sd160_snapshots',wraps=R._load_sd160_snapshots) as snapshots, mock.patch.dict(os.environ,{'HEARTING_GATES':'on'}):
+            with self.assertRaises(ValueError): R.verify_route(route)
+        snapshots.assert_not_called()
+        self.assertEqual(topo._unit_frontmatter('editorial/report')['role'],'deep editor')
 
 
 class LegacyDesignRegistryBasisTest(unittest.TestCase):

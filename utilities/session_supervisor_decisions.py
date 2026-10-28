@@ -30,6 +30,33 @@ class SupervisorError(RuntimeError):
     """A session supervisor could not preserve its completion contract."""
 
 
+def inherit_continuation_ledger(ledger: ContinuationLedger, state_root,
+                                parent_attempt_id: str) -> tuple[int, bool]:
+    """Replay this attempt's durable reservations without writing new rows."""
+    rows = budget_record.read_rows(state_root, parent_attempt_id)
+    next_ordinal = 0
+    terminal_handoff_issued = False
+    for row in rows:
+        if row.get("record_kind") != "reservation":
+            continue
+        ordinal = row.get("ordinal")
+        purpose = row.get("purpose")
+        klass = row.get("class")
+        if (not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0
+                or row.get("parent_attempt_id") != parent_attempt_id
+                or purpose not in {"ordinary", "terminal-handoff"}
+                or klass not in {"gross", "stall", "reserved"}
+                or (purpose == "terminal-handoff") != (klass == "reserved")
+                or (purpose == "ordinary" and klass == "reserved")):
+            raise SupervisorError("continuation-ledger-inheritance-invalid")
+        verdict = ledger.admit(purpose=purpose, stalled=klass == "stall", reservation_ok=True)
+        if not verdict.admitted:
+            raise SupervisorError("continuation-ledger-inheritance-invalid")
+        next_ordinal = max(next_ordinal, ordinal + 1)
+        terminal_handoff_issued = terminal_handoff_issued or purpose == "terminal-handoff"
+    return next_ordinal, terminal_handoff_issued
+
+
 OWNER_TURN_IDLE_SECONDS = 7200.0
 
 

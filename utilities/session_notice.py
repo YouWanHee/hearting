@@ -179,11 +179,18 @@ def render_text(receipt: dict) -> str:
 
 
 def notice_is_current(record: dict) -> bool:
-    """A notice is retired only by its delivery, never by registry state."""
+    """A notice is retired by its delivery, never by registry state, except a
+    role-bound steward-check notice, which its own duty keeps current."""
     try:
-        validate(record.get("receipt"))
+        receipt = validate(record.get("receipt"))
     except ValueError:
         return False
+    if receipt["key"].startswith("steward-check:"):
+        try:
+            import steward_check
+            return bool(steward_check.notice_is_current(record))
+        except Exception:  # noqa: BLE001 - unknown evidence stays recoverable
+            return True
     return True
 
 

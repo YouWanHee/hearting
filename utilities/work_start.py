@@ -570,6 +570,16 @@ def _slot(route, node, rows, jobs=None):
                     and route["route_id"] in {meta.get("owner_route_id"), meta.get("route_id")})
                    or (node != "owner" and meta.get("route_id") == route["route_id"]
                        and meta.get("route_node") == node and meta.get("worker_type") == "frame"))]
+    adopted = {}
+    owner = route.get("owner_attempt_id")
+    if node == "owner" and not matches and jobs is not None and owner in rows:
+        from owner_route_binding import resolve_owner_route_lifecycle
+        if rows[owner][1].get("worker_type") == "owner":
+            binding, _ = resolve_owner_route_lifecycle(jobs, owner_attempt_id=owner)
+            if binding is not None and (binding.route_id, binding.route_hash) == (
+                    route["route_id"], route["route_hash"]):
+                matches = [owner]
+                adopted[owner] = binding
     aid = matches[-1] if matches else attempt_id(route, node)
     if aid in rows:
         if not matches:
@@ -596,6 +606,8 @@ def _slot(route, node, rows, jobs=None):
             if not _owns(meta, parent, jobs):
                 raise DispatchContractError("work-parent-recovery-required", aid)
         digest = (meta.get("owner_route_hash") or meta.get("route_hash")) if node == "owner" else meta.get("route_hash")
+        if aid in adopted:
+            digest = adopted[aid].route_hash
         if digest != route["route_hash"]:
             raise DispatchContractError("work-attempt-identity-conflict", aid)
     return aid
@@ -1640,6 +1652,8 @@ def _owner_pin_handoff(route, path, jobs, result, rows=None):
     if aid not in rows:
         return None
     status, metadata = rows[aid]
+    # Early resource-watch returns also need this verified current owner.
+    result["owner_attempt_id"] = aid
     if (status not in {"open", "running"}
             or not (metadata.get("launch_claimed") == "1" or metadata.get("launch_started") == "1")):
         return None
@@ -1820,6 +1834,12 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
     watches = (OWNER_RESOURCE.supervisor().recover_resource_watches(route, jobs)
                if any(n.get("kind") == "resource-runner" for n in route.get("nodes", [])) else [])
     if watches:
+        attempt = result.get("owner_attempt_id")
+        if attempt:
+            from dispatch_owner_input import recover_consumer
+            recovery = recover_consumer(jobs, attempt)
+            if recovery.get("consumer_recovery") != "not-started:no-queued-correction":
+                result = {**result, **recovery}
         return {**result, "state": "resource-watching", "required_action": "end-turn",
                 "resource_watches": watches, "parent_next": "end-turn",
                 "next_step": "The exact resource retains its watch and declared continuation; end this turn."}
@@ -1926,7 +1946,8 @@ def _advance(route, path, jobs, result, *, wait=False, interview=None, answers=N
             timeout=_wait_budget(result) if wait else 0, recover=True, observe_only=not wait)
         result["observation"] = joined
         from dispatch_replacement import advance_batch
-        effective, lineage, attention = advance_batch(jobs, attempts, run=run)
+        # Match explicit owner start; existing capacity checks still guard launch.
+        effective, lineage, attention = advance_batch(jobs, attempts, run=run, resume_capacity=True)
         if lineage and effective != attempts:
             result["replacement_lineage"] = lineage
             return _advance(route, path, jobs, result, wait=wait and _wait_budget(result) > 0, interview=interview,

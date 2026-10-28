@@ -469,11 +469,18 @@ def retry_step(route, armed, jobs, reason):
 
 
 def prove(route, ledger, armed, failure, gates, jobs, module, *, snapshots=None,
-          compute_observations=None):
+          compute_observations=None, armed_path=None):
     snapshot = Snapshot()
-    observed_armed, _ = snapshot.document(ledger.root / "armed" / f"{armed['node']}.json")
-    if observed_armed != armed:
-        raise ValueError("resource-watch-changed")
+    if armed_path is None:
+        armed_path = ledger.root / "armed" / f"{armed['node']}.json"
+    if Path(armed_path).is_file():
+        observed_armed, _ = snapshot.document(armed_path)
+        if observed_armed != armed:
+            raise ValueError("resource-watch-changed")
+    else:
+        # Historical bindings are already pinned in the append-only journal;
+        # current additive watches use their own exact path, never node lookup.
+        observed_armed = armed
     node_id = armed["node"]
     node = WS.route_node(route, node_id)
     if (node is None or node.get("kind") != "resource-runner"
@@ -489,7 +496,8 @@ def prove(route, ledger, armed, failure, gates, jobs, module, *, snapshots=None,
     if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
         # The caller captures this before writer locks; require exact armed and
         # row identity here, then the snapshot digest is checked before append.
-        captured = (compute_observations or {}).get(node_id)
+        key = OWNER_RESOURCE.supervisor().resource_watch_key(armed)
+        captured = (compute_observations or {}).get(key)
         if not captured or captured.get("armed") != armed or captured.get("row") != row:
             raise ValueError("compute-resource-observation-changed")
         observation = captured.get("observation") or {}
@@ -617,6 +625,7 @@ def reconcile(route, ledger, gates, jobs, module, *, compute_observations=None):
     planned = {}
     retries = {}
     snapshots = []
+    supervisor = OWNER_RESOURCE.supervisor()
     for node_id, stage in current["nodes"].items():
         prior = (stage.get("evidence") or {}).get("resolved_resource_failure")
         if stage["state"] != "FAILED_RETRYABLE" and not prior:
@@ -627,25 +636,36 @@ def reconcile(route, ledger, gates, jobs, module, *, compute_observations=None):
         node = WS.route_node(route, node_id)
         if not node or node.get('kind') != 'resource-runner':
             continue
-        path = ledger.root / "armed" / f"{node_id}.json"
         retry_armed = {'node': node_id, 'predecessor_id':
                  str(failure.get('identity') or f"{route['route_id']}__{node_id}").split(':')[0]}
         try:
-            armed = json.loads(path.read_text())
-            if not isinstance(armed, dict):
+            run_id = retry_armed["predecessor_id"]
+            pairs = supervisor.resource_predecessors(ledger, node_id)
+            pair = next(((armed, row) for armed, row in pairs
+                         if row.get("run_id") == run_id
+                         and resource_resume.row_digest(row) == failure.get("resource_sha256")), None)
+            if pair is None:
                 raise ValueError('resource-watch-unreadable')
+            armed, failed_row = pair
+            primary = supervisor.read_armed(ledger).get(node_id)
+            armed_path = (ledger.root / "armed" / f"{node_id}.json" if armed == primary
+                          else supervisor.resource_watch_path(ledger, armed))
+            if not Path(armed_path).is_file():
+                armed_path = None
             for key in ('resource_registry', 'route_file'):
                 if isinstance(armed.get(key), str):
                     retry_armed[key] = armed[key]
             if armed.get("predecessor_kind") != "resource":
                 raise ValueError('resource-watch-binding-mismatch')
-            if compute_observations and node_id in compute_observations:
+            observation_key = supervisor.resource_watch_key(armed)
+            if compute_observations and observation_key in compute_observations:
                 planned[node_id] = prove(route, ledger, armed, failure, gates, jobs, module,
                                          snapshots=snapshots,
-                                         compute_observations=compute_observations)
+                                         compute_observations=compute_observations,
+                                         armed_path=armed_path)
             else:
                 planned[node_id] = prove(route, ledger, armed, failure, gates, jobs, module,
-                                         snapshots=snapshots)
+                                         snapshots=snapshots, armed_path=armed_path)
             retries[node_id] = retry_armed
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise UnresolvedResource(node_id, str(exc), retry_step(route, retry_armed, jobs, str(exc))) from exc
