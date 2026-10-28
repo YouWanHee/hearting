@@ -1201,10 +1201,12 @@ def session_successor(session: str, *, harness=None, read_context=None) -> tuple
     if harness:
         start = (harness, session)
     else:
-        origins = {left for left, _right in edges if left[1] == session}
-        if len(origins) > 1:
+        # A legacy retire's source may already be a qualified incoming target,
+        # even though its outgoing edge has not been expanded yet.
+        candidates = {vertex for vertex in vertices if vertex[1] == session}
+        if len(candidates) > 1:
             raise OSError("notice-lineage-unresolved")
-        start = next(iter(origins), ("", session))
+        start = next(iter(candidates), ("", session))
     vertices.add(start)
     for origin, right in legacy_retire:
         sources = {vertex for vertex in vertices if vertex[1] == origin}

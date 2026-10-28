@@ -2882,6 +2882,111 @@ class CanonicalNoticeJoinTest(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(pending.read(self.root, old, record["delivery_id"])["state"], "acked")
 
+    def _intermediate_retire_notice(self, harness, *, first_source):
+        import dispatch_seat_handover as handover
+        import dispatch_pending_delivery as pending
+        import dispatch_session_sweep as sweep
+        import session_tidy as tidy
+        prefix = "intermediate-" + first_source + "-" + harness
+        old, intermediate, current = (prefix + suffix for suffix in ("-A", "-B", "-C"))
+        record, = self.notices(harness, intermediate)
+        duty, = self.duties(intermediate)
+        path = pending.record_path(self.root, intermediate, record["delivery_id"])
+        original = path.read_bytes()
+        identity = pending.received_ack_identity(record, intermediate, record["delivery_id"])
+        (self.store.root / (duty["id"] + ".json")).unlink()  # Require real discovery.
+        meta = self.parent_row(old, harness=harness, index=100 + len(self.duties()))
+        binding = handover.binding_of(self.jobs, meta)
+        self.assertEqual(binding["parent"], old)
+        seat = tidy.Seat("pane", prefix)
+        if first_source == "tidy-clear":
+            self.edge(harness, old, intermediate)
+        else:
+            tidy._append_ledger_entry(seat, dict(event="handover", source="retire",
+                harness=harness, sid=intermediate, bindings=[binding], ts=1, **{"from": old}))
+        # The inherited job's parent stays A even though this retire originates at B.
+        tidy._append_ledger_entry(seat, dict(event="handover", source="retire",
+            harness=harness, sid=current, bindings=[binding], ts=2, **{"from": intermediate}))
+        for origin in (old, intermediate):
+            self.assertEqual(handover.session_successor(origin), (current, harness))
+            self.assertEqual(handover.session_successor(origin, harness=harness), (current, harness))
+        self.assertEqual(handover.effective_parent(meta, self.jobs), current)
+        self.assertEqual(handover.record_recipient_binding(record, intermediate, harness=harness),
+                         (harness, current))
+        with mock.patch.object(handover, "pane_seat", return_value=seat):
+            scopes = dict(handover.storage_recipients(current, harness=harness))
+            self.assertEqual(scopes[old], {meta["attempt_id"]})
+            self.assertEqual(scopes[intermediate], frozenset(), "B grants notices, not A's jobs")
+            self.assertTrue(scopes[intermediate].lineage_notice)
+            addressed, _count = sweep.addressed_records(self.root, record["recipient_kind"], current)
+        self.assertEqual([(item[sweep.STORAGE_KEY], item["delivery_id"]) for item in addressed],
+                         [(intermediate, record["delivery_id"])])
+        self.assertTrue(peer_steward._discover_session_notice_duties(self.store))
+        self.assertEqual([item["id"] for item in self.duties(intermediate)], [duty["id"]])
+        # Discovery preserves all original bytes, including claim/lease/fence/ACK state.
+        self.assertEqual(path.read_bytes(), original)
+        self.assertIsNone(pending.read_submission_fence(self.root, intermediate, record["delivery_id"],
+            expected_identity=pending.submission_fence_identity(record, current)))
+        with mock.patch.object(pending, "claim", wraps=pending.claim) as claims, \
+             mock.patch.object(pending, "ack_received", wraps=pending.ack_received) as acks, \
+             self.courier(harness, current, receive=True) as sent:
+            peer_steward._reconcile_obligations(self.store, self.duties(intermediate))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["producer_binding"]["records"], [{"duty_id": duty["id"],
+            "storage_sid": intermediate, "delivery_id": record["delivery_id"],
+            "receipt_digest": record["receipt_digest"]}])
+        self.assertTrue(claims.call_args_list)
+        self.assertTrue(acks.call_args_list)
+        for call in claims.call_args_list + acks.call_args_list:
+            self.assertEqual(call.args[:3], (self.root, intermediate, record["delivery_id"]))
+        settled = pending.read(self.root, intermediate, record["delivery_id"])
+        self.assertEqual(settled["state"], "acked")
+        self.assertEqual(pending.received_ack_identity(settled, intermediate, record["delivery_id"]), identity)
+        self.assertEqual(self.store.get(duty["id"])["state"], "complete")
+        for sid in (old, current):
+            self.assertIsNone(pending.read(self.root, sid, record["delivery_id"]))
+
+    def test_intermediate_notice_after_two_legacy_retires_keeps_original_storage(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                self._intermediate_retire_notice(harness, first_source="retire")
+
+    def test_intermediate_notice_after_tidy_then_legacy_retire_keeps_original_storage(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                self._intermediate_retire_notice(harness, first_source="tidy-clear")
+
+    def test_sid_only_successor_refuses_same_sid_in_two_qualified_incoming_targets(self):
+        import dispatch_seat_handover as handover
+        sid = "ambiguous-incoming-target"
+        self.edge("claude", "claude-origin", sid)
+        self.edge("codex", "codex-origin", sid)
+        with self.assertRaisesRegex(OSError, "notice-lineage-unresolved"):
+            handover.session_successor(sid)
+        for harness in ("claude", "codex"):
+            self.assertEqual(handover.session_successor(sid, harness=harness), ("", ""))
+
+    def test_legacy_retire_successor_refuses_fork_merge_cycle_and_unreadable(self):
+        import dispatch_seat_handover as handover
+        import session_tidy as tidy
+        for kind in ("fork", "merge", "cycle", "unreadable"):
+            with self.subTest(kind=kind):
+                old, middle, current = (kind + "-legacy-" + suffix for suffix in ("A", "B", "C"))
+                seat = tidy.Seat("pane", kind + "-legacy-control")
+                pairs = [(old, middle), (middle, current)]
+                if kind != "unreadable":
+                    pairs.append({"fork": (middle, current + "-other"),
+                                  "merge": (old + "-other", current), "cycle": (current, old)}[kind])
+                for ts, (origin, target) in enumerate(pairs):
+                    tidy._append_ledger_entry(seat, dict(event="handover", source="retire",
+                        harness="codex", sid=target, bindings=[], ts=ts, **{"from": origin}))
+                if kind == "unreadable":
+                    tidy._ledger_path(seat).write_bytes(b"{unreadable")
+                for origin in (old, middle, current):
+                    for harness in (None, "codex"):
+                        with self.assertRaises(OSError):
+                            handover.session_successor(origin, harness=harness)
+
     def test_provenance_same_sid_in_another_harness_does_not_transfer_authority(self):
         import dispatch_seat_handover as handover
         sid = "same-sid-two-harnesses"
