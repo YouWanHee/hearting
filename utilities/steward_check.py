@@ -193,15 +193,25 @@ def _agents():
         return None
 
 
-def _session_liveness(harness: str, session_id: str, agents=None) -> str:
+def _end_observation():
+    """One pass's shared process observation from the collector, or None."""
+    function = getattr(_collector(), "end_observation", None)
+    try:
+        return function() if function is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _session_liveness(harness: str, session_id: str, agents=None, observation=None) -> str:
     """``live|ended|unknown``; unknown when the collector lacks the proof."""
     collector = _collector()
     function = getattr(collector, "session_liveness", None)
     if function is None or not session_id:
         return "unknown"
+    options = {key: value for key, value in (("agents", agents), ("observation", observation))
+               if value is not None}
     try:
-        result = (function(harness, session_id, agents=agents) if agents is not None
-                  else function(harness, session_id))
+        result = function(harness, session_id, **options)
     except Exception:  # noqa: BLE001
         return "unknown"
     return result if result in {"live", "ended", "unknown"} else "unknown"
@@ -223,6 +233,7 @@ def _observe_role(harness: str, session_id: str) -> dict:
     collector = _collector()
     targets = []
     agents = _agents()
+    observation = _end_observation()
     by_session = {}
     for agent in agents or ():
         identity = agent.get("agent_session") or {}
@@ -239,7 +250,8 @@ def _observe_role(harness: str, session_id: str) -> dict:
                 "name": str(target.get("name") or (t_sid or "-")[:8]),
                 "harness": t_harness or "-", "session_id": t_sid,
                 "state": state,
-                "liveness": _session_liveness(t_harness, t_sid, agents) if t_sid else "unknown"})
+                "liveness": (_session_liveness(t_harness, t_sid, agents, observation)
+                             if t_sid else "unknown")})
     pending = 0
     try:
         module = collector._peer_message_module() if collector is not None else None
@@ -593,9 +605,10 @@ def reconcile_all(store) -> None:
     if not holders:
         return
     agents = _agents()
+    observation = _end_observation()
     for (harness, session_id) in holders:
         try:
-            if _session_liveness(harness, session_id, agents) != "ended":
+            if _session_liveness(harness, session_id, agents, observation) != "ended":
                 register(harness, session_id, store=store, ensure_runner=False)
         except Exception:  # noqa: BLE001
             continue

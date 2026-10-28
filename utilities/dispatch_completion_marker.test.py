@@ -1408,6 +1408,8 @@ class CompletionMarkerTest(unittest.TestCase):
             # Asserts the real gate refuses changed saved outputs, config drift,
             # cancellation and pending corrections before verifier admission.
             (ROOT / "utilities" / "resource_sequence.test.py").resolve(),
+            # Reproduces the real pre-repair gate refusal for preserved resources.
+            (ROOT / "utilities" / "preserved_resource_handoff.test.py").resolve(),
         }
         for adapter in ("claude", "codex", "opencode"):
             allow.add((ROOT / "adapters" / adapter / "bin" / "dispatch-headless.py").resolve())

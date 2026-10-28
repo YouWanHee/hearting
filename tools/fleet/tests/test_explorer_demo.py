@@ -10,6 +10,7 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -297,9 +298,16 @@ class OnceCommand(unittest.TestCase):
                     os.environ[name] = value
 
     def test_fleet_explorer_once_demo_exits_zero(self):
-        env = dict(os.environ, COLUMNS="100", LINES=str(ROWS), PYTHONDONTWRITEBYTECODE="1")
-        done = subprocess.run([sys.executable, str(FLEET), "--explorer", "--once", "--demo"], env=env,
-                              capture_output=True, text=True, timeout=180)
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = os.path.join(tmp, "jobs.log")
+            open(jobs, "w").close()
+            env = dict(os.environ, COLUMNS="100", LINES=str(ROWS),
+                       PYTHONDONTWRITEBYTECODE="1",
+                       AGENT_DISPATCH_JOBS=jobs,
+                       AGENT_RESOURCE_RUN_INDEX=os.path.join(
+                           tmp, "resource-runs.index.json"))
+            done = subprocess.run([sys.executable, str(FLEET), "--explorer", "--once", "--demo"], env=env,
+                                  capture_output=True, text=True, timeout=180)
         self.assertEqual(done.returncode, 0, done.stderr[-400:])
         self.assertIn("OVERVIEW", done.stdout)
 

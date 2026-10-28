@@ -158,7 +158,7 @@ def saved_output_admission(route, successor, jobs, owner_attempt_id, owner_sessi
     input_module = __import__("dispatch_owner_input")
     with _locked(jobs_path, owner_attempt_id) as (_, value):
         if not sup._owner_input_matches_locked(
-                armed, row, owner_attempt_id, owner_session_id, value, input_module):
+                route, armed, row, owner_attempt_id, owner_session_id, value, input_module):
             return None
 
     snapshot = Snapshot()

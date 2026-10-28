@@ -917,7 +917,7 @@ it lists them and starts nothing.
 `close` may preserve `terminal_gate_proven=false`; later exact completion on the
 same route is consumed by complete/finish/close/finalize (artifact-path-contract
 §46). An owner-pin handoff settles the predecessor's execution while preserving
-its cycle for the hash-bound successor; it does not mean the task was abandoned.
+its cycle and the preserved resource runs of the nodes it resumes for the hash-bound successor; it does not mean the task was abandoned.
 Historical `abandoned` is reconsidered only when that complete handoff lineage
 and the successor's exact terminal binding verify. Identity conflicts, live or
 unknown work, explicit stop/CANCELLED, and other abandoned/autoclose outcomes

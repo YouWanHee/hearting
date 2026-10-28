@@ -835,5 +835,91 @@ class NativeCurrentSelectionTest(unittest.TestCase):
         self.assertEqual(self._current(pid=worker.pid), "")
 
 
+class TerminalCallerTest(unittest.TestCase):
+    """Private controlling PTYs, with a foreground job distinct from its shell."""
+
+    def terminal(self, foreground=True):
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        env = {k: v for k, v in os.environ.items() if k not in
+               (*po._WORKER_ENV, "AGENT_SESSION_ROLE") and not k.startswith("OPENCODE_DISPATCH")}
+        script = '''
+import os, subprocess, sys, json, signal, time
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+def stop(*_): raise SystemExit(0)
+signal.signal(signal.SIGTERM, stop)
+child = subprocess.Popen([sys.executable, '-u', '-c', "import time; print('ready', flush=True); time.sleep(60)"],
+    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    preexec_fn=lambda: os.setpgid(0, 0))
+try:
+    assert child.stdout.readline() == b'ready\\n'
+    os.tcsetpgrp(0, child.pid if sys.argv[1] == '1' else os.getpgrp())
+    print(json.dumps({'shell_pid':os.getpid(), 'pid':child.pid, 'tty':os.ttyname(0),
+        'foreground_process_group_id':os.tcgetpgrp(0),
+        'foreground_processes':[{'pid':os.tcgetpgrp(0)}]}), flush=True)
+    time.sleep(60)
+finally:
+    child.terminate()
+    child.wait(timeout=5)
+    child.stdout.close()
+'''
+        def terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        proc = subprocess.Popen([sys.executable, "-u", "-c", script, "1" if foreground else "0"],
+                                stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                preexec_fn=terminal, env=env)
+        os.close(slave)
+        def settle():
+            proc.terminate()
+            _out, err = proc.communicate(timeout=5)
+            self.assertEqual(proc.returncode, 0, err.decode())
+        self.addCleanup(settle)
+        line = proc.stdout.readline()
+        self.assertTrue(line, "private PTY driver did not report readiness")
+        info = json.loads(line)
+        return info, info["pid"]
+
+    def test_foreground_job_with_redirected_stdio_is_proved(self):
+        info, pid = self.terminal()
+        self.assertNotEqual(info["shell_pid"], info["foreground_process_group_id"])
+        self.assertEqual(os.readlink(f"/proc/{pid}/fd/0"), "/dev/null")
+        self.assertTrue(po.verified_terminal_caller(info, pid=pid))
+
+    def test_background_job_and_other_terminal_are_refused(self):
+        background, pid = self.terminal(foreground=False)
+        self.assertFalse(po.verified_terminal_caller(background, pid=pid))
+        first, pid = self.terminal()
+        other, other_pid = self.terminal()
+        self.assertFalse(po.verified_terminal_caller(other, pid=pid))
+        self.assertFalse(po.verified_terminal_caller(first, pid=other_pid))
+
+    def test_stale_start_inaccessible_uid_namespace_and_worker_are_refused(self):
+        info, pid = self.terminal()
+        read = po._process
+        calls = {"n": 0}
+        def stale(value):
+            record = read(value)
+            if int(value) == pid:
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    return (*record[:5], str(int(record[5]) + 1))
+            return record
+        with mock.patch.object(po, "_process", side_effect=stale):
+            self.assertFalse(po.verified_terminal_caller(info, pid=pid))
+        with mock.patch.object(po, "_process", side_effect=lambda p: None if p == info["shell_pid"] else read(p)):
+            self.assertFalse(po.verified_terminal_caller(info, pid=pid))
+        with mock.patch.object(po, "_registered_worker", return_value=True):
+            self.assertFalse(po.verified_terminal_caller(info, pid=pid))
+        with mock.patch.object(po, "_runtime", return_value=("codex", True)):
+            self.assertFalse(po.verified_terminal_caller(info, pid=pid))
+
+    def test_missing_tty_and_wrong_foreground_group_are_refused(self):
+        info, pid = self.terminal()
+        for altered in ({**info, "tty": None}, {**info, "foreground_process_group_id": info["shell_pid"]},
+                        {**info, "foreground_processes": []}, {**info, "shell_pid": 999999999}):
+            self.assertFalse(po.verified_terminal_caller(altered, pid=pid))
+
+
 if __name__ == "__main__":
     unittest.main()

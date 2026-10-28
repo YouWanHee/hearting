@@ -235,6 +235,11 @@ def main() -> int:
             if again and again.returncode == 0 and _single(fields, "state") == "rearmed" and new_id:
                 watch_id, rearmed = new_id, 1
                 continue
+            # Observer recovery may restore the same watch between the join and
+            # this rearm; that watch is observed again, so join it once more.
+            if (again and again.returncode == 0 and new_id == watch_id
+                    and _single(fields, "state") in ("alive", "already-done")):
+                continue
         # First death that could not be rearmed, or the second death: attention.
         return emit(notice(watch_id, target, joined.stdout, rearmed=rearmed))
 

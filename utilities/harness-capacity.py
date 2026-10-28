@@ -543,18 +543,16 @@ def is_gated(scores, harness, *, usage_gate_used_percent=90):
     return value is not None and float(value) <= gate_cutoff(usage_gate_used_percent)
 
 
-def gate_release_epoch(harness, source, *, usage_gate_used_percent=90, now=None, stale_after=3600):
-    """When `harness` leaves the `balanced` usage gate, if its gauge says so; else None.
+def window_release_epoch(harness, *, usage_gate_used_percent=100, now=None, stale_after=3600):
+    """The last reset among `harness`'s cached windows at or above the gate, else None.
 
-    The gate holds while a usage window is at or above the gate and lifts when the
-    last such window resets. Only a score read from the shared usage cache (`live`
-    writes through to it, `cache:<age>s` reads it) has those windows: codex
-    `windows` and opencode `rl_windows`, rows `[label, used, reset_epoch]`. A
-    window at the gate without a future reset makes the answer unknown; a time is
-    never guessed.
+    The cache-reading half of `gate_release_epoch`, exported so the hard
+    eligibility reader judges the same rows at 100% instead of parsing them a
+    second time. Codex `windows` and opencode `rl_windows` carry
+    `[label, used, reset_epoch]`; a window at the gate without a future reset
+    makes the answer unknown (a time is never guessed), and a cache older than
+    `stale_after` carries no answer at all.
     """
-    if not isinstance(source, str) or not source.startswith(("live", "cache:")):
-        return None
     cache = _usage_cache()
     if cache is None:
         return None
@@ -575,6 +573,37 @@ def gate_release_epoch(harness, source, *, usage_gate_used_percent=90, now=None,
             return None
         release = reset if release is None else max(release, reset)
     return release
+
+
+def gauge_limit_epoch(harness, *, now=None, stale_after=3600):
+    """When the shared gauge itself says `harness` is out of room, else None.
+
+    Hard-eligibility counterpart of `gate_release_epoch`: the same cached
+    windows, at 100% used instead of the soft gate, with a future reset. A
+    manual `HARNESS_CAPACITY_SCORES` entry replaces the gauge exactly as it does
+    in `capacity_report`, and Claude has no gauge windows here (its limits stay
+    native). No window, a past reset, or a cache older than `stale_after`
+    stays unknown.
+    """
+    if harness not in ("codex", "opencode") or harness in _manual_scores():
+        return None
+    return window_release_epoch(harness, usage_gate_used_percent=100, now=now, stale_after=stale_after)
+
+
+def gate_release_epoch(harness, source, *, usage_gate_used_percent=90, now=None, stale_after=3600):
+    """When `harness` leaves the `balanced` usage gate, if its gauge says so; else None.
+
+    The gate holds while a usage window is at or above the gate and lifts when the
+    last such window resets. Only a score read from the shared usage cache (`live`
+    writes through to it, `cache:<age>s` reads it) has those windows: codex
+    `windows` and opencode `rl_windows`, rows `[label, used, reset_epoch]`. A
+    window at the gate without a future reset makes the answer unknown; a time is
+    never guessed.
+    """
+    if not isinstance(source, str) or not source.startswith(("live", "cache:")):
+        return None
+    return window_release_epoch(harness, usage_gate_used_percent=usage_gate_used_percent,
+                                now=now, stale_after=stale_after)
 
 
 def rank_band(candidates, states, counts, declared_order, scores, *, strategy="capacity-aware", usage_gate_used_percent=90,
