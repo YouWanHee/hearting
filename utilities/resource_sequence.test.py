@@ -119,10 +119,11 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         armed_path.write_text(json.dumps(armed))
         return attempt, owner_input
 
-    def record_original_owner_exit(self, route, jobs, registry, original_attempt):
+    def record_original_owner_exit(self, route, jobs, registry, original_attempt, *,
+                                   owner_pid=999999999):
         data = json.loads(registry.read_text())
         row = data['runs']['fixture-run']
-        row['owner_wait'].update(owner_pid='999999999', owner_start='1')
+        row['owner_wait'].update(owner_pid=owner_pid, owner_start='1')
         registry.write_text(json.dumps(data))
         ledger = SUP.ledger_for(route, jobs)
         armed_path = ledger.root / 'armed' / 'full-run.json'
@@ -2357,9 +2358,15 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
                     proc.wait(timeout=5)
 
     def test_replacement_owner_consumes_original_success_via_public_start(self):
+        for owner_pid in (999999999, '999999999'):
+            with self.subTest(owner_pid=owner_pid), self.subfixture():
+                self._check_replacement_owner_consumes_original_success(owner_pid)
+
+    def _check_replacement_owner_consumes_original_success(self, owner_pid):
         route, path, jobs, registry, _output, ledger = self.fixture()
         original_attempt, _original_input = self.live_owner(route, jobs, registry, harness='claude')
-        self.record_original_owner_exit(route, jobs, registry, original_attempt)
+        self.record_original_owner_exit(route, jobs, registry, original_attempt,
+                                       owner_pid=owner_pid)
         observed = SUP.poll_once(route, ledger)
         self.assertEqual(observed[0]['action'], 'wait-next-resource')
         original_row = json.loads(registry.read_text())['runs']['fixture-run']
@@ -2410,6 +2417,69 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertEqual(registry.read_bytes(), resource_bytes)
         self.assertEqual(json.loads(registry.read_text())['runs']['fixture-run']['parent_attempt_id'],
                          original_attempt)
+
+    def test_owner_input_snapshot_keeps_pinned_owner_and_refuses_conflicting_source(self):
+        route, _path, jobs, registry, _output, ledger = self.fixture()
+        owner_attempt, _owner_input = self.live_owner(route, jobs, registry, harness='claude')
+        resource = json.loads(registry.read_text())['runs']['fixture-run']
+        armed = SUP.read_armed(ledger)['full-run']
+        del resource['parent_attempt_id']
+        self.assertTrue(SUP._owner_input_is_current(armed, resource, owner_attempt, 'same-native'))
+        for source in ('att-foreign', None, ''):
+            with self.subTest(source=source):
+                resource['parent_attempt_id'] = source
+                self.assertFalse(SUP._owner_input_is_current(
+                    armed, resource, owner_attempt, 'same-native'))
+        resource['parent_attempt_id'] = owner_attempt
+        resource['owner_wait']['parent_attempt_id'] = 'att-foreign'
+        self.assertFalse(SUP._owner_input_is_current(armed, resource, owner_attempt, 'same-native'))
+
+    def test_replacement_owner_rejects_invalid_resource_owner_pid_with_proven_lineage(self):
+        for owner_pid in (True, False, 0, -1, 999999999.0, 'invalid', '0', None):
+            with self.subTest(owner_pid=owner_pid), self.subfixture():
+                route, path, jobs, registry, _output, ledger = self.fixture()
+                original_attempt, _original_input = self.live_owner(
+                    route, jobs, registry, harness='claude')
+                self.record_original_owner_exit(route, jobs, registry, original_attempt)
+                self.assertEqual(SUP.poll_once(route, ledger)[0]['action'], 'wait-next-resource')
+                current_attempt, _current_input = self.launched_replacement_owner(
+                    route, jobs, original_attempt)
+                # Even identities that would match after bool/int coercion must
+                # not authorize consumption. Keep the real replacement proof.
+                lines = Path(jobs).read_text().splitlines()
+                for index, line in enumerate(lines):
+                    fields = line.split('\t')
+                    metadata = DC.parse_registry_metadata(fields[5])
+                    if metadata.get('attempt_id') == original_attempt:
+                        metadata['owner_identity_lineage'] = '1:1+0:1'
+                        fields[5] = ','.join(f'{key}={value}' for key, value in metadata.items())
+                        lines[index] = '\t'.join(fields)
+                        break
+                Path(jobs).write_text('\n'.join(lines) + '\n')
+                proof = dict(source_attempt_id=original_attempt, consumer_attempt_id=current_attempt,
+                    resource_route_file=str(path), resource_route_id=route['route_id'],
+                    resource_route_hash=route['route_hash'], resource_owner_start='1')
+                self.assertTrue(RA.resource_owner_consumer_matches(
+                    jobs, resource_owner_pid=999999999, **proof))
+                self.assertFalse(RA.resource_owner_consumer_matches(
+                    jobs, resource_owner_pid=owner_pid, **proof))
+                data = json.loads(registry.read_text())
+                row = data['runs']['fixture-run']
+                row['owner_wait']['owner_pid'] = owner_pid
+                registry.write_text(json.dumps(data))
+                armed_path = ledger.root / 'armed/full-run.json'
+                armed = json.loads(armed_path.read_text())
+                armed['resource_binding'] = WAIT.resource_body_digest(row)
+                armed_path.write_text(json.dumps(armed))
+                before = registry.read_bytes(), ledger.journal_path.read_bytes()
+                with self.assertRaisesRegex(SUP.SupervisorError,
+                                            'resource-owner-successor-binding-conflict'):
+                    SUP.admit_owner_successor_start(
+                        route, 'run-verify', jobs, current_attempt, 'replacement-native')
+                self.assertEqual((registry.read_bytes(), ledger.journal_path.read_bytes()), before)
+                self.assertEqual(ledger.claims(), {})
+                self.assertFalse((SUP.route_module().completion_dir(
+                    route['route_id'], jobs=jobs) / 'full-run.json').exists())
 
     def test_unlaunched_or_tampered_replacement_cannot_consume_original_resource(self):
         for mutation in ('unlaunched', 'tampered-claim', 'foreign-owner-route',

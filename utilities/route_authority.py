@@ -974,8 +974,14 @@ def resource_owner_consumer_matches(jobs, *, source_attempt_id, consumer_attempt
     """
     if not all(isinstance(value, str) and value for value in (
             source_attempt_id, consumer_attempt_id, resource_route_file,
-            resource_route_id, resource_route_hash, resource_owner_pid,
-            resource_owner_start)):
+            resource_route_id, resource_route_hash, resource_owner_start)):
+        return False
+    # Resource-runner JSON stores an integer PID; historical waits used text.
+    # Reject bools and coercible non-PIDs before comparing the exact lineage.
+    if isinstance(resource_owner_pid, bool) or not isinstance(resource_owner_pid, (int, str)):
+        return False
+    owner_pid = str(resource_owner_pid)
+    if not owner_pid.isascii() or not owner_pid.isdigit() or not owner_pid.strip("0"):
         return False
     try:
         import dispatch_replacement as DR
@@ -1020,7 +1026,7 @@ def resource_owner_consumer_matches(jobs, *, source_attempt_id, consumer_attempt
                 (resource_route_id, resource_route_hash)
                 or (source_route_record.get("route_id"), source_route_record.get("route_hash")) !=
                 (source.get("owner_route_id"), source.get("owner_route_hash"))
-                or (str(resource_owner_pid), str(resource_owner_start))
+                or (owner_pid, resource_owner_start)
                     not in attempt_identity_lineage(source)):
             return False
 

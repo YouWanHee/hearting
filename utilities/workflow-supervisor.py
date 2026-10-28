@@ -1148,7 +1148,9 @@ def _owner_input_matches_locked(armed, resource_row, owner_attempt_id, owner_ses
     import dispatch_contract as DC
     parent, target = input_module._target(armed["jobs"], owner_attempt_id)
     owner = resource_row.get("owner_wait") or {}
-    source_attempt_id = resource_row.get("parent_attempt_id")
+    source_attempt_id = resource_row.get("parent_attempt_id", owner.get("parent_attempt_id"))
+    if owner.get("parent_attempt_id") != source_attempt_id:
+        return False
     if source_attempt_id != owner_attempt_id:
         import route_authority as AUTHORITY
         if not AUTHORITY.resource_owner_consumer_matches(
@@ -1759,15 +1761,21 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
                 raise WS.WorkflowStateError(f"resource-operation-unsettled:{node}:{armed.get('predecessor_id')}") from error
             owner = row.get("owner_wait") or {}
             source_attempt_id = row.get("parent_attempt_id")
+            # Original-owner settlement keeps its exact route binding; a new
+            # consumer also needs the launched replacement's lineage proof.
+            same_owner = source_attempt_id == owner_attempt_id
             if (not source_attempt_id or owner.get("parent_attempt_id") != source_attempt_id
-                    or not AUTHORITY.resource_owner_consumer_matches(
+                    or (same_owner and (
+                        armed.get("route_id") != route.get("route_id")
+                        or armed.get("route_hash") != route.get("route_hash")))
+                    or (not same_owner and not AUTHORITY.resource_owner_consumer_matches(
                         jobs, source_attempt_id=source_attempt_id,
                         consumer_attempt_id=owner_attempt_id,
                         resource_route_file=armed.get("route_file"),
                         resource_route_id=armed.get("route_id"),
                         resource_route_hash=armed.get("route_hash"),
                         resource_owner_pid=owner.get("owner_pid"),
-                        resource_owner_start=owner.get("owner_start"))):
+                        resource_owner_start=owner.get("owner_start")))):
                 raise WS.WorkflowStateError(f"resource-operation-owner-unsettled:{node}:{row.get('run_id')}")
             execution = row.get("execution") if isinstance(row, dict) else None
             if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
@@ -1855,21 +1863,23 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
             current_artifacts = artifact_evidence(armed)
             source_attempt_id = row.get("parent_attempt_id") if isinstance(row, dict) else None
             owner = (row.get("owner_wait") or {}) if isinstance(row, dict) else {}
+            same_owner = source_attempt_id == owner_attempt_id
+            settlement_route = route if same_owner else owner
             if (row is None or row.get("resource_policy") != "supervised-owner"
                     or not source_attempt_id
                     or owner.get("parent_attempt_id") != source_attempt_id
-                    or not AUTHORITY.resource_owner_consumer_matches(
+                    or (not same_owner and not AUTHORITY.resource_owner_consumer_matches(
                         jobs, source_attempt_id=source_attempt_id,
                         consumer_attempt_id=owner_attempt_id,
                         resource_route_file=armed.get("route_file"),
                         resource_route_id=armed.get("route_id"),
                         resource_route_hash=armed.get("route_hash"),
                         resource_owner_pid=owner.get("owner_pid"),
-                        resource_owner_start=owner.get("owner_start"), require_live=False)
+                        resource_owner_start=owner.get("owner_start"), require_live=False))
                     or row.get("route") != armed.get("route_file") or row.get("node") != node
                     or row.get("jobs") != str(jobs) or armed.get("jobs") != str(jobs)
-                    or armed.get("route_id") != owner.get("route_id")
-                    or armed.get("route_hash") != owner.get("route_hash")
+                    or armed.get("route_id") != settlement_route.get("route_id")
+                    or armed.get("route_hash") != settlement_route.get("route_hash")
                     or not OWNER_RESOURCE.resource_binding_matches(armed, row)
                     or not current_artifacts.get("checked") or current_artifacts.get("missing")):
                 continue
