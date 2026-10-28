@@ -235,7 +235,7 @@ class StatuslinePriorClaimTest(unittest.TestCase):
     def reader(self):
         return claude.session_id_of_process(71, home=str(self.f.home))
 
-    def event(self):
+    def event(self, *, expect_tap_update=True):
         result = subprocess.run(["bash", _STATUSLINE], input=json.dumps({
             "session_id": "current", "cwd": str(self.root), "cost": {"total_cost_usd": 2.25},
             "pid": 9999, "proc_start": "9999"}), capture_output=True, text=True, timeout=30,
@@ -243,9 +243,12 @@ class StatuslinePriorClaimTest(unittest.TestCase):
                  "CLAUDE_CONFIG_DIR": str(self.f.home), "FLEET_TITLE_DISABLE": "1",
                  "HARNESS_CAPACITY_REFRESH_DISABLE": "1"})
         self.assertEqual(result.returncode, 0, result.stderr)
+        latest = json.loads((self.f.home / ".statusline-last.json").read_text())
+        self.assertEqual(latest["cost"]["total_cost_usd"], 2.25)
         tap = json.loads((self.f.home / ".statusline/current.json").read_text())
-        self.assertEqual(tap["cost"]["total_cost_usd"], 2.25)
-        self.assertIn("hearting_context_request", tap)
+        if expect_tap_update:
+            self.assertEqual(tap["cost"]["total_cost_usd"], 2.25)
+            self.assertIn("hearting_context_request", tap)
         return tap
 
     def test_conflict_survives_real_shell_overwrite_without_becoming_old_sid(self):
@@ -261,6 +264,52 @@ class StatuslinePriorClaimTest(unittest.TestCase):
                 self.assertEqual((tap["pid"], tap["proc_start"]), (71, "101"))
                 self.assertEqual((self.f.home / ".statusline/old.json").read_bytes(), old)
                 self.assertIsNone(json.loads(self.display.read_text()))
+
+    def test_unobserved_callback_leaves_both_conflicting_raw_claims_untouched(self):
+        proxy = self.agent / "utilities/claude_process_identity.py"
+        original = proxy.read_text()
+        for mode in ("unknown-argv", "helper-raises", "helper-import-unavailable"):
+            with self.subTest(mode=mode):
+                self.f.process(argv=["unrecognized-runtime-title"] if mode == "unknown-argv" else ["claude"])
+                self.f.tap(sid="old")
+                self.f.tap()
+                paths = {sid: self.f.home / ".statusline" / (sid + ".json") for sid in ("old", "current")}
+                # Even expiry housekeeping must not turn a no-write decision
+                # into deletion of either side of the same conflict.
+                for path in paths.values():
+                    os.utime(path, (1000, 1000))
+                before = {sid: path.read_bytes() for sid, path in paths.items()}
+                for sid, raw in before.items():
+                    self.assertEqual(json.loads(raw), {"session_id": sid, "pid": 71, "proc_start": "101"})
+                self.assertEqual(list((self.f.home / "sessions").iterdir()), [])
+                self.assertIsNone(self.reader())
+                if mode == "helper-raises":
+                    proxy.write_text(original + "\ndef statusline_bindings(*args, **kwargs):\n"
+                                     "    raise RuntimeError('private helper lookup failure')\n")
+                elif mode == "helper-import-unavailable":
+                    proxy.write_text("raise ImportError('private helper unavailable')\n")
+                try:
+                    tap = self.event(expect_tap_update=False)
+                finally:
+                    proxy.write_text(original)
+                self.assertIsNone(self.reader())
+                for sid, path in paths.items():
+                    self.assertEqual(path.read_bytes(), before[sid])
+                    self.assertEqual(path.stat().st_mtime, 1000)
+                self.assertEqual((tap["pid"], tap["proc_start"]), (71, "101"))
+                self.assertNotEqual(tap["pid"], 9999)  # stdin is never new evidence
+                self.assertIsNone(json.loads(self.display.read_text()))
+                self.assertEqual(list((self.f.home / "sessions").iterdir()), [])
+
+    def test_unobserved_callback_without_prior_claim_writes_telemetry_without_pid(self):
+        self.f.process(argv=["unrecognized-runtime-title"], parent=72)
+        self.f.process(72)
+        self.f.registry(72)
+        tap = self.event()
+        self.assertNotIn("pid", tap)
+        self.assertNotIn("proc_start", tap)
+        self.assertIsNone(self.reader())
+        self.assertIsNone(json.loads(self.display.read_text()))
 
     def test_current_prior_tap_survives_historical_selector(self):
         self.f.process(argv=["claude", "--session-id=old"])
@@ -280,23 +329,31 @@ class StatuslinePriorClaimTest(unittest.TestCase):
         self.assertNotIn("proc_start", tap)
 
     def test_invalid_prior_claims_are_not_copied(self):
-        for case in ("reused", "other-pid", "nearer", "service", "unknown", "foreign-current",
-                     "malformed-current"):
+        for case in ("reused", "other-pid", "nearer", "service", "foreign-current",
+                     "malformed-current", "unknown-reused", "unknown-other-pid",
+                     "unknown-foreign-current", "foreign-owner"):
             with self.subTest(case=case):
+                (self.f.home / "sessions/71.json").unlink(missing_ok=True)
                 self.f.process()
-                self.f.tap(start="100" if case == "reused" else "101",
-                           pid=72 if case in {"other-pid", "nearer"} else 71)
+                self.f.tap(start="100" if case in {"reused", "unknown-reused"} else "101",
+                           pid=72 if case in {"other-pid", "nearer", "unknown-other-pid"} else 71)
                 if case == "nearer":
                     self.f.process(71, parent=72)
                     self.f.process(72)
                 elif case == "service":
                     self.f.process(argv=["claude", "daemon", "run"])
-                elif case == "unknown":
+                elif case.startswith("unknown-"):
                     self.f.process(argv=["unrecognized-runtime-title"])
+                    if case == "unknown-foreign-current":
+                        self.f.registry(sid="foreign")
                 elif case == "foreign-current":
                     self.f.registry(sid="foreign")
                 elif case == "malformed-current":
                     self.f.registry().write_text("{")
+                elif case == "foreign-owner":
+                    proxy = self.agent / "utilities/claude_process_identity.py"
+                    with proxy.open("a") as handle:
+                        handle.write("\nm.os.geteuid = lambda: m.os.getuid() + 1\n")
                 tap = self.event()
                 self.assertNotIn("pid", tap)
                 self.assertNotIn("proc_start", tap)

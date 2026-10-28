@@ -291,10 +291,11 @@ class ClaudeNativeIdentityHelperTest(unittest.TestCase):
                             return raw
                         stack.enter_context(unittest.mock.patch.object(claude_identity.os, "read",
                                                                        side_effect=replace_during_read))
-                current, tap = claude_identity.statusline_bindings(71, "current", f.home, proc_root=f.root)
+                current, tap, policy = claude_identity.statusline_bindings(71, "current", f.home, proc_root=f.root)
                 self.assertIsNone(current)
                 self.assertEqual(tap["pid"] if tap else None,
                                  71 if case in {"conflict", "incomplete", "unreadable-inventory"} else None)
+                self.assertEqual(policy, "unobserved" if case in {"reuse", "exit"} else "replace")
 
 
 class OpenCodeProcessTest(unittest.TestCase):

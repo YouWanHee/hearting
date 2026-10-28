@@ -395,19 +395,28 @@ def statusline_identity(parent_pid, sid: str, home: str | os.PathLike, *,
 
 def statusline_bindings(parent_pid, sid: str, home: str | os.PathLike, *,
                         proc_root: str | os.PathLike = "/proc", max_depth: int = 5):
-    """Return (current-SID proof, tap claim); retaining a claim selects no SID.
+    """Return (current-SID proof, tap claim, tap replacement policy).
 
     Failed selection may still preserve this callback's prior exact claim on
-    the freshly verified nearest runtime. It must never erase one side of a
-    conflict merely because telemetry is being replaced.
+    the freshly verified nearest runtime. An unobserved result authorizes no
+    new PID evidence and leaves existing claims untouched; it does not reject
+    them. Positive mismatches still permit replacement without PID fields.
     """
     if not isinstance(sid, str) or not sid or Path(sid).name != sid:
-        return None, None
+        return None, None, "unobserved"
     pid = parent_pid
     for _ in range(max_depth):
         observed = observe_process(pid, proc_root=proc_root)
-        if observed is None or observed["kind"] in {"service", "unknown"}:
-            return None, None
+        if observed is None:
+            # A foreign owner is positive rejection. Other failed process
+            # reads cannot establish that an existing claim became invalid.
+            try:
+                foreign = (Path(proc_root) / str(pid)).stat().st_uid != os.geteuid()
+            except OSError:
+                foreign = False
+            return None, None, "replace" if foreign else "unobserved"
+        if observed["kind"] == "service":
+            return None, None, "replace"
         if observed["kind"] == "helper":
             pid = observed["ppid"]
             continue
@@ -415,9 +424,23 @@ def statusline_bindings(parent_pid, sid: str, home: str | os.PathLike, *,
         try:
             current, valid = _native_session_claim(Path(home), str(pid), start)
         except OSError:
-            return None, None
+            return None, None, "unobserved"
         if not valid:
-            return None, None
+            return None, None, "replace"
+        if observed["kind"] == "unknown":
+            # Unknown argv stops ancestry lookup and supplies no proof. Known
+            # PID/start or current-native mismatches may still reject a prior.
+            if current not in {None, sid}:
+                return None, None, "replace"
+            try:
+                prior = _focused_tap_claim(Path(home) / ".statusline" / (sid + ".json"), pid, start)
+            except FileNotFoundError:
+                prior = None
+            except (OSError, ValueError):
+                return None, None, "unobserved"
+            if observe_process(pid, proc_root=proc_root) != observed:
+                return None, None, "unobserved"
+            return None, None, "replace" if prior != sid else "unobserved"
         selected = current == sid
         retained = False
         if current is None:
@@ -454,9 +477,10 @@ def statusline_bindings(parent_pid, sid: str, home: str | os.PathLike, *,
                 except (OSError, ValueError):
                     pass
         if observe_process(pid, proc_root=proc_root) != observed:
-            return None, None
-        return observed if selected else None, observed if selected or retained else None
-    return None, None
+            return None, None, "unobserved"
+        return (observed if selected else None, observed if selected or retained else None,
+                "replace")
+    return None, None, "unobserved"
 
 
 def _remote_mount(home: Path, mounts_path: Path) -> bool:

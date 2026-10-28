@@ -109,7 +109,7 @@ print("S_CTX=" + shlex.quote(str(cpct)))
 # `resolve_display_inputs()` needs the same pid to read `sessions/<pid>.json`'s
 # `nameSource` (Amendment 2 — statusline must apply the same derived-vs-user-set rule
 # Fleet applies, not print its own stdin `session_name` unconditionally).
-display_pid=""; tap_pid=""; tap_start=""
+display_pid=""; tap_pid=""; tap_start=""; tap_policy="unobserved"
 identity_helper="$AGENT_HOME/utilities/claude_process_identity.py"
 [ -f "$identity_helper" ] || identity_helper="$(dirname "$AGENT_HOME")/utilities/claude_process_identity.py"
 if [ ! -f "$identity_helper" ]; then
@@ -121,13 +121,13 @@ if [ -n "$S_SID" ] && [ -f "$identity_helper" ]; then
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("claude_process_identity", sys.argv[1])
 mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-current, tap = mod.statusline_bindings(sys.argv[2], sys.argv[3], sys.argv[4])
+current, tap, policy = mod.statusline_bindings(sys.argv[2], sys.argv[3], sys.argv[4])
 # A retained tap claim preserves conflict evidence, not current-SID proof.
 print(current["pid"] if current else "-",
-      tap["pid"] if tap else "-", tap["proc_start"] if tap else "-")
+      tap["pid"] if tap else "-", tap["proc_start"] if tap else "-", policy)
 PY
   )
-  read -r display_pid tap_pid tap_start <<< "$identity" || true
+  read -r display_pid tap_pid tap_start tap_policy <<< "$identity" || true
 fi
 S_SESSION_DISPLAY=""
 session_helper="$AGENT_HOME/tools/fleet/session_handle.py"
@@ -178,10 +178,13 @@ if [ -n "$S_SID" ]; then
   # pid→sid 를 복구할 유일한 소스가 이 tap 이다. proc_start 는 PID 재사용 오귀속 방지 짝
   # (F-26). 위 bounded lookup의 current proof 또는 fresh prior claim만 기록한다.
   # prior claim 보존은 conflict를 지우지 않기 위한 것이며 display PID를 주지 않는다.
-  tap_json=$input
+  # Observation failure is not claim invalidation. Keep an existing owner tap
+  # unchanged rather than publish its old PID as fresh proof. Latest raw telemetry
+  # still reaches .statusline-last.json and the statusline display.
+  tap_json=""
   if command -v python3 >/dev/null 2>&1; then
     tap_with_policy=$(printf '%s' "$input" | python3 -c '
-import json, os, sys
+import json, os, stat, sys
 raw = sys.stdin.read()
 try:
     value = json.loads(raw)
@@ -191,9 +194,24 @@ except Exception:
 if not isinstance(value, dict):
     sys.stdout.write(raw)
     raise SystemExit(0)
-pid, start = sys.argv[1:3]
+pid, start, policy, path = sys.argv[1:5]
 value.pop("pid", None)
 value.pop("proc_start", None)
+if policy != "replace":
+    try:
+        info = os.lstat(path)
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+            if info.st_size > 65536:
+                raise SystemExit(0)
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    prior = json.load(handle)
+            except (OSError, ValueError):
+                raise SystemExit(0)  # unreadable is not disproven
+            if isinstance(prior, dict) and "pid" in prior and "proc_start" in prior:
+                raise SystemExit(0)
+    except OSError:
+        pass
 if pid.isdigit() and start.isdigit():
     value["pid"], value["proc_start"] = int(pid), start
 
@@ -227,16 +245,18 @@ value["hearting_context_request"] = {
     "auto_compact_enabled": False if config_disables_auto_compact() else None,
 }
 sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
-    ' "$tap_pid" "$tap_start" 2>/dev/null) || tap_with_policy=""
+    ' "$tap_pid" "$tap_start" "$tap_policy" "$sldir/$S_SID.json" 2>/dev/null) || tap_with_policy=""
     [ -n "$tap_with_policy" ] && tap_json=$tap_with_policy
   fi
   # atomic write (temp + rename) so a concurrent reader (tools/fleet dashboard) never sees a
   # half-written file → JSON parse fail → telemetry ('$cost' etc.) flickers to '—' for a tick.
-  if printf '%s' "$tap_json" > "$sldir/.$S_SID.json.tmp" 2>/dev/null; then
+  if [ -n "$tap_json" ] && printf '%s' "$tap_json" > "$sldir/.$S_SID.json.tmp" 2>/dev/null; then
     mv -f "$sldir/.$S_SID.json.tmp" "$sldir/$S_SID.json" 2>/dev/null || true
   fi
   # stale 청소: mtime > 1일 세션 파일 제거(디렉토리 폭증 방지 — 종료된 세션 잔존물). find 없으면 skip.
-  find "$sldir" -maxdepth 1 \( -name '*.json' -o -name '.*.json.tmp' \) -mtime +1 -delete 2>/dev/null || true
+  if [ -n "$tap_json" ]; then
+    find "$sldir" -maxdepth 1 \( -name '*.json' -o -name '.*.json.tmp' \) -mtime +1 -delete 2>/dev/null || true
+  fi
 fi
 
 # 용량 계기판 간헐 갱신(2026-09-16): codex/opencode 사용량은 공유 캐시
