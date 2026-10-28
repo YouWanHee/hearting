@@ -1985,13 +1985,16 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         self._release()
         self._wait_for_receipt(self._fields(proc.stdout)["watch_id"])
 
-    def _unbound_watch(self, mode, extra_env=None):
+    def _unbound_watch(self, extra_env=None):
         identity_path = self.tmp_root / "identity.json"
         # The first get sees no session; the following native wait/get sees the
         # session created by first input. Keep that transition consistent across
         # the fake Herdr calls so the observer can prove the same pane identity.
         identity_path.write_text(json.dumps({"session_id": "", "once": True}))
-        env = self._env(mode)
+        # Held: the detached watcher's native wait blocks on the FIFO, so the
+        # first session cannot bind before the unbound arm is read below. An
+        # idle wait returned at once and let a slow test read the bound arm.
+        env = self._env("held")
         env["FAKE_HERDR_IDENTITY_FILE"] = str(identity_path)
         env.update(extra_env or {})
         proc = self._run("watch", "peer-a", env=env)
@@ -2006,20 +2009,22 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
     def test_watch_on_a_pane_before_its_first_session_arms_on_the_pane(self):
         """2026-10-10 regression: a fresh Codex has no session until its first
         input, and `watch` refused it (`watch-identity-unverified`)."""
-        watch_id, _arm, _identity, _env = self._unbound_watch("idle")
+        watch_id, _arm, identity_path, _env = self._unbound_watch()
+        identity_path.write_text(json.dumps({"session_id": "sid-fake"}))
+        self._release()
         receipt = self._wait_for_receipt(watch_id)
         self.assertEqual((receipt["agent"]["session_id"], receipt["agent"]["pane"]), ("sid-fake", "w1:p9"))
 
     def test_sidless_watch_marker_uses_resolved_name_and_pane(self):
         _watch_id, _arm, _identity, env = self._unbound_watch(
-            "idle", {"FAKE_HERDR_NAME": "hearting-1d"})
+            {"FAKE_HERDR_NAME": "hearting-1d"})
         markers = peer_steward.peer_message.read_steward_markers()
         entry = markers[("claude", "steward-1")]["targets"]["hearting-1d"]
         self.assertEqual((entry["harness"], entry["session_id"], entry["name"], entry["pane"]),
                          ("claude", None, "hearting-1d", "w1:p9"))
 
     def test_pane_armed_watch_keeps_the_session_it_took(self):
-        watch_id, arm_path, identity_path, env = self._unbound_watch("held")
+        watch_id, arm_path, identity_path, env = self._unbound_watch()
         identity_path.write_text(json.dumps({"session_id": "sid-first"}))
         again = self._run("watch", "w1:p9", env=env)
         self.assertEqual(self._fields(again.stdout.splitlines()[0]).get("watch_id"), watch_id)
@@ -2048,7 +2053,7 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         state_file = self.tmp_root / "agent-state.txt"
         state_file.write_text("working")
         watch_id, arm_path, identity_path, env = self._unbound_watch(
-            "held", {"FAKE_HERDR_AGENT_STATE_FILE": str(state_file),
+            {"FAKE_HERDR_AGENT_STATE_FILE": str(state_file),
                      "FAKE_HERDR_WAIT_STATE": "idle"})
         original_arm = json.loads(arm_path.read_text())
         original_deadline = original_arm["deadline"]
@@ -2223,7 +2228,7 @@ class WatchArmTest(_WatchMixin, unittest.TestCase):
         import contextlib
         import io
 
-        watch_id, arm_path, identity_path, env = self._unbound_watch("held")
+        watch_id, arm_path, identity_path, env = self._unbound_watch()
         original_arm = json.loads(arm_path.read_text())
         original_deadline = original_arm["deadline"]
         paths = peer_steward._watch_paths(watch_id, self.watch_root)

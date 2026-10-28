@@ -19,6 +19,26 @@ unset AGENT_DISPATCH_JOBS
 jobs="$AH/.dispatch/jobs.log"
 # Use the canonical registry input, independent of the installed state root.
 export AGENT_DISPATCH_JOBS="$jobs"
+# A manual score replaces the shared gauge in harness-capacity; the gauge cases
+# below must exercise the cache, not an inherited override.
+unset HARNESS_CAPACITY_SCORES
+# The gauge reader reads Fleet's shared usage cache. Point it at a fixture so
+# the live ~/.local/state/agent-fleet/usage never decides a case (this host's
+# real codex 7d window can be at 100%).
+export FLEET_USAGE_STATE_DIR="$tmp/fleet-usage"
+mkdir -p "$FLEET_USAGE_STATE_DIR"
+TOOLS="$SCRIPT_DIR/../tools"
+
+record_usage() {   # record_usage <harness> <payload-json> [age-seconds]
+  python3 - "$TOOLS" "$FLEET_USAGE_STATE_DIR" "$1" "$2" "${3:-5}" <<'PY'
+import json, os, sys, time
+sys.path.insert(0, sys.argv[1])
+os.environ["FLEET_USAGE_STATE_DIR"] = sys.argv[2]
+from fleet.collectors import usage_cache
+usage_cache.record(sys.argv[3], json.loads(sys.argv[4]), now=time.time() - float(sys.argv[5]))
+PY
+}
+clear_usage() { rm -f "$FLEET_USAGE_STATE_DIR"/*.json; }
 now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 old_iso=$(date -u -d '10 hours ago' +%Y-%m-%dT%H:%M:%SZ)
 # SD-16e: reset 값을 실행 시각에 비의존이 되도록 now 상대로 동적 산출한다.
@@ -86,6 +106,46 @@ echo "$out" | grep -q '^claude ok$' && echo "$out" | grep -q '^codex limited(unk
 printf '%s\tdone\tr\tw\ts6\tcapability=code-plan,depth=1,owner_harness=claude,note=dead-session-limit\n' "$now_iso" > "$jobs"
 out=$(AGENT_HOME="$AH" bash "$UC" --harness claude 2>&1 | grep -v "^bias ")
 [ "$out" = "claude limited(unknown-reset)" ] && ok "legacy owner_harness-only row → limited" || bad "expected 'claude limited(unknown-reset)' (legacy fallback), got [$out]"
+
+# --- Shared gauge: harness-capacity's cached windows are hard limits ---------
+# Backlog E: the same cache `harness-capacity` scores must hold hard
+# eligibility too, without a second parser. A window at 100% used with a future
+# reset is a real limit (usage-check: limited), while 99%, a past reset, or a
+# cache older than an hour stay ok. Claude keeps its native evidence.
+gauge_reset=$(( $(date +%s) + 86400 ))
+gauge_iso=$(date -u -d "@$gauge_reset" +%Y-%m-%dT%H:%M:%SZ)
+past_reset=$(( $(date +%s) - 60 ))
+
+clear_usage; : > "$jobs"
+record_usage codex "{\"windows\": [[\"7d\", 100, $gauge_reset]]}"
+out=$(AGENT_HOME="$AH" bash "$UC" --harness codex 2>&1 | grep -v "^bias ")
+[ "$out" = "codex limited($gauge_iso)" ] && ok "gauge: codex 7d 100% + future reset → limited(reset)" || bad "expected 'codex limited($gauge_iso)', got [$out]"
+
+clear_usage; : > "$jobs"
+record_usage codex "{\"windows\": [[\"7d\", 99, $gauge_reset]]}"
+out=$(AGENT_HOME="$AH" bash "$UC" --harness codex 2>&1 | grep -v "^bias ")
+[ "$out" = "codex ok" ] && ok "gauge: codex 99% → ok" || bad "expected 'codex ok' at 99%, got [$out]"
+
+clear_usage; : > "$jobs"
+record_usage codex "{\"windows\": [[\"7d\", 100, $past_reset]]}"
+out=$(AGENT_HOME="$AH" bash "$UC" --harness codex 2>&1 | grep -v "^bias ")
+[ "$out" = "codex ok" ] && ok "gauge: codex 100% + past reset → ok" || bad "expected 'codex ok' after reset, got [$out]"
+
+clear_usage; : > "$jobs"
+record_usage codex "{\"windows\": [[\"7d\", 100, $gauge_reset]]}" 4000
+out=$(AGENT_HOME="$AH" bash "$UC" --harness codex 2>&1 | grep -v "^bias ")
+[ "$out" = "codex ok" ] && ok "gauge: codex 100% + stale cache → ok" || bad "expected 'codex ok' for stale cache, got [$out]"
+
+clear_usage; : > "$jobs"
+record_usage opencode "{\"rl_windows\": [[\"mo\", 100, $gauge_reset]]}"
+out=$(AGENT_HOME="$AH" bash "$UC" --harness opencode 2>&1 | grep -v "^bias ")
+[ "$out" = "opencode limited($gauge_iso)" ] && ok "gauge: opencode rl_windows 100% → limited(reset)" || bad "expected 'opencode limited($gauge_iso)', got [$out]"
+
+clear_usage; : > "$jobs"
+record_usage claude "{\"windows\": [[\"7d\", 100, $gauge_reset]]}"
+out=$(AGENT_HOME="$AH" bash "$UC" --harness claude 2>&1 | grep -v "^bias ")
+[ "$out" = "claude ok" ] && ok "gauge: claude cache 100% → ok (native evidence only)" || bad "expected 'claude ok' (Claude gauge excluded), got [$out]"
+clear_usage
 
 # Case: bias default line present and defaults to neutral auto
 out=$(AGENT_HOME="$AH" bash "$UC" --harness claude 2>&1)

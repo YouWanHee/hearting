@@ -16,10 +16,10 @@ REFERENCE_DIR = os.environ.get("FLEET_EXPLORER_REFERENCE_COPY")
 
 
 class ExplorerDragPtyTests(unittest.TestCase):
-    def run_viewer(self, evidence, env):
+    def run_viewer(self, evidence, env, extra=(), timeout=45):
         result = subprocess.run(
-            [sys.executable, str(VIEWPORT), "--explorer", "--evidence-dir", str(evidence)],
-            cwd=str(TOOLS.parent), env=env, capture_output=True, text=True, timeout=45)
+            [sys.executable, str(VIEWPORT), "--explorer", *extra, "--evidence-dir", str(evidence)],
+            cwd=str(TOOLS.parent), env=env, capture_output=True, text=True, timeout=timeout)
         report_path = evidence / "run.json"
         report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
         event_path = evidence / "events.jsonl"
@@ -138,6 +138,34 @@ class ExplorerDragPtyTests(unittest.TestCase):
             self.assertEqual(second["explorer"]["order"]["repos"], saved["repos"])
             self.assertEqual(second["explorer"]["order"]["session_keys"], saved["sessions"])
             self.compare_reference(first, first_report, root)
+
+    def test_session_clicks_open_their_page_while_snapshots_refresh(self):
+        """No session click is lost to a refresh that lands between paint, press and release.
+
+        The fixture refreshes at Fleet's default 2 s cadence. A press or release is adopted
+        for the frame still on screen, so every target opens on its first click.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = dict(os.environ)
+            env.pop("FLEET_PTY_DRAG", None)
+            env["XDG_STATE_HOME"] = str(root / "state")
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            env["TERM"] = "xterm-256color"
+            evidence = root / "measure"
+            self.run_viewer(evidence, env, ("--click-measure", "--refresh-interval", "2.0"),
+                            timeout=240)
+            measure = json.loads((evidence / "click-measure.json").read_text(encoding="utf-8"))
+            targets = measure["targets"]
+            self.assertGreater(measure["snapshot_collects"], 5, measure["elapsed_seconds"])
+            for name in ("tree_session", "overview_fold", "repo_page_session", "open_link"):
+                with self.subTest(target=name):
+                    row = targets[name]
+                    self.assertEqual((row["clicks"], row["success"], row["absent"]), (20, 20, 0), row)
+                    self.assertEqual(row["first_attempt_success"], 20, row)
+                    self.assertEqual((row["press_not_current"], row["release_not_current"],
+                                      row["release_lost"], row["lost_with_all_current"]),
+                                     (0, 0, 0, 0), row)
 
 
 if __name__ == "__main__":
