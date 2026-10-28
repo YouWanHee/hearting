@@ -34,6 +34,8 @@
 #     mode: hybrid                     # hybrid | both | post-frame-only
 #   steward:                           # SD-122 (9): peer-session steward
 #     child_permission_mode: bypass    # bypass | inherit
+#     check_interval_seconds: 7200     # periodic steward check, 600..86400
+#     max_supervisors_per_repo: 2      # new steward grants per repository, 1..8
 #   capabilities:
 #     <capability-name>:
 #       <canonical-topology-node-id>: <claude|codex|opencode|diverse>
@@ -155,6 +157,10 @@ confirmation:
 # verbatim; `inherit` is the opt-out (prepends nothing).
 steward:
   child_permission_mode: bypass
+  # Periodic steward check through the shared obligation runner (seconds, 600-86400).
+  check_interval_seconds: 7200
+  # New steward grants per repository (linked worktrees fold to the primary), 1-8.
+  max_supervisors_per_repo: 2
 
 capabilities:
   # autopilot-code: canonical topology node ids are frame, plan, plan-check,

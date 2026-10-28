@@ -5,7 +5,14 @@ Zero external deps (stdlib curses/sqlite3/json/subprocess/re/os/time only). Pure
 observer: reads process table + on-disk state artifacts and injects nothing (PRD §0.5).
 Summary production belongs to dispatch or the interactive runtime lifecycle; starting,
 refreshing, or closing this TUI never invokes a model provider. Git telemetry remains
-bounded background work. ``--json`` and ``--once`` are side-effect-free snapshots.
+bounded background work. Every mode — ``--once`` and ``--json`` included — is a
+snapshot in what it displays: no task is started, settled, or marked, no model
+provider is invoked, and no route, registry, or authority state changes. "Snapshot"
+still allows one bounded write: collection may create or refresh the two-hex
+session-tag display reservations in
+``~/.local/state/agent-fleet/tag-assignments.json`` (core/OPERATIONS §5.11). Existing
+live assignments keep their tag, the stable (harness, session_id) identity remains
+the authority, and display tags never settle or advance work.
 
 Modes:
   (default)  curses full-screen, background re-collect every --interval seconds
@@ -17,6 +24,29 @@ import json
 import os
 import sys
 from dataclasses import replace
+
+
+def _cap_malloc_arenas(environ=os.environ, platform=sys.platform):
+    """Keep glibc from giving every concurrent reader thread its own heap arena.
+
+    Fleet starts a fresh worker thread for each pass and a burst of short pane-read
+    threads. With one arena per concurrent thread, each large collector pass lands in
+    a different arena and the memory it frees stays mapped there, so RSS climbs pass
+    after pass (measured: 0.6GB to 1.9GB in 20 rewrites of a 45MB registry, flat at
+    0.9GB with two arenas). Set once, before any thread exists. An operator's own
+    MALLOC_ARENA_MAX wins; other platforms and C libraries are left alone.
+    """
+    if not platform.startswith("linux") or environ.get("MALLOC_ARENA_MAX"):
+        return False
+    try:
+        import ctypes
+        mallopt = getattr(ctypes.CDLL(None), "mallopt", None)
+        return bool(mallopt is not None and mallopt(-8, 2))   # M_ARENA_MAX
+    except (OSError, AttributeError, TypeError, ValueError):
+        return False
+
+
+_cap_malloc_arenas()
 
 # Support both `python3 fleet.py` (script) and `python3 -m fleet.fleet` (module).
 if __package__ in (None, ""):
@@ -286,7 +316,11 @@ def main(argv=None):
             else:
                 from .projection import attach_projections
             ds, dj = attach_projections(ds, dj, **report_option)
-            return replace(observed, sessions=rs + ds, jobs=rj + dj)
+            answer_waits = demo.merge_answer_waits(
+                observed.answer_waits,
+                demo.answer_wait_snapshot(harness_filter=harness_filter))
+            return replace(observed, sessions=rs + ds, jobs=rj + dj,
+                           answer_waits=answer_waits)
 
     def projected_collector(harness_filter=None, usage="cache-only", fast_first=False,
                             include_report_verification=True):

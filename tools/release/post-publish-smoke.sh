@@ -57,6 +57,8 @@ for entries in settings.get("hooks", {}).values():
     for entry in entries:
         for hook in entry.get("hooks", []):
             command = hook.get("command", "")
+            # `${CLAUDE_CONFIG_DIR:-$HOME/.claude}` names `$HOME/.claude` here.
+            command = re.sub(r"\$\{\w+:-(\$HOME/[^}\s\"']*)\}", r"\1", command)
             for raw in re.findall(r"\$HOME/[^\s\"']+", command):
                 candidate = Path(str(home) + raw[len("$HOME"):])
                 if candidate.suffix and not candidate.exists():

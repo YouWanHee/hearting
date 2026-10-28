@@ -1079,6 +1079,42 @@ class LegPlanTest(StartBase):
         self.assertIn("adopted direction: the person chose this brief's route", task)
         self.assertIsNone(RP.leg_plan({**route, "route_plan": None}))
 
+    def test_sixteen_parallel_slices_survive_selection_and_first_leg_card_without_graph_changes(self):
+        parallel = [f"slice {index:02d}" for index in range(16)]
+        planned = {**CODE_STAGED, "parallel": parallel}
+        self.set_briefs(planned, planned)
+        self.set_interview({"legs": [planned]})
+        notice = io.StringIO()
+        with contextlib.redirect_stderr(notice):
+            self.settle()
+
+        record = self.record()
+        decision = record["decision"]
+        self.assertEqual(decision["proposal"]["legs"][0]["parallel"], parallel)
+        self.assertFalse(any("ignored:legs[0].parallel" in note
+                             for row in decision["proposals"] for note in row.get("read_notes", [])))
+        route = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        self.assertEqual(RP.leg_plan(route)["leg"]["parallel"], parallel)
+        self.assertEqual([node["id"] for node in route["nodes"]], ["plan", "execute", "test", "report"])
+        card_lines = [line.strip() for line in notice.getvalue().splitlines()
+                      if line.strip().startswith("승인된 분할:")]
+        self.assertEqual(len(card_lines), 1)
+        self.assertIn("slice 00 · slice 01 · slice 02", card_lines[0])
+        self.assertIn("외 13개(route·owner 지시문에 전부)", card_lines[0])
+        self.assertNotIn("slice 03", card_lines[0])
+
+        planned_graph = ([ (node["id"], node.get("depends_on")) for node in route["nodes"] ],
+                         route.get("human_gates"), route.get("parallel_groups"))
+        self.tearDown()
+        self.setUp()
+        self.set_briefs(CODE_STAGED, CODE_STAGED)
+        self.set_interview({"legs": [CODE_STAGED]})
+        self.settle()
+        baseline = json.loads(self.leg_routes()[0].read_text(encoding="utf-8"))
+        baseline_graph = ([(node["id"], node.get("depends_on")) for node in baseline["nodes"]],
+                          baseline.get("human_gates"), baseline.get("parallel_groups"))
+        self.assertEqual(planned_graph, baseline_graph)
+
     def test_owner_and_verification_prompts_carry_the_plan_and_the_items_file(self):
         import worker_bootstrap as WB
         route = self.planned_leg()

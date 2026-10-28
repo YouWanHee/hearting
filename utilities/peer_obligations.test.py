@@ -9,6 +9,7 @@ import importlib.util
 import fcntl
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -216,14 +217,50 @@ class ObligationStoreTest(unittest.TestCase):
         pending = self.store.create("old-active", "message", {}, {})
         unknown = self.store.create("old-unknown", "registered-batch", {}, {})
         self.store.update(unknown["id"], state="unknown", observer_error="unavailable")
-        result = self.store.prune_terminal_obligations(now=now)
+        with mock.patch.object(obligations.time, "monotonic", return_value=0.0):
+            result = self.store.prune_terminal_obligations(now=now)
         self.assertLessEqual(result["examined"], 64)
         self.assertEqual(result["removed"], 16)
         self.assertEqual(sum(self.store.get(duty_id) is None for duty_id in old_ids), 16)
         self.assertEqual(self.store.prune_terminal_obligations(now=now)["status"], "not-due")
 
-        next_pass = self.store.prune_terminal_obligations(now=now + 300)
+        with mock.patch.object(obligations.time, "monotonic", return_value=0.0):
+            next_pass = self.store.prune_terminal_obligations(now=now + 300)
         self.assertEqual(next_pass["removed"], 4)
+        self.assertIsNotNone(self.store.get(pending["id"]))
+        self.assertEqual(self.store.get(unknown["id"])["state"], "unknown")
+
+        deadline_ids = []
+        for index in range(2):
+            duty_id = f"deadline-readiness-{index:02d}"
+            duty = self.store.create(duty_id, "readiness-observation",
+                                     {"consumer": {"pid": 2_000_000_100 + index,
+                                                    "pid_start": "1"}}, {})
+            self.store.update(duty["id"], state="complete", result="consumer-exited")
+            record_path = self.store._record_path(duty["id"])
+            persisted = json.loads(record_path.read_text(encoding="utf-8"))
+            persisted["terminal_at"] = now - 2 * 86400
+            record_path.write_text(json.dumps(persisted), encoding="utf-8")
+            deadline_ids.append(duty_id)
+
+        with mock.patch.object(obligations.time, "monotonic",
+                               side_effect=(0.0, 0.0, 0.05)) as clock:
+            deadline_pass = self.store.prune_terminal_obligations(
+                now=now + 3600, time_budget=0.05)
+        self.assertEqual(clock.call_count, 3)
+        self.assertEqual(deadline_pass["examined"], 1)
+        self.assertEqual(deadline_pass["removed"], 1)
+        self.assertEqual(deadline_pass["cursor"], deadline_ids[0] + ".json")
+        self.assertIsNone(self.store.get(deadline_ids[0]))
+        self.assertIsNotNone(self.store.get(deadline_ids[1]))
+
+        not_due = self.store.prune_terminal_obligations(now=now + 3601)
+        self.assertEqual(not_due["status"], "not-due")
+        self.assertEqual(not_due["cursor"], deadline_pass["cursor"])
+        with mock.patch.object(obligations.time, "monotonic", return_value=0.0):
+            resumed = self.store.prune_terminal_obligations(now=now + 3900)
+        self.assertEqual(resumed["removed"], 1)
+        self.assertIsNone(self.store.get(deadline_ids[1]))
         self.assertIsNotNone(self.store.get(pending["id"]))
         self.assertEqual(self.store.get(unknown["id"])["state"], "unknown")
 
@@ -1572,6 +1609,195 @@ class StewardRecoveryIntegrationTest(unittest.TestCase):
         mismatched_work, _mismatch_state, mismatched_ready = observe()
         self.assertEqual((mismatched_work[0].delivery_state, mismatched_ready.state),
                          ("unknown", "unknown"))
+
+
+_LEASE_HOLDER = """\
+import fcntl, os, time
+mode = os.environ["CHILD_MODE"]
+lease = os.open(os.environ["LEASE"], os.O_RDWR | os.O_CREAT, 0o600)
+if mode == "hold":
+    fcntl.flock(lease, fcntl.LOCK_EX)
+elif mode == "dup":
+    fcntl.flock(lease, fcntl.LOCK_EX)
+    spare = os.dup(lease)
+elif mode == "other":
+    other = os.open(os.environ["OTHER"], os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(other, fcntl.LOCK_EX)
+print("ready", flush=True)
+time.sleep(60)
+"""
+
+
+class FirstGenerationObserverReplacementTest(unittest.TestCase):
+    """Replacement of observers whose argv never advertised the lease fd."""
+
+    RELATIVE = "utilities/codex-managed-completion.py"
+    FIRST_GENERATION = ["--jobs", "J", "--sealed-batch-id", "batch-x", "--attempt-id", "att-x"]
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.data = self.base / "data"
+        self.releases = self.data / "releases"
+        self.releases.mkdir(parents=True)
+        self.current_release = self._release("current")
+        self.old_release = self._release("old")
+        (self.data / "current").symlink_to(self.current_release)
+        self.lease = self.base / "duty.lease"
+        self.lease.write_text("", encoding="utf-8")
+        self.other = self.base / "other.lease"
+        self.argv = [value if value != "J" else str(self.base / "jobs.log")
+                     for value in self.FIRST_GENERATION]
+        self.children = []
+        self.addCleanup(self._reap)
+
+    def _release(self, name):
+        root = self.releases / name
+        for relative in ("core", "utilities", "tools/install"):
+            (root / relative).mkdir(parents=True, exist_ok=True)
+        (root / "RELEASE_VERSION").write_text(name + "\n", encoding="utf-8")
+        (root / "harness-manifest.json").write_text("{}\n", encoding="utf-8")
+        (root / "core/CORE.md").write_text("fixture\n", encoding="utf-8")
+        for relative in ("utilities/peer_obligations.py", "utilities/peer-steward.py"):
+            (root / relative).write_text("", encoding="utf-8")
+        shutil.copy2(_HERE.parent / "tools/install/distribution.py",
+                     root / "tools/install/distribution.py")
+        (root / self.RELATIVE).write_text(_LEASE_HOLDER, encoding="utf-8")
+        return root
+
+    def _checkout(self, *, markers=True):
+        root = self.base / "dev-checkout"
+        (root / "utilities").mkdir(parents=True, exist_ok=True)
+        (root / "core").mkdir(parents=True, exist_ok=True)
+        if markers:
+            (root / "utilities/peer_obligations.py").write_text("", encoding="utf-8")
+            (root / "core/CORE.md").write_text("fixture\n", encoding="utf-8")
+        (root / self.RELATIVE).write_text(_LEASE_HOLDER, encoding="utf-8")
+        return root
+
+    def _environment(self, mode, *, data=None, agent_home=None, fixture_home=None):
+        environment = {
+            "HOME": str(self.base / "home"),
+            "HARNESS_DATA_ROOT": str(data or self.data),
+            "AGENT_HOME": str(agent_home or self.current_release),
+            "PATH": os.environ.get("PATH", ""),
+            "CHILD_MODE": mode,
+            "LEASE": str(self.lease),
+            "OTHER": str(self.other),
+        }
+        if fixture_home is not None:
+            # The shape of a development owner's test run: its own checkout
+            # as AGENT_HOME and a throwaway HOME/XDG data root.
+            del environment["HARNESS_DATA_ROOT"]
+            environment["HOME"] = str(fixture_home)
+            environment["XDG_DATA_HOME"] = str(fixture_home / ".local/share")
+        return environment
+
+    def _start(self, root, mode="hold", *, argv=None, data=None, agent_home=None,
+               fixture_home=None):
+        process = subprocess.Popen(
+            [sys.executable, str(root / self.RELATIVE), *(argv or self.argv)],
+            env=self._environment(mode, data=data, agent_home=agent_home,
+                                  fixture_home=fixture_home),
+            stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True)
+        self.children.append(process)
+        self.assertEqual(process.stdout.readline().strip(), "ready")
+        return process
+
+    def _reap(self):
+        for process in self.children:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            process.stdout.close()
+
+    def _replace(self, process, *, variants=None, replace_checkout=True):
+        required = ["--jobs", self.argv[1], "--resume-obligation", "duty"]
+        with mock.patch.object(obligations, "__file__",
+                               str(self.current_release / "utilities/peer_obligations.py")), \
+             mock.patch.dict(os.environ, self._environment("hold"), clear=True):
+            binding = obligations.managed_service_binding(self.current_release)
+            self.assertIsNotNone(binding)
+            return obligations.replace_managed_observer(
+                process.pid, obligations._proc_start_identity(process.pid), self.lease,
+                self.RELATIVE, required, binding, lock_fd_option="--obligation-lock-fd",
+                exact_arguments=True,
+                argument_variants=[self.argv] if variants is None else variants,
+                root=self.current_release, replace_checkout=replace_checkout)
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_lock_fd_is_found_from_proc_when_argv_does_not_advertise_it(self):
+        process = self._start(self.old_release)
+        self.assertEqual(self._replace(process), "replaced")
+        process.wait(timeout=5)
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_unlisted_first_generation_arguments_are_not_replaced(self):
+        process = self._start(self.old_release)
+        self.assertFalse(self._replace(process, variants=[]))
+        self.assertFalse(self._replace(process, variants=[[*self.argv, "--extra"]]))
+        self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_no_lock_fd_proof_leaves_the_observer_alone(self):
+        for mode in ("open", "other", "dup"):
+            with self.subTest(mode=mode):
+                process = self._start(self.old_release, mode)
+                self.assertFalse(self._replace(process))
+                self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_development_checkout_observer_is_legacy_and_replaced(self):
+        process = self._start(self._checkout())
+        self.assertEqual(self._replace(process), "replaced")
+        process.wait(timeout=5)
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_development_checkout_with_its_own_home_is_replaced(self):
+        checkout = self._checkout()
+        process = self._start(checkout, agent_home=checkout,
+                              fixture_home=self.base / "fixture-home")
+        self.assertEqual(self._replace(process), "replaced")
+        process.wait(timeout=5)
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_development_checkout_needs_markers_and_no_foreign_install(self):
+        marker_less = self._start(self._checkout(markers=False))
+        self.assertFalse(self._replace(marker_less))
+        self.assertIsNone(marker_less.poll())
+        marker_less.kill()
+        marker_less.wait(timeout=5)
+        foreign = self.base / "foreign-checkout"
+        foreign.mkdir()
+        elsewhere = self._start(self._checkout(), agent_home=foreign)
+        self.assertFalse(self._replace(elsewhere))
+        self.assertIsNone(elsewhere.poll())
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_development_checkout_is_left_alone_without_the_caller_opt_in(self):
+        checkout = self._checkout()
+        process = self._start(checkout, agent_home=checkout,
+                              fixture_home=self.base / "fixture-home")
+        self.assertFalse(self._replace(process, replace_checkout=False))
+        self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_another_installs_release_is_not_a_checkout(self):
+        foreign_data = self.base / "foreign-data"
+        (foreign_data / "releases").mkdir(parents=True)
+        foreign = foreign_data / "releases" / "foreign"
+        shutil.copytree(self.old_release, foreign)
+        process = self._start(foreign, agent_home=foreign,
+                              fixture_home=self.base / "fixture-home")
+        self.assertFalse(self._replace(process))
+        self.assertIsNone(process.poll())
+
+    @unittest.skipUnless(_PIDFD_HANDOFF, "pidfd handoff unavailable")
+    def test_current_release_observer_is_still_reported_current(self):
+        process = self._start(self.current_release)
+        self.assertEqual(self._replace(process), "current")
+        self.assertIsNone(process.poll())
 
 
 if __name__ == "__main__":

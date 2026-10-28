@@ -373,6 +373,8 @@ class ExclusiveSuiteSchedulingFixture(unittest.TestCase):
                     with lock:
                         serial_observed_parallel = active_regular
                     return rel
+                if rel not in {"a.test.py", "b.test.py"}:
+                    return rel
                 with lock:
                     active_regular += 1
                     regular_overlap = regular_overlap or active_regular > 1
@@ -396,6 +398,50 @@ class ExclusiveSuiteSchedulingFixture(unittest.TestCase):
                 "b.test.py",
             ],
         )
+
+    def test_fast_parallel_attempt_is_removed_while_slow_peer_is_running(self):
+        mod = load_runner_module()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fast = root / "fast.test.py"
+            slow = root / "slow.test.py"
+            fast.touch()
+            slow.touch()
+            fast_root = {}
+            fast_ready = threading.Event()
+            slow_started = threading.Event()
+            fast_removed = threading.Event()
+            slow_saw_fast_removed = []
+            original_remove = mod._remove_exact_suite_tmp_root
+
+            def fake_run(suite, suite_root, env, profile, _timeout):
+                scratch = Path(env[mod.CHILD_STDERR_ENV]).parent
+                if suite.name == "fast.test.py":
+                    fast_root["path"] = scratch
+                    fast_ready.set()
+                    self.assertTrue(slow_started.wait(3))
+                else:
+                    slow_started.set()
+                    self.assertTrue(fast_ready.wait(3))
+                    self.assertTrue(fast_removed.wait(3))
+                    slow_saw_fast_removed.append(not fast_root["path"].exists())
+                return mod.SuiteResult(
+                    suite.relative_to(suite_root).as_posix(), 0, False, "", "", .01, profile
+                )
+
+            def note_remove(path, identity):
+                removed = original_remove(path, identity)
+                if fast_root.get("path") == path and removed:
+                    fast_removed.set()
+                return removed
+
+            with mock.patch.object(mod, "run_suite", side_effect=fake_run), \
+                    mock.patch.object(mod, "reap_suite_tmp_processes", return_value=[]), \
+                    mock.patch.object(mod, "_remove_exact_suite_tmp_root", side_effect=note_remove):
+                results = mod.run_profile([fast, slow], root, "isolated", 2, 5, None)
+
+        self.assertEqual([result.returncode for result in results], [0, 0])
+        self.assertEqual(slow_saw_fast_removed, [True])
 
 
 class FingerprintScopedSiblingRows(unittest.TestCase):
@@ -650,6 +696,600 @@ class CompareBaselineFixture(RunTestsFixtureBase):
         self.assertEqual(json.loads(result.stdout)["fixed"], [{"suite_path": "a.test.py", "test_id": "-"}])
 
 
+class SuiteScratchLifetimeFixture(RunTestsFixtureBase):
+    def test_suite_scratch_is_removed_before_the_next_suite_starts(self):
+        prior_root = self.root / "prior-suite-root.txt"
+        write_suite(self.root, "a_first.test.py", f"""
+            import os
+            from pathlib import Path
+            Path({str(prior_root)!r}).write_text(str(Path(os.environ['HOME']).parent))
+        """)
+        write_suite(self.root, "b_second.test.py", f"""
+            from pathlib import Path
+            prior = Path(Path({str(prior_root)!r}).read_text())
+            assert not prior.exists(), f'prior suite scratch still exists: {{prior}}'
+        """)
+
+        result, rows = self.run_fixture([], extra_args=["--jobs", "1"])
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([row["verdict"] for row in rows], ["PASS", "PASS"])
+        self.assertFalse(Path(prior_root.read_text()).exists())
+
+    def test_failure_diagnostics_survive_attempt_scratch_cleanup(self):
+        prior_root = self.root / "failed-suite-root.txt"
+        diagnostics = self.root / "diagnostics"
+        write_suite(self.root, "fail.test.py", f"""
+            import os, sys
+            from pathlib import Path
+            Path({str(prior_root)!r}).write_text(str(Path(os.environ['HOME']).parent))
+            print('attempt stdout retained')
+            print('attempt stderr retained', file=sys.stderr)
+            sys.exit(1)
+        """)
+
+        result, rows = self.run_fixture(
+            [], extra_args=["--jobs", "1", "--diagnostics-dir", str(diagnostics)],
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(rows[0]["verdict"], "FAIL")
+        self.assertFalse(Path(prior_root.read_text()).exists())
+        index = (diagnostics / "index.tsv").read_text(encoding="utf-8")
+        self.assertIn("fail.test.py", index)
+        stdout_path = next(diagnostics.glob("*/attempt-001.stdout.txt"))
+        stderr_path = next(diagnostics.glob("*/attempt-001.stderr.txt"))
+        self.assertIn("attempt stdout retained", stdout_path.read_text(encoding="utf-8"))
+        self.assertIn("attempt stderr retained", stderr_path.read_text(encoding="utf-8"))
+
+    def test_unrelated_unreadable_process_does_not_block_root_but_owned_unknown_does(self):
+        mod = load_runner_module()
+        real_read_bytes = Path.read_bytes
+        real_listdir = os.listdir
+
+        def unreadable_unrelated(path):
+            if str(path) == "/proc/88001/stat":
+                raise PermissionError("unrelated stat is hidden")
+            return real_read_bytes(path)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "unrelated"
+            root.mkdir()
+            identity = mod.register_fixture_root(root)
+            with mock.patch.object(os, "listdir", side_effect=lambda p: ["88001"] if p == "/proc" else real_listdir(p)), \
+                    mock.patch.object(Path, "read_bytes", unreadable_unrelated):
+                self.assertTrue(mod.cleanup_suite_tmp_root(root, expected_identity=identity))
+            self.assertFalse(root.exists())
+
+            owned = Path(td) / "owned"
+            owned.mkdir()
+            owned_identity = mod.register_fixture_root(owned)
+            mod._remember_fixture_process(str(owned), 88002, "78")
+
+            def unreadable_owned(path):
+                if str(path) == "/proc/88002/stat":
+                    raise PermissionError("observed owned stat is hidden")
+                return real_read_bytes(path)
+
+            with mock.patch.object(os, "listdir", side_effect=lambda p: ["88002"] if p == "/proc" else real_listdir(p)), \
+                    mock.patch.object(Path, "read_bytes", unreadable_owned):
+                self.assertFalse(mod.cleanup_suite_tmp_root(owned, expected_identity=owned_identity))
+            self.assertTrue(owned.is_dir())
+
+    def test_process_group_observation_tracks_descendants_but_not_unmarked_bystanders(self):
+        mod = load_runner_module()
+        real_read_bytes = Path.read_bytes
+        real_listdir = os.listdir
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "group"
+            root.mkdir()
+            identity = mod.register_fixture_root(root)
+            phase = {"settled": False}
+
+            def make_stat(pid, state, ppid, ticks):
+                fields = [b"0"] * 20
+                fields[0] = state.encode()
+                fields[1] = str(ppid).encode()
+                fields[2] = b"440"
+                fields[19] = str(ticks).encode()
+                return f"{pid} (fixture) ".encode() + b" ".join(fields)
+
+            def fake_read_bytes(path):
+                name = str(path)
+                if name == "/proc/88010/stat":
+                    return make_stat(88010, "Z" if phase["settled"] else "S", 1, 10)
+                if name == "/proc/88012/stat":
+                    return make_stat(88012, "Z" if phase["settled"] else "S", 88010, 12)
+                if name == "/proc/88011/stat":
+                    if phase["settled"]:
+                        raise PermissionError("unmarked same-group bystander is unreadable")
+                    return make_stat(88011, "S", 99999, 11)
+                if name.endswith(("/cmdline", "/environ")):
+                    return b""
+                return real_read_bytes(path)
+
+            with mock.patch.object(os, "listdir", side_effect=lambda p: ["88010", "88011", "88012"] if p == "/proc" else real_listdir(p)), \
+                    mock.patch.object(Path, "read_bytes", fake_read_bytes), \
+                    mock.patch.object(os, "kill") as kill:
+                mod._remember_process_group(440, [str(root)], owner_pid=88010)
+                self.assertEqual(
+                    mod._FIXTURE_PROCESS_IDENTITIES[str(root)],
+                    {88010: "10", 88012: "12"},
+                )
+                phase["settled"] = True
+                self.assertTrue(mod.cleanup_suite_tmp_root(root, expected_identity=identity))
+                kill.assert_not_called()
+
+    def test_unreadable_child_stderr_keeps_attempt_root_after_profile_finally(self):
+        import shutil
+
+        mod = load_runner_module()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            suite = root / "suite.test.py"
+            suite.touch()
+            attempt_root = {}
+
+            def fake_run(_suite, _root, env, profile, _timeout):
+                attempt = Path(env[mod.CHILD_STDERR_ENV]).parent
+                attempt_root["path"] = attempt
+                Path(env[mod.CHILD_STDERR_ENV], "unreadable.log").write_text("keep")
+                return mod.SuiteResult("suite.test.py", 1, False, "out", "err", .01, profile)
+
+            with mock.patch.object(mod, "run_suite", side_effect=fake_run), \
+                    mock.patch.object(mod, "reap_suite_tmp_processes", return_value=[]), \
+                    mock.patch.object(mod, "collect_child_stderr", side_effect=PermissionError("fixture log hidden")):
+                results = mod.run_profile([suite], root, "isolated", 1, 5, None)
+
+            self.assertEqual(results[0].returncode, 1)
+            self.assertTrue(attempt_root["path"].is_dir())
+            self.assertEqual(
+                (attempt_root["path"] / "child-stderr" / "unreadable.log").read_text(),
+                "keep",
+            )
+            shutil.rmtree(attempt_root["path"], ignore_errors=True)
+
+    def test_live_marked_process_and_replaced_root_are_preserved(self):
+        mod = load_runner_module()
+        real_read_bytes = Path.read_bytes
+        real_listdir = os.listdir
+
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td)
+            root = parent / "live"
+            root.mkdir()
+            identity = mod.register_fixture_root(root)
+            marker = os.fsencode(str(root))
+            fields = [b"0"] * 20
+            fields[0] = b"S"
+            fields[2] = b"1"
+            fields[19] = b"79"
+            proc_stat = b"88003 (fixture) " + b" ".join(fields)
+
+            def read_live(path):
+                if str(path) == "/proc/88003/stat":
+                    return proc_stat
+                if str(path) == "/proc/88003/cmdline":
+                    return b""
+                if str(path) == "/proc/88003/environ":
+                    return b"TMPDIR=" + marker
+                return real_read_bytes(path)
+
+            with mock.patch.object(os, "listdir", side_effect=lambda p: ["88003"] if p == "/proc" else real_listdir(p)), \
+                    mock.patch.object(Path, "read_bytes", read_live), \
+                    mock.patch.object(os, "kill"):
+                self.assertFalse(mod.cleanup_suite_tmp_root(root, expected_identity=identity, timeout=0))
+            self.assertTrue(root.is_dir())
+
+            external = parent / "external"
+            sibling = parent / "sibling"
+            external.mkdir()
+            sibling.mkdir()
+            (external / "sentinel").write_text("keep")
+            replaced = parent / "replaced"
+            replaced.mkdir()
+            replaced_identity = mod.register_fixture_root(replaced)
+            replaced.rmdir()
+            replaced.symlink_to(external, target_is_directory=True)
+            self.assertFalse(mod.cleanup_suite_tmp_root(replaced, expected_identity=replaced_identity))
+            self.assertEqual((external / "sentinel").read_text(), "keep")
+            self.assertTrue(sibling.is_dir())
+            self.assertTrue(replaced.is_symlink())
+
+
+class SuiteScratchExceptionFinalizationFixture(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.mod = load_runner_module()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def make_attempt(self, name):
+        attempt_root = self.root / name
+        log_dir = attempt_root / "child-stderr"
+        log_dir.mkdir(parents=True)
+        identity = self.mod.register_fixture_root(attempt_root)
+        log = log_dir / "child.log"
+        log.write_text("early child stderr\n", encoding="utf-8")
+        env = {self.mod.CHILD_STDERR_ENV: str(log_dir)}
+        return attempt_root, identity, log, env
+
+    def recording_stderr(self, attempt_root):
+        class RecordingStderr(io.StringIO):
+            root_was_live_when_consumed = False
+
+            def write(inner_self, value):
+                if "final child stderr" in value:
+                    inner_self.root_was_live_when_consumed = attempt_root.is_dir()
+                return super(RecordingStderr, inner_self).write(value)
+
+        return RecordingStderr()
+
+    def test_runtime_error_and_keyboard_interrupt_finalize_then_reraise_original(self):
+        for error in (RuntimeError("synthetic runner failure"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                attempt_root, identity, log, env = self.make_attempt(type(error).__name__)
+                events = []
+                stderr = self.recording_stderr(attempt_root)
+
+                def settle(_tmp_root):
+                    events.append("settled")
+                    with log.open("a", encoding="utf-8") as stream:
+                        stream.write("final child stderr\n")
+                    return []
+
+                with mock.patch.object(self.mod, "run_suite", side_effect=error), \
+                        mock.patch.object(self.mod, "reap_suite_tmp_processes", side_effect=settle), \
+                        mock.patch.object(self.mod.sys, "stderr", stderr):
+                    with self.assertRaises(type(error)) as raised:
+                        self.mod.run_suite_with_scratch(
+                            self.root / "suite.test.py", self.root, env,
+                            "isolated", 1, attempt_root, identity,
+                        )
+
+                self.assertIs(raised.exception, error)
+                self.assertIn("early child stderr", stderr.getvalue())
+                self.assertIn("final child stderr", stderr.getvalue())
+                self.assertTrue(stderr.root_was_live_when_consumed)
+                self.assertEqual(events, ["settled"])
+                self.assertFalse(attempt_root.exists())
+
+    def test_popen_failure_uses_common_finalizer_and_reraises_original(self):
+        attempt_root, identity, log, env = self.make_attempt("popen-failure")
+        suite = write_suite(self.root, "spawn-failure.test.py", "print('not launched')")
+        error = FileNotFoundError("synthetic Popen failure")
+        stderr = self.recording_stderr(attempt_root)
+
+        def settle(_tmp_root):
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write("final child stderr\n")
+            return []
+
+        with mock.patch.object(self.mod, "_suite_progress"), \
+                mock.patch.object(self.mod.subprocess, "Popen", side_effect=error), \
+                mock.patch.object(self.mod, "reap_suite_tmp_processes", side_effect=settle), \
+                mock.patch.object(self.mod.sys, "stderr", stderr):
+            with self.assertRaises(FileNotFoundError) as raised:
+                self.mod.run_suite_with_scratch(
+                    suite, self.root, env, "isolated", 1, attempt_root, identity,
+                )
+
+        self.assertIs(raised.exception, error)
+        self.assertIn("final child stderr", stderr.getvalue())
+        self.assertTrue(stderr.root_was_live_when_consumed)
+        self.assertFalse(attempt_root.exists())
+
+    def test_cleanup_baseexception_does_not_replace_runner_exception(self):
+        attempt_root, identity, log, env = self.make_attempt("cleanup-interrupted")
+        error = RuntimeError("original suite error")
+        stderr = self.recording_stderr(attempt_root)
+
+        with mock.patch.object(self.mod, "run_suite", side_effect=error), \
+                mock.patch.object(
+                    self.mod, "reap_suite_tmp_processes",
+                    side_effect=KeyboardInterrupt("cleanup interrupted"),
+                ), \
+                mock.patch.object(self.mod.sys, "stderr", stderr):
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.run_suite_with_scratch(
+                    self.root / "suite.test.py", self.root, env,
+                    "isolated", 1, attempt_root, identity,
+                )
+
+        self.assertIs(raised.exception, error)
+        self.assertTrue(attempt_root.is_dir())
+        self.assertTrue(log.is_file())
+        self.assertIn("interrupted-finalization-error", stderr.getvalue())
+
+    def test_live_unknown_and_unreadable_output_preserve_scratch_and_diagnostics(self):
+        cases = (
+            ("live", [88031], False, "owned-process-live-or-unreadable"),
+            ("unknown", None, False, "process-state-unreadable"),
+            ("unreadable-output", [], True, "child-stderr-unreadable"),
+        )
+        for name, settlement, unreadable, reason in cases:
+            with self.subTest(name=name):
+                attempt_root, identity, log, env = self.make_attempt(name)
+                error = RuntimeError(f"{name} runner error")
+                stderr = self.recording_stderr(attempt_root)
+
+                def settle(_tmp_root):
+                    if not unreadable:
+                        with log.open("a", encoding="utf-8") as stream:
+                            stream.write("final child stderr\n")
+                    return settlement
+
+                patches = [
+                    mock.patch.object(self.mod, "run_suite", side_effect=error),
+                    mock.patch.object(self.mod, "reap_suite_tmp_processes", side_effect=settle),
+                    mock.patch.object(self.mod.sys, "stderr", stderr),
+                ]
+                if unreadable:
+                    patches.append(mock.patch.object(
+                        self.mod, "collect_child_stderr",
+                        side_effect=PermissionError("fixture child log unreadable"),
+                    ))
+                with contextlib.ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    with self.assertRaises(RuntimeError) as raised:
+                        self.mod.run_suite_with_scratch(
+                            self.root / "suite.test.py", self.root, env,
+                            "isolated", 1, attempt_root, identity,
+                        )
+
+                self.assertIs(raised.exception, error)
+                self.assertTrue(attempt_root.is_dir())
+                self.assertIn(reason, stderr.getvalue())
+                if unreadable:
+                    self.assertNotIn("final child stderr", stderr.getvalue())
+                    self.assertTrue(log.is_file())
+                else:
+                    self.assertIn("final child stderr", stderr.getvalue())
+                    self.assertTrue(stderr.root_was_live_when_consumed)
+
+    def test_failed_diagnostic_consumer_preserves_scratch_and_original_exception(self):
+        attempt_root, identity, log, env = self.make_attempt("consumer-failure")
+        error = RuntimeError("original suite error")
+
+        class BrokenStderr(io.StringIO):
+            def write(inner_self, value):
+                if "final child stderr" in value:
+                    raise BrokenPipeError("diagnostic output closed")
+                return super(BrokenStderr, inner_self).write(value)
+
+        stderr = BrokenStderr()
+
+        def settle(_tmp_root):
+            with log.open("a", encoding="utf-8") as stream:
+                stream.write("final child stderr\n")
+            return []
+
+        with mock.patch.object(self.mod, "run_suite", side_effect=error), \
+                mock.patch.object(self.mod, "reap_suite_tmp_processes", side_effect=settle), \
+                mock.patch.object(self.mod.sys, "stderr", stderr):
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.run_suite_with_scratch(
+                    self.root / "suite.test.py", self.root, env,
+                    "isolated", 1, attempt_root, identity,
+                )
+
+        self.assertIs(raised.exception, error)
+        self.assertTrue(attempt_root.is_dir())
+        self.assertTrue(log.is_file())
+        self.assertIn("child-stderr-consumer-failed", stderr.getvalue())
+
+    def test_replaced_root_preserves_external_target_and_sibling_on_interruption(self):
+        attempt_root, identity, _log, env = self.make_attempt("replaced-root")
+        external = self.root / "external"
+        sibling = self.root / "sibling"
+        external.mkdir()
+        sibling.mkdir()
+        sentinel = external / "sentinel"
+        sentinel.write_text("keep", encoding="utf-8")
+        error = RuntimeError("suite failed after replacing its scratch root")
+        stderr = self.recording_stderr(attempt_root)
+
+        def replace_then_raise(*_args):
+            import shutil
+            shutil.rmtree(attempt_root)
+            attempt_root.symlink_to(external, target_is_directory=True)
+            raise error
+
+        with mock.patch.object(self.mod, "run_suite", side_effect=replace_then_raise), \
+                mock.patch.object(self.mod.sys, "stderr", stderr):
+            with self.assertRaises(RuntimeError) as raised:
+                self.mod.run_suite_with_scratch(
+                    self.root / "suite.test.py", self.root, env,
+                    "isolated", 1, attempt_root, identity,
+                )
+
+        self.assertIs(raised.exception, error)
+        self.assertTrue(attempt_root.is_symlink())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        self.assertTrue(sibling.is_dir())
+        self.assertIn("root-identity-changed", stderr.getvalue())
+
+
+class InstalledLayoutLifetimeFixture(RunTestsFixtureBase):
+    def test_shared_layout_lives_through_diagnostics_then_is_removed(self):
+        mod = load_runner_module()
+        layout_file = self.root / "installed-layout.txt"
+        diagnostics = self.root / "diagnostics"
+        write_suite(self.root, "installed_failure.test.py", f"""
+            import os, sys
+            from pathlib import Path
+            layout = Path(os.environ['AGENT_HOME'])
+            assert layout.exists(), f'installed layout missing during suite: {{layout}}'
+            Path({str(layout_file)!r}).write_text(str(layout))
+            print('installed-layout attempt output')
+            sys.exit(1)
+        """)
+        baseline = write_baseline(self.root, [])
+        isolation = write_isolation_tsv(self.root, [])
+        prefix_holder = []
+        original_writer = mod.write_failure_diagnostics
+        original_mkdtemp = tempfile.mkdtemp
+
+        def make_stub_layout():
+            prefix = Path(original_mkdtemp(prefix="runner-layout-stub-"))
+            (prefix / "home" / ".claude").mkdir(parents=True)
+            identity = mod.register_fixture_root(prefix)
+            mod._INSTALLED_LAYOUT_CACHE.update(prefix=prefix, identity=identity)
+            prefix_holder.append(prefix)
+            return prefix
+
+        def diagnostics_with_layout(*args, **kwargs):
+            self.assertTrue(prefix_holder[-1].is_dir())
+            return original_writer(*args, **kwargs)
+
+        args = [
+            "--root", str(self.root), "--baseline", str(baseline),
+            "--isolation-tsv", str(isolation), "--isolation=installed-layout",
+            "--no-leak-sweep", "--report", str(self.root / "report.tsv"),
+            "--diagnostics-dir", str(diagnostics),
+        ]
+        with mock.patch.object(mod, "get_installed_layout_prefix", side_effect=make_stub_layout), \
+                mock.patch.object(mod, "write_failure_diagnostics", side_effect=diagnostics_with_layout):
+            self.assertEqual(mod.main(args), 1)
+
+        self.assertTrue((diagnostics / "index.tsv").is_file())
+        stdout_path = next(diagnostics.glob("*/attempt-001.stdout.txt"))
+        self.assertIn("installed-layout attempt output", stdout_path.read_text(encoding="utf-8"))
+        self.assertTrue(prefix_holder)
+        self.assertEqual(
+            layout_file.read_text(encoding="utf-8"),
+            str(prefix_holder[0] / "home" / ".claude"),
+        )
+        self.assertFalse(prefix_holder[0].exists())
+        self.assertEqual(mod._INSTALLED_LAYOUT_CACHE, {})
+
+    def test_main_keeps_layout_through_retry_probe_and_diagnostics_then_expires_cache(self):
+        mod = load_runner_module()
+        probe_seen = self.root / "probe-layout.txt"
+        diagnostics = self.root / "diagnostics"
+        write_suite(self.root, "declared.test.py", """
+            import os
+            from pathlib import Path
+            assert Path(os.environ["AGENT_HOME"]).is_dir()
+        """)
+        write_suite(self.root, "probe.test.py", f"""
+            import os, sys
+            from pathlib import Path
+            home = os.environ.get("AGENT_HOME", "")
+            present = bool(home and Path(home).is_dir())
+            Path({str(probe_seen)!r}).write_text("present" if present else "missing")
+            print("probe output", "installed" if present else "isolated")
+            if not present:
+                sys.exit(1)
+        """)
+        baseline = write_baseline(self.root, [])
+        isolation = write_isolation_tsv(self.root, [
+            f"declared.test.py\tinstalled-layout\tfixture\tMA-LAYOUT\t{TOMORROW}"
+        ])
+        prefix_holder = []
+        original_writer = mod.write_failure_diagnostics
+        original_mkdtemp = tempfile.mkdtemp
+
+        def make_stub_layout():
+            prefix = Path(original_mkdtemp(prefix="runner-layout-stub-"))
+            (prefix / "home" / ".claude").mkdir(parents=True)
+            identity = mod.register_fixture_root(prefix)
+            mod._INSTALLED_LAYOUT_CACHE["prefix"] = prefix
+            mod._INSTALLED_LAYOUT_CACHE["identity"] = identity
+            prefix_holder.append(prefix)
+            return prefix
+
+        def diagnostics_after_probe(*args, **kwargs):
+            self.assertTrue(prefix_holder[-1].is_dir(), "layout removed before diagnostics consumed attempts")
+            return original_writer(*args, **kwargs)
+
+        args = [
+            "--root", str(self.root), "--baseline", str(baseline),
+            "--isolation-tsv", str(isolation),
+            "--jobs", "1", "--timeout", "5", "--retries", "1",
+            "--no-leak-sweep", "--report", str(self.root / "report.tsv"),
+            "--diagnostics-dir", str(diagnostics),
+        ]
+        with mock.patch.object(mod, "get_installed_layout_prefix", side_effect=make_stub_layout), \
+                mock.patch.object(mod, "write_failure_diagnostics", side_effect=diagnostics_after_probe):
+            self.assertEqual(mod.main(args), 1)  # the unlisted isolated failure is reported
+
+        self.assertEqual(probe_seen.read_text(), "present")
+        self.assertTrue(prefix_holder)
+        self.assertFalse(prefix_holder[0].exists())
+        self.assertEqual(mod._INSTALLED_LAYOUT_CACHE, {})
+        index = (diagnostics / "index.tsv").read_text(encoding="utf-8")
+        self.assertIn("probe.test.py", index)
+        probe_attempts = [line for line in index.splitlines()[1:] if "probe.test.py" in line]
+        self.assertGreaterEqual(len(probe_attempts), 2)
+
+    def test_partial_layout_build_and_suite_preparation_failures_release_created_roots(self):
+        mod = load_runner_module()
+        write_suite(self.root, "installed.test.py", "pass\n")
+        baseline = write_baseline(self.root, [])
+        isolation = write_isolation_tsv(self.root, [])
+        layout_roots = []
+        original_mkdtemp = tempfile.mkdtemp
+        original_build = mod.build_isolated_env
+
+        def track_layout_mkdtemp(*args, **kwargs):
+            value = original_mkdtemp(*args, **kwargs)
+            if kwargs.get("prefix", "").startswith("w1-installed-layout-"):
+                layout_roots.append(Path(value))
+            return value
+
+        def fail_layout_build(tmpdir, *args, **kwargs):
+            if Path(tmpdir).name == "build-env":
+                raise RuntimeError("stub partial layout build failure")
+            return original_build(tmpdir, *args, **kwargs)
+
+        args = [
+            "--root", str(self.root), "--baseline", str(baseline),
+            "--isolation-tsv", str(isolation), "--isolation=installed-layout",
+            "--no-leak-sweep", "--report", str(self.root / "report.tsv"),
+        ]
+        with mock.patch.object(mod.tempfile, "mkdtemp", side_effect=track_layout_mkdtemp), \
+                mock.patch.object(mod, "build_isolated_env", side_effect=fail_layout_build):
+            with self.assertRaisesRegex(RuntimeError, "partial layout build failure"):
+                mod.main(args)
+        self.assertEqual(len(layout_roots), 1)
+        self.assertFalse(layout_roots[0].exists())
+        self.assertEqual(mod._INSTALLED_LAYOUT_CACHE, {})
+
+        prep_mod = load_runner_module()
+        prep_roots = []
+
+        def track_attempt_mkdtemp(*args, **kwargs):
+            value = original_mkdtemp(*args, **kwargs)
+            if kwargs.get("prefix", "").startswith("w1-isolated-"):
+                prep_roots.append(Path(value))
+            return value
+
+        with mock.patch.object(prep_mod.tempfile, "mkdtemp", side_effect=track_attempt_mkdtemp), \
+                mock.patch.object(prep_mod, "build_isolated_env", side_effect=RuntimeError("suite prep failed")):
+            with self.assertRaisesRegex(RuntimeError, "suite prep failed"):
+                prep_mod.run_profile(
+                    [self.root / "installed.test.py"], self.root, "isolated", 1, 5, None
+                )
+        self.assertEqual(len(prep_roots), 1)
+        self.assertFalse(prep_roots[0].exists())
+
+    def test_catchable_interruption_expires_cached_layout(self):
+        mod = load_runner_module()
+        prefix = Path(tempfile.mkdtemp(prefix="runner-layout-interrupt-"))
+        (prefix / "home").mkdir()
+        identity = mod.register_fixture_root(prefix)
+        mod._INSTALLED_LAYOUT_CACHE.update(prefix=prefix, identity=identity)
+        with mock.patch.object(mod, "_run_main", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                mod.main([])
+        self.assertFalse(prefix.exists())
+        self.assertEqual(mod._INSTALLED_LAYOUT_CACHE, {})
+
+
 class RetryFixture(RunTestsFixtureBase):
     def write_retry_suite(self, mode: str):
         write_suite(self.root, "retry.test.py", f"""
@@ -733,10 +1373,15 @@ class RetryFixture(RunTestsFixtureBase):
     def test_diagnostics_preserve_every_retry_attempt(self):
         write_suite(self.root, "retry.test.py", """
             from pathlib import Path
-            import sys
+            import subprocess, sys
             p = Path('attempts.txt')
             n = int(p.read_text()) + 1 if p.exists() else 1
             p.write_text(str(n))
+            subprocess.run([
+                sys.executable, "-c",
+                "import sys; sys.stderr.write('child stderr attempt ' + sys.argv[1]); sys.exit(7)",
+                str(n),
+            ], capture_output=True, text=True)
             print(f'run stdout attempt {n}')
             print(f'run stderr attempt {n}', file=sys.stderr)
             if n == 1:
@@ -763,6 +1408,9 @@ class RetryFixture(RunTestsFixtureBase):
                 f"run stderr attempt {number}",
                 (diagnostics / row["stderr_path"]).read_text(encoding="utf-8"),
             )
+        child_stderr = next(diagnostics.glob("*/attempt-001.child-stderr.txt"))
+        self.assertIn("child stderr attempt 1", child_stderr.read_text(encoding="utf-8"))
+        self.assertFalse(list(diagnostics.glob("*/attempt-002.child-stderr.txt")))
 
     def test_retry_budget_reaches_short_suites_before_long_suites(self):
         order = self.root / "retry-order.txt"
@@ -839,6 +1487,32 @@ class ChildStderrDiagnosticsFixture(RunTestsFixtureBase):
             self.assertEqual(probe.stdout.strip(), "1 'why\\n'", probe.stderr)
             self.assertIn("why", runner.collect_child_stderr(env))
             self.assertEqual(runner.collect_child_stderr(env), "")
+
+    def test_stderr_written_during_owned_process_settlement_is_in_the_result(self):
+        runner = load_runner_module()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "attempt"
+            log_dir = root / "child-stderr"
+            log_dir.mkdir(parents=True)
+            identity = runner.register_fixture_root(root)
+            log = log_dir / "late.log"
+            log.write_text("early stderr\n", encoding="utf-8")
+            env = {runner.CHILD_STDERR_ENV: str(log_dir)}
+            result = runner.SuiteResult(
+                "late.test.py", 1, False, "out", "err", .01, "isolated"
+            )
+
+            def settle_then_write(_tmp_root):
+                with log.open("a", encoding="utf-8") as stream:
+                    stream.write("late stderr after suite return\n")
+                return []
+
+            with mock.patch.object(runner, "reap_suite_tmp_processes", side_effect=settle_then_write):
+                finalized = runner.finalize_suite_attempt(result, env, root, identity)
+
+            self.assertIn("early stderr", finalized.child_stderr)
+            self.assertIn("late stderr after suite return", finalized.child_stderr)
+            self.assertFalse(root.exists())
 
 
 class DiagnosticConfinementTest(RunTestsFixtureBase):

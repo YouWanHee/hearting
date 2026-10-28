@@ -19,9 +19,21 @@ def expand_rows(rows):
              for cell in [[glyph, colour, tint]] * count] for row in rows]
 
 
+def _sidebar_rule(row, width):
+    """True when ``row``'s sidebar cells are the faint section rule (with its optional ↓ more)."""
+    glyphs = "".join(str(cell[0] or "") for cell in row[1:width - 1])
+    plain = "┈" * (width - 2)
+    marked = "┈" * (width - 10) + " ↓ more "
+    return glyphs in (plain, marked)
+
+
 def normalize_new_tree_viewport_row(actual_cells, expected_cells, actual_hits, expected_hits,
                                    tree_scroll):
-    """Apply only the new scroll help row and one newly visible r14 tree row."""
+    """Apply only the new scroll help row and the sidebar's faint section rules.
+
+    r14 made one more tree row visible above RESOURCES; the faint rules now take that
+    row and the blank row above SESSIONS, so the tree rows and hits are the frozen ones.
+    """
     help_y = len(actual_cells) - 2
     help_text = "".join(str(cell[0] or "") for cell in actual_cells[help_y]).rstrip()
     expected_help = (" ↑↓ move · ←→ focus · PgUp/Dn·Home/End·wheel scroll · "
@@ -30,27 +42,19 @@ def normalize_new_tree_viewport_row(actual_cells, expected_cells, actual_hits, e
         raise AssertionError(f"scroll help row changed outside the approved text: {help_text!r}")
     normalized_cells = [list(row) for row in expected_cells]
     normalized_cells[help_y] = actual_cells[help_y]
-    if len(tree_scroll) < 8 or int(tree_scroll[5]) <= 0:
-        return normalized_cells, expected_hits
-    _x0, _top, width, bottom, offset, _maximum, _total, _visible = tree_scroll[:8]
-    boundary = int(bottom) - 1
-    if int(offset) != 0 or not 0 <= boundary < len(actual_cells):
-        raise AssertionError("the frozen r14 row delta applies only to the initial tree viewport")
-    additions = [hit for hit in actual_hits if hit not in expected_hits]
-    if (len(additions) != 1 or additions[0][0] != boundary or
-            additions[0][3][:1] not in (["scope"], ["route"])):
-        raise AssertionError(f"expected exactly one newly visible tree-row hit: {additions!r}")
-    if any(hit[0] == boundary and hit[3][:1] in (["scope"], ["route"])
-           for hit in expected_hits):
-        raise AssertionError("the frozen r14 oracle already contains a hit on the expanded row")
-    normalized_cells[boundary][:int(width)] = actual_cells[boundary][:int(width)]
-    normalized_hits = list(expected_hits)
-    compute_index = next((index for index, hit in enumerate(normalized_hits)
-                          if hit[3][:2] == ["root", "COMPUTE"]), None)
-    if compute_index is None:
-        raise AssertionError("the frozen frame has no COMPUTE summary hit")
-    normalized_hits.insert(compute_index, additions[0])
-    return normalized_cells, normalized_hits
+    width = int(tree_scroll[2]) if len(tree_scroll) > 2 else 32
+    tree_bottom = int(tree_scroll[3]) if len(tree_scroll) > 3 else -1
+    for y, row in enumerate(actual_cells):
+        if not _sidebar_rule(row, width):
+            continue
+        # The frozen row above RESOURCES held the tree's cut marker; the one above
+        # SESSIONS was blank. Neither carried a hit, so the hits stay the frozen ones.
+        if y != tree_bottom and any(str(cell[0] or " ") != " " for cell in expected_cells[y][:width]):
+            raise AssertionError(f"the faint sidebar rule covers a painted frozen row {y}")
+        if any(hit[0] == y and hit[1] < width for hit in expected_hits):
+            raise AssertionError(f"the faint sidebar rule covers a frozen hit on row {y}")
+        normalized_cells[y][:width] = actual_cells[y][:width]
+    return normalized_cells, expected_hits
 
 
 def _fixture_header_identity(vm):

@@ -15,7 +15,9 @@ KEY_ALIASES = {
     "colhead": "section_head", "sect": "section_head",
     "lvl_g": "grp_live", "lvl_y": "g_idle", "lvl_r": "g_dead",
     "lvl_r_flat": "g_blocked", "chip_on": "hearting_name", "eff_medium": "branch_s",
-    "fam_opus": "hb_claude", "fam_gpt": "g_idle", "bold": "section_head", "code": "hb_opencode", "tool": "g_work",
+    # `fam_*` model keys pass through unchanged: one key per family keeps every viewer
+    # on the same hue. A local alias here is how Sol/Astra/Luna once shared one yellow.
+    "bold": "section_head", "code": "hb_opencode", "tool": "g_work",
 }
 
 REFERENCE_STYLES = {

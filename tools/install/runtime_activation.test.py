@@ -1491,12 +1491,183 @@ class ClaudeHookGroupIdentityTest(unittest.TestCase):
         previous = {"managed_config": {"claude_hooks": json.loads(
             (previous_release / "adapters/claude/settings.json").read_text(encoding="utf-8")
         )["hooks"]}}
+        return self._merge_data(config, release, previous)
+
+    def _merge_data(self, config: Path, release: Path, previous) -> dict:
         original = activation._config_path
         activation._config_path = lambda *_args, **_kwargs: config
         try:
             return activation._merge_claude_settings(release, previous)
         finally:
             activation._config_path = original
+
+    @staticmethod
+    def _with_command(hook: dict, command: str, **fields) -> dict:
+        return {**hook, "command": command, **fields}
+
+    def test_old_and_new_root_spellings_merge_as_one_tuned_managed_hook(self):
+        old_command = self.PROJECTION["command"]
+        new_command = old_command.replace(
+            "$HOME/.claude/", "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/"
+        )
+        source_old = self._with_command(self.PROJECTION, old_command)
+        source_new = self._with_command(self.PROJECTION, new_command)
+
+        for spelling in ("old", "new"):
+            for prior in ("state", "none", "active-root"):
+                with self.subTest(spelling=spelling, prior=prior), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    old_release = self._release(
+                        root, "old", [{"matcher": "*", "hooks": [source_old]}]
+                    )
+                    new_release = self._release(
+                        root, "new", [{"matcher": "*", "hooks": [source_new]}]
+                    )
+                    current_command = old_command if spelling == "old" else new_command
+                    tuned = self._with_command(
+                        self.PROJECTION, current_command, timeout=123, **{"async": True}
+                    )
+                    user_hook = {
+                        "type": "command", "command": 'bash "$HOME/.claude/my.sh"',
+                        "timeout": 9,
+                    }
+                    extra_arg = self._with_command(
+                        self.PROJECTION, current_command + " --user-option", timeout=77
+                    )
+                    other_matcher = {
+                        "matcher": "Bash",
+                        "hooks": [self._with_command(self.PROJECTION, current_command)],
+                    }
+                    mixed = {"matcher": "*", "hooks": [tuned, user_hook]}
+                    config = root / "settings.json"
+                    config.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+                        mixed,
+                        {"matcher": "*", "hooks": [extra_arg]},
+                        other_matcher,
+                    ]}}), encoding="utf-8")
+
+                    if prior == "state":
+                        old_hooks = json.loads(
+                            (old_release / "adapters/claude/settings.json").read_text()
+                        )["hooks"]
+                        previous = {"managed_config": {"claude_hooks": old_hooks}}
+                    elif prior == "active-root":
+                        previous = {"active_root": str(old_release)}
+                    else:
+                        previous = None
+
+                    source_bytes = (new_release / "adapters/claude/settings.json").read_bytes()
+                    self._merge_data(config, new_release, previous)
+
+                    settings = json.loads(config.read_text(encoding="utf-8"))
+                    groups = settings["hooks"]["UserPromptSubmit"]
+                    expected_tuned = self._with_command(
+                        self.PROJECTION, new_command, timeout=123, **{"async": True}
+                    )
+                    self.assertEqual(groups, [
+                        {"matcher": "*", "hooks": [expected_tuned, user_hook]},
+                        {"matcher": "*", "hooks": [extra_arg]},
+                        other_matcher,
+                    ])
+                    identities = activation._event_hook_keys(groups)
+                    self.assertEqual(sum(
+                        key in identities for key in activation._hook_keys(
+                            {"matcher": "*", "hooks": [source_new]}
+                        )
+                    ), 1)
+                    self.assertEqual((new_release / "adapters/claude/settings.json").read_bytes(), source_bytes)
+
+    def test_root_spelling_does_not_hide_untuned_release_values(self):
+        old_command = self.PROJECTION["command"]
+        new_command = old_command.replace(
+            "$HOME/.claude/", "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/"
+        )
+        for prior_spelling in ("old", "new"):
+            for current_spelling in ("old", "new"):
+                with self.subTest(prior=prior_spelling, current=current_spelling), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    prior_command = old_command if prior_spelling == "old" else new_command
+                    current_command = old_command if current_spelling == "old" else new_command
+                    old = self._release(root, "old", [{"matcher": "*", "hooks": [
+                        self._with_command(self.PROJECTION, prior_command)
+                    ]}])
+                    new_hook = self._with_command(self.PROJECTION, new_command, timeout=12)
+                    new = self._release(root, "new", [{"matcher": "*", "hooks": [new_hook]}])
+                    config = root / "settings.json"
+                    config.write_text(json.dumps({"hooks": {"UserPromptSubmit": [{
+                        "matcher": "*", "hooks": [self._with_command(self.PROJECTION, current_command)]
+                    }]}}), encoding="utf-8")
+                    self._merge_data(config, new, {"managed_config": {"claude_hooks": {
+                        "UserPromptSubmit": [{"matcher": "*", "hooks": [
+                            self._with_command(self.PROJECTION, prior_command)
+                        ]}]
+                    }}})
+                    self.assertEqual(
+                        json.loads(config.read_text())["hooks"]["UserPromptSubmit"],
+                        [{"matcher": "*", "hooks": [new_hook]}],
+                    )
+
+    def test_unmerge_removes_both_spellings_but_preserves_user_hook(self):
+        old_command = self.PROJECTION["command"]
+        new_command = old_command.replace(
+            "$HOME/.claude/", "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/"
+        )
+        user_hook = {"type": "command", "command": 'bash "$HOME/.claude/my.sh"'}
+        for state_spelling in ("old", "new"):
+            for present in (("old",), ("new",), ("old", "new")):
+                with self.subTest(state=state_spelling, present=present), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    commands = [old_command if item == "old" else new_command for item in present]
+                    config = root / "settings.json"
+                    config.write_text(json.dumps({"hooks": {"UserPromptSubmit": [{
+                        "matcher": "*",
+                        "hooks": [
+                            *[self._with_command(self.PROJECTION, command, timeout=123) for command in commands],
+                            user_hook,
+                        ],
+                    }]}}), encoding="utf-8")
+                    state_command = old_command if state_spelling == "old" else new_command
+                    original = activation._config_path
+                    activation._config_path = lambda *_args, **_kwargs: config
+                    try:
+                        activation._unmerge_claude_settings({"managed_config": {
+                            "claude_hooks": {"UserPromptSubmit": [{"matcher": "*", "hooks": [
+                                self._with_command(self.PROJECTION, state_command)
+                            ]}]}
+                        }}, "global")
+                    finally:
+                        activation._config_path = original
+                    self.assertEqual(
+                        json.loads(config.read_text())["hooks"]["UserPromptSubmit"],
+                        [{"matcher": "*", "hooks": [user_hook]}],
+                    )
+
+    def test_respelled_merge_is_idempotent_and_does_not_mutate_source(self):
+        old_command = self.PROJECTION["command"]
+        new_command = old_command.replace(
+            "$HOME/.claude/", "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = self._release(root, "old", [{"matcher": "*", "hooks": [self.PROJECTION]}])
+            new = self._release(root, "new", [{"matcher": "*", "hooks": [
+                self._with_command(self.PROJECTION, new_command)
+            ]}])
+            source_path = new / "adapters/claude/settings.json"
+            source_before = source_path.read_bytes()
+            config = root / "settings.json"
+            config.write_text(json.dumps({"hooks": {"UserPromptSubmit": [{
+                "matcher": "*", "hooks": [dict(self.PROJECTION, timeout=123)]
+            }]}}), encoding="utf-8")
+            old_hooks = json.loads((old / "adapters/claude/settings.json").read_text())["hooks"]
+            first = self._merge_data(config, new, {"managed_config": {"claude_hooks": old_hooks}})
+            after_first = config.read_bytes()
+            second = self._merge_data(config, new, {"managed_config": {
+                "claude_hooks": first["managed_hooks"]
+            }})
+            self.assertEqual(config.read_bytes(), after_first)
+            self.assertEqual(second["added"], 0)
+            self.assertEqual(source_path.read_bytes(), source_before)
 
     def test_a_tuned_group_is_kept_once_and_a_retired_one_leaves(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -2535,10 +2706,11 @@ class NativeAgentRenderTest(unittest.TestCase):
                 report = activation.activate(runtime, "linked", str(REPO_ROOT))
                 self.assertEqual(report["model_config_source"], "user")
                 desired = activation._desired_entries(runtime, "linked", REPO_ROOT, REPO_ROOT, "x", "global")
-                # No agent is rendered; OpenCode's V2 plugin entry always is.
+                # No agent is rendered; OpenCode's V2 server and TUI plugin entries always are.
                 renders = [e for e in desired if e["kind"] == "render"]
                 self.assertEqual([Path(e["dest"]).relative_to(self.home(runtime)).as_posix() for e in renders],
-                                 ["plugins/hearting-guards/index.ts"] if runtime == "opencode" else [])
+                                 ["plugins/hearting-guards/index.ts", "plugins/hearting-tui-identity/tui.ts"]
+                                 if runtime == "opencode" else [])
                 agents = [e for e in desired if Path(e["dest"]).parent == self.home(runtime) / "agents"]
                 self.assertEqual(len(agents), 5)
                 for entry in agents:

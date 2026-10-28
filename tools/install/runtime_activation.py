@@ -600,23 +600,27 @@ def _mode_entries(source: Path, dest: Path) -> List[dict]:
 
 
 _OPENCODE_V2_SERVER_IMPORT = 'from "../hearting-guards.js"'
+_OPENCODE_V2_TUI_IMPORT = 'from "../../tui/hearting-tui-identity.ts"'
 
 
-def _opencode_v2_plugin_entry(entrypoint: Path, server: Path, dest: Path) -> dict:
+def _opencode_v2_plugin_entry(entrypoint: Path, server: Path, dest: Path,
+                              marker: str = _OPENCODE_V2_SERVER_IMPORT) -> dict:
     """The OpenCode 2 package entry as an activation-owned file, never a link.
 
     OpenCode 2 drops a plugin package whose entry resolves outside the package
     directory (v2.0.32 `config/plugin/source.ts`), so a link into the bundle is
     silently never loaded. The rendered entry stays inside the package and
-    imports the activated server export by absolute path; each release renders
-    a new import, so the server's config watcher sees the change.
+    imports the activated module by absolute path; each release renders a new
+    import, so the config watcher sees the change. The same rendering serves the
+    terminal-client package, whose `tui` entry V2 discovers under `plugins/`
+    while it skips a tui.json/cli.json entry that names a plain file.
     """
     if not entrypoint.is_file():
         return _entry(entrypoint, dest, "hook_config")
     text = entrypoint.read_text(encoding="utf-8")
-    if _OPENCODE_V2_SERVER_IMPORT not in text:
-        raise ActivationError(f"{entrypoint} lacks {_OPENCODE_V2_SERVER_IMPORT}")
-    content = text.replace(_OPENCODE_V2_SERVER_IMPORT, f"from {json.dumps(str(server))}", 1)
+    if marker not in text:
+        raise ActivationError(f"{entrypoint} lacks {marker}")
+    content = text.replace(marker, f"from {json.dumps(str(server))}", 1)
     entry = _entry(entrypoint, dest, "hook_config", kind="render")
     entry["content"] = content
     entry["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -905,6 +909,10 @@ def _linked_entries(
         entries.append(_entry(herdr_plugin, home / "plugins/herdr-agent-state.js", "hook_config", kind="copy"))
         tui_entry = source_root / "adapters/opencode/tui/hearting-tui-identity.ts"
         entries.append(_entry(tui_entry, home / "tui/hearting-tui-identity.ts", "hook_config"))
+        tui_v2 = source_root / "adapters/opencode/plugins/hearting-tui-identity/tui.ts"
+        entries.append(_opencode_v2_plugin_entry(
+            tui_v2, tui_entry, home / "plugins/hearting-tui-identity/tui.ts",
+            marker=_OPENCODE_V2_TUI_IMPORT))
         herdr_tui = source_root / "adapters/opencode/tui/herdr-tui-session.js"
         entries.append(_entry(herdr_tui, home / "herdr-tui-session.js", "hook_config", kind="copy"))
         herdr_tui_v2 = source_root / "adapters/opencode/tui/herdr-opencode/tui.js"
@@ -1537,6 +1545,86 @@ def _claude_managed_values(source: dict) -> dict:
     }
 
 
+def _normalize_claude_hook_command(command):
+    """Normalize only Claude's two managed config-root spellings for identity."""
+    if not isinstance(command, str):
+        return command
+    return command.replace(
+        "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/", "$HOME/.claude/"
+    )
+
+
+def _claude_hook_group_identity(item) -> str:
+    """Serialize a previous group while treating only root spelling as equal."""
+    if not isinstance(item, dict) or not isinstance(item.get("hooks"), list):
+        return json.dumps(item, sort_keys=True)
+    normalized = dict(item)
+    hooks = []
+    for hook in item["hooks"]:
+        if isinstance(hook, dict) and isinstance(hook.get("command"), str):
+            normalized_hook = dict(hook)
+            normalized_hook["command"] = _normalize_claude_hook_command(
+                hook["command"]
+            )
+            hooks.append(normalized_hook)
+        else:
+            hooks.append(hook)
+    normalized["hooks"] = hooks
+    return json.dumps(normalized, sort_keys=True)
+
+
+def _respell_claude_managed_hooks(entries: list, source_entries: list) -> tuple[list, bool]:
+    """Update commands only for source-owned event/matcher/command identities."""
+    source_commands = {}
+    for source_group in source_entries:
+        if not isinstance(source_group, dict):
+            continue
+        source_hooks = source_group.get("hooks")
+        if not isinstance(source_hooks, list):
+            continue
+        matcher = source_group.get("matcher")
+        for source_hook in source_hooks:
+            if not isinstance(source_hook, dict):
+                continue
+            command = source_hook.get("command")
+            if not isinstance(command, str):
+                continue
+            identity = json.dumps([
+                matcher, _normalize_claude_hook_command(command)
+            ])
+            source_commands[identity] = command
+
+    updated_entries = []
+    changed = False
+    for group in entries:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            updated_entries.append(group)
+            continue
+        matcher = group.get("matcher")
+        updated_hooks = []
+        group_changed = False
+        for hook in group["hooks"]:
+            if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
+                updated_hooks.append(hook)
+                continue
+            command = hook["command"]
+            identity = json.dumps([
+                matcher, _normalize_claude_hook_command(command)
+            ])
+            source_command = source_commands.get(identity)
+            if source_command is not None and command != source_command:
+                updated_hooks.append(dict(hook, command=source_command))
+                group_changed = True
+            else:
+                updated_hooks.append(hook)
+        if group_changed:
+            updated_entries.append(dict(group, hooks=updated_hooks))
+            changed = True
+        else:
+            updated_entries.append(group)
+    return (updated_entries if changed else entries), changed
+
+
 def _hook_keys(item) -> List[str]:
     """Which hooks a group runs: one key per hook, its matcher plus command.
 
@@ -1551,7 +1639,8 @@ def _hook_keys(item) -> List[str]:
     return [
         json.dumps([
             item.get("matcher"),
-            hook.get("command", "") if isinstance(hook, dict) else json.dumps(hook, sort_keys=True),
+            _normalize_claude_hook_command(hook.get("command", ""))
+            if isinstance(hook, dict) else json.dumps(hook, sort_keys=True),
         ])
         for hook in (hooks if isinstance(hooks, list) else [])
     ]
@@ -1664,13 +1753,13 @@ def _merge_claude_settings(
             current = hooks.get(event)
             if not isinstance(current, list) or not isinstance(old_entries, list):
                 continue
-            old = {json.dumps(item, sort_keys=True) for item in old_entries}
+            old = {_claude_hook_group_identity(item) for item in old_entries}
             # A hook the user tuned keeps its values while the release still
             # ships it; once the release drops it, the tuned copy goes too
             # instead of pointing at a script that no longer exists.
             retired = _event_hook_keys(old_entries) - _event_hook_keys(source_hooks.get(event))
             kept = _without_hooks(
-                [item for item in current if json.dumps(item, sort_keys=True) not in old],
+                [item for item in current if _claude_hook_group_identity(item) not in old],
                 retired,
             )
             if kept != current:
@@ -1682,6 +1771,10 @@ def _merge_claude_settings(
         current = hooks.setdefault(event, [])
         if not isinstance(current, list):
             raise ActivationError(f"Claude settings hook event is not a list: {event}")
+        current, respelled = _respell_claude_managed_hooks(current, entries)
+        if respelled:
+            hooks[event] = current
+            changed = True
         known = _event_hook_keys(current)
         for item in entries:
             missing = [key for key in _hook_keys(item) if key not in known]
@@ -1844,7 +1937,7 @@ def _claude_settings_health(
                 continue
             if _event_hook_keys(entries) - _event_hook_keys(actual[event]):
                 missing = True
-        if not _hook_command_files_present(actual):
+        if not _hook_command_files_present(actual, scope):
             missing = True
 
     try:
@@ -2500,12 +2593,16 @@ def _codex_identity_health(active_root: Path, scope: str = "global") -> tuple[bo
     return existing is None, []
 
 
-_HOOK_COMMAND_PATH_RE = re.compile(r"\$HOME/[^\s\"']+")
+_HOOK_COMMAND_PATH_RE = re.compile(
+    r"\$\{CLAUDE_CONFIG_DIR:-\$HOME/\.claude\}/[^\s\"']+|\$HOME/[^\s\"']+"
+)
 
 
-def _hook_command_files_present(hooks: dict) -> bool:
+def _hook_command_files_present(hooks: dict, scope: str = "global") -> bool:
     """A registered hook whose command file is gone breaks every matching event."""
     home = os.environ.get("HOME") or str(Path.home())
+    claude_home = str(paths.runtime_home("claude", scope))
+    config_root = "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
     for entries in hooks.values():
         if not isinstance(entries, list):
             continue
@@ -2520,7 +2617,10 @@ def _hook_command_files_present(hooks: dict) -> bool:
                 if not isinstance(command, str):
                     continue
                 for raw in _HOOK_COMMAND_PATH_RE.findall(command):
-                    candidate = Path(raw.replace("$HOME", home, 1))
+                    if raw.startswith(config_root + "/"):
+                        candidate = Path(claude_home + raw[len(config_root):])
+                    else:
+                        candidate = Path(raw.replace("$HOME", home, 1))
                     if candidate.suffix and not candidate.exists():
                         return False
     return True

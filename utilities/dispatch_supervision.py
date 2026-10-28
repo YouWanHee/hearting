@@ -113,6 +113,25 @@ def _inside_root(path, root):
         return False
 
 
+def _tool_event_source(metadata, log_path):
+    """The file that carries the owner's tool rows.
+
+    A supervised Claude owner's attempt log is a receipt log with control rows
+    only; it announces the child session whose own transcript has the tool
+    rows. The summary follower already resolves that transcript the same way.
+    """
+    try:
+        from dispatch_summary import announced_session, session_transcript
+        decided, announced = announced_session(log_path)
+        if (not decided or not isinstance(announced, dict) or announced.get("invalid")
+                or announced.get("runtime")):
+            return log_path
+        runtime_home = metadata.get("runtime_home") or None
+        return session_transcript(announced, runtime_home=runtime_home) or log_path
+    except (ImportError, OSError, ValueError, TypeError):
+        return log_path
+
+
 def runtime_tool_progress(metadata, previous=None):
     """Read only the latest bounded native tool identity, never transcript prose."""
     latest = previous or None
@@ -120,7 +139,7 @@ def runtime_tool_progress(metadata, previous=None):
     if not raw_path or not Path(raw_path).is_absolute():
         return latest
     try:
-        with Path(raw_path).open("rb") as handle:
+        with _tool_event_source(metadata, Path(raw_path)).open("rb") as handle:
             handle.seek(0, os.SEEK_END)
             start = max(0, handle.tell() - 262144)
             handle.seek(start)
@@ -643,8 +662,13 @@ def join_process_error(returncode: int, receipt: object, parent_attempt_id: str)
     return f"join-process-contract-failed:exit={returncode}:reason={reason}"
 
 
-def _rows(jobs: Path, attempts: Iterable[str] | None = None) -> dict:
+def _rows(jobs: Path, attempts: Iterable[str] | None = None, *,
+          require_unique: bool = False) -> dict:
     view = registry_view(Path(jobs))
+    if require_unique and view.has_duplicate_attempts:
+        # The registry-wide duplicate refusal of an unfiltered read, kept for
+        # callers that now look up only the attempts they own.
+        raise SupervisionError("supervision-attempt-ambiguous")
     rows = {}
     if attempts is None:
         selected = ((record, record.completion_metadata()) for record in view.records)
@@ -680,6 +704,15 @@ def _rows(jobs: Path, attempts: Iterable[str] | None = None) -> dict:
     return rows
 
 
+def _owned_rows(jobs: Path, attempt_id: str) -> dict:
+    """Rows of one owner and its direct children, without parsing the registry."""
+    view = registry_view(Path(jobs))
+    ids = {attempt_id} | {meta.get("attempt_id") for meta in
+                          (record.completion_metadata() for record in view.completion_children(attempt_id))
+                          if meta.get("attempt_id")}
+    return _rows(jobs, ids, require_unique=True)
+
+
 def _root(rows: dict, attempt: str) -> str:
     seen = set()
     while attempt in rows and attempt not in seen:
@@ -695,11 +728,11 @@ def _root(rows: dict, attempt: str) -> str:
 def _awaiting_answers(jobs: Path, aid: str) -> list[str]:
     """The kept answers of a BLOCKED owner whose continuation has not launched yet."""
     from dispatch_owner_input import blocked_owner_answers
-    from dispatch_replacement import _replacement_in_flight, _rows as replacement_rows
+    from dispatch_replacement import _replacement_in_flight, registry_rows
     answers = blocked_owner_answers(jobs, aid)
     if not answers:
         return []
-    rows = replacement_rows(Path(jobs).read_text(encoding="utf-8").splitlines())
+    rows = registry_rows(jobs)
     if aid in rows and _replacement_in_flight(jobs, rows, rows[aid][1]):
         return []
     return [item["id"] for item in answers]
@@ -708,10 +741,10 @@ def _awaiting_answers(jobs: Path, aid: str) -> list[str]:
 def _attempt_stall_superseded(jobs: Path, aid: str, metadata: dict) -> bool:
     """A claimed replacement or linked retry owns the route's live attempt now."""
     from dispatch_replacement import (
-        _plain_retry_successor, _replacement_in_flight, _rows as replacement_rows,
+        _plain_retry_successor, _replacement_in_flight, registry_rows,
     )
     try:
-        rows = replacement_rows(Path(jobs).read_text(encoding="utf-8").splitlines())
+        rows = registry_rows(jobs)
     except (OSError, UnicodeError, ValueError):
         return True
     if aid not in rows:
@@ -743,6 +776,17 @@ def _attempt_stall_superseded(jobs: Path, aid: str, metadata: dict) -> bool:
     return False
 
 
+def _settlement_decision(status: str, meta: dict):
+    from dispatch_contract import observed_attempt_liveness
+    from codex_dispatch_terminal import terminal_envelope_observed
+    proof = observed_attempt_liveness(status, meta,
+        terminal_envelope=terminal_envelope_observed(meta.get("log_file")),
+        terminal_receipt_gate=True)
+    decision = decide_attempt(status, meta, process_state=proof.process_state,
+                              process_reason=proof.process_reason)
+    return proof, decision
+
+
 def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
     import route_parent_close
     attempts = [aid for aid in attempts if aid not in rows or not route_parent_close.row_requested(rows[aid][1], jobs)]
@@ -771,8 +815,6 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
             if parent_resume_obligation(jobs, aid, route_id=route_id) is not None:
                 return True
         return False
-    from dispatch_contract import observed_attempt_liveness
-    from codex_dispatch_terminal import terminal_envelope_observed
     for aid in attempts:
         if aid not in rows:
             raise SupervisionError("supervision-attempt-missing")
@@ -782,13 +824,7 @@ def _pending(rows: dict, attempts: list[str], jobs: Path, reason=None) -> bool:
         # unknown, or conflicting execution.
         from dispatch_notice_state import route_obligation_closed
         route_closed = reason == "supervisor-exited" and route_obligation_closed(meta, jobs)
-        from dispatch_contract import observed_attempt_liveness
-        from codex_dispatch_terminal import terminal_envelope_observed
-        proof = observed_attempt_liveness(status, meta,
-            terminal_envelope=terminal_envelope_observed(meta.get("log_file")),
-            terminal_receipt_gate=True)
-        decision = decide_attempt(status, meta, process_state=proof.process_state,
-                                  process_reason=proof.process_reason)
+        _proof, decision = _settlement_decision(status, meta)
         if decision.action in {"wait", "recover", "reconcile", "inspect-conflict"}:
             return True
         # A supervisor-exited notice may be only a lagging route-settlement
@@ -1546,5 +1582,30 @@ def wait_for_child_settlement(*, jobs: Path, attempts: set[str],
             time.sleep(1.0)
         return {"state": "timeout"}
 
+    def held_by_conflict() -> str:
+        """End the wait only when every remaining child is a settled, unreviewed conflict.
+
+        Open, live, or recoverable work keeps the wait; a closed and quiescent
+        child that only a person's review can change would otherwise hold this
+        supervisor, and its watchers, forever.
+        """
+        from dispatch_contract import PARENT_EXTINCTION_TERMINAL_STATUSES
+        rows = _rows(jobs, attempts)
+        held = False
+        for aid in sorted(attempts):
+            if aid not in rows:
+                return ""
+            if not _pending({aid: rows[aid]}, [aid], jobs):
+                continue
+            status, meta = rows[aid]
+            proof, decision = _settlement_decision(status, meta)
+            if (decision.action != "inspect-conflict"
+                    or status not in PARENT_EXTINCTION_TERMINAL_STATUSES
+                    or proof.process_state != "quiescent"):
+                return ""
+            held = True
+        return "terminal-evidence-conflict" if held else ""
+
     wait_for_batch(join=observe, attempts=attempts, jobs=jobs,
-                   parent_attempt_id=parent_attempt_id, emit=emit)
+                   parent_attempt_id=parent_attempt_id, emit=emit,
+                   stop_check=held_by_conflict)

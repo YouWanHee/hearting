@@ -133,6 +133,44 @@ class LeasesTest(unittest.TestCase):
         with self.assertRaises(G.GPUUnavailable):
             self.acquire(requested="0")
 
+    def test_boot_id_mismatch_proves_death_but_missing_boot_id_stays_unknown(self):
+        host = G.socket.gethostname().lower().split(".")[0]
+        namespace = os.readlink("/proc/self/ns/pid")
+        record = {"host": host, "pid_namespace": namespace,
+                  "boot_id": "previous-boot", "pid": os.getpid(),
+                  "starttime": "0", "state": "S"}
+        self.assertIs(G.living(record), False)
+        remote = {}
+        exec(compile(G._REMOTE_LEASE_CORE, "serialized-lease-core", "exec"), remote)
+        self.assertIs(remote["living"](record), False)
+        record.pop("boot_id")
+        record["pid_namespace"] = "pid:[other]"
+        self.assertIsNone(G.living(record))
+        self.assertIsNone(remote["living"](record))
+
+    def test_unreadable_boot_id_keeps_identity_and_live_lease(self):
+        original_read_text = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if str(path) == "/proc/sys/kernel/random/boot_id":
+                raise PermissionError("boot id unreadable")
+            return original_read_text(path, *args, **kwargs)
+
+        remote = {}
+        exec(compile(G._REMOTE_LEASE_CORE, "serialized-lease-core", "exec"), remote)
+        host = G.socket.gethostname().lower().split(".")[0]
+        with mock.patch.object(Path, "read_text", read_text):
+            local = G.identity(os.getpid())
+            remote_record = remote["identity"](os.getpid())
+        self.assertIsNotNone(local)
+        self.assertIsNotNone(remote_record)
+        self.assertNotIn("boot_id", local)
+        self.assertNotIn("boot_id", remote_record)
+        local["host"] = host
+        remote_record["host"] = host
+        self.assertIs(G.living(local), True)
+        self.assertIs(remote["living"](remote_record), True)
+
     def test_multi_gpu_admission_is_all_or_nothing_and_uuid_is_canonicalized(self):
         self.acquire(requested="1")
         with self.assertRaises(G.GPUUnavailable):

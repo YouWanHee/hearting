@@ -3815,8 +3815,14 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
         self.assertNotEqual(live["watch_id"], dead["watch_id"],
                             f"live={live} dead={dead}")
         self._wait_for_lock(dead["watch_id"])
-        waits_before_dead = len(self._wait_calls())
-        self._wait_for_wait_calls(waits_before_dead + 1)
+        # Wait for this watch's own native wait, not for the total count to grow:
+        # that wait may already be logged before the count is read.
+        def dead_waits():
+            return [line for line in self._wait_calls() if " peer-dead" in f" {line} "]
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not dead_waits():
+            time.sleep(0.02)
+        self.assertEqual(len(dead_waits()), 1, self._wait_calls())
         os.kill(int(dead["pid"]), signal.SIGKILL)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and peer_steward._pid_identity_ok(
@@ -3834,7 +3840,7 @@ class StatusRearmTest(_WatchMixin, unittest.TestCase):
             new_arm["watcher"]["pid"], new_arm["watcher"]["pid_start"]))
         self.assertTrue(peer_steward._lock_held(
             self.watch_root / f"{fields['watch_id']}.lock"))
-        self.assertEqual(len(self._wait_calls()), waits_before_dead + 1,
+        self.assertEqual(len(dead_waits()), 1,
                          "reattachment adopts the one already launched native wait")
 
         self._release()
@@ -4603,6 +4609,55 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertIsNone(resolved[1])
         self.assertEqual((resolved[0]["harness"], resolved[0]["session_id"],
                           resolved[0]["pane"]), ("claude", "sid-child", "w1:pX"))
+
+    def test_unrelated_unknown_identity_does_not_block_exact_name_or_tag(self):
+        rows = [self._inventory_row(), self._inventory_row(
+            harness="claude", sid="sid-unrelated", name="other", pane="w1:pU")]
+        self._set_inventory(rows)
+        self._native_sid_by_pid.pop(40001, None)
+        self._native_sid_by_harness["claude"] = ""
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_retire_target", side_effect=self._target_for), \
+             mock.patch.object(peer_steward, "_retire_pane_info", side_effect=self._pane_info_for), \
+             mock.patch.object(peer_steward, "_prompt_process_session",
+                               wraps=peer_steward._prompt_process_session) as process_session, \
+             mock.patch.object(peer_steward, "_prompt_fleet_tag",
+                               side_effect=lambda _harness, sid, **_kw:
+                               ({"sid-child": "3e", "sid-unrelated": "7a"}.get(sid), None)):
+            named = peer_steward._resolve_prompt_target("child")
+            tagged = peer_steward._resolve_prompt_target("[3e]")
+        self.assertIsNone(named[1])
+        self.assertIsNone(tagged[1])
+        self.assertEqual((named[0]["pane"], tagged[0]["pane"]), ("w1:pX", "w1:pX"))
+        self.assertEqual(process_session.call_count, 4,
+                         "only the matching pane needs native identity proof per address")
+
+        self._native_sid_by_pid.pop(40000, None)
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=(rows, None)), \
+             mock.patch.object(peer_steward, "_retire_target", side_effect=self._target_for), \
+             mock.patch.object(peer_steward, "_retire_pane_info", side_effect=self._pane_info_for):
+            uncertain = peer_steward._resolve_prompt_target("child")
+        self.assertIsNone(uncertain[0])
+        self.assertEqual(uncertain[1:], ("target-identity-unverified", ["w1:pX"]))
+
+    def test_native_identity_can_discover_a_registry_name_when_census_has_no_name(self):
+        row = self._inventory_row(sid=None, name=None)
+        self._set_inventory([row])
+        self._census_panes[0].pop("agent_session", None)
+        self._native_sid_by_pid[40000] = "sid-native-only"
+        target = ("idle", {"harness": "claude", "session_id": "-",
+                            "name": None, "pane": "w1:pX"}, 0, None)
+        with mock.patch.object(peer_steward, "_prompt_agent_inventory",
+                               return_value=([row], None)), \
+             mock.patch.object(peer_steward, "_retire_target", return_value=target), \
+             mock.patch.object(peer_steward, "_retire_pane_info", side_effect=self._pane_info_for), \
+             mock.patch.object(peer_steward, "_from_name", return_value="registry-only"):
+            resolved = peer_steward._resolve_prompt_target("registry-only")
+        self.assertIsNone(resolved[1])
+        self.assertEqual((resolved[0]["session_id"], resolved[0]["pane"]),
+                         ("sid-native-only", "w1:pX"))
 
     def test_same_pane_duplicate_observation_merges_optional_name_and_identity(self):
         rows = [self._inventory_row(sid=None, name=None), self._inventory_row()]
@@ -8314,12 +8369,14 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
         with st.seat_lock(seat.key):
             card = st.write_card(seat, harness, sid, "card body", prompt_seq=seq)
             if receipt and harness == "claude":
-                st._write_consumed(seat, generation=card["generation"], receipts=[f"claude:{new}:0"])
+                st._write_consumed(st.session_seat(seat, harness, sid),
+                                   generation=card["generation"], receipts=[f"claude:{new}:0"])
             clear._write_reservation({
                 "schema": 1, "nonce": "n0nce", "status": "cleared", "created": now - 30,
                 "deadline": now + 570,
                 "seat": {"kind": "pane", "key": seat.key, "pane": pane,
-                         "harness": harness, "project_key": ""},
+                         "harness": harness, "project_key": "",
+                         "session": {"harness": harness, "sid": sid}},
                 "harness": harness, "sid": sid, "cwd": str(self.tmp_root), "new_session": new,
                 "card_generation": card["generation"], "prompt_seq": seq, "continue_off": False,
                 "continued": {"state": "pending", "deadline": now + window}})
@@ -8503,7 +8560,7 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
 
         def rewrite(seat):
             with self.st.seat_lock(seat.key):
-                self.st.write_card(seat, "claude", "sid-B", "new card")
+                self.st.write_card(seat, "claude", self.booking()["sid"], "new card")
 
         def expired(_seat):
             data = self.booking()
@@ -8511,7 +8568,9 @@ class ContinueTest(_TmpRootMixin, unittest.TestCase):
             self.path.write_text(json.dumps(data), encoding="utf-8")
 
         for change, reason in ((bump, "new-input"), (rewrite, "card-changed"),
-                               (self.st.mark_card_handed_off, "handed-off"), (expired, "expired")):
+                               (lambda seat: self.st.mark_card_handed_off(
+                                   self.st.session_seat(seat, "claude", self.booking()["sid"])),
+                                "handed-off"), (expired, "expired")):
             with self.subTest(reason=reason):
                 change(self.cleared())
                 with mock.patch.object(peer_steward, "_herdr_prompt",
@@ -8627,7 +8686,7 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                     (self.TWO, None, "split", "w1:p1", "down"),
                     (self.THREE, None, "split", "w1:p0", "down"),
                     (self.FOUR, "w1:p3", "reuse", "w1:p3", None),
-                    (self.FOUR, None, "tab", "w1", None)):
+                    (self.FOUR, None, "split", "w1:p0", "right")):
                 with self.subTest(kind=kind, action=action, target=target):
                     calls = []
                     def run(argv, **kwargs):
@@ -8684,6 +8743,78 @@ class GridStartTest(_TmpRootMixin, unittest.TestCase):
                             self.assertEqual(create[create.index("--ratio") + 1], "0.5")
                         else:
                             self.assertEqual(create[create.index("--workspace") + 1], "w1")
+
+    def test_beside_a_full_reference_tab_splits_that_pane_instead_of_spilling(self):
+        """The reference tab wins over a newer tab with room: split it, never fill another."""
+        reference = self.layout(self.FOUR)
+        reference["tab_id"] = "w1:t1"
+        newer = self.layout(self.TWO)
+        newer["tab_id"] = "w1:t2"
+        newer["panes"] = [{"pane_id": f"w1:p2-{i}", "rect": pane["rect"]}
+                          for i, pane in enumerate(newer["panes"])]
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            action = argv[1:3]
+            if action == ["pane", "layout"]:
+                target = argv[argv.index("--pane") + 1]
+                return _herdr_json({"result": {"layout":
+                                               newer if target.startswith("w1:p2-") else reference}})
+            if action == ["tab", "list"]:
+                return _herdr_json({"result": {"tabs": [
+                    {"tab_id": "w1:t1", "workspace_id": "w1", "number": 1},
+                    {"tab_id": "w1:t2", "workspace_id": "w1", "number": 2}]}})
+            if action == ["pane", "list"]:
+                return _herdr_json({"result": {"panes": [
+                    {"pane_id": pane["pane_id"], "workspace_id": "w1", "tab_id": layout["tab_id"]}
+                    for layout in (reference, newer) for pane in layout["panes"]
+                ] + [{"pane_id": "w1:pNew", "workspace_id": "w1", "tab_id": "w1:t1"}]}})
+            if action == ["pane", "split"]:
+                return _herdr_json({"result": {"pane": {"pane_id": "w1:pNew", "focused": False}}})
+            if action == ["tab", "create"]:
+                return _herdr_json({"result": {"root_pane": {"pane_id": "w1:pTab", "focused": False}}})
+            if action == ["agent", "start"]:
+                return _herdr_json({"result": {"agent": {"agent": "codex", "name": "grid"}}})
+            if action == ["pane", "get"]:
+                return _herdr_json({"result": {"pane": {"pane_id": argv[3], "agent": "codex"}}})
+            if action == ["pane", "process-info"]:
+                return _herdr_json({"result": {"process_info": {
+                    "pane_id": argv[-1], "shell_pid": 7, "foreground_process_group_id": 7,
+                    "foreground_processes": [{"pid": 7}]}}})
+            if action == ["pane", "wait-output"]:
+                return _herdr_json({"result": {}})
+            raise AssertionError(argv)
+
+        with mock.patch.object(peer_steward.shutil, "which", return_value="herdr"), \
+             mock.patch.object(peer_steward.subprocess, "run", side_effect=run), \
+             mock.patch.object(peer_steward, "_pane_has_agent", return_value="pane-occupied"), \
+             mock.patch.object(peer_steward, "_pane_foreground_shell", return_value=None), \
+             mock.patch.object(peer_steward, "_wait_for_shell_prompt", return_value=True), \
+             mock.patch.object(peer_steward, "_ensure_pane_ingress", return_value=None), \
+             mock.patch.object(peer_steward, "_start_shell_identity", return_value=(101, "700")), \
+             mock.patch.object(peer_steward, "_wait_for_created_shell", return_value=(None, (101, "700"))), \
+             mock.patch.object(peer_steward, "_start_shell_snapshot", return_value="ready"), \
+             mock.patch.object(peer_steward, "_export_opencode_tui_scoped", return_value=None), \
+             mock.patch.object(peer_steward, "_process_session", return_value=None), \
+             mock.patch.object(peer_steward, "_read_screen", return_value=None), \
+             mock.patch.object(peer_steward, "_pane_is_managed", return_value=False), \
+             mock.patch("builtins.print") as printed:
+            rc = peer_steward.main(["start", "grid", "--kind", "codex",
+                                    "--beside", "w1:p0", "--cwd", str(self.tmp_root)])
+        self.assertEqual(rc, 0, printed.call_args_list)
+        splits = [a for a in calls if a[1:3] == ["pane", "split"]]
+        self.assertEqual(len(splits), 1, calls)
+        split = splits[0]
+        self.assertEqual(split[split.index("--pane") + 1], "w1:p0")
+        self.assertIn("--no-focus", split)
+        self.assertEqual(split[split.index("--direction") + 1], "right")
+        self.assertFalse(any(a[1:3] == ["tab", "create"] for a in calls))
+        self.assertFalse(any(a[1:3] == ["tab", "list"] for a in calls))
+        self.assertFalse(any(a[1:3] == ["pane", "layout"]
+                             and a[a.index("--pane") + 1].startswith("w1:p2-") for a in calls))
+        start = next(a for a in calls if a[1:3] == ["agent", "start"])
+        self.assertEqual(start[start.index("--pane") + 1], "w1:pNew")
 
 
 class ProjectStartTest(_TmpRootMixin, unittest.TestCase):
@@ -8794,7 +8925,7 @@ class BesideStartTest(_TmpRootMixin, unittest.TestCase):
         super().setUp()
         # These tests own startup/readiness; terminal_surface.test.py owns layout selection.
         placement = mock.patch.object(terminal_surface, "place",
-                                      side_effect=lambda surface, pane=None, workspace=None:
+                                      side_effect=lambda surface, pane=None, workspace=None, **kwargs:
                                       ("split", pane, "right"))
         placement.start()
         self.addCleanup(placement.stop)

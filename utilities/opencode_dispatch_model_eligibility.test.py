@@ -196,6 +196,25 @@ class OpencodeDispatchModelEligibilityTest(unittest.TestCase):
         self.assertEqual((fallback["model"], fallback["provider_fallback_reason"]),
                          ("opencode-go/fallback", "provider-model-unverified"))
 
+    def test_provider_fallback_provenance_reaches_the_launch_receipt(self):
+        # The receipt already names the final model and the synthesized
+        # model_source; these extra fields say which provider was replaced and
+        # why, and stay absent when the launch kept its first choice.
+        args = selection(profile="balanced-deep", role="deep maker")
+        with mock.patch.object(WRAPPER.opencode_runtime, "is_v2", return_value=False):
+            primary = WRAPPER.resolve_model_settings(args)
+        self.assertEqual(WRAPPER.provider_fallback_fields(primary), {})
+        moved = {"state": "unknown", "automatic_eligible": True,
+                 "reason": "no-observation", "fallback_from_reason": "provider-model-unverified"}
+        with mock.patch.object(WRAPPER.opencode_runtime, "is_v2", return_value=True), \
+             mock.patch.object(WRAPPER.opencode_runtime, "select_automatic_model",
+                               return_value=("opencode-go/fallback", "max", moved)):
+            fallback = WRAPPER.resolve_model_settings(args)
+        self.assertEqual(
+            WRAPPER.provider_fallback_fields(fallback),
+            {"provider_fallback_from": primary["model"],
+             "provider_fallback_reason": "provider-model-unverified"})
+
     def test_explicit_model_remains_exact_even_when_provider_cache_rejects_it(self):
         with mock.patch.object(WRAPPER.opencode_runtime, "is_v2", return_value=True), \
              mock.patch.object(WRAPPER.opencode_runtime, "select_automatic_model") as select:

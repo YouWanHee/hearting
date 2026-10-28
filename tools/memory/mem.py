@@ -2583,6 +2583,26 @@ def _seen_reset_main(argv):
     return 0
 
 
+def _apply_candidate_receipt_main():
+    """Hidden ``_apply-candidate-receipt``: commit a probe's deferred receipt.
+
+    The caller pipes the ``deferredCandidateReceipt`` object it held back until
+    its own output was rendered. A malformed or absent payload applies nothing.
+    """
+    try:
+        value = json.load(sys.stdin)
+    except (ValueError, OSError):
+        value = None
+    pending = value.get("deferredCandidateReceipt") if isinstance(value, dict) \
+        and "deferredCandidateReceipt" in value else value
+    try:
+        applied = apply_candidate_receipt(pending)
+    except Exception:
+        applied = False
+    print(json.dumps({"applied": bool(applied)}))
+    return 0
+
+
 def _hook_stdin_payload(timeout=CANDIDATE_HOOK_STDIN_SECONDS, limit=65536):
     """The hook JSON on stdin, read without ever waiting for it: {} when absent."""
     try:
@@ -2644,6 +2664,64 @@ def _candidate_body_text(body):
     return re.sub(r"[\x00-\x1f\x7f\s]+", " ", body or "").strip()[:CANDIDATE_BODY_MAX_CHARS]
 
 
+def _candidate_defer_requested():
+    """True when the caller renders this probe into its own final output.
+
+    Only a bridge that captures ``--hook`` output and emits later (the Codex
+    prompt lifecycle, the OpenCode plugin) sets ``MEM_CANDIDATE_DEFER_COMMIT``;
+    every standalone caller keeps today's immediate receipt. Deferring is never
+    silent: the pending receipt rides in the same JSON object as the context.
+    """
+    return str(os.environ.get("MEM_CANDIDATE_DEFER_COMMIT", "")).strip().lower() in {
+        "1", "on", "true", "yes"}
+
+
+def apply_candidate_receipt(pending):
+    """Commit a candidate probe's seen IDs, recall event and receipt.
+
+    The probe only *computed* them while ``MEM_CANDIDATE_DEFER_COMMIT`` was set;
+    its caller applies them after the text actually went out. Failure keeps them
+    unapplied (the next prompt shows the same candidates again).
+    """
+    if not isinstance(pending, dict):
+        return False
+    applied = False
+    seen = pending.get("seen")
+    if isinstance(seen, dict) and seen.get("name"):
+        name = str(seen.get("name") or "")
+        now = float(seen.get("now") or time.time())
+        added = [str(value) for value in seen.get("ids") or [] if value]
+        body_ids = seen.get("body_ids") if isinstance(seen.get("body_ids"), dict) else {}
+        try:
+            with _seen_lock(name) as held:
+                if held:
+                    state = _seen_load(name, now)
+                    for record_id in added:
+                        state["ids"].setdefault(record_id, now)
+                    state["saved_bytes"] = max(
+                        0, int(state.get("saved_bytes", 0)) + int(seen.get("saved_bytes", 0) or 0))
+                    for record_id, stamp in body_ids.items():
+                        state["body_ids"].setdefault(str(record_id), float(stamp or now))
+                    state["body_bytes"] = max(
+                        0, int(state.get("body_bytes", 0)) + int(seen.get("body_bytes", 0) or 0))
+                    applied = _seen_save(name, str(seen.get("digest") or ""),
+                                         str(seen.get("project") or ""), state, now) or applied
+        except (OSError, TypeError, ValueError):
+            pass
+    event = pending.get("event")
+    if isinstance(event, dict):
+        _append_recall_event(event)
+        applied = True
+    receipt = pending.get("receipt")
+    if pending.get("probe_ok") and isinstance(receipt, dict):
+        _write_recall_receipt(
+            receipt.get("session_id"), receipt.get("turn_id"),
+            str(receipt.get("project") or ""), list(receipt.get("result_ids") or []),
+            source=str(receipt.get("source") or "candidate-probe"))
+        applied = True
+    return applied
+
+
 def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
                max_bytes=CANDIDATE_MAX_UTF8_BYTES, runtime=None,
                session_id=None, turn_id=None, hook=False):
@@ -2660,6 +2738,7 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
     turn_id = turn_id if turn_id is not None else os.environ.get("MEM_TURN_ID", "")
     project = project_key(Path.cwd())
     query_hash = hashlib.sha256((query or "").encode()).hexdigest()
+    deferred = [] if (hook and _candidate_defer_requested()) else None
     limit = max(1, min(int(limit), CANDIDATE_MAX_RESULTS))
     max_bytes = max(1, min(int(max_bytes), CANDIDATE_MAX_UTF8_BYTES))
     rows = []
@@ -2714,12 +2793,17 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
     body_count = 0
     context = None
     seen_sid = _seen_session(session_id)
+    pending_seen = None
     if rows and seen_sid and _candidate_dedup_enabled():
         digest, name = _seen_names(seen_sid, project)
         with _seen_lock(name) as held:
             if held:
                 now = time.time()
                 state = _seen_load(name, now)
+                before_ids = set(state["ids"])
+                before_saved = int(state["saved_bytes"])
+                before_body = set(state["body_ids"])
+                before_body_bytes = int(state["body_bytes"])
                 fresh = [row for row in rows if row[0] not in state["ids"]]
                 suppressed = len(rows) - len(fresh)
                 base, shown = _render_candidate_block(fresh, max_bytes)
@@ -2744,11 +2828,22 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
                 shown_rows = fresh[:shown]
                 for row in shown_rows:
                     state["ids"][row[0]] = now
-                _seen_save(name, digest, project, state, now)
+                if deferred is None:
+                    _seen_save(name, digest, project, state, now)
+                else:
+                    pending_seen = {
+                        "name": name, "digest": digest, "project": project, "now": now,
+                        "ids": sorted(set(state["ids"]) - before_ids),
+                        "saved_bytes": int(state["saved_bytes"]) - before_saved,
+                        "body_ids": {record_id: stamp
+                                     for record_id, stamp in state["body_ids"].items()
+                                     if record_id not in before_body},
+                        "body_bytes": int(state["body_bytes"]) - before_body_bytes,
+                    }
     if context is None:
         context = _render_candidate_context(rows, max_bytes=max_bytes)
     result_ids = [row[0] for row in shown_rows]
-    _append_recall_event({
+    event = {
         "at": datetime.datetime.now().isoformat(timespec="seconds"),
         "event": "candidate-probe" if probe_ok else "candidate-probe-error",
         "runtime": str(runtime)[:32],
@@ -2758,18 +2853,38 @@ def candidates(query, *, limit=CANDIDATE_MAX_RESULTS,
         "result_count": len(result_ids), "result_ids": result_ids,
         "output_utf8_bytes": len(context.encode("utf-8")),
         "suppressed_count": suppressed, "body_count": body_count,
-    })
-    if probe_ok:
-        _write_recall_receipt(
-            session_id, turn_id, project, result_ids, source="candidate-probe"
-        )
+    }
+    pending = {
+        "seen": pending_seen,
+        "event": event,
+        "probe_ok": probe_ok,
+        "receipt": {"session_id": session_id, "turn_id": turn_id,
+                    "project": project, "result_ids": result_ids,
+                    "source": "candidate-probe"},
+    }
+    if deferred is not None:
+        deferred.append(pending)
     if hook:
         if context:
-            print(json.dumps({"hookSpecificOutput": {
+            output = {"hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit", "additionalContext": context,
-            }}, ensure_ascii=False))
+            }}
+            if deferred:
+                output["deferredCandidateReceipt"] = pending
+            print(json.dumps(output, ensure_ascii=False))
     elif context:
         print(context)
+    if deferred is None:
+        # A standalone helper is its own delivery boundary: the text printed
+        # above went out, so the event/receipt may now be written.
+        if probe_ok:
+            _write_recall_receipt(
+                session_id, turn_id, project, result_ids, source="candidate-probe"
+            )
+        _append_recall_event(event)
+    elif not context:
+        # Nothing was shown, so there is nothing a later render could lose.
+        apply_candidate_receipt(deferred.pop())
     return shown_rows
 
 
@@ -10819,6 +10934,8 @@ def main():
         sys.exit(_exchange_worker_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "_seen-reset":
         sys.exit(_seen_reset_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "_apply-candidate-receipt":
+        sys.exit(_apply_candidate_receipt_main())
     try:
         _cli_main()
     finally:

@@ -189,6 +189,9 @@ PY
   { test -f "$HOME/.config/opencode/plugins/hearting-guards/index.ts" \
     && test ! -L "$HOME/.config/opencode/plugins/hearting-guards/index.ts"; } \
     || fail "$mode lost OpenCode V2 guard package entrypoint (must be a regular file inside the package)"
+  { test -f "$HOME/.config/opencode/plugins/hearting-tui-identity/tui.ts" \
+    && test ! -L "$HOME/.config/opencode/plugins/hearting-tui-identity/tui.ts"; } \
+    || fail "$mode lost OpenCode V2 TUI identity entrypoint (must be a regular file inside the package)"
 
   python3 - "$HOME/.claude/settings.json" <<'PY'
 import json, sys

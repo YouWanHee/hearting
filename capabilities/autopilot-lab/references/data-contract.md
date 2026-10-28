@@ -40,13 +40,37 @@ write `run.json` or rewrite existing registry rows.
 Hearting's separate public run record is one atomically replaced file at
 `<artifact-root>/resource-runs/<run_id>.json`; `resource-runner observation
 --registry <resource-runs.json> --run-id <run_id> --json` reads the same record.
-It lists only detected `epochs-jsonl`, `epoch-json-files`, or `tfevents` paths and
+It lists only detected `epochs-jsonl`, `epoch-json-files`, or `tfevents` locations and
 metric keys, plus known run/route/host/output/progress/time fields; unknown values
-stay empty. Cairn reads those listed files incrementally from NAS and does not
+stay empty. Cairn reads those listed locations incrementally from NAS and does not
 discover runs by scanning folders. The record does not rewrite experiment `run.json`
 or replace the root `metrics.jsonl` contract. Existing run/config metadata may
 optionally declare an observation path/key filter and known decision metric, proxy,
 rules, time budget, baselines, or comparable group; none is required to start a run.
+
+The public record is bounded. It is replaced at no more than 16 KiB (16,384 bytes,
+trailing newline included) and a write is never skipped for size: an over-budget
+record is reduced in a fixed order and the trace stays in `compaction`
+(`budget_bytes`, `level`, `rows_omitted`, `metrics_omitted`). The authoritative
+per-row observation lives in the private observation state, whose read limit is
+separate; `compaction` only says what this file left out.
+
+- **Metric declarations** are one per (format, location), at most 16, the currently
+  observed ones first. `epoch-json-files` and `tfevents` declare a folder path
+  string plus `file_count` (`epoch-json-files`: the run folder; `tfevents`: the
+  folder holding the event files); per-file path lists are not written.
+  `epochs-jsonl` declares a file path string.
+  `compaction.metrics_omitted` counts declarations this file left out: ones pushed
+  out of the existing record (over the 16 limit or a vanished location) add once,
+  while the same input offering the same overflow again does not raise it. It is a
+  bounded count, not a list of omitted identities.
+- **Output folder state.** `output_dir_state` is `present | none | unknown`, with
+  `output_dir_reason` attached when it is not `present`. `present`: `output_dir` is
+  an existing folder. `none` (`node-declares-no-training-output`): the sealed
+  resource node declares no training output flow, e.g. `eval-run`. `unknown`:
+  `output_dir` is null, with reason `not-declared` (no output binding evidence)
+  or `declared-unresolved` (a bound path is not currently an existing folder).
+  Runs that never declared an output folder stay `unknown`; they are not filled in.
 
 An in-flight process kept alive across a policy change records an optional
 `existing_run_exception` object with a fixed shape:

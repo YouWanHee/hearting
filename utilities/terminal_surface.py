@@ -60,6 +60,7 @@ class Near:
     surface: object
     pane: Optional[str] = None
     workspace: Optional[str] = None
+    same_tab: bool = False
 
 
 def _run(argv):
@@ -424,11 +425,13 @@ def _tab_cell(surface, layout):
     return _empty_shell(surface, layout["panes"])
 
 
-def place(surface, pane=None, workspace=None):
+def place(surface, pane=None, workspace=None, *, same_tab=False):
     """``(action, target, direction)`` or None when the inventory cannot be trusted.
 
     Fill the reference tab, then the newest other tab of its workspace, then add a tab.
     With only a workspace, reuse an empty shell or add a tab; nobody's pane is split.
+    ``same_tab`` keeps placement inside the reference tab: when it has no grid cell or
+    empty shell left, split the reference pane itself instead of reading other tabs.
     """
     if pane is None:
         panes = surface.panes(workspace)
@@ -441,6 +444,12 @@ def place(surface, pane=None, workspace=None):
     found = _tab_cell(surface, layout)
     if found:
         return found
+    if same_tab:
+        rect = next((p.get("rect") for p in layout["panes"] if p.get("pane_id") == pane), None)
+        keys = ("x", "y", "width", "height")
+        if not isinstance(rect, dict) or any(type(rect.get(k)) is not int for k in keys):
+            return None
+        return "split", pane, "right" if rect["width"] >= 2 * rect["height"] else "down"
     workspace = layout["workspace_id"]
     tabs = surface.tabs(workspace)
     if tabs is None:
@@ -530,7 +539,7 @@ def open_pane(argv=None, *, launch=None, title=None, labels=None, group="session
     if not workspace:
         return PaneResult(surface.name, None, "none", ["pane-layout-unavailable"], command)
     with workspace_lock(surface, workspace):
-        found = place(surface, near.pane, near.workspace)
+        found = place(surface, near.pane, near.workspace, same_tab=near.same_tab)
         if found is None:
             return PaneResult(surface.name, None, "none", ["pane-layout-unavailable"], command)
         action, target, direction = found

@@ -282,8 +282,8 @@ class LaunchTest(unittest.TestCase):
         spec.loader.exec_module(hook)
         payload = json.dumps({"session_id": THREAD, "turn_id": TURN, "prompt": "hi",
                               "hook_event_name": "UserPromptSubmit"})
-        quiet = dict(run_preflight=mock.Mock(return_value=""), card_context=mock.Mock(return_value=""),
-                     candidate_context=mock.Mock(return_value=""), launch_trigger=mock.Mock(),
+        quiet = dict(run_preflight=mock.Mock(return_value=""), card_context=mock.Mock(return_value=("", None)),
+                     candidate_context=mock.Mock(return_value=("", None)), launch_trigger=mock.Mock(),
                      token_budget_context=mock.Mock(return_value=""), emit_context=mock.Mock(),
                      sd111_first_prompt_sweep=mock.Mock(), retry_pending_peer=mock.Mock(),
                      native_queue_prompt_receipts=mock.Mock(return_value=([], [])))

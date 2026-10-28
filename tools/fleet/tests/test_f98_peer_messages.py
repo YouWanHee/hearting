@@ -62,6 +62,53 @@ def _rec(from_sid, to_sid=None, to_name=None, kind="steer", summary="hi",
 
 
 class CollectorTest(unittest.TestCase):
+    def test_health_success_for_missing_ledger_and_default_shape_stays_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = peer_messages.collect(state_roots=[tmp])
+            result, health = peer_messages.collect(state_roots=[tmp], include_health=True)
+        self.assertEqual(result, legacy)
+        self.assertEqual(set(result), {"records", "by_session"})
+        self.assertEqual(health.state, "success")
+        self.assertEqual(health.diagnostics, ())
+
+    def test_health_failed_when_all_ledger_root_scans_fail(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(peer_messages.os, "scandir", side_effect=PermissionError):
+            result, health = peer_messages.collect(state_roots=[tmp], include_health=True)
+        self.assertEqual(result, {"records": [], "by_session": {}})
+        self.assertEqual(health.state, "failed")
+        self.assertTrue(health.diagnostics)
+
+    def test_partial_ledger_read_reports_unknown_and_keeps_successful_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_ledger(tmp, "sid-a", [_rec("sid-a", to_sid="sid-b")])
+            broken = os.path.join(tmp, "peer-messages", "2026-09", "sid-b.jsonl")
+            Path(broken).write_text(json.dumps(_rec("sid-b", to_sid="sid-a")) + "\n",
+                                    encoding="utf-8")
+            real_open = open
+
+            def fail_one_reader(path, *args, **kwargs):
+                if os.fspath(path) == broken:
+                    raise PermissionError("fixture read failure")
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", new=fail_one_reader):
+                result, health = peer_messages.collect(state_roots=[tmp], include_health=True)
+        self.assertIn(("claude", "sid-b"), result["by_session"])
+        self.assertEqual(health.state, "unknown")
+        self.assertTrue(any(item["operation"] == "read_peer_ledger"
+                            for item in health.diagnostics))
+
+    def test_health_failed_when_root_discovery_fails_without_scan_roots(self):
+        def fail_discovery(diagnostics=None):
+            peer_messages._note_diagnostic(diagnostics, "resolve_state_roots", "PermissionError")
+            return ()
+
+        with mock.patch.object(peer_messages, "_state_roots", side_effect=fail_discovery):
+            result, health = peer_messages.collect(include_health=True)
+        self.assertEqual(result, {"records": [], "by_session": {}})
+        self.assertEqual(health.state, "failed")
+
     def test_persisted_retire_identity_reaches_session_display_without_body(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = peer_steward.peer_obligations.ObligationStore(tmp)
@@ -174,9 +221,10 @@ class CollectorTest(unittest.TestCase):
             path = _write_ledger(tmp, "sid-a", [_rec("sid-a", to_sid="sid-b")])
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write("{not json\n")
-            result = peer_messages.collect(state_roots=[tmp])
+            result, health = peer_messages.collect(state_roots=[tmp], include_health=True)
         self.assertEqual(peer_messages.collect.last_malformed, 1)
         self.assertEqual(result["by_session"][("claude", "sid-b")]["recv_1h"], 1)
+        self.assertEqual(health.state, "unknown")
 
     def test_records_older_than_24h_excluded(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 from pathlib import Path
 import sys
@@ -265,9 +266,9 @@ class NativeContextTests(unittest.TestCase):
         claude_text = (ROOT / "adapters/claude/config/models.conf").read_text()
         (claude_config / "models.conf").write_text(claude_text.replace(
             "CFG_MODEL_CONTEXT_WINDOW=800000", "CFG_MODEL_CONTEXT_WINDOW=760000"))
-        (codex_config / "models.conf").write_text(
-            (ROOT / "adapters/codex/config/models.conf").read_text().replace(
-                "CFG_MODEL_CONTEXT_WINDOW=800000", "CFG_MODEL_CONTEXT_WINDOW=760000"))
+        (codex_config / "models.conf").write_text(re.sub(
+            r"(?m)^CFG_MODEL_CONTEXT_WINDOW=\d+$", "CFG_MODEL_CONTEXT_WINDOW=760000",
+            (ROOT / "adapters/codex/config/models.conf").read_text(), count=1))
         env = {**os.environ, "HOME": str(self.home), "ZDOTDIR": str(self.home),
                "CLAUDE_CONFIG_DIR": str(claude_home), "CODEX_HOME": str(codex_home),
                "HEARTING_FIXTURE_ROOT": str(self.home)}

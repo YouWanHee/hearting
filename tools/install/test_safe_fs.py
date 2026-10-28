@@ -166,6 +166,22 @@ class SafeFsTest(unittest.TestCase):
             self.assertNotEqual(safe_fs.capture_state(first), first_post)
             self.assertEqual(second.read_bytes(), b"ours-second")
 
+    def test_lock_root_resolves_symlinked_system_temp(self) -> None:
+        # macOS ships /tmp as a symlink to /private/tmp; the lock parent must be
+        # the resolved real directory, not rejected as an unsafe symlink parent.
+        real_tmp = self.root / "real-tmp"
+        real_tmp.mkdir()
+        link_tmp = self.root / "link-tmp"
+        link_tmp.symlink_to(real_tmp, target_is_directory=True)
+        self.assertTrue(link_tmp.is_symlink())
+        with mock.patch.object(safe_fs.os, "name", "posix"), mock.patch.object(
+            safe_fs, "_POSIX_TEMP_ROOT", str(link_tmp)
+        ):
+            root = safe_fs._lock_root()
+        self.assertEqual(root.parent, real_tmp)
+        self.assertTrue(root.is_dir())
+        self.assertFalse(root.is_symlink())
+
     @unittest.skipIf(safe_fs.fcntl is None, "POSIX flock required")
     def test_replaced_lock_path_is_rejected(self) -> None:
         target = self.root / "replaced-lock-target"

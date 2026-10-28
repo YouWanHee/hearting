@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import socket
 import stat
+import sys
 import threading
 import time
 import unicodedata
@@ -45,6 +46,8 @@ class ExplorerRuntime:
         self._cached_continuation = None
         self._has_complete = False
         self._persisted_generations = set()
+        self._pending_generations = set()
+        self._persist_lock = threading.Lock()
         self._writer_threads = []
 
     @property
@@ -300,8 +303,7 @@ class ExplorerRuntime:
             result[name[:100]] = record
         return result
 
-    def _cache_envelope(self, vm, readiness, detail_continuation=None):
-        from .view_model import persistable_view_model
+    def _cache_token(self, vm, readiness):
         if self._cache_context is None:
             self.configure_persistence()
         if not isinstance(readiness, Mapping) or not self.publication_ready(readiness):
@@ -318,6 +320,14 @@ class ExplorerRuntime:
         if not isinstance(identity, (str, int, float)) or isinstance(identity, bool):
             identity = generation
         identity = hashlib.sha256(str(identity).encode("utf-8", "replace")).hexdigest()
+        return generation, identity, float(stamp)
+
+    def _cache_envelope(self, vm, readiness, detail_continuation=None):
+        from .view_model import persistable_view_model
+        token = self._cache_token(vm, readiness)
+        if token is None:
+            return None
+        generation, identity, stamp = token
         clean_model = persistable_view_model(vm)
         clean_continuation = None
         if detail_continuation is not None and self._valid_continuation(detail_continuation):
@@ -329,7 +339,7 @@ class ExplorerRuntime:
         envelope = {
             "schema_version": _CACHE_SCHEMA,
             **self._cache_context,
-            "observed_at": float(stamp),
+            "observed_at": stamp,
             "generation": generation,
             "generation_identity": identity,
             "source_freshness": self._source_freshness(readiness),
@@ -342,18 +352,41 @@ class ExplorerRuntime:
 
     def persist_complete_async(self, vm, readiness, detail_continuation=None):
         """Freeze the safe payload now and write it away from the curses/UI thread."""
+        token = self._cache_token(vm, readiness)
+        if token is None:
+            return None
+        with self._persist_lock:
+            if token in self._persisted_generations or token in self._pending_generations:
+                return None
+            self._pending_generations.add(token)
         envelope = self._cache_envelope(vm, readiness, detail_continuation)
         if envelope is None:
+            with self._persist_lock:
+                self._pending_generations.discard(token)
             return None
-        token = (envelope["generation"], envelope["generation_identity"], envelope["observed_at"])
-        if token in self._persisted_generations:
-            return None
-        self._persisted_generations.add(token)
-        thread = threading.Thread(target=self._write_cache, args=(envelope,),
+        thread = threading.Thread(target=self._write_generation, args=(envelope, token),
                                   name="fleet2-observation-save", daemon=True)
         self._writer_threads.append(thread)
-        thread.start()
+        try:
+            thread.start()
+        except (RuntimeError, OSError):
+            with self._persist_lock:
+                self._pending_generations.discard(token)
+            return None
         return thread
+
+    def _write_generation(self, envelope, token):
+        try:
+            written = self._write_cache(envelope)
+            if not written:
+                existing = self._read_cache()
+                written = existing is not None and existing.get("observed_at", 0) >= token[2]
+            if written:
+                with self._persist_lock:
+                    self._persisted_generations.add(token)
+        finally:
+            with self._persist_lock:
+                self._pending_generations.discard(token)
 
     def wait_for_writes(self, timeout=None):
         """Test seam: wait for the bounded cache writers without making UI shutdown wait."""
@@ -536,8 +569,13 @@ class ExplorerRuntime:
                 "tags_by_key": tags_by_key,
                 "tag_cycle": ["session:" + tag for tag in ordered_tags],
             }
-            model = replace(model, repos=tuple(reconciled["repos"]),
-                            sessions=tuple(ordered_sessions), ordering=ordering)
+            from .view_model import freeze
+            repos_value = tuple(reconciled["repos"])
+            sessions_value = tuple(ordered_sessions)
+            if (tuple(model.repos) != repos_value or tuple(model.sessions) != sessions_value
+                    or model.ordering != freeze(ordering)):
+                model = replace(model, repos=repos_value,
+                                sessions=sessions_value, ordering=ordering)
         except (AttributeError, TypeError, ValueError):
             # Preserve a valid frame if a third-party snapshot violates an optional
             # ordering identity shape; malformed order files are handled by load_order.
@@ -637,17 +675,211 @@ class ExplorerRuntime:
         if self.publication_ready(readiness):
             self._has_complete = True
 
+    @staticmethod
+    def _model_settings_module():
+        """Load the install model utility in the same module layout as its CLI."""
+        import importlib
+
+        install_dir = Path(__file__).resolve().parents[3] / "tools" / "install"
+        original_path = list(sys.path)
+        try:
+            if str(install_dir) not in sys.path:
+                sys.path.insert(0, str(install_dir))
+            return importlib.import_module("model_settings")
+        finally:
+            sys.path[:] = original_path
+
+    def _apply_model_action(self, effect, vm):
+        """Validate one MODELS hit and pass its structured values to the model utility."""
+        from collections.abc import Mapping
+
+        def failed(message):
+            return {"model_action": True, "status": "failed",
+                    "message": str(message)[:240], "error": str(message)[:240],
+                    "models": None}
+
+        if os.environ.get("FLEET_DEMO"):
+            return {"model_action": True, "status": "read-only",
+                    "message": "MODELS is read-only in demo", "models": None}
+        try:
+            models = getattr(vm, "models", None)
+            if not isinstance(models, Mapping):
+                raise ValueError("model configuration is unavailable")
+            if not isinstance(effect, (tuple, list)) or not effect or effect[0] != "models.apply":
+                raise ValueError("invalid model action")
+            if len(effect) == 5:
+                _kind, harness, target, amount, dry_run = effect
+                if target != "context-window":
+                    raise ValueError("unsupported model setting")
+                units = models.get("token_units")
+                allowed_amounts = set(units.values()) if isinstance(units, Mapping) else set()
+                if (not isinstance(amount, int) or isinstance(amount, bool)
+                        or amount not in allowed_amounts):
+                    raise ValueError("context window is not a displayed choice")
+                target_name, requested = "context-window", str(amount)
+            elif len(effect) == 7:
+                _kind, harness, target, profile, model, effort, dry_run = effect
+                profiles = models.get("profiles", ())
+                if (target != "profile" or not isinstance(profile, str)
+                        or not isinstance(profiles, (list, tuple, set, frozenset))
+                        or profile not in profiles):
+                    raise ValueError("profile is not a displayed choice")
+                choices = models.get("model_choices", {})
+                current_profiles = models.get("profile_map", {})
+                current = (current_profiles.get(harness, {}).get(profile)
+                           if isinstance(current_profiles, Mapping)
+                           and isinstance(current_profiles.get(harness), Mapping) else None)
+                current_model = (current[0] if isinstance(current, (list, tuple)) and current else None)
+                harness_choices = choices.get(harness) if isinstance(choices, Mapping) else None
+                if (not isinstance(harness_choices, (list, tuple, set, frozenset))
+                        or not isinstance(model, str)
+                        or (model not in harness_choices and model != current_model)):
+                    raise ValueError("model is not a displayed or current choice")
+                efforts = models.get("efforts", ())
+                if (not isinstance(effort, str)
+                        or (not isinstance(efforts, (list, tuple, set, frozenset))
+                            or effort not in efforts)
+                        and not (harness == "opencode" and effort == "runtime-default")):
+                    raise ValueError("effort is not a supported choice")
+                target_name = "profile/" + profile
+                requested = model + "@" + effort
+            else:
+                raise ValueError("invalid model action shape")
+            if harness not in ("claude", "codex", "opencode") or not isinstance(dry_run, bool):
+                raise ValueError("invalid model action target")
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            return failed(exc)
+
+        from . import focus
+        model_settings = None
+        try:
+            model_settings = self._model_settings_module()
+            model_config = focus.utility("model_config")
+            install_dir = str(Path(__file__).resolve().parents[3] / "tools" / "install")
+            original_path = list(sys.path)
+            try:
+                if install_dir not in sys.path:
+                    sys.path.insert(0, install_dir)
+                result = model_settings.set_model(
+                    harness, target_name, requested,
+                    runtime=model_config.runtime_home(harness),
+                    source_root=Path(__file__).resolve().parents[3],
+                    dry_run=dry_run)
+            finally:
+                sys.path[:] = original_path
+            if not isinstance(result, Mapping):
+                raise RuntimeError("model utility returned no structured result")
+        except Exception as exc:
+            status = ("invalid-arguments" if model_settings is not None
+                      and isinstance(exc, model_settings.ModelSettingsUsageError) else "failed")
+            result = {"status": status, "error": str(exc),
+                      "lines": [f"model set: {exc}"]}
+        try:
+            refreshed = focus.read_model_config()
+        except Exception as exc:
+            refreshed = None
+            refresh_error = str(exc)
+        else:
+            refresh_error = None
+        if not isinstance(result, Mapping):
+            result = {"status": "failed", "error": "model utility returned no result",
+                      "lines": ["model set: failed"]}
+        lines = result.get("lines", ())
+        message = next((str(line) for line in lines if line), None)
+        if not message:
+            message = "model set: " + str(result.get("status", "finished"))
+        if refresh_error:
+            message += " · refresh failed: " + refresh_error
+        return {"model_action": True, "status": result.get("status", "failed"),
+                "message": message[:240], "error": result.get("error"),
+                "models": refreshed}
+
+    def _apply_allocation_action(self, effect, vm):
+        """Validate one DISPATCH ALLOCATION or SUPERVISION hit and pass its typed values to the shared setter."""
+        from . import focus
+
+        payload = effect[1] if isinstance(effect, (tuple, list)) and len(effect) > 1 else ()
+        steward = bool(payload) and isinstance(payload, (tuple, list)) and all(
+            isinstance(item, (tuple, list)) and str(item[0]).startswith("steward.") for item in payload)
+        section = "steward" if steward else "allocation"
+
+        def failed(message, status="failed"):
+            text = f"{section}: {status}: {message}"[:240]
+            return {"model_action": True, "status": status, "message": text, "error": str(message)[:240],
+                    "models": None}
+
+        if os.environ.get("FLEET_DEMO"):
+            return {"model_action": True, "status": "read-only",
+                    "message": f"{section}: read-only in demo", "models": None}
+        kinds = {"strategy": str, "window": int, "usage_gate_used_percent": int,
+                 "usage_headroom_exponent": int, "depth_affinity_weight": float}
+        updates = {}
+        try:
+            _kind, payload, dry_run = effect
+            if not isinstance(dry_run, bool) or not isinstance(payload, (tuple, list)) or not payload:
+                raise ValueError("invalid allocation action")
+            for name, text in payload:
+                parent, _dot, child = str(name).partition(".")
+                if steward:
+                    if child not in ("check_interval_seconds", "max_supervisors_per_repo"):
+                        raise ValueError(f"steward.{child} is not editable here")
+                    updates[child] = int(text)
+                elif name in kinds:
+                    updates[name] = kinds[name](text)
+                elif parent == "depth_affinity" and child in ("owner", "worker"):
+                    updates[name] = None if text == "none" else str(text)
+                elif parent == "harness_weights" and child in ("claude", "codex", "opencode"):
+                    updates[name] = float(text)
+                else:
+                    raise ValueError(f"allocation.{name} is not editable here")
+        except (TypeError, ValueError) as exc:
+            return failed(exc, "invalid-arguments")
+        install_dir = str(Path(__file__).resolve().parents[3] / "tools" / "install")
+        original_path = list(sys.path)
+        settings = None
+        try:
+            import importlib
+            if install_dir not in sys.path:
+                sys.path.insert(0, install_dir)
+            settings = importlib.import_module("dispatch_settings")
+            result = settings.set_allocation(updates, dry_run=dry_run, section=section)
+        except Exception as exc:
+            usage = settings is not None and isinstance(exc, settings.DispatchSettingsUsageError)
+            return failed(exc, "invalid-arguments" if usage else "failed")
+        finally:
+            sys.path[:] = original_path
+        try:
+            refreshed = focus.read_model_config()
+        except Exception as exc:
+            refreshed, note = None, " · refresh failed: " + str(exc)
+        else:
+            note = ""
+        lines = [str(line) for line in result.get("lines", ()) if line]
+        message = (lines[0] if lines else f"{section}: " + str(result.get("status", "finished")))
+        if result.get("warnings"):
+            message += " · warning: " + "; ".join(result["warnings"])
+        return {"model_action": True, "status": result.get("status", "failed"),
+                "message": (message + note)[:240], "error": None, "models": refreshed}
+
     def apply_effects(self, effects, vm):
-        """Apply persisted ordering effects after the pure reducer accepts a drop."""
+        """Apply accepted ordering and validated MODELS effects."""
         from . import order
         ordering = getattr(vm, "ordering", None)
-        if not isinstance(ordering, Mapping):
-            return None
-        saved = {"repos": list(ordering.get("repo_keys", ())),
+        saved = ({"repos": list(ordering.get("repo_keys", ())),
                  "sessions": {str(key): list(value) for key, value in
                               ordering.get("session_keys", {}).items()}}
+                 if isinstance(ordering, Mapping) else None)
+        result = None
         for effect in effects or ():
+            if effect and effect[0] == "models.apply":
+                result = self._apply_model_action(effect, vm)
+                continue
+            if effect and effect[0] == "alloc.apply":
+                result = self._apply_allocation_action(effect, vm)
+                continue
             if not effect or effect[0] != "reorder" or len(effect) < 5:
+                continue
+            if saved is None:
                 continue
             _name, kind, repo, source, target = effect[:5]
             if kind == "repo":
@@ -658,7 +890,49 @@ class ExplorerRuntime:
             # A drag writes the authoritative order. Reload on the next compose so
             # the cached view follows the same disk-backed path as external changes.
             self._order_signature = object()
-        return None
+        return result
+
+    @staticmethod
+    def execute_question_action(effect):
+        """Call the shared selected-request API for one typed UI action."""
+        if not isinstance(effect, (tuple, list)) or not effect:
+            return {"state": "unknown", "reason": "invalid selected request action"}
+        kind = effect[0]
+        names = {"questions.read": "read_selected_request",
+                 "questions.draft": "write_selected_draft",
+                 "questions.submit": "submit_selected_response"}
+        method_name = names.get(kind)
+        if method_name is None:
+            return {"state": "unknown", "reason": "unsupported selected request action"}
+        if len(effect) < 2 or not isinstance(effect[1], Mapping):
+            return {"state": "unknown", "reason": "selected request binding is unavailable"}
+        # Read starts from a body-free row locator. Draft and submit carry the
+        # selected private envelope, including native transport incarnation/state.
+        ref = dict(effect[1])
+        if not all(ref.get(key) for key in ("id", "harness", "session_id")):
+            return {"state": "unknown", "reason": "selected request has no exact session binding"}
+        try:
+            import importlib
+            module = importlib.import_module("human_wait_state")
+            method = getattr(module, method_name, None)
+            if not callable(method):
+                return {"state": "unknown",
+                        "reason": "selected request backend is not available; use the native prompt"}
+            if kind == "questions.read":
+                result = method(ref)
+            elif kind == "questions.draft":
+                if len(effect) != 3 or not isinstance(effect[2], str):
+                    return {"state": "unknown", "reason": "invalid answer draft"}
+                result = method(ref, effect[2])
+            else:
+                if len(effect) != 3 or not isinstance(effect[2], Mapping):
+                    return {"state": "unknown", "reason": "invalid selected response"}
+                result = method(ref, dict(effect[2]), action_id=None)
+        except Exception:
+            return {"state": "unknown", "reason": "selected request backend failed; use the native prompt"}
+        if not isinstance(result, Mapping):
+            return {"state": "unknown", "reason": "selected request backend returned no status"}
+        return dict(result)
 
     def loading_frame(self, cols, rows):
         """Return a small terminal-safe loading frame while a source is pending."""

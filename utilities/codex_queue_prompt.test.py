@@ -22,6 +22,82 @@ sys.modules[spec.name] = hook
 spec.loader.exec_module(hook)
 
 class PromptReceiptTest(unittest.TestCase):
+    def test_real_ack_deletes_only_the_exact_shared_builder_singleton(self):
+        import codex_queue_delivery as queue
+        import codex_queue_dispatch
+        from dispatch_completion_join import completion_followup_text
+
+        class FakeSession:
+            def __init__(self, _path, *, timeout, deadline=None):
+                self.timeout = timeout
+                self.deadline = deadline
+                self.methods = []
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return None
+            def close(self):
+                return None
+            def request(self, _path, method, params, *, timeout=None, deadline=None):
+                self.methods.append((method, params, timeout))
+                if method == "thread/queue/list":
+                    return {"data": queue_items}
+                if method == "thread/queue/delete":
+                    queue_items[:] = [queued for queued in queue_items
+                                      if queued.get("id") != params["queuedSubmissionId"]]
+                    return {"deleted": True}
+                raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs.log"
+            jobs.touch()
+            session_id = "native-parent"
+            did = "delivery-real-incident"
+            receipt = {
+                "schema_version": 2, "state": "ready", "job_registry": str(jobs),
+                "parent_attempt_id": "parent-session-native", "delivery_classification": "success",
+                "children": [{"attempt_id": "att-exact", "status": "done", "readiness": "ready",
+                              "reason": "registry-closed", "required_action": "advance-completed",
+                              "harness": "codex", "delivery_classification": "success"}],
+            }
+            pending.create(root, recipient_kind="codex-native-queue", recipient_key=session_id,
+                delivery_id=did, session_generation="", session_generation_supported="0",
+                attempt_ids=["att-exact"], parent_attempt_id="parent-session-native",
+                route_id="rt-test", route_node="execute", receipt=receipt,
+                receipt_digest=pending._canonical_receipt_digest(receipt), row_revisions={"att-exact": "rev"})
+            pending.claim(root, session_id, did, claim_owner="fixture", lease_seconds=60)
+            seed = pending.read(root, session_id, did)
+            followup = completion_followup_text(
+                receipt, jobs=str(jobs),
+                surface=str(ROOT / "adapters" / "codex" / "bin" / "preflight.sh"))
+            body = queue.native_completion_body(session_id, [seed], receipt, followup)
+            client_id = queue.native_client_message_id(session_id, [did])
+            item = {"id": "queued-exact", "clientUserMessageId": client_id,
+                    "input": [{"type": "text", "text": body}]}
+            queue_items = [item,
+                           {"id": "user-item", "clientUserMessageId": "user-created",
+                            "input": [{"type": "text", "text": "keep this"}]},
+                           {"id": "other-hearting", "clientUserMessageId": "other-delivery",
+                            "input": [{"type": "text", "text": "other thread's item"}]}]
+            fake_session = FakeSession(Path("/tmp/fake-queue.sock"), timeout=1.0)
+            with mock.patch.object(codex_queue_dispatch, "resolve_queue_socket",
+                                   return_value=Path("/tmp/fake-queue.sock")), \
+                 mock.patch.object(queue, "DeliverySession", return_value=fake_session):
+                self.assertEqual(sweep.ack_delivered(root, session_id, [{**seed, sweep.STORAGE_KEY: session_id}],
+                                                     acked_by="codex-native-prompt:native-parent"), 1)
+            self.assertEqual([row[0] for row in fake_session.methods], [
+                "thread/queue/list", "thread/queue/delete",
+            ])
+            self.assertEqual(fake_session.methods[-1][1], {
+                "threadId": session_id, "queuedSubmissionId": "queued-exact",
+            })
+            self.assertEqual(pending.read(root, session_id, did)["state"], "acked")
+            # The delayed drain sees only unrelated/user queue entries; cleanup
+            # is tied to the exact ACKed body and submission ID.
+            self.assertEqual([queued["id"] for queued in queue_items],
+                             ["user-item", "other-hearting"])
+
     def test_runtime_completion_trailer_is_received_as_runtime_by_the_codex_hook(self):
         peer_spec = importlib.util.spec_from_file_location(
             "codex_runtime_prompt_peer", ROOT / "utilities/peer-message.py")
@@ -121,7 +197,7 @@ class PromptReceiptTest(unittest.TestCase):
              mock.patch.object(hook, "interaction_session_id", return_value=sid), \
              mock.patch.object(hook, "peer_notice"), mock.patch.object(hook, "retry_pending_peer"), \
              mock.patch.object(hook, "launch_trigger"), mock.patch.object(hook, "sd111_first_prompt_sweep"), \
-             mock.patch.object(hook, "card_context", return_value=""), \
+             mock.patch.object(hook, "card_context", return_value=("", None)), \
              mock.patch.object(hook, "native_queue_prompt_receipts", return_value=(batches, ["receipt"])), \
              mock.patch.object(hook, "native_receiving_turn", return_value={
                  "thread_id": sid, "turn_id": "turn-exact", "status": "inProgress"}) as bind, \
@@ -129,7 +205,7 @@ class PromptReceiptTest(unittest.TestCase):
                         side_effect=lambda *a, **kw: events.append("retain") or {
                             (str(root), record["delivery_id"])
                         }) as retain, \
-             mock.patch.object(hook, "candidate_context", return_value=""), \
+             mock.patch.object(hook, "candidate_context", return_value=("", None)), \
              mock.patch.object(hook, "run_preflight", return_value=""), \
              mock.patch.object(hook, "token_budget_context", return_value=""), \
              mock.patch.object(hook, "emit_context", side_effect=lambda *a, **kw: events.append("emit")), \
@@ -140,6 +216,64 @@ class PromptReceiptTest(unittest.TestCase):
         self.assertEqual(retain.call_args.kwargs["request_context"], request_prompt)
         self.assertEqual(ack.call_args.args[2], [record])
         bind.assert_called_once()
+
+    def test_receipts_commit_only_after_the_final_context_render(self):
+        import session_tidy
+        sys.path.insert(0, str(ROOT / "tools" / "memory"))
+        import mem
+        import types
+        sid = "native-parent"
+        card_pending = [{"kind": "card-consumed", "path": "/tmp/card",
+                         "generation": 1, "receipt": "codex:sid:1"}]
+        candidate_pending = {
+            "seen": None, "event": {"event": "candidate-probe"},
+            "probe_ok": True,
+            "receipt": {"session_id": sid, "turn_id": "", "project": "/tmp",
+                        "result_ids": [], "source": "candidate-probe"},
+        }
+        context_alert = types.ModuleType("context_alert")
+        context_alert.codex_notice = lambda _payload: ""
+        fleet = types.ModuleType("fleet")
+        fleet.interaction = types.SimpleNamespace(clear_wait=lambda *a, **kw: None)
+        projection = types.ModuleType("herdr_session_projection")
+        projection.project = lambda *a, **kw: None
+
+        def run(emit):
+            events = []
+            with mock.patch.dict(sys.modules, {"context_alert": context_alert, "fleet": fleet,
+                                               "herdr_session_projection": projection}), \
+                 mock.patch.object(hook, "is_worker_session", return_value=False), \
+                 mock.patch.object(hook, "load_payload",
+                                   return_value={"session_id": sid, "prompt": "hi"}), \
+                 mock.patch.object(hook, "interaction_session_id", return_value=sid), \
+                 mock.patch.object(hook, "peer_notice"), \
+                 mock.patch.object(hook, "retry_pending_peer"), \
+                 mock.patch.object(hook, "launch_trigger"), \
+                 mock.patch.object(hook, "sd111_first_prompt_sweep"), \
+                 mock.patch.object(hook, "card_context", return_value=("card", card_pending)), \
+                 mock.patch.object(hook, "native_queue_prompt_receipts", return_value=([], [])), \
+                 mock.patch.object(hook, "candidate_context",
+                                   return_value=("candidate", candidate_pending)), \
+                 mock.patch.object(hook, "run_preflight", return_value=""), \
+                 mock.patch.object(hook, "token_budget_context", return_value=""), \
+                 mock.patch.object(hook, "emit_context", side_effect=emit), \
+                 mock.patch.object(session_tidy, "apply_deferred",
+                                   side_effect=lambda *a: events.append("card")) as card_apply, \
+                 mock.patch.object(mem, "apply_candidate_receipt",
+                                   side_effect=lambda *a: events.append("candidate")) as mem_apply:
+                hook.main()
+            return events, card_apply, mem_apply
+
+        events, card_apply, mem_apply = run(lambda *a, **kw: None)
+        self.assertEqual(events, ["card", "candidate"])
+        self.assertEqual(card_apply.call_args.args[0], card_pending)
+        self.assertEqual(mem_apply.call_args.args[0], candidate_pending)
+
+        def broken(*_args, **_kwargs):
+            raise BrokenPipeError("render failed")
+
+        with self.assertRaises(BrokenPipeError):
+            run(broken)
 
     def test_hook_withholds_completion_ack_when_native_turn_binding_is_unknown(self):
         import sys
@@ -161,11 +295,11 @@ class PromptReceiptTest(unittest.TestCase):
              mock.patch.object(hook, "interaction_session_id", return_value=sid), \
              mock.patch.object(hook, "peer_notice"), mock.patch.object(hook, "retry_pending_peer"), \
              mock.patch.object(hook, "launch_trigger"), mock.patch.object(hook, "sd111_first_prompt_sweep"), \
-             mock.patch.object(hook, "card_context", return_value=""), \
+             mock.patch.object(hook, "card_context", return_value=("", None)), \
              mock.patch.object(hook, "native_queue_prompt_receipts", return_value=(batches, ["receipt"])), \
              mock.patch.object(hook, "native_receiving_turn", return_value=None), \
              mock.patch("dispatch_session_sweep.retain_receiving_turn", return_value=set()), \
-             mock.patch.object(hook, "candidate_context", return_value=""), \
+             mock.patch.object(hook, "candidate_context", return_value=("", None)), \
              mock.patch.object(hook, "run_preflight", return_value=""), \
              mock.patch.object(hook, "token_budget_context", return_value=""), \
              mock.patch.object(hook, "emit_context"), \
@@ -203,9 +337,9 @@ class PromptReceiptTest(unittest.TestCase):
              mock.patch.object(hook, "retry_pending_peer"), \
              mock.patch.object(hook, "launch_trigger"), \
              mock.patch.object(hook, "sd111_first_prompt_sweep"), \
-             mock.patch.object(hook, "card_context", return_value=""), \
+             mock.patch.object(hook, "card_context", return_value=("", None)), \
              mock.patch.object(hook, "native_queue_prompt_receipts", return_value=([], [])), \
-             mock.patch.object(hook, "candidate_context", return_value=""), \
+             mock.patch.object(hook, "candidate_context", return_value=("", None)), \
              mock.patch.object(hook, "run_preflight", side_effect=no_context), \
              mock.patch.object(hook, "token_budget_context", return_value=""), \
              mock.patch.object(hook, "emit_context"), \

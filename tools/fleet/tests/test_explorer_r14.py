@@ -29,6 +29,49 @@ class R14Renderer(unittest.TestCase):
         self.assertEqual(rows[2].strip(), "")
         self.assertIn("┴", rows[-4])
 
+    def test_resources_label_keeps_the_internal_compute_navigation_key(self):
+        frame = draw(self.vm, NavState(view="COMPUTE"), cols=140, rows=45)
+        text = "\n".join(frame.text_rows())
+        self.assertIn("RESOURCES", text)
+        self.assertNotIn("COMPUTE", text)
+        self.assertTrue(any(hit.action == ("tab", "COMPUTE") for hit in frame.hits))
+        self.assertTrue(any(hit.action == ("root", "COMPUTE") for hit in frame.hits))
+
+    def test_sol_astra_and_luna_get_distinct_family_colors_in_every_viewer(self):
+        from tools.fleet import render
+        from tools.fleet.explorer import live, models
+        from tools.fleet.explorer.grid import CellGrid
+
+        cases = (("sol", ("gpt-6.1-sol", "Sol", "gpt-6-sol")),
+                 ("astra", ("gpt-6.1-astra", "Astra")),
+                 ("luna", ("gpt-6-luna", "Luna")))
+        for family, names in cases:
+            for model in names:
+                with self.subTest(model=model):
+                    key = "fam_" + family
+                    self.assertEqual(render._model_key(model), key)
+                    self.assertEqual(live._model_pair(model)[1], key)
+                    self.assertEqual(live._stage_model(model)[1], key)
+                    grid = CellGrid(48, 3)
+                    models._model_cell(grid, 1, 1, "codex", (model, "high"), {}, {}, 40)
+                    self.assertEqual(grid.cells[1][1][1], key)
+        hues = {render._HUE_OF["fam_" + family][0] for family, _names in cases}
+        self.assertEqual(len(hues), 3)
+        self.assertEqual(render._model_key("gpt-5.5"), "fam_gpt")
+
+    def test_route_columns_leave_progress_room_at_100_140_and_168(self):
+        from tools.fleet.explorer.tables import _route_columns
+
+        for width in (100, 140, 168):
+            use = width - 36
+            cols = _route_columns(use)
+            age_start = use - 6 - 3
+            with self.subTest(width=width):
+                self.assertLessEqual(cols["title_w"], 48)
+                self.assertLess(cols["kind"], cols["own"])
+                self.assertLess(cols["own"], cols["prog"])
+                self.assertGreater(age_start - cols["prog"], 0)
+
     def test_peers_and_all_renderer_views_stay_inside_four_viewports(self):
         views = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE",
                  "MEMORY", "MODELS", "SYSTEM")
@@ -107,7 +150,8 @@ class R14Renderer(unittest.TestCase):
                         self.assertTrue(all(hit.y < footer for hit in compute_hits))
                         self.assertTrue(any(hit.action == ("tab", "COMPUTE") for hit in frame.hits))
                         tree = frame.tree_scroll
-                        self.assertEqual(tree[3], compute_hit.y)
+                        rule = tree[1] < compute_hit.y - 1       # the faint rule row above RESOURCES
+                        self.assertEqual(tree[3], compute_hit.y - 1 if rule else compute_hit.y)
                         tree_hits = [hit for hit in frame.hits
                                      if hit.action[:1] in (("scope",), ("route",))]
                         self.assertTrue(all(tree[1] <= hit.y < tree[3] for hit in tree_hits))

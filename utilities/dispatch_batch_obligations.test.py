@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -920,6 +921,285 @@ class BatchObligationTest(unittest.TestCase):
         with mock.patch.object(obligations, "_parent_duty_has_recipient", return_value=True), \
              mock.patch.object(obligations.subprocess, "Popen", return_value=type("P", (), {"pid": 9001})()):
             self.assertEqual(obligations.ensure_observers(self.jobs), 1)
+
+
+class _Handover:
+    """Stand-ins for the registry's handover rows and the seat-handover lineage."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def handover_attempt(self, attempt):
+        return self.rows.get(attempt)
+
+
+class DeliveryDutyLifetimeTest(unittest.TestCase):
+    PARENT = "thread-parent-fixture"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.jobs = self.base / "jobs.log"
+        self.jobs.write_text("fixture\n", encoding="utf-8")
+        self.processes = []
+        self.addCleanup(self._stop_processes)
+
+    def _stop_processes(self):
+        for process in self.processes:
+            process.kill()
+            process.wait(timeout=5)
+            process.stdout.close()
+
+    def _args(self, batch, attempt, **overrides):
+        values = dict(
+            jobs=self.jobs, sealed_batch_id=batch, parent_attempt_id=None,
+            parent_session_id=self.PARENT, thread_id=self.PARENT, attempt_id=[attempt],
+            delivery_parent_id=self.PARENT, control_socket=None,
+            queue_socket=self.base / "queue.sock", interval=0.1, timeout=3600.0)
+        values.update(overrides)
+        return Namespace(**values)
+
+    def _duty(self, batch, attempt, **state):
+        duty_id, record = obligations.create(self._args(batch, attempt))
+        if state:
+            obligations.update(self.jobs, duty_id, **state)
+        return duty_id, obligations.read(self.jobs, duty_id)
+
+    def _service(self):
+        script = self.base / "release" / "utilities" / "codex-managed-completion.py"
+        return mock.patch("peer_obligations.service_script",
+                          return_value=(script, {}, "/fixture/managed/current"))
+
+    # -- D2: only a successor that can receive the completion keeps the duty --
+
+    def _successor(self, rows, *, harness="codex", successor="successor-thread",
+                   tui=(), current_session=None):
+        import dispatch_seat_handover as handover
+        view = _Handover(rows)
+        probe = mock.Mock(return_value=list(tui))
+        with mock.patch("dispatch_registry_cache.registry_view", return_value=view), \
+             mock.patch.object(handover, "effective_parent", return_value=successor), \
+             mock.patch.object(handover, "effective_parent_harness", return_value=harness), \
+             mock.patch("pane_ownership.codex_tui_processes_for_session", probe):
+            result = obligations.parent_successor(
+                self.jobs, self.PARENT, ["att-a"], current_session=current_session)
+        return result, probe
+
+    def test_successor_must_be_a_codex_session_with_a_live_tui(self):
+        rows = {"att-a": ("done", {"parent_sid": self.PARENT})}
+        self.assertEqual(self._successor(rows, tui=[{"pid": 1}])[0], "successor-thread")
+        self.assertEqual(self._successor(rows, harness="claude", tui=[{"pid": 1}])[0], "")
+        self.assertEqual(self._successor(rows, tui=[])[0], "")
+        self.assertEqual(self._successor({})[0], "")
+        self.assertEqual(self._successor(rows, successor=self.PARENT, tui=[{"pid": 1}])[0], "")
+
+    def test_known_current_session_is_matched_without_a_tui_lookup(self):
+        rows = {"att-a": ("done", {"parent_sid": self.PARENT})}
+        result, probe = self._successor(rows, current_session="successor-thread")
+        self.assertEqual(result, "successor-thread")
+        probe.assert_not_called()
+        self.assertEqual(self._successor(rows, current_session="someone-else")[0], "")
+
+    def test_successor_reads_each_attempt_by_index_not_every_registry_row(self):
+        view = mock.Mock(spec=["handover_attempt"])
+        view.handover_attempt.return_value = None
+        with mock.patch("dispatch_registry_cache.registry_view", return_value=view):
+            self.assertEqual(obligations.parent_successor(
+                self.jobs, self.PARENT, ["att-a", "att-b"]), "")
+        self.assertEqual([call.args for call in view.handover_attempt.call_args_list],
+                         [("att-a",), ("att-b",)])
+
+    def test_unreadable_handover_evidence_keeps_the_runner_duty(self):
+        _duty_id, record = self._duty("batch-a", "att-a", state="unknown",
+                                      reason="parent-session-ended")
+        with mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]), \
+             mock.patch.object(obligations, "parent_successor", side_effect=OSError("registry")):
+            self.assertTrue(obligations._parent_duty_has_recipient(record, self.jobs))
+
+    # -- D1: a duty without a recorded TUI binding is judged by the session TUI --
+
+    def test_unbound_duty_follows_the_session_tui_and_deliverable_successor(self):
+        _duty_id, record = self._duty("batch-a", "att-a", state="unknown",
+                                      reason="parent-session-ended")
+        self.assertNotIn("parent_lifetime", record)
+        tui = [{"pid": 4242, "pid_start": "1", "session_id": self.PARENT}]
+        with mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]), \
+             mock.patch.object(obligations, "parent_successor", return_value=""):
+            self.assertFalse(obligations._parent_duty_has_recipient(record, self.jobs))
+        with mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=tui):
+            self.assertTrue(obligations._parent_duty_has_recipient(record, self.jobs))
+        with mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]), \
+             mock.patch.object(obligations, "parent_successor", return_value="successor"):
+            self.assertTrue(obligations._parent_duty_has_recipient(record, self.jobs))
+        with mock.patch("pane_ownership.codex_tui_processes_for_session",
+                        side_effect=OSError("proc")):
+            self.assertTrue(obligations._parent_duty_has_recipient(record, self.jobs))
+
+    def test_runner_leaves_an_unbound_ended_duty_asleep_until_its_tui_returns(self):
+        duty_id, _record = self._duty("batch-a", "att-a", state="unknown",
+                                      reason="parent-session-ended")
+        tui = [{"pid": 4242, "pid_start": "1", "session_id": self.PARENT}]
+
+        class Launched:
+            pid = 903001
+
+        with self._service(), \
+             mock.patch.object(obligations.subprocess, "Popen", return_value=Launched()) as launch:
+            with mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=[]):
+                self.assertEqual(obligations.ensure_observers(self.jobs), 0)
+            launch.assert_not_called()
+            self.assertEqual(obligations.read(self.jobs, duty_id)["state"], "unknown")
+            with mock.patch("pane_ownership.codex_tui_processes_for_session", return_value=tui):
+                self.assertEqual(obligations.ensure_observers(self.jobs), 1)
+            launch.assert_called_once()
+
+    def test_runner_wakes_an_unbound_ended_duty_for_a_deliverable_successor(self):
+        self._duty("batch-a", "att-a", state="unknown", reason="parent-session-ended")
+
+        class Launched:
+            pid = 903002
+
+        def probe(session):
+            return [{"pid": 7, "pid_start": "1", "session_id": session}] \
+                if session == "successor-thread" else []
+
+        with self._service(), \
+             mock.patch.object(obligations, "_resume_owner_settlements", return_value=[]), \
+             mock.patch("pane_ownership.codex_tui_processes_for_session", side_effect=probe), \
+             mock.patch("dispatch_registry_cache.registry_view",
+                        return_value=_Handover({"att-a": ("done", {})})), \
+             mock.patch("dispatch_seat_handover.effective_parent",
+                        return_value="successor-thread"), \
+             mock.patch("dispatch_seat_handover.effective_parent_harness", return_value="codex"), \
+             mock.patch.object(obligations.subprocess, "Popen", return_value=Launched()):
+            self.assertEqual(obligations.ensure_observers(self.jobs), 1)
+
+    # -- D3: first-generation observers join the existing replacement path --
+
+    def _first_generation(self, batch, attempt, *, extra=()):
+        script = self.base / "bin" / "codex-managed-completion.py"
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("import time\nprint('ready', flush=True)\ntime.sleep(60)\n",
+                          encoding="utf-8")
+        argv = ["--queue-socket", str(self.base / "queue.sock"), "--jobs", str(self.jobs),
+                "--parent-session-id", self.PARENT, "--thread-id", self.PARENT,
+                "--sealed-batch-id", batch, "--launch-ready-timeout", "60",
+                "--timeout", "3600.0", "--attempt-id", attempt, *extra]
+        process = subprocess.Popen([sys.executable, str(script), *argv],
+                                   stdout=subprocess.PIPE, text=True)
+        self.processes.append(process)
+        self.assertEqual(process.stdout.readline().strip(), "ready")
+        return process, argv
+
+    def test_first_generation_argv_is_a_variant_only_for_its_own_batch(self):
+        _id_a, record_a = self._duty("batch-a", "att-a")
+        _id_b, record_b = self._duty("batch-b", "att-b")
+        process_a, argv_a = self._first_generation("batch-a", "att-a")
+        process_b, argv_b = self._first_generation("batch-b", "att-b")
+        self.assertEqual(obligations._observer_argument_variants(process_a.pid, record_a),
+                         (tuple(argv_a),))
+        self.assertEqual(obligations._observer_argument_variants(process_b.pid, record_b),
+                         (tuple(argv_b),))
+        self.assertEqual(obligations._observer_argument_variants(process_a.pid, record_b), ())
+        self.assertEqual(obligations._observer_argument_variants(process_b.pid, record_a), ())
+
+    def test_variant_ignores_control_options_and_refuses_resumed_or_unreadable_argv(self):
+        _id_a, record_a = self._duty("batch-a", "att-a")
+        process, argv = self._first_generation(
+            "batch-a", "att-a", extra=("--service-current", "/fixture/managed/current"))
+        self.assertEqual(obligations._observer_argument_variants(process.pid, record_a),
+                         (tuple(argv[:-2]),))
+        resumed, _argv = self._first_generation(
+            "batch-a", "att-a", extra=("--resume-obligation", "batch-a"))
+        self.assertEqual(obligations._observer_argument_variants(resumed.pid, record_a), ())
+        self.assertEqual(obligations._observer_argument_variants(2 ** 22 + 7, record_a), ())
+        altered = dict(record_a, identity=dict(record_a["identity"], attempt_ids=["att-z"]))
+        self.assertEqual(obligations._observer_argument_variants(process.pid, altered), ())
+
+    def test_runner_offers_each_observer_only_its_own_first_generation_argv(self):
+        id_a, record_a = self._duty("batch-a", "att-a", state="observing")
+        id_b, record_b = self._duty("batch-b", "att-b", state="observing")
+        process_a, argv_a = self._first_generation("batch-a", "att-a")
+        process_b, argv_b = self._first_generation("batch-b", "att-b")
+        for duty_id, process in ((id_a, process_a), (id_b, process_b)):
+            obligations.update(self.jobs, duty_id, observer={
+                "pid": process.pid, "pid_start": obligations._pid_start(process.pid)})
+        before_b = obligations.read(self.jobs, id_b)
+        offered = {}
+
+        def replace(pid, _start, lock, _script, _required, _binding, **kwargs):
+            offered[Path(lock).stem] = (pid, kwargs)
+            return False
+
+        with self._service(), \
+             mock.patch.object(obligations, "acquire", return_value=None), \
+             mock.patch("peer_obligations.replace_managed_observer", side_effect=replace), \
+             mock.patch.object(obligations.subprocess, "Popen") as launch:
+            self.assertEqual(obligations.ensure_observers(self.jobs), 0)
+        launch.assert_not_called()
+        self.assertEqual(set(offered), {id_a, id_b})
+        for duty_id, process, argv in ((id_a, process_a, argv_a), (id_b, process_b, argv_b)):
+            pid, kwargs = offered[duty_id]
+            self.assertEqual(pid, process.pid)
+            self.assertTrue(kwargs["exact_arguments"])
+            self.assertEqual(kwargs["argument_variants"], (tuple(argv),))
+        self.assertEqual(obligations.read(self.jobs, id_b)["observer"], before_b["observer"])
+
+    def test_old_first_generation_observer_is_replaced_by_the_resumed_form(self):
+        duty_id, _record = self._duty("batch-a", "att-a", state="observing")
+        process, argv = self._first_generation("batch-a", "att-a")
+        obligations.update(self.jobs, duty_id, observer={
+            "pid": process.pid, "pid_start": obligations._pid_start(process.pid)})
+        lock_fd = os.open(obligations._root(self.jobs) / (duty_id + ".lease"),
+                          os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        class Launched:
+            pid = 903003
+
+        try:
+            with self._service(), \
+                 mock.patch.object(obligations, "acquire", side_effect=[None, lock_fd]), \
+                 mock.patch("peer_obligations.replace_managed_observer",
+                            return_value="replaced") as replace, \
+                 mock.patch.object(obligations.subprocess, "Popen",
+                                   return_value=Launched()) as launch:
+                self.assertEqual(obligations.ensure_observers(self.jobs), 1)
+        finally:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+        self.assertEqual(replace.call_args.kwargs["argument_variants"], (tuple(argv),))
+        self.assertIn("--resume-obligation", launch.call_args.args[0])
+        self.assertIn(duty_id, launch.call_args.args[0])
+
+    # -- C-B: one observer per undelivered duty, delivered duties are not woken --
+
+    def test_two_unbound_batches_of_one_parent_each_keep_one_observer(self):
+        id_a, _a = self._duty("batch-a", "att-a", state="observing")
+        id_b, _b = self._duty("batch-b", "att-b", state="observing")
+        seen = []
+
+        def replace(pid, *_args, **_kwargs):
+            seen.append(pid)
+            return "current"
+
+        for duty_id, pid in ((id_a, 811), (id_b, 812)):
+            obligations.update(self.jobs, duty_id, observer={"pid": pid, "pid_start": "1"})
+        with self._service(), \
+             mock.patch.object(obligations, "acquire", return_value=None), \
+             mock.patch("peer_obligations.replace_managed_observer", side_effect=replace), \
+             mock.patch.object(obligations.subprocess, "Popen") as launch:
+            self.assertEqual(obligations.ensure_observers(self.jobs), 0)
+            launch.assert_not_called()
+            self.assertEqual(sorted(seen), [811, 812])
+            obligations.update(self.jobs, id_a, state="complete", delivery="accepted",
+                               outcome={"state": "ready"})
+            seen.clear()
+            self.assertEqual(obligations.ensure_observers(self.jobs), 0)
+        self.assertEqual(seen, [812])
 
 
 if __name__ == "__main__":
