@@ -27,6 +27,33 @@ const checkpointTrigger = path.join(root, "utilities", "artifact_checkpoint_trig
 const sessionTidy = path.join(root, "utilities", "session_tidy.py")
 const sessionTidyIdle = path.join(root, "utilities", "session_tidy_idle.py")
 const fleetInteractionState = path.join(root, "hooks", "fleet-interaction-state.py")
+const interactionWrites = new Map()
+
+function publishInteraction(action, sessionID, refs = {}, kind = null) {
+  // Observation stays off the native event consumer. Serialize the existing
+  // short-lived hook per session so a slow set cannot land after its reply.
+  const previous = interactionWrites.get(sessionID) || Promise.resolve()
+  const pending = previous.catch(() => {}).then(() => new Promise((resolve) => {
+    let timer
+    const done = () => { clearTimeout(timer); resolve() }
+    try {
+      const args = [fleetInteractionState, action, "--harness", "opencode"]
+      if (kind) args.push("--kind", kind)
+      const child = spawn("python3", args, { stdio: ["pipe", "ignore", "ignore"], detached: true })
+      child.on("error", done)
+      child.on("close", done)
+      child.stdin?.on?.("error", () => {})
+      timer = setTimeout(() => { try { child.kill("SIGKILL") } catch {} }, 5000)
+      timer.unref?.()
+      child.unref()
+      child.stdin?.end(JSON.stringify({ session_id: sessionID, ...refs }))
+    } catch { done() }
+  })).finally(() => {
+    if (interactionWrites.get(sessionID) === pending) interactionWrites.delete(sessionID)
+  })
+  interactionWrites.set(sessionID, pending)
+}
+
 const herdrProjection = path.join(root, "tools", "fleet", "herdr_projection.py")
 const coreWriteGuard = path.join(root, "hooks", "core-write-guard.py")
 const routePresenceGate = path.join(root, "utilities", "route_presence_gate.py")
@@ -1128,6 +1155,9 @@ async function setupOpenCodeV2(ctx) {
     const model = event.model
     const status = event.response?.status
     if (!model?.providerID || !model?.id || !Number.isInteger(status)) return
+    // The V2 request's model is exact to this session. Retain only limits the
+    // callback actually supplies; V1's compaction formula is not a V2 policy.
+    writeContextPolicy({ sessionID: event.sessionID, model, contextObservation: "v2-http-response" }, {})
     // The runtime consumes the original body after this callback returns.
     // Reading/cancelling its clone must not hold that consumer behind telemetry.
     void (async () => {
@@ -1152,7 +1182,7 @@ async function setupOpenCodeV2(ctx) {
       for await (const native of ctx.event.subscribe({ signal: controller.signal })) {
         const data = native?.data || native?.properties || {}
         const info = data.info || data.session || null
-        const sessionID = data.sessionID || info?.id || native?.sessionID || ""
+        const sessionID = data.sessionID || data.form?.sessionID || info?.id || native?.sessionID || ""
         if (!sessionID) continue
         if (native.type === "session.deleted" && v2WorkerSessions.has(sessionID)) {
           v2WorkerSessions.delete(sessionID)
@@ -1168,6 +1198,13 @@ async function setupOpenCodeV2(ctx) {
             ...(native.type === "session.execution.started" ? { status: { type: "busy" } } : {}),
             ...(info ? { info } : {}), sessionID } }
           if (native.type === "session.execution.started") event.type = "session.status"
+          if (native.type === "form.created") {
+            event.type = "question.asked"
+            event.properties = { sessionID, id: data.form?.id, source: "opencode-form" }
+          } else if (["form.replied", "form.cancelled"].includes(native.type)) {
+            event.type = native.type === "form.replied" ? "question.replied" : "question.rejected"
+            event.properties = { sessionID, requestID: data.id, source: "opencode-form" }
+          }
           await hooks.event?.({ event })
         })
         if (native.type === "session.deleted") v2SessionInfo.delete(sessionID)
@@ -2434,6 +2471,11 @@ function contextPolicyFromChat(input, output) {
     attempt_id: process.env.AGENT_DISPATCH_ATTEMPT_ID || null,
     reason: "native-policy-input-unavailable",
   }
+  if (input?.contextObservation === "v2-http-response") {
+    policy.source = "opencode-native-v2-http-response"
+    policy.reason = context === null ? "native-model-window-not-observed" : "native-consumer-version-unverified"
+    return policy
+  }
   if (contextPolicyRuntimeVersion !== nativeContextPolicyVersion) {
     policy.reason = "native-consumer-version-unverified"
     return policy
@@ -2623,12 +2665,9 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
       const sid = event.properties?.sessionID || ""
       if (sid) { pendingPeerStatus.set(sid, "blocked"); completionCarrier.status(sid, "blocked") }
       observeCompactRuntimeStatus(ctx, sid, "blocked")
-      if (event.type === "question.asked" && sid && !isWorkerSession()) {
-        const child = spawn("python3", [fleetInteractionState, "set", "--harness", "opencode",
-          "--kind", "decision"], { stdio: ["pipe", "ignore", "ignore"], detached: true })
-        child.on("error", () => {})
-        child.unref()
-        child.stdin?.end(JSON.stringify({ session_id: sid }))
+      if (sid && !isWorkerSession()) {
+        publishInteraction("set", sid, { request_id: event.properties?.id, source: event.properties?.source },
+          event.type === "permission.asked" ? "permission" : "decision")
       }
     }
     if (event && ["question.replied", "question.rejected", "permission.replied"].includes(event.type)) {
@@ -2636,11 +2675,7 @@ export const AgentHarnessGuards = async (ctx, options = {}) => {
       if (sid) { pendingPeerStatus.set(sid, "working"); completionCarrier.status(sid, "working") }
       observeCompactRuntimeStatus(ctx, sid, "working")
       if (sid && !isWorkerSession()) {
-        const child = spawn("python3", [fleetInteractionState, "clear", "--harness", "opencode"], {
-          stdio: ["pipe", "ignore", "ignore"], detached: true })
-        child.on("error", () => {})
-        child.unref()
-        child.stdin?.end(JSON.stringify({ session_id: sid }))
+        publishInteraction("clear", sid, { request_id: event.properties?.requestID })
       }
     }
     if (event && event.type === "session.idle") {

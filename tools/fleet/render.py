@@ -906,15 +906,20 @@ def _native_context_gauge(entity):
 
     An unknown or disabled policy still has a measured window and usage; showing nothing would
     hide what every session showed before applied triggers existed."""
-    policy = getattr(entity, "context_policy", None)
-    if isinstance(policy, dict) and policy.get("state") == "applied":
+    from collections.abc import Mapping
+    field = entity.get if isinstance(entity, Mapping) else lambda key: getattr(entity, key, None)
+    policy = field("context_policy")
+    if isinstance(policy, Mapping) and policy.get("state") == "applied":
         return None, None
-    window = getattr(entity, "context_window_tokens", None)
-    raw = policy.get("raw_percentage") if isinstance(policy, dict) else None
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+    window = field("context_window_tokens")
+    if type(window) is not int or window <= 0:
+        window = None
+    raw = policy.get("raw_percentage") if isinstance(policy, Mapping) else None
+    if (isinstance(raw, (int, float)) and not isinstance(raw, bool)
+            and math.isfinite(raw) and raw >= 0):
         return min(99, round(raw)), window
-    active = getattr(entity, "active_context_tokens", None)
-    if getattr(entity, "harness", None) == "codex":
+    active = field("active_context_tokens")
+    if field("harness") == "codex":
         from .token_budget import codex_context_used_pct
         return codex_context_used_pct(active, window), window
     if (type(active) is int and active >= 0 and type(window) is int and window > 0):

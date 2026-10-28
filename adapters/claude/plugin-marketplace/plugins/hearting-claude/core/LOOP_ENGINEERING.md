@@ -294,6 +294,14 @@ defect. A slower or emptier view is a regression even when every check passes.
 Publish observed session identity, execution/wait reasons and resources first;
 campaign titles, route details and installation/git metadata fill asynchronously.
 Unknown observations stay unknown, and slow details must not stop basic refresh.
+Titles summarize the person's current goal in their language; NOW describes
+progress toward that goal. Internal stage, review and handoff instructions do
+not replace the goal. Failed generation preserves the last successful text and
+its original age. A folded session exposes its currently executing connected
+routes from the same observation; completed history alone is not activity.
+Model choices follow the installed runtime's current catalog through the existing
+bounded refresh. A saved model absent from that catalog remains visible as
+unavailable for selection, without silently rewriting the person's configuration.
 Project activity includes running resources nested under an idle owner. A file
 update is labelled as a file update, never as completion. Recent results show
 the recorded task, result and event time; an unproven gate is not a failed task.
@@ -354,6 +362,14 @@ notifications count current items only. Unknown seat attribution remains in the
 global current total. Reading does not claim, resume, settle, or mutate a job.
 S4 signals and derived caches are observational, private state; folding never
 changes source state and adds no hook, gate, or user setting.
+
+For a supported selected question or approval, Fleet sends the person's explicit
+response through the existing native transport to that exact live request once.
+Revalidate a changed or already answered request before submission. Submitted,
+received and applied remain distinct; transport acceptance alone proves neither
+native consumption nor resumed work. Current pending questions, answered or
+expired requests, unknown observations and older history remain distinct on
+every display. Unsupported response surfaces retain their native fallback.
 
 Fleet's interactive view keeps shared status, usage, compute/GPU observations,
 and its controls outside the scrolling work-list viewport. The list body owns

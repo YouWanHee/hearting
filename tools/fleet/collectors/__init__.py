@@ -286,6 +286,13 @@ def _adopt_child_titles(sessions, jobs):
                     job.summary = None
                     job.summary_ts = None
             continue
+        source_sid = getattr(source, "session_id", None)
+        source_attempt = getattr(source, "attempt_id", None)
+        job_attempt = getattr(job, "attempt_id", None)
+        if ((runtime_sid and source_sid and runtime_sid != source_sid)
+                or (job_attempt and source_attempt and job_attempt != source_attempt)):
+            job.association_ambiguity = "child-native-identity-conflict"
+            continue
         job._child_session_associated = True
         # Identity association alone is not enough to suppress the attempt-log
         # fallback.  `claude -p --no-session-persistence` exposes a session id and
@@ -305,9 +312,6 @@ def _adopt_child_titles(sessions, jobs):
             job.summary_ts = getattr(source, 'summary_ts', None)
         if getattr(job, 'subagents', None) is None:
             job.subagents = getattr(source, 'subagents', None)
-        source_attempt = getattr(source, "attempt_id", None)
-        job_attempt = getattr(job, "attempt_id", None)
-        source_sid = getattr(source, "session_id", None)
         runtime_sid = getattr(job, "_runtime_session_id", None)
         if (source_sid and (runtime_sid is None or runtime_sid == source_sid)
                 and source_attempt == job_attempt):
@@ -318,7 +322,24 @@ def _adopt_child_titles(sessions, jobs):
             if (not isinstance(current_observation, dict)
                     or current_observation.get("state") == "unavailable"):
                 job.shell_job_observation = getattr(source, "shell_job_observation", None)
-        if not getattr(job, '_dispatch_context_owned', False):
+        # The cwd join above remains useful for legacy TITLE/NOW, but cannot
+        # authorize telemetry. Reject conflicting facts even when another key
+        # (for example a PID before reuse) matched.
+        exact_process = (all(item is not None for item in identity)
+                         and identity == (source.harness, source.pid, source.proc_start))
+        exact_session = bool(runtime_sid and runtime_sid == source_sid)
+        conflicts = any(left is not None and right is not None and left != right
+                        for left, right in (
+                            (runtime_sid, source_sid), (job_attempt, source_attempt)))
+        # A native child can have a different PID from its registered wrapper.
+        # Equal PIDs with conflicting start times are reuse, not a wrapper join.
+        if (getattr(job, 'pid', None) == getattr(source, 'pid', None)
+                and getattr(job, 'proc_start', None) is not None
+                and getattr(source, 'proc_start', None) is not None
+                and job.proc_start != source.proc_start):
+            conflicts = True
+        if (not getattr(job, '_dispatch_context_owned', False)
+                and (exact_process or exact_session) and not conflicts):
             for field_name in (
                     'ctx_pct', 'active_context_tokens', 'context_window_tokens',
                     'context_display_window_tokens', 'context_policy',

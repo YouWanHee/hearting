@@ -2315,13 +2315,16 @@ for (let i = 0; i < 100 && !prompts.length; i++) await new Promise(r => setTimeo
         prompt shape, settles it from session.context, and does not send it again."""
         self.v2_turn_carrier_case()
 
+    def test_v2_execution_and_form_events_preserve_waits_and_one_delivery(self):
+        self.v2_turn_carrier_case(interleave_events=True)
+
     def test_v2_carrier_withholds_unknown_native_identity_idle_and_changed_selection(self):
         for scenario in ("wrong-session", "child", "directory", "get-error", "history-error",
                          "wait-error", "missing-wait", "busy", "selection-at-second-wait"):
             with self.subTest(scenario=scenario):
                 self.v2_turn_carrier_case(scenario)
 
-    def v2_turn_carrier_case(self, scenario="success"):
+    def v2_turn_carrier_case(self, scenario="success", *, interleave_events=False):
         self.seed_turn()
         plugin = ROOT / "adapters/opencode/plugins/hearting-guards.js"
         js = r'''
@@ -2334,6 +2337,10 @@ const idleGate = new Promise((resolve) => { releaseIdle = resolve });
 const secondGate = new Promise((resolve) => { releaseSecond = resolve });
 const sessionID = "ses-oc-parent";
 const scenario = SCENARIO;
+const interleaveEvents = INTERLEAVE_EVENTS;
+let releaseExecution, observedWait;
+const executionGate = new Promise(resolve => { releaseExecution = resolve });
+const firstWait = new Promise(resolve => { observedWait = resolve });
 let waits = 0;
 const hooks = new Map();
 const ctx = {
@@ -2351,6 +2358,7 @@ const ctx = {
     wait: async ({ sessionID: sid }, { signal }) => {
       assert.equal(sid, sessionID);
       waits++;
+      if (interleaveEvents && waits === 1) { observedWait(); await executionGate; }
       if (scenario === "wait-error") throw new Error("native idle unavailable");
       if (scenario === "busy") await new Promise((_, reject) =>
         signal.addEventListener("abort", () => reject(new Error("native wait aborted")), {once: true}));
@@ -2378,6 +2386,38 @@ const ctx = {
   event: { subscribe: async function* ({ signal }) {
     await idleGate;
     yield { type: "session.execution.succeeded", data: { sessionID } };
+    if (interleaveEvents) {
+      // A new execution arrives while the retained delivery is awaiting native idle.
+      await firstWait;
+      yield { type: "session.execution.started", data: { sessionID } };
+      releaseExecution();
+      for (let i = 0; i < 200 && !carrierLog("skip", "native-admission-withheld"); i++) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      assert.ok(carrierLog("skip", "native-admission-withheld"), JSON.stringify(logs));
+      assert.equal(prompts.length, 0, "execution start must stop the in-flight delivery");
+      const sidecar = `${process.env.XDG_STATE_HOME}/agent-fleet/interactions/opencode/${sessionID}.json`;
+      for (const close of ["form.replied", "form.cancelled"]) {
+        const id = "form-" + close;
+        yield { type: "form.created", data: { form: { sessionID, id,
+          questions: [{ question: "PRIVATE-PROMPT", options: ["PRIVATE-CHOICE"] }] } } };
+        for (let i = 0; i < 200 && !carrierFs.existsSync(sidecar); i++) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        const observation = JSON.parse(carrierFs.readFileSync(sidecar, "utf8"));
+        assert.equal(observation.session_id, sessionID);
+        assert.equal(observation.request_id, id);
+        assert.equal(observation.source, "opencode-form");
+        assert.doesNotMatch(JSON.stringify(observation), /PRIVATE-|questions|options/);
+        assert.equal(prompts.length, 0, "an open form cannot admit the retained delivery");
+        yield { type: close, data: { sessionID, id, answers: ["PRIVATE-ANSWER"] } };
+        for (let i = 0; i < 200 && carrierFs.existsSync(sidecar); i++) {
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        assert.equal(carrierFs.existsSync(sidecar), false, "the exact form must close its wait");
+      }
+      yield { type: "session.execution.failed", data: { sessionID } };
+    }
     await secondGate;
     yield { type: "session.execution.succeeded", data: { sessionID } };
     secondProcessed = true;
@@ -2428,7 +2468,8 @@ try {
   console.log(JSON.stringify({ prompts, logs }));
   }
 } finally { await cleanup(); }
-'''.replace("PLUGIN", json.dumps(str(plugin))).replace("SCENARIO", json.dumps(scenario))
+'''.replace("PLUGIN", json.dumps(str(plugin))).replace("SCENARIO", json.dumps(scenario)).replace(
+            "INTERLEAVE_EVENTS", json.dumps(interleave_events))
         env = self.env()
         js = self.admitted_plugin_script(js)
         run = subprocess.run([self.native_node(), "--input-type=module", "-e", js], env=env, cwd=str(self.root),
