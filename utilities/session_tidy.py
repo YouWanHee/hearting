@@ -134,7 +134,9 @@ COMPACT_CARD_INSTRUCTIONS = (
     "Carry the source description and distinguishing comparison condition before the "
     "original identifier; preserve document/revision and checkpoint references when they "
     "affect meaning. Keep failed, interrupted and unfinished states with their next action, "
-    "and leave unexplained identifiers unresolved."
+    "and leave unexplained identifiers unresolved. In the existing related or other fields, "
+    "keep a session's confirmed Fleet number together with its observed pane and full exact "
+    "native SID; leave any unknown number, pane or SID unknown."
     " Some recent turns may remain verbatim after compaction, depending on the runtime. "
     "Do not infer that an omitted request or reply was undelivered. When known, say which "
     "last turn this summary covers; note when the preserved transcript needs checking. "
@@ -2200,11 +2202,29 @@ def mark_card_handed_off(seat: Seat) -> None:
             atomic_write_json(card_json_path(seat), card)
 
 
+def _card_author_label(card: dict) -> str:
+    """Use the stored author's exact identity, independently of the current seat."""
+    author = card.get("author") if isinstance(card.get("author"), dict) else {}
+    seat = card.get("seat") if isinstance(card.get("seat"), dict) else {}
+    harness, sid = author.get("harness") or "-", author.get("sid") or "-"
+    tag = None
+    if sid != "-":
+        try:
+            tools = str(Path(__file__).resolve().parents[1] / "tools")
+            if tools not in sys.path:
+                sys.path.insert(0, tools)
+            from fleet.session_handle import resolve_tag
+            tag = resolve_tag(harness, sid)
+        except Exception:
+            pass
+    badge = f" [{tag}]" if isinstance(tag, str) and re.fullmatch(r"[0-9a-f]{2}", tag) else ""
+    return f"{harness}{badge} pane={seat.get('pane') or '-'} sid={sid}"
+
+
 def render_card_text(card: dict) -> str:
     """The readable card file: header, the card body (layer A), and the "참고할 기억" section (layer B)."""
-    author = card.get("author") or {}
     header = (f"# session card {card.get('generation')} — {card.get('authored_at')} "
-              f"({author.get('harness', '')} {str(author.get('sid', ''))[:8]})\n\n")
+              f"({_card_author_label(card)})\n\n")
     text = header + str(card.get("body", "")) + "\n"
     refs = card.get("memory_refs")
     if isinstance(refs, dict) and refs.get("revision"):
@@ -2523,11 +2543,11 @@ def _ago(seconds: float) -> str:
 def build_card_injection(card: dict, card_path: Path, now: float, cap: int,
                          previous_transcript: Optional[dict] = None) -> str:
     """Card text within ``cap`` UTF-8 bytes; guidance is part of the fixed header."""
-    author = card.get("author") or {}
     stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(card.get("authored_at_epoch") or now)))
-    header = (f"[세션 카드] 같은 자리에서 이어받는 작업 카드 — 작성 {stamp} "
-              f"({_ago(now - float(card.get('authored_at_epoch') or now))}, {author.get('harness', '')} "
-              f"{str(author.get('sid', ''))[:8]})\n{CARD_FIRST_REPLY_GUIDANCE}")
+    prefix = (f"[세션 카드] 같은 자리에서 이어받는 작업 카드 — 작성 {stamp} "
+              f"({_ago(now - float(card.get('authored_at_epoch') or now))})")
+    identity = f" · {_card_author_label(card)}"
+    header = f"{prefix}{identity}\n{CARD_FIRST_REPLY_GUIDANCE}"
     footer = f"카드 전문: {card_path}"
     previous_line = ""
     if isinstance(previous_transcript, dict):
@@ -2550,14 +2570,24 @@ def build_card_injection(card: dict, card_path: Path, now: float, cap: int,
     if fixed > cap and previous_line:
         previous_line = ""
         fixed = len(header.encode("utf-8")) + len(footer.encode("utf-8")) + 2
+    if fixed > cap:
+        header = prefix + identity
+        fixed = len(header.encode("utf-8")) + len(footer.encode("utf-8")) + 2
+    if fixed > cap:
+        # A tiny cap drops identity as a unit, never an apparently exact SID prefix.
+        header = prefix
+        fixed = len(header.encode("utf-8")) + len(footer.encode("utf-8")) + 2
     room = cap - fixed
     if room <= 0:
         return _cut_bytes(f"{header}\n{footer}" + (f"\n{previous_line}" if previous_line else ""), cap)[0]
     if len(body.encode("utf-8")) <= room:
         return f"{header}\n{body}\n{footer}" + (f"\n{previous_line}" if previous_line else "")
-    room -= len(cut_note.encode("utf-8")) + 1
-    trimmed = _cut_bytes(body, max(0, room))[0].rstrip()
-    return f"{header}\n{trimmed}\n{cut_note}\n{footer}" + (f"\n{previous_line}" if previous_line else "")
+    if room > len(cut_note.encode("utf-8")) + 1:
+        room -= len(cut_note.encode("utf-8")) + 1
+        trimmed = _cut_bytes(body, room)[0].rstrip() + "\n" + cut_note
+    else:
+        trimmed = _cut_bytes(body, room)[0].rstrip()
+    return f"{header}\n{trimmed}\n{footer}" + (f"\n{previous_line}" if previous_line else "")
 
 
 # ---------------------------------------------------------------------------

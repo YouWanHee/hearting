@@ -58,7 +58,8 @@ _STEWARD_TARGETS_MAX = 32
 # F-100c — the harness-neutral sender trailer a steward appends to a herdr prompt so the
 # RECEIVER (Claude UserPromptSubmit hook, Codex userprompt hook, OpenCode plugin) can write
 # its own `notice` record with an exact sender. New trailers display [tag] and
-# an opaque transfer ref; legacy full-session-id trailers remain receive-only.
+# observed pane/full SID and an opaque transfer ref; the bracket keeps exact
+# receipt attribution on the sealed-ref path. Legacy full-id trailers are receive-only.
 # Native Claude SendMessage already wraps its delivery in <cross-session-message from=…>;
 # a herdr prompt has no envelope, so the trailer is the envelope.
 _PEER_TRAILER_RE = re.compile(
@@ -105,15 +106,21 @@ def peer_alias(harness, session_id):
     return f"[{tag}]" if isinstance(tag, str) and re.fullmatch(r"[0-9a-f]{2}", tag) else "[?]"
 
 
-def peer_trailer(harness, session_id, name=None, *, transfer_ref=None):
-    """Human display; old receivers reject bracketed tags as session identities."""
-    parts = [str(harness or "unknown"), peer_alias(harness, session_id)]
-    clean = " ".join(str(name or "").replace(")", " ").replace(";", " ").split())
+def peer_trailer(harness, session_id, name=None, *, transfer_ref=None, pane_id=None):
+    """Human display; the bracket token keeps display identity off the legacy path."""
+    def clean(value):
+        return " ".join("".join(ch if ch.isprintable() and ch not in ");" else " "
+                                for ch in str(value or "")).split())
+
+    parts = [clean(harness) or "unknown", peer_alias(harness, session_id)]
+    display_name = clean(name)
     if session_id:
-        clean = clean.replace(str(session_id), parts[1])
-    if clean:
-        parts.append(clean)
-    suffix = f" ; ref={transfer_ref}" if transfer_ref else ""
+        display_name = display_name.replace(str(session_id), parts[1])
+    if display_name:
+        parts.append(display_name)
+    suffix = " ; pane=%s ; sid=%s" % (clean(pane_id) or "-", usable_session_id(session_id) or "-")
+    if transfer_ref:
+        suffix += f" ; ref={transfer_ref}"
     tag = "runtime-from" if harness == "runtime" else "peer-from"
     return "(%s: %s%s)" % (tag, " ".join(parts), suffix)
 
@@ -364,7 +371,7 @@ def _prepare_peer_message(body, sender, recipient, *, include_trailer=True,
 
     This immutable record shares the ledger's local write trust boundary; it is
     not an authorization token. The final ledger row refers to this message_id.
-    Full identities live here, never in the generated display trailer.
+    The sealed endpoints own attribution; visible trailer identities are only display.
     """
     if producer_binding is not None and not _valid_runtime_producer_binding(
             producer_binding, sender, recipient, list(refs)):
@@ -377,6 +384,9 @@ def _prepare_peer_message(body, sender, recipient, *, include_trailer=True,
     normalized = body.rstrip("\n")
     source_sha256 = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     wire_body = normalized
+    trailer = peer_trailer(
+        sender.get("harness"), sender.get("session_id"), sender.get("name"),
+        transfer_ref=ref, pane_id=sender.get("pane_id")) if include_trailer else None
     body_ref = None
     payload_path = None
     raw_body = body.encode("utf-8")
@@ -385,7 +395,7 @@ def _prepare_peer_message(body, sender, recipient, *, include_trailer=True,
         try:
             body_ref, payload_path = _write_body_payload(ref, raw_body, source_sha256)
             wire_body = _body_reference_envelope(
-                body, payload_path, len(raw_body), sender, ref)
+                body, payload_path, len(raw_body), sender, ref, prepared_trailer=trailer)
             if wire_body is None:
                 payload_path.unlink()
                 body_ref, payload_path, wire_body = None, None, normalized
@@ -395,8 +405,7 @@ def _prepare_peer_message(body, sender, recipient, *, include_trailer=True,
             body_ref, payload_path, wire_body = None, None, normalized
     text = wire_body
     if include_trailer:
-        text += "\n\n" + peer_trailer(
-            sender.get("harness"), sender.get("session_id"), sender.get("name"), transfer_ref=ref)
+        text += "\n\n" + trailer
     record = {"schema_version": 1, "message_id": ref, "from": dict(sender),
               "to": dict(recipient), "body_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
               "refs": list(refs)}
@@ -500,12 +509,13 @@ def _truncate_utf8(text, limit):
     return ""
 
 
-def _body_reference_envelope(body, payload_path, raw_size, sender, ref):
+def _body_reference_envelope(body, payload_path, raw_size, sender, ref, *, prepared_trailer=None):
     lines = body.splitlines()
     first_line = lines[0] if lines else ""
     path = str(payload_path)
-    trailer = peer_trailer(
-        sender.get("harness"), sender.get("session_id"), sender.get("name"), transfer_ref=ref)
+    trailer = prepared_trailer if prepared_trailer is not None else peer_trailer(
+        sender.get("harness"), sender.get("session_id"), sender.get("name"),
+        transfer_ref=ref, pane_id=sender.get("pane_id"))
     for preview_bytes in range(_BODY_REFERENCE_PREVIEW_BYTES, -1, -16):
         preview = _truncate_utf8(first_line, preview_bytes) or "(empty first line)"
         envelope = (
@@ -1732,8 +1742,11 @@ def parse_peer_trailer(text, recipient=None, *, include_ref=False):
     }
     if match.group("sid").startswith("["):
         display_name, sep, ref = (match.group("name") or "").rpartition("; ref=")
-        if sep:
-            result["name"] = display_name.strip() or None
+        if not sep:
+            display_name = match.group("name") or ""
+        # Decorative native identity never selects a sender or a legacy path.
+        display_name = display_name.split("; pane=", 1)[0].strip()
+        result["name"] = display_name or None
         # A missing display tag does not decide identity. Malformed metadata,
         # wrong actual recipient and changed bodies remain unattributed.
         if not _valid_transfer_endpoint(recipient) or not re.fullmatch(r"\[(?:[0-9a-f]{2}|\?)\]", match.group("sid")):
