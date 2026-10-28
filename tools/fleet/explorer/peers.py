@@ -7,7 +7,7 @@ from .output import cell_width
 from .tables import _clip, repo_rule_label
 
 STAGE_HUES = ("l", "c", "g", "y", "m")          # blue · cyan · green · yellow · magenta
-LANE_HEAD_LEFT, LANE_HEAD_RIGHT = "◀", "▶"
+LANE_HEAD_LEFT, LANE_HEAD_RIGHT = "◂", "▸"
 STATE_MARKS = {"working": ("⠏", "spin"), "active": ("⠏", "spin"), "idle": ("●", "idle"),
                "blocked": ("●", "blocked"), "failed": ("✕", "dead"), "done": ("✓", "done"),
                "dead": ("✕", "dead")}
@@ -144,6 +144,66 @@ def _link_when(links, upper, lower):
     return None
 
 
+def _clear_text(seat):
+    """The recent-clear label a seat puts on its card's bottom border, if it has one."""
+    recent = re.search(r"· (\S+) ago$", str(seat[3])) if len(seat) > 3 else None
+    if recent and str(seat[2]).isdigit():
+        return f"◂ gen {int(seat[2]) - 1} · {recent.group(1)}"
+    return None
+
+
+def _lane_cells(edges, boxes, right):
+    """Screen cells a side lane and its two labels occupy, from the same geometry it draws with."""
+    cells = set()
+    links = tuple(edges.get("links", ()))
+    for lane in edges.get("side_lanes", ()):
+        if len(lane) < 2:
+            continue
+        upper, lower = str(lane[0]), str(lane[1])
+        top, bottom = boxes.get(upper), boxes.get(lower)
+        if (not top or not bottom or top[4] != bottom[4] or top[2] != bottom[2]
+                or top[3] >= bottom[1]):
+            continue
+        ux, uy, edge, ub = top[0], top[1], top[2], top[3]
+        fy = bottom[1]
+        for yy in range(uy + 1, fy + 3):
+            for xx in range(edge, edge + 6):
+                cells.add((xx, yy))
+        label_right = min(right, top[2])
+        for row, (src, dst) in enumerate(((upper, lower), (lower, upper))):
+            sent = _link_when(links, src, dst)
+            if sent:
+                text = f"[{src}]→[{dst}] {sent[0]} {sent[1]}"
+                for xx in range(ux + 2, min(label_right, ux + 2 + cell_width(text))):
+                    cells.add((xx, ub + 1 + row))
+    return cells
+
+
+def _cross_occupancy(boxes, frames, lane_cells):
+    """Cells a cross line may not paint over: every card, every frame border, every side lane."""
+    cells = set(lane_cells)
+    for box in boxes.values():
+        for yy in range(box[1], box[3] + 1):
+            for xx in range(box[0], box[2] + 1):
+                cells.add((xx, yy))
+    for fx0, fy0, fx1, fy1 in frames.values():
+        for xx in range(fx0, fx1 + 1):
+            cells.add((xx, fy0))
+            cells.add((xx, fy1))
+        for yy in range(fy0, fy1 + 1):
+            cells.add((fx0, yy))
+            cells.add((fx1, yy))
+    return cells
+
+
+def _footer_start(box, clear):
+    """Where text may start on a card's bottom border without covering the clear marker."""
+    start = box[0] + 2
+    if clear:
+        start = max(start, box[0] + 1 + cell_width(clear))
+    return start
+
+
 def _draw_side_lanes(grid, edges, boxes, right):
     """Stacked pairs join round their right side, one lane each way, labelled under the upper card.
 
@@ -183,15 +243,24 @@ def _draw_side_lanes(grid, edges, boxes, right):
         put(second, uy + 1, "┐")
         put(edge + 2, uy + 1, "───")
         put(edge + 1, uy + 1, LANE_HEAD_LEFT, "soft")
+        label_right = min(right, top[2])
         for row, (src, dst) in enumerate(((upper, lower), (lower, upper))):
             sent = _link_when(links, src, dst)
             if sent:
                 _segments(grid, ux + 2, ub + 1 + row,
-                          [(f"[{src}]→[{dst}] ", "dim"), (sent[0], "soft"), (f" {sent[1]}", "dim")], right)
+                          [(f"[{src}]→[{dst}] ", "dim"), (sent[0], "soft"), (f" {sent[1]}", "dim")],
+                          label_right)
 
 
-def _draw_cross_links(grid, edges, boxes, frames, right):
-    """A line between two frames that sit side by side, else a ``→[tag]`` badge on the sender."""
+def _draw_cross_links(grid, edges, boxes, frames, right, clear_of):
+    """A line between two frames that sit side by side, else a ``→[tag]`` badge on the sender.
+
+    A line may only use empty cells: the side-lane gutter, another card or a third frame's border
+    turns it into the existing badge. Both ends stay on the card borders they belong to, and the
+    badge starts after the clear marker so the two never paint over each other.
+    """
+    lane_cells = _lane_cells(edges, boxes, right)
+    occupied = _cross_occupancy(boxes, frames, lane_cells)
     for edge in edges.get("cross", ()):
         if len(edge) < 2:
             continue
@@ -203,7 +272,15 @@ def _draw_cross_links(grid, edges, boxes, frames, right):
         sx0, sy0, sx1, sy1 = a[:4]
         dx0, dy0, _dx1, dy1 = b[:4]
         ly = max(sy0, dy0) + 2
-        if sx1 < dx0 and sy0 < ly < sy1 and dy0 < ly < dy1:
+        drawable = (sx1 + 1 < dx0 and sy0 < ly < sy1 and dy0 < ly < dy1
+                    and (len(a) < 8 or a[7] != ly) and (len(b) < 8 or b[7] != ly)
+                    and (sx1, ly) not in lane_cells)
+        if drawable:
+            allowed = {(sx1, ly), (frames[a[4]][2], ly), (frames[b[4]][0], ly)}
+            drawable = (all((xx, ly) not in lane_cells for xx in range(sx1, dx0))
+                        and all((xx, ly) not in occupied or (xx, ly) in allowed
+                                for xx in range(sx1, dx0)))
+        if drawable:
             grid.put(sx1, ly, "├", a[5], limit=right)
             for xx in range(sx1 + 1, dx0 - 1):
                 grid.put(xx, ly, "─", "branch_s", limit=right)
@@ -215,22 +292,24 @@ def _draw_cross_links(grid, edges, boxes, frames, right):
             if frames[b[4]][0] - frames[a[4]][2] - 3 >= label_width:
                 _segments(grid, frames[a[4]][2] + 2, ly - 1, label, right)
             else:
-                _segments(grid, sx0 + 2, sy1, [(" steer", "soft"), (" " + when + " ", "dim")], right)
+                _segments(grid, _footer_start(a, clear_of.get(src)), sy1,
+                          [(" steer", "soft"), (" " + when + " ", "dim")], min(right, sx1))
         else:
-            _segments(grid, sx0 + 2, sy1, [(" →", "soft"), (f"[{dst}]", "text"), (" steer", "soft"),
-                                           (" " + when + " ", "dim")], right)
+            _segments(grid, _footer_start(a, clear_of.get(src)), sy1,
+                      [(" →", "soft"), (f"[{dst}]", "text"), (" steer", "soft"),
+                       (" " + when + " ", "dim")], min(right, sx1))
 
 
-def _draw_markers(grid, vm, edges, boxes, frames, right):
+def _draw_markers(grid, vm, edges, boxes, frames, right, clear_of):
     """A recent clear on a seat marks its card's bottom border; a steward's watch marks its frame."""
     session_by_tag = {str(item.get("tag")): item for item in vm.sessions}
     for seat in vm.seats or ():
         tag = str(seat[0])
         box = boxes.get(tag)
-        recent = re.search(r"· (\S+) ago$", str(seat[3])) if len(seat) > 3 else None
-        if box and recent and str(seat[2]).isdigit():
+        text = clear_of.get(tag)
+        if box and text:
             harness = str(session_by_tag.get(tag, {}).get("harness") or "claude")
-            grid.put(box[0] + 1, box[3], f"◂ gen {int(seat[2]) - 1} · {recent.group(1)}", "hb_" + harness,
+            grid.put(box[0] + 1, box[3], text, "hb_" + harness,
                      limit=min(right, box[2] + 1))
     for marker in edges.get("watches", ()):
         frame = frames.get(str(marker.get("repo")))
@@ -308,6 +387,11 @@ def draw_peers(grid, vm, state, x=34, y=3):
     frame_gap, column_gap, lane_gap, stack_gap = 3, 2, 6, 2
     owners_of = {tag: tuple(card.get("owners", ())) for tag, card in cards.items()}
     extra_of = {tag: _extra_lines(item, questions) for tag, item in session_by_tag.items()}
+    clear_of = {}
+    for seat in vm.seats or ():
+        text = _clear_text(seat)
+        if text:
+            clear_of[str(seat[0])] = text
 
     def height_of(tag):
         return _card_height(owners_of.get(tag, ()), extra_of[tag])
@@ -428,15 +512,17 @@ def draw_peers(grid, vm, state, x=34, y=3):
                 border = ("hb_" if selected else "h_") + harness
                 _draw_card(grid, session, tag, bx, by, box_width, right, border,
                            extra_of[tag], owners_of.get(tag, ()))
+                # The last field is the owner divider row; cross lines must not land on it.
+                divider = by + 3 + len(extra_of[tag]) if owners_of.get(tag) else None
                 session_boxes[tag] = (bx, by, bx + box_width - 1, by + card_h, repo, "h_" + harness,
-                                      "hb_" + harness)
+                                      "hb_" + harness, divider)
                 for hit_y in range(by, by + card_h + 1):
                     grid.add_hit(hit_y, bx, min(right, bx + box_width), ("fold", "pfocus:" + state.view, tag))
         cursor_y += band_h + 1
 
     _draw_side_lanes(grid, edges, session_boxes, right)
-    _draw_cross_links(grid, edges, session_boxes, frame_boxes, right)
-    _draw_markers(grid, vm, edges, session_boxes, frame_boxes, right)
+    _draw_cross_links(grid, edges, session_boxes, frame_boxes, right, clear_of)
+    _draw_markers(grid, vm, edges, session_boxes, frame_boxes, right, clear_of)
 
     y = cursor_y
     if not placements:

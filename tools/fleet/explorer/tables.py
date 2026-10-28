@@ -483,6 +483,10 @@ def _session_open_link(grid, x_lab, x_val, right, y, tag):
 
 def _draw_overview_route(grid, x, use, y, route, steward=False):
     _draw_route_line(grid, x + IND + 1, x + use, y, route, steward=steward)
+    if route_is_history(route):
+        # Only the OVERVIEW summary row recedes here. `_draw_route_line` is also the
+        # session-unfold route line, which another change owns; leave that path alone.
+        _recede_row(grid, y, x + IND + 1, x + use)
 
 
 def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False):
@@ -519,8 +523,6 @@ def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False)
     x += title_width + GAP
     _draw_route_progress(grid, x, x1 - AGE_W - GAP, y, route)
     grid.put(x1 - _seg_width(age), y, age, "dim")
-    if route_is_history(route):
-        _recede_row(grid, y, x0, x1)
 
 
 def _draw_route_progress(grid, x, end, y, route):
