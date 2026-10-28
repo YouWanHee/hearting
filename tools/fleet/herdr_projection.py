@@ -262,7 +262,7 @@ def _tag_metadata_identity(agent):
     harness = agent.get("agent")
     identity = agent.get("agent_session") or {}
     pane = agent.get("pane_id")
-    if (harness not in {"codex", "opencode"} or not pane
+    if (harness not in HARNESSES or not pane
             or not isinstance(identity, dict) or identity.get("kind") != "id"
             or identity.get("agent", harness) != harness):
         return None

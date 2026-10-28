@@ -233,6 +233,196 @@ def _native_session_claim(home: Path, pid: str, start: str):
     return sid, True
 
 
+def _conversation_tokens(argv: list[str]) -> list[str] | None:
+    """Only a native launcher or the supported Node/Bun CLI script position."""
+    if not argv:
+        return None
+    name = os.path.basename(argv[0]).lower()
+    if name in {"node", "nodejs", "bun"}:
+        if (len(argv) < 2 or Path(argv[1]).parent.name != "claude-code"
+                or Path(argv[1]).name not in {"cli.js", "cli.mjs", "cli.cjs"}):
+            return None
+        return ["claude", *argv[2:]]
+    if name in {"claude bg-spare", "claude bg-pty-host"}:
+        return ["claude", name.split(" ", 1)[1], *argv[1:]]
+    if name in {"claude", "claude-code"} or _native_claude_executable(argv[0]):
+        return ["claude", *argv[1:]]
+    return None
+
+
+def conversation_invocation(argv: list[str]) -> str:
+    """Fleet conversation mode; census holder semantics deliberately stay separate."""
+    tokens = _conversation_tokens(argv)
+    if tokens is None:
+        return "unknown"
+    services = _CLAUDE_COMMANDS | {"daemon", "remote-control", "bg-spare", "bg-pty-host"}
+    index = 1
+    while index < len(tokens):
+        word = tokens[index]
+        if word in {"--", "-p", "--print"}:
+            return "session"
+        if word.split("=", 1)[0] in {"--bg-pty-host", "--bg-spare"}:
+            return "command"
+        if word in _CLAUDE_VALUE_OPTIONS:
+            if index + 1 >= len(tokens):
+                return "unknown"
+            index += 2
+            continue
+        if word in _CLAUDE_FLAG_OPTIONS or word == "--fork-session":
+            if word in {"--help", "-h", "--version", "-V"}:
+                return "command"
+            index += 1
+            continue
+        if word.startswith("--") and "=" in word:
+            option = word.split("=", 1)[0]
+            if option not in _CLAUDE_VALUE_OPTIONS:
+                return "unknown"
+            index += 1
+            continue
+        if word.startswith("-"):
+            return "unknown"
+        return "command" if word in services else "session"
+    return "session"
+
+
+def observe_process(pid, *, proc_root: str | os.PathLike = "/proc"):
+    """A bounded same-user PID/start/executable/NUL-argv observation, or unknown.
+
+    The second read rejects exits, PID reuse and exec during observation. This
+    focused predicate is shared by the producer and both Fleet consumers; it
+    never enumerates processes or decides whether a recipient is dead.
+    """
+    if isinstance(pid, bool) or not str(pid).isdecimal() or int(pid) <= 1:
+        return None
+    proc = Path(proc_root) / str(pid)
+
+    def read():
+        uid = proc.stat().st_uid
+        with (proc / "stat").open(encoding="ascii") as handle:
+            text = handle.read(8193)
+        with (proc / "cmdline").open("rb") as handle:
+            raw = handle.read(32769)
+        if len(text) > 8192 or not raw or len(raw) > 32768 or not raw.endswith(b"\0"):
+            return None
+        fields = text[text.rfind(")") + 2:].split()
+        start = _proc_start(text)
+        argv = [os.fsdecode(item) for item in raw[:-1].split(b"\0")]
+        if (uid != os.geteuid() or not start.isdecimal() or len(fields) < 20
+                or not fields[1].isdecimal() or fields[0] in {"Z", "X", "x"}
+                or not argv[0]):
+            return None
+        return uid, start, int(fields[1]), argv, os.readlink(proc / "exe")
+
+    try:
+        before = read()
+        if before is None or read() != before:
+            return None
+    except (OSError, ValueError, UnicodeError):
+        return None
+    _, start, parent, argv, executable = before
+    tokens = _conversation_tokens(argv)
+    launcher = os.path.basename(executable).lower()
+    native = (_native_claude_executable(executable) and tokens is not None
+              and os.path.basename(argv[0]).lower() not in {"node", "nodejs", "bun"})
+    scripted = (launcher in {"node", "nodejs", "bun"} and tokens is not None
+                and os.path.basename(argv[0]).lower() in {"node", "nodejs", "bun"})
+    mode = conversation_invocation(argv) if native or scripted else "unknown"
+    kind = ("service" if mode == "command" else "runtime") if native or scripted else "helper"
+    return {"pid": int(pid), "proc_start": start, "ppid": parent,
+            "argv": argv, "executable": executable, "kind": kind, "invocation": mode}
+
+
+def _focused_tap_claims(home: Path, pid, start: str):
+    """Bound registry-loss work without changing the census's raw tap reader."""
+    claims = set()
+    with os.scandir(home / ".statusline") as entries:
+        for count, entry in enumerate(entries):
+            if count >= 128:
+                raise OSError("statusline fallback inventory incomplete")
+            if entry.name.startswith(".") or not entry.name.endswith(".json"):
+                continue
+            fd = os.open(entry.path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                         | getattr(os, "O_NONBLOCK", 0))
+            try:
+                before = os.fstat(fd)
+                if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                        or before.st_size > 65536):
+                    raise OSError("statusline fallback file unusable")
+                raw = os.read(fd, 65537)
+                stamp = lambda info: (info.st_dev, info.st_ino, info.st_size,
+                                      info.st_mtime_ns, info.st_ctime_ns)
+                if (len(raw) > 65536 or stamp(os.fstat(fd)) != stamp(before)
+                        or stamp(os.lstat(entry.path)) != stamp(before)):
+                    raise OSError("statusline fallback file changed")
+                row = json.loads(raw)
+                if not isinstance(row, dict):
+                    raise ValueError("invalid statusline fallback")
+                sid = row.get("session_id") or entry.name[:-5]
+                if (str(row.get("pid")) == str(pid) and str(row.get("proc_start")) == start
+                        and isinstance(sid, str) and sid):
+                    claims.add(sid)
+            finally:
+                os.close(fd)
+    return claims
+
+
+def statusline_identity(parent_pid, sid: str, home: str | os.PathLike, *,
+                        proc_root: str | os.PathLike = "/proc", max_depth: int = 5):
+    """Bind only the nearest verified runtime; a mismatch never borrows an ancestor."""
+    if not isinstance(sid, str) or not sid or Path(sid).name != sid:
+        return None
+    pid = parent_pid
+    for _ in range(max_depth):
+        observed = observe_process(pid, proc_root=proc_root)
+        if observed is None or observed["kind"] == "service":
+            return None
+        if observed["kind"] == "helper":
+            pid = observed["ppid"]
+            continue
+        start = observed["proc_start"]
+        try:
+            current, valid = _native_session_claim(Path(home), str(pid), start)
+        except OSError:
+            return None
+        if not valid:
+            return None
+        if current is None:
+            # Explicit current-session arguments may bind a first event. Resume
+            # selectors can be paths or a pre-fork SID and are not current proof.
+            tokens = _conversation_tokens(observed["argv"])
+            claims = set()
+            index = 1
+            while index < len(tokens):
+                word = tokens[index]
+                if word in {"--", "-p", "--print"}:
+                    break
+                if word in _CLAUDE_VALUE_OPTIONS:
+                    if index + 1 >= len(tokens):
+                        break
+                    if word == "--session-id":
+                        claims.add(tokens[index + 1])
+                    index += 2
+                elif word.startswith("--session-id="):
+                    claims.add(word.split("=", 1)[1])
+                    index += 1
+                elif word in _CLAUDE_FLAG_OPTIONS or word == "--fork-session":
+                    index += 1
+                else:
+                    break
+            if not claims:
+                # Registry-loss fallback is bounded to this config home. An
+                # incomplete or conflicting tap inventory cannot select a SID.
+                try:
+                    claims = _focused_tap_claims(Path(home), pid, start)
+                except (OSError, ValueError):
+                    return None
+            current = sid if claims == {sid} else None
+        if current != sid or observe_process(pid, proc_root=proc_root) != observed:
+            return None
+        return observed
+    return None
+
+
 def _remote_mount(home: Path, mounts_path: Path) -> bool:
     try:
         home = home.resolve(strict=True)

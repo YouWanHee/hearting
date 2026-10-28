@@ -10,15 +10,16 @@ Root-cause pair, both fixed here and pinned by these tests:
       successful Fleet sidecars alone provide generated session subjects.
 
 Hermetic: temp CLAUDE_CONFIG_DIR only; no real ~/.claude, no live process dependency.
-The statusline.sh injection tests drive the real script with a stub `claude` ancestor.
+The statusline.sh injection tests drive the real script with a verified native executable fixture.
 """
 import json
 import os
-import stat
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _TOOLS_DIR not in sys.path:
@@ -192,11 +193,58 @@ class TapSidRecoveryTest(_HomeMixin, unittest.TestCase):
         self.assertEqual(s.cost, 1.25)
 
 
-@unittest.skipUnless(os.path.exists(_STATUSLINE) and os.path.isdir("/proc"),
+@unittest.skipUnless(os.path.exists(_STATUSLINE) and os.path.isdir("/proc") and shutil.which("cc"),
                      "needs adapters/claude/statusline.sh and /proc")
 class StatuslineTapInjectionTest(unittest.TestCase):
-    """Drives the real statusline.sh under a stub `claude` ancestor: the tap file must be
-    valid JSON carrying pid/proc_start, and non-`{"`-prefixed input must stay verbatim."""
+    """Real shell + native executable/argv/PID/start + private current registry."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.native = tempfile.TemporaryDirectory()
+        root = Path(cls.native.name)
+        source = root / "runtime.c"
+        source.write_text(r'''#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+int main(void) {
+    char buffer[8192], path[8192];
+    snprintf(path, sizeof(path), "/proc/%d/stat", getpid());
+    FILE *f = fopen(path, "r");
+    if (!f || !fgets(buffer, sizeof(buffer), f)) return 2;
+    fclose(f);
+    char *token = strtok(strrchr(buffer, ')') + 2, " ");
+    for (int i=0; i<19 && token; i++) token = strtok(NULL, " ");
+    if (!token) return 3;
+    snprintf(path, sizeof(path), "%s/sessions/%d.json", getenv("CLAUDE_CONFIG_DIR"), getpid());
+    if (!getenv("FIXTURE_NO_REGISTRY")) {
+        f = fopen(path, "w");
+        if (!f) return 4;
+        fprintf(f, "{\"pid\":%d,\"procStart\":\"%s\",\"sessionId\":\"%s\","
+                "\"name\":\"%s\",\"nameSource\":\"%s\"}", getpid(), token, getenv("FIXTURE_SID"),
+                getenv("FIXTURE_NAME") ? getenv("FIXTURE_NAME") : "",
+                getenv("FIXTURE_NAME_SOURCE") ? getenv("FIXTURE_NAME_SOURCE") : "derived");
+        fclose(f);
+    }
+    pid_t child = fork();
+    if (child == 0) { execl("/bin/bash", "bash", getenv("FIXTURE_STATUSLINE"), NULL); _exit(5); }
+    int status; waitpid(child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 6;
+}
+''')
+        cls.binary = root / "claude" / "versions" / "8.7.6"
+        cls.binary.parent.mkdir(parents=True)
+        try:
+            subprocess.run([shutil.which("cc"), str(source), "-o", str(cls.binary)],
+                           check=True, capture_output=True, timeout=30)
+        except BaseException:
+            cls.native.cleanup()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.native.cleanup()
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -206,16 +254,8 @@ class StatuslineTapInjectionTest(unittest.TestCase):
         # under AGENT_HOME: a managed release tree written to goes cache-stale.
         self.config_home = os.path.join(self._tmp.name, "claude-config")
         os.makedirs(self.config_home)
-        # Stub `claude`: a script whose comm is "claude"; it runs statusline.sh as a child
-        # so the ancestor walk finds it (statusline PPID → bash stub, comm == "claude").
-        self.stub = os.path.join(self._tmp.name, "claude")
-        with open(self.stub, "w", encoding="utf-8") as f:
-            # Direct-shebang: `#!/usr/bin/env bash` would exec twice (env → bash) and leave
-            # comm "bash"; a direct interpreter keeps comm = script basename = "claude".
-            # Trailing `:` stops bash's tail-call exec of the last command — the stub must
-            # STAY alive as the statusline child's parent, or the ancestor walk skips it.
-            f.write("#!/bin/bash\nbash \"$1\"\nrc=$?\n:\nexit $rc\n")
-        os.chmod(self.stub, os.stat(self.stub).st_mode | stat.S_IEXEC)
+        os.makedirs(os.path.join(self.config_home, "sessions"))
+        self.stub = str(self.binary)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -229,8 +269,10 @@ class StatuslineTapInjectionTest(unittest.TestCase):
         env["CLAUDE_CONFIG_DIR"] = self.config_home
         env["FLEET_TITLE_DISABLE"] = "1"           # keep the refresher out of the test
         env["HARNESS_CAPACITY_REFRESH_DISABLE"] = "1"   # and the capacity gauge probe (network + live cache)
+        env["FIXTURE_STATUSLINE"] = _STATUSLINE
+        env["FIXTURE_SID"] = json.loads(stdin_json)["session_id"]
         env.update(extra_env or {})
-        proc = subprocess.Popen([self.stub, _STATUSLINE], stdin=subprocess.PIPE,
+        proc = subprocess.Popen([self.stub], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         out, err = proc.communicate(stdin_json.encode("utf-8"), timeout=30)
         return proc, out, err
@@ -258,9 +300,59 @@ class StatuslineTapInjectionTest(unittest.TestCase):
         proc, _out, _err = self._run(stdin_json)
         raw = self._tap("sidZ")
         d = json.loads(raw)                        # valid JSON after injection
-        self.assertEqual(d["pid"], proc.pid)       # the stub IS the claude ancestor
+        self.assertEqual(d["pid"], proc.pid)       # actual version-named native fixture
         self.assertTrue(str(d["proc_start"]).isdigit())
         self.assertEqual(d["session_id"], "sidZ")  # original fields intact
+
+    def test_unverified_or_foreign_runtime_drops_supplied_pid_evidence(self):
+        payload = json.dumps({"session_id": "current", "cwd": "/tmp",
+                              "pid": 12345, "proc_start": "54321"})
+        for extra in ({"FIXTURE_NO_REGISTRY": "1"}, {"FIXTURE_SID": "foreign"}):
+            with self.subTest(extra=extra):
+                self._run(payload, extra)
+                record = json.loads(self._tap("current"))
+                self.assertNotIn("pid", record)
+                self.assertNotIn("proc_start", record)
+                self.assertIn("hearting_context_request", record)
+
+    def test_failed_identity_helper_keeps_telemetry_without_unverified_pid(self):
+        helper = Path(self.agent_home) / "utilities/claude_process_identity.py"
+        helper.parent.mkdir()
+        helper.write_text("raise OSError('fixture helper unavailable')\n")
+        process, _, _ = self._run(json.dumps({"session_id": "helper-failure", "cwd": "/tmp",
+                                            "pid": 12345, "proc_start": "54321"}))
+        self.assertEqual(process.returncode, 0)
+        record = json.loads(self._tap("helper-failure"))
+        self.assertNotIn("pid", record)
+        self.assertNotIn("proc_start", record)
+        self.assertIn("hearting_context_request", record)
+
+    def test_normal_claude_launcher_keeps_exact_pid_evidence(self):
+        launcher = Path(self._tmp.name) / "claude"
+        shutil.copyfile(self.binary, launcher)
+        launcher.chmod(0o700)
+        self.stub = str(launcher)
+        process, _, _ = self._run(json.dumps({"session_id": "normal", "cwd": "/tmp"}))
+        self.assertEqual(json.loads(self._tap("normal"))["pid"], process.pid)
+
+    def test_verified_runtime_displays_user_name_and_derived_name_uses_last_title(self):
+        source = Path(_STATUSLINE).resolve().parents[2]
+        tools = Path(self.config_home) / "tools"
+        tools.mkdir()
+        (tools / "fleet").symlink_to(source / "tools/fleet", target_is_directory=True)
+        state = Path(self._tmp.name) / "titles"
+        (state / "claude").mkdir(parents=True)
+        for sid, name_source, name, expected in (
+                ("named", "user", "User chosen subject", "User chosen subject"),
+                ("derived", "derived", "workspace-42", "Last successful title")):
+            (state / "claude" / (sid + ".json")).write_text(json.dumps({
+                "title": "Last successful title", "ts": 1, "source": "refresher"}))
+            process, output, error = self._run(json.dumps({"session_id": sid, "cwd": "/tmp"}), {
+                "AGENT_HOME": self.config_home, "FLEET_TITLE_STATE_DIR": str(state),
+                "FIXTURE_NAME": name, "FIXTURE_NAME_SOURCE": name_source})
+            self.assertEqual(process.returncode, 0, error)
+            self.assertIn(expected, output.decode())
+            self.assertEqual(json.loads(self._tap(sid))["pid"], process.pid)
 
     def test_non_brace_quote_input_stays_verbatim(self):
         stdin_json = '{ "session_id": "sidY", "cwd": "/tmp" }'

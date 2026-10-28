@@ -24,7 +24,139 @@ import claude_process_identity as claude_identity  # noqa: E402
 SID = "ses_abcDEF123"
 
 
+class FakeClaudeProc:
+    """Private proc/native files; readers and classification remain production code."""
+    def __init__(self, root):
+        self.root = Path(root) / "proc"
+        self.home = Path(root) / "claude"
+        self.root.mkdir()
+        (self.home / "sessions").mkdir(parents=True)
+
+    def process(self, pid=71, parent=1, start="101", argv=None, executable=None):
+        proc = self.root / str(pid)
+        proc.mkdir(exist_ok=True)
+        (proc / "stat").write_text(f"{pid} (native fixture) S {parent} " +
+                                   " ".join(["0"] * 17 + [start]))
+        (proc / "cmdline").write_bytes(b"\0".join(os.fsencode(x) for x in
+            (argv or ["claude"])) + b"\0")
+        (proc / "exe").unlink(missing_ok=True)
+        (proc / "exe").symlink_to(executable or "/opt/claude/versions/8.7.6")
+        return proc
+
+    def registry(self, pid=71, start="101", sid="current", **extra):
+        path = self.home / "sessions" / f"{pid}.json"
+        path.write_text(json.dumps({"pid": pid, "procStart": start, "sessionId": sid, **extra}))
+        return path
+
+    def tap(self, sid="current", pid=71, start="101"):
+        directory = self.home / ".statusline"
+        directory.mkdir(exist_ok=True)
+        (directory / f"{sid}.json").write_text(json.dumps({
+            "session_id": sid, "pid": pid, "proc_start": start}))
+
+
 class ClaudeNativeIdentityHelperTest(unittest.TestCase):
+    def test_focused_native_predicate_rejects_appearance_and_prompt_false_positives(self):
+        cases = [
+            ("/opt/claude/versions/8.7.6", ["claude"], "runtime"),
+            ("/usr/bin/claude", ["claude", "--model", "daemon"], "runtime"),
+            ("/opt/claude/versions/8.7.6", ["claude", "--session-id", "new",
+                "--fork-session", "--resume", "/old/transcript.jsonl"], "runtime"),
+            ("/usr/bin/node", ["node", "/opt/@anthropic-ai/claude-code/cli.js"], "runtime"),
+            ("/usr/bin/bun", ["bun", "/opt/@anthropic-ai/claude-code/cli.js", "daemon"], "service"),
+            ("/usr/bin/claude", ["claude", "daemon", "run"], "service"),
+            ("/opt/claude/versions/8.7.6", ["claude bg-pty-host", "--bg-pty-host", "/sock"], "service"),
+            ("/opt/claude/versions/8.7.6", ["claude bg-spare"], "service"),
+            ("/opt/claude/versions/8.7.6", ["claude", "--bg-pty-host", "/sock"], "service"),
+            ("/usr/bin/claude", ["claude", "-p", "daemon"], "runtime"),
+            ("/usr/bin/claude", ["claude", "--system-prompt", "daemon"], "runtime"),
+            ("/usr/bin/claude", ["claude", "--unknown", "daemon"], "runtime"),
+            ("/opt/claude/versions/8.7.6", ["rg", "claude"], "helper"),
+            ("/usr/bin/python3", ["python3", "/tmp/claude", "--resume", "sid"], "helper"),
+            ("/usr/bin/node", ["node", "/tmp/app.js", "@anthropic-ai/claude-code"], "helper"),
+            ("/tmp/8.7.6", ["8.7.6", "claude"], "helper"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = FakeClaudeProc(temporary)
+            for executable, argv, expected in cases:
+                with self.subTest(executable=executable, argv=argv):
+                    fixture.process(executable=executable, argv=argv)
+                    observed = claude_identity.observe_process(71, proc_root=fixture.root)
+                    self.assertEqual(observed["kind"], expected)
+                    self.assertEqual((observed["pid"], observed["proc_start"]), (71, "101"))
+            with unittest.mock.patch.object(claude_identity.os, "geteuid", return_value=os.getuid() + 1):
+                self.assertIsNone(claude_identity.observe_process(71, proc_root=fixture.root))
+
+    def test_nearest_runtime_binding_and_registry_loss_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            f = FakeClaudeProc(temporary)
+            f.process(73, parent=72, executable="/bin/bash", argv=["bash", "statusline.sh"])
+            f.process(72, parent=71, start="102")
+            f.process(71)
+            f.registry(71)
+            lookup = lambda: claude_identity.statusline_identity(73, "current", f.home, proc_root=f.root)
+            self.assertIsNone(lookup(), "must not borrow the upper runtime's registry")
+            path = f.registry(72, start="102", sid="foreign")
+            self.assertIsNone(lookup())
+            f.registry(72, start="102", sid="current")
+            self.assertEqual(lookup()["pid"], 72)
+            f.registry(72, start="stale", sid="current")
+            self.assertIsNone(lookup())
+            path.write_text("{")
+            self.assertIsNone(lookup())
+            path.unlink()
+            f.tap(pid=72, start="102")
+            self.assertEqual(lookup()["pid"], 72)
+            f.tap(sid="conflict", pid=72, start="102")
+            self.assertIsNone(lookup())
+            # An exact current native record outranks historical launch/tap claims.
+            f.registry(72, start="102")
+            self.assertEqual(lookup()["pid"], 72)
+
+    def test_focused_observation_revalidates_process_reads_and_binding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            f = FakeClaudeProc(temporary)
+            proc = f.process()
+            real_readlink = os.readlink
+            def reuse(path):
+                result = real_readlink(path)
+                f.process(start="102")
+                return result
+            with unittest.mock.patch.object(claude_identity.os, "readlink", side_effect=reuse):
+                self.assertIsNone(claude_identity.observe_process(71, proc_root=f.root))
+            f.process()
+            f.registry()
+            original_claim = claude_identity._native_session_claim
+            def exit_after_claim(*args):
+                result = original_claim(*args)
+                (proc / "cmdline").unlink()
+                return result
+            with unittest.mock.patch.object(claude_identity, "_native_session_claim", side_effect=exit_after_claim):
+                self.assertIsNone(claude_identity.statusline_identity(71, "current", f.home, proc_root=f.root))
+            with unittest.mock.patch.object(claude_identity.Path, "open", side_effect=PermissionError()):
+                self.assertIsNone(claude_identity.observe_process(71, proc_root=f.root))
+
+    def test_explicit_current_argument_and_unreadable_registry_never_borrow_parent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            f = FakeClaudeProc(temporary)
+            f.process(71, argv=["claude", "daemon", "run"])
+            f.registry(71)
+            for argv, bound in ((["claude", "--session-id", "current", "--fork-session",
+                                  "--resume", "/old.jsonl"], True),
+                                (["claude", "--session-id=foreign"], False),
+                                (["claude", "--resume", "current"], False),
+                                (["claude", "--model", "--session-id=current"], False),
+                                (["claude", "--unknown", "--session-id=current"], False),
+                                (["claude", "--bg-pty-host=/sock"], False)):
+                with self.subTest(argv=argv):
+                    f.process(72, parent=71, argv=argv)
+                    self.assertEqual(bool(claude_identity.statusline_identity(
+                        72, "current", f.home, proc_root=f.root)), bound)
+            f.process(72, parent=71)
+            f.registry(72)
+            with unittest.mock.patch.object(claude_identity.os, "open", side_effect=PermissionError()):
+                self.assertIsNone(claude_identity.statusline_identity(72, "current", f.home, proc_root=f.root))
+
     def test_indexed_and_direct_taps_match_fleet_exact_pid_start_claims(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)

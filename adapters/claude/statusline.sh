@@ -110,24 +110,24 @@ print("S_CTX=" + shlex.quote(str(cpct)))
 # `nameSource` (Amendment 2 — statusline must apply the same derived-vs-user-set rule
 # Fleet applies, not print its own stdin `session_name` unconditionally).
 tap_pid=""; tap_start=""
-p=$PPID
-for _ in 1 2 3 4 5; do
-  [ -n "$p" ] && [ "$p" != 1 ] && [ -r "/proc/$p/comm" ] || break
-  if [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "claude" ]; then
-    st=$(cat "/proc/$p/stat" 2>/dev/null) || break
-    st=${st##*) }                       # comm 뒤 (state 부터); ppid=2번째, starttime=20번째
-    # shellcheck disable=SC2086
-    set -- $st
-    if [ "$#" -ge 20 ]; then tap_pid=$p; tap_start=${20}; fi
-    break
-  fi
-  st=$(cat "/proc/$p/stat" 2>/dev/null) || break
-  st=${st##*) }
-  # shellcheck disable=SC2086
-  set -- $st
-  [ "$#" -ge 2 ] || break
-  p=$2
-done
+identity_helper="$AGENT_HOME/utilities/claude_process_identity.py"
+[ -f "$identity_helper" ] || identity_helper="$(dirname "$AGENT_HOME")/utilities/claude_process_identity.py"
+if [ ! -f "$identity_helper" ]; then
+  script_path=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)
+  identity_helper="$(dirname "$(dirname "$(dirname "$script_path")")")/utilities/claude_process_identity.py"
+fi
+if [ -n "$S_SID" ] && [ -f "$identity_helper" ]; then
+  identity=$(python3 - "$identity_helper" "$PPID" "$S_SID" "$SL_STATE_HOME" <<'PY' 2>/dev/null || true
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("claude_process_identity", sys.argv[1])
+mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+found = mod.statusline_identity(sys.argv[2], sys.argv[3], sys.argv[4])
+if found:
+    print(found["pid"], found["proc_start"])
+PY
+  )
+  read -r tap_pid tap_start <<< "$identity" || true
+fi
 S_SESSION_DISPLAY=""
 session_helper="$AGENT_HOME/tools/fleet/session_handle.py"
 [ -f "$session_helper" ] || session_helper="$(dirname "$AGENT_HOME")/tools/fleet/session_handle.py"
@@ -191,6 +191,8 @@ if not isinstance(value, dict):
     sys.stdout.write(raw)
     raise SystemExit(0)
 pid, start = sys.argv[1:3]
+value.pop("pid", None)
+value.pop("proc_start", None)
 if pid.isdigit() and start.isdigit():
     value["pid"], value["proc_start"] = int(pid), start
 
@@ -227,13 +229,6 @@ sys.stdout.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
     ' "$tap_pid" "$tap_start" 2>/dev/null) || tap_with_policy=""
     [ -n "$tap_with_policy" ] && tap_json=$tap_with_policy
   fi
-  # Older/minimal environments without Python retain the original additive PID tap.
-  case "$tap_pid$tap_start" in
-    ''|*[!0-9]*) ;;                       # 미확보·비정상 값 → 원문 그대로 (주입 생략)
-    *) case "$tap_json" in
-         '{"'*) case "$tap_json" in *'"pid":'*) ;; *) tap_json='{"pid":'"$tap_pid"',"proc_start":"'"$tap_start"'",'"${tap_json#\{}" ;; esac ;;
-       esac ;;
-  esac
   # atomic write (temp + rename) so a concurrent reader (tools/fleet dashboard) never sees a
   # half-written file → JSON parse fail → telemetry ('$cost' etc.) flickers to '—' for a tick.
   if printf '%s' "$tap_json" > "$sldir/.$S_SID.json.tmp" 2>/dev/null; then
