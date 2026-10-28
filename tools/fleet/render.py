@@ -30,14 +30,16 @@ try:
 except ImportError:  # native Windows without windows-curses: plain --once / --json still work
     curses = None
 import glob
+import json
 import math
 import os
 import re
 import shlex
 import sys
+import threading
 import time
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Mapping
 from .display import label as _user_label, project as _user_project, gpu_owner as _gpu_owner_label
 
@@ -213,9 +215,11 @@ _HUE_OF = {
     "h_claude": ("c", _A_D), "h_codex": ("m", _A_D), "h_opencode": ("l", _A_D),
     "hb_claude": ("c", 0), "hb_codex": ("m", 0), "hb_opencode": ("l", 0), "hb_other": ("d", 0),
     "fam_opus": ("c", 0), "fam_sonnet": ("l", 0), "fam_haiku": ("g", 0),
-    "fam_fable": ("m", 0), "fam_gpt": ("y", 0), "fam_other": ("d", 0),
+    "fam_fable": ("m", 0), "fam_sol": ("y", 0), "fam_astra": ("o", 0),
+    "fam_luna": ("w", 0), "fam_gpt": ("y", 0), "fam_other": ("d", 0),
     "famd_opus": ("c", _A_D), "famd_sonnet": ("l", _A_D), "famd_haiku": ("g", _A_D),
-    "famd_fable": ("m", _A_D), "famd_gpt": ("y", _A_D), "famd_other": ("d", _A_D),
+    "famd_fable": ("m", _A_D), "famd_sol": ("y", _A_D), "famd_astra": ("o", _A_D),
+    "famd_luna": ("w", _A_D), "famd_gpt": ("y", _A_D), "famd_other": ("d", _A_D),
     "gpu_rtx6000": ("l", _A_D), "gpu_rtx4090": ("c", _A_D),
     "gpu_rtx5090": ("g", _A_D),
     "gpu_blackwell": ("g", _A_D), "gpu_hopper": ("m", _A_D),
@@ -294,6 +298,19 @@ def _key_attr(key, tint=None):
 
 
 # ---------- color ----------
+# curses pair numbers. Model families take 10-17 (eight families since Sol/Astra/Luna
+# split), so the structural bars must sit above the steward badge, not inside the family
+# block: when the bars reused 15-17, `fam_astra/luna/gpt` text inherited the header's
+# chrome background (user 2026-10-27: "astra 모델 컬러가 왜이래.. 왜 틴트가 있어").
+# Keep everything except the 256-color tints below 64 so 8-color terminals still get bars.
+_FAMILY_PAIR_START = 10
+_STEWARD_PAIR = 18
+_HDR_BAR_PAIR = 19
+_HDR_WARN_PAIR = 20
+_HDR_BLK_PAIR = 21
+_TINT_PAIR_START = 22
+
+
 def _init_colors():
     _COLOR.clear()
     try:
@@ -374,12 +391,20 @@ def _init_colors():
     # per-MODEL family colors, in TWO intensities (2026-07-02: main↔dispatch contrast = whole-row
     # brightness): fam_* = BRIGHT (main session rows) / famd_* = DIM (dispatch rows recede).
     _hue = {h: _COLOR.get("h_" + h, 0) for h in ("claude", "codex", "opencode")}
+    # The three named Codex models are separate families, not one `gpt` bucket (user
+    # 2026-10-27: "codex 모델들 전부 같은 컬러"). Sol keeps the old gpt yellow, Astra
+    # takes the unused orange, and Luna takes soft white; a bare gpt-* id still lands
+    # on the shared `gpt` key. Names stay the primary identifier — the 8-color
+    # fallback folds orange into yellow — but the 256-color board separates them.
     _fam = {"opus": _palette_fg("cyan", curses.COLOR_CYAN),
             "sonnet": _palette_fg("blue", curses.COLOR_BLUE),
             "haiku": _palette_fg("green", curses.COLOR_GREEN),
             "fable": _palette_fg("magenta", curses.COLOR_MAGENTA),
+            "sol": _palette_fg("yellow", curses.COLOR_YELLOW),
+            "astra": _palette_fg("orange", curses.COLOR_YELLOW),
+            "luna": _palette_fg("soft", curses.COLOR_WHITE),
             "gpt": _palette_fg("yellow", curses.COLOR_YELLOW)}
-    n_pair = 10                                     # pairs 1-9 reserved above; families from 10
+    n_pair = _FAMILY_PAIR_START                     # pairs 1-9 reserved above; families from 10
     for fam, fg in _fam.items():
         try:
             curses.init_pair(n_pair, fg, bg)
@@ -415,8 +440,8 @@ def _init_colors():
     _COLOR["tag"] = _COLOR.get("soft", 0)
     _COLOR["tag_dim"] = curses.A_DIM
     try:
-        curses.init_pair(18, _palette_fg("steward_pink", curses.COLOR_MAGENTA), bg)
-        _COLOR["tag_steward"] = curses.color_pair(18) | curses.A_BOLD
+        curses.init_pair(_STEWARD_PAIR, _palette_fg("steward_pink", curses.COLOR_MAGENTA), bg)
+        _COLOR["tag_steward"] = curses.color_pair(_STEWARD_PAIR) | curses.A_BOLD
     except Exception:
         _COLOR["tag_steward"] = (_COLOR.get("h_codex", 0) & ~curses.A_DIM) | curses.A_BOLD
     _COLOR["herdr_on"] = _COLOR.get("soft", 0)
@@ -467,9 +492,9 @@ def _init_colors():
     # Structural, one-shot — NOT a per-item classification color, so the fg color-axis budget
     # The no-rainbow-noise rule remains; keycaps use bold because dim vanishes on the bar.
     try:
-        curses.init_pair(15, curses.COLOR_BLACK,
+        curses.init_pair(_HDR_BAR_PAIR, curses.COLOR_BLACK,
                          _palette_fg("chrome", curses.COLOR_WHITE))
-        _COLOR["hdr_bar"] = curses.color_pair(15)
+        _COLOR["hdr_bar"] = curses.color_pair(_HDR_BAR_PAIR)
     except Exception:
         _COLOR["hdr_bar"] = curses.A_REVERSE
     _COLOR["hdr_key"] = _COLOR["hdr_bar"] | curses.A_BOLD
@@ -480,21 +505,21 @@ def _init_colors():
     # inverts the hierarchy the double-confirm ladder depends on: the live-session prompt must
     # read as MORE serious, not like a render glitch.
     try:
-        curses.init_pair(17, _palette_fg("soft", curses.COLOR_WHITE),
+        curses.init_pair(_HDR_WARN_PAIR, _palette_fg("soft", curses.COLOR_WHITE),
                          _palette_fg("warning", curses.COLOR_RED))
-        _COLOR["hdr_warn"] = curses.color_pair(17) | curses.A_BOLD
+        _COLOR["hdr_warn"] = curses.color_pair(_HDR_WARN_PAIR) | curses.A_BOLD
     except Exception:
         _COLOR["hdr_warn"] = curses.A_REVERSE | curses.A_BOLD
     # The one key the user must press, advertised on top of the red bar.
     _COLOR["hdr_warn_key"] = _COLOR["hdr_warn"] | curses.A_REVERSE
-    # bar BLANKS are drawn as muted-neutral █ blocks on the DEFAULT bg (pair 16), not as bg-colored
+    # bar BLANKS are drawn as muted-neutral █ blocks on the DEFAULT bg (hdr_blk), not as bg-colored
     # spaces: ncurses collapses blank runs into ECH/EL erase sequences, and on terminals without
     # working BCE the erased cells come out BLACK — the bar broke between words and after the
     # text. A block glyph is a real character, so it is
     # physically written every time and matches the muted bar background cell.
     try:
-        curses.init_pair(16, _palette_fg("chrome", curses.COLOR_WHITE), bg)
-        _COLOR["hdr_blk"] = curses.color_pair(16)
+        curses.init_pair(_HDR_BLK_PAIR, _palette_fg("chrome", curses.COLOR_WHITE), bg)
+        _COLOR["hdr_blk"] = curses.color_pair(_HDR_BLK_PAIR)
     except Exception:
         _COLOR["hdr_blk"] = 0
     # Subtle panel tints in 256-color mode: seven hues by tint level.
@@ -515,7 +540,7 @@ def _init_colors():
                     "o": _palette_fg("orange", curses.COLOR_YELLOW),
                     "p": _palette_fg("steward_pink", curses.COLOR_MAGENTA),
                     "l": _palette_fg("blue", curses.COLOR_BLUE)}
-            n_pair = 20
+            n_pair = _TINT_PAIR_START
             for tch, lvl in _TINT_LVL.items():
                 for hch, fg in hues.items():
                     curses.init_pair(n_pair, fg, lvl)
@@ -642,15 +667,24 @@ def _flat_level(key):
     return "lvl_r_flat" if key == "lvl_r" else key
 
 
-_FAMILIES = ("opus", "sonnet", "haiku", "fable", "gpt")
+_FAMILIES = ("sol", "astra", "luna", "opus", "sonnet", "haiku", "fable", "gpt")
 
 
 def _model_family(model):
     """Model-family token from a model/bucket name: 'Opus 4.8'→opus, 'gpt-5.5'→gpt, 'fable'→fable.
-    Unknown (glm/deepseek/…) → 'other' (default fg — distinct from the colored families)."""
+    The named Codex models keep their own tokens ('gpt-6.1-sol'→sol, 'Astra'→astra,
+    'gpt-6-luna'→luna) so each gets one stable identity colour in every view; any
+    other gpt id stays on the shared 'gpt' token. Unknown (glm/deepseek/…) → 'other'
+    (default fg — distinct from the colored families)."""
     m = (model or "").lower()
     for fam in _FAMILIES:
-        if fam in m:
+        if fam in ("sol", "astra", "luna"):
+            matched = re.search(r"\b%s\b" % fam, m)
+        elif fam == "gpt":
+            matched = "gpt" in m
+        else:
+            matched = fam in m
+        if matched:
             return fam
     return "other"
 
@@ -677,7 +711,13 @@ def _clean_model(name):
     name = name.split(" (", 1)[0]
     if "/" in name:
         name = name.split("/", 1)[1]
-    return _shorten_model_suffix(_ROLE_MODEL_NAME.get(name.lower(), name))
+    role = _ROLE_MODEL_NAME.get(name.lower())
+    if role:
+        # Only the bare lowercase alias the configs/dispatch env actually export is
+        # resolved against the catalog; a proper-noun value already came from an
+        # observed display name and is not rewritten by today's catalog.
+        name = (_resolved_alias_model(name) if name == name.lower() else None) or role
+    return _shorten_model_suffix(name)
 
 
 # Variant/effort tokens that carry no information: the runtime picked its own default and
@@ -731,10 +771,105 @@ def _short_model_id(name):
     return "%s %s" % (fam, major + ("." + minor if minor else ""))
 
 
+# A bare role alias names a family, not one model. The Claude runtime's own catalog is
+# the checked source for which concrete id this account currently resolves that family
+# to; a version is never written into this file. A missing, malformed, or ambiguous
+# catalog keeps the family word (the honest fallback this table always had).
+_ALIAS_FAMILIES = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku", "fable": "fable"}
+_MODEL_CATALOG_MAX_BYTES = 16 * 1024 * 1024
+_ALIAS_MODEL_CACHE = {"stamp": None, "models": {}}
+
+
+def _claude_catalog_paths():
+    """The runtime's already-written catalog caches, in the same root order the explorer uses."""
+    config = (os.environ.get("HEARTING_MODEL_CONFIG_HOME")
+              or os.environ.get("CLAUDE_CONFIG_DIR")
+              or os.path.join(os.path.expanduser("~"), ".claude"))
+    return tuple(sorted(glob.glob(os.path.join(config, "cache", "model-catalog", "*.json"))))
+
+
+def _catalog_model_records(document):
+    """The model records in the runtime catalogs' bounded public shapes."""
+    if not isinstance(document, dict):
+        return ()
+    catalog = document.get("catalog")
+    config = catalog.get("config") if isinstance(catalog, dict) else None
+    records = config.get("models") if isinstance(config, dict) else None
+    if not isinstance(records, list):
+        records = document.get("models")
+    if not isinstance(records, list):
+        return ()
+    return tuple(item for item in records if isinstance(item, dict))
+
+
+def _resolved_alias_models():
+    """Role family → the one concrete id the account's runtime catalog marks ``main``.
+
+    Reads only the cache files the runtime already wrote. A family with no record,
+    zero ``main`` entries, or two different ``main`` ids across accounts stays
+    unresolved, so display never guesses. Cached by each file's (mtime, size) so a
+    frame never re-reads an unchanged catalog.
+    """
+    paths = _claude_catalog_paths()
+    stamps = []
+    for path in paths:
+        try:
+            info = os.stat(path)
+        except OSError:
+            continue
+        stamps.append((path, info.st_mtime_ns, info.st_size))
+    stamp = tuple(stamps)
+    cached = _ALIAS_MODEL_CACHE
+    if cached["stamp"] == stamp:
+        return cached["models"]
+    found = {}
+    for path, _mtime, size in stamps:
+        if size > _MODEL_CATALOG_MAX_BYTES:
+            continue
+        try:
+            with open(path, encoding="utf-8") as stream:
+                document = json.load(stream)
+        except (OSError, ValueError, UnicodeError, TypeError):
+            continue
+        for item in _catalog_model_records(document):
+            if item.get("section") != "main":
+                continue
+            runtime = item.get("runtime")
+            family = runtime.get("family") if isinstance(runtime, Mapping) else None
+            model_id = item.get("id")
+            if not isinstance(family, str) or not isinstance(model_id, str) or not model_id:
+                continue
+            found.setdefault(family.lower(), []).append(model_id)
+    resolved = {}
+    for family, ids in found.items():
+        distinct = tuple(dict.fromkeys(ids))
+        if family in _ALIAS_FAMILIES.values() and len(distinct) == 1:
+            resolved[family] = distinct[0]
+    cached["stamp"] = stamp
+    cached["models"] = resolved
+    return resolved
+
+
+def _resolved_alias_model(name):
+    """Versioned display for a bare role alias, or None when the catalog cannot confirm it."""
+    family = _ALIAS_FAMILIES.get(str(name).strip().lower())
+    if family is None:
+        return None
+    model_id = _resolved_alias_models().get(family)
+    if not model_id:
+        return None
+    return _short_model_id(model_id)
+
+
 def _dispatch_display_model(name):
     if not name:
         return name
-    return _short_model_id(_ROLE_MODEL_NAME.get(str(name).strip().lower(), name))
+    raw = str(name).strip()
+    token = raw.lower()
+    role = _ROLE_MODEL_NAME.get(token)
+    if role:
+        return (_resolved_alias_model(raw) if raw == token else None) or role
+    return _short_model_id(name)
 
 
 def _job_display_model(job, parent_model=None):
@@ -6698,6 +6833,10 @@ _EXPLORER_NAV_ROWS = ()
 _EXPLORER_ALL_ROWS = ()      # every navigation row, folded or not: the s/x target map is built from these
 _EXPLORER_RESULT = None      # the accepted selected-scope result; never one read for another session
 _EXPLORER_MODEL = None       # the view model of the last frame: it names the session a route page belongs to
+_EXPLORER_COMPOSE_MODEL = None
+_EXPLORER_COMPOSE_SNAPSHOT = None
+_EXPLORER_COMPOSE_DETAIL = None
+_EXPLORER_COMPOSE_GENERATION = None
 _EXPLORER_ORDER = []         # main-session ids in first-seen order, so the navigation does not reshuffle
 _EXPLORER_SIZE = None
 _EXPLORER_EARLIER = False    # the output pane was scrolled past its first row: read further back once
@@ -6709,6 +6848,11 @@ _EXPLORER_PUBLISHED_MODEL = None
 _EXPLORER_REPLAY_ACTIVE = False
 _EXPLORER_DETAIL_CONTINUATION = None
 _EXPLORER_REMOTE_OBSERVATION = None
+_EXPLORER_QUESTION_QUEUE = None
+_EXPLORER_QUESTION_QUEUE_LOCK = threading.Lock()
+_EXPLORER_QUESTION_PUMP = None
+_EXPLORER_QUESTION_GENERATION = 0
+_EXPLORER_QUESTION_REFRESH_AT = 0.0
 
 
 def set_explorer_mode(enabled=True):
@@ -7015,18 +7159,44 @@ def _explorer_state_for(state, cols):
     return NavState.from_value(state)
 
 
+def _explorer_selected_models(model, focus_result):
+    """Overlay the accepted MODELS selection result on the last complete base VM."""
+    if model is None or focus_result is None:
+        return None
+    config = getattr(focus_result, "config", None)
+    if config is None and isinstance(focus_result, Mapping):
+        config = focus_result.get("config")
+    if config is None or config == getattr(model, "models", None):
+        return None
+    from dataclasses import replace
+    return replace(model, models=config)
+
+
 def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_good=None, now=None,
                       providers=None):
     """Project collected facts through the immutable view model into the cell renderer."""
     from .explorer import frame as explorer_frame, live
     global _SELECTABLE, _EXPLORER_NAV_ROWS, _EXPLORER_STATE, _EXPLORER_ALL_ROWS
     global _EXPLORER_GENERATION, _EXPLORER_MODEL, _EXPLORER_READINESS, _EXPLORER_ORDER
+    global _EXPLORER_COMPOSE_MODEL, _EXPLORER_COMPOSE_SNAPSHOT
+    global _EXPLORER_COMPOSE_DETAIL, _EXPLORER_COMPOSE_GENERATION
     state = _explorer_state_for(state, cols)
-    view = _explorer_view(snapshot)
-    model = live.build_view_model(view, accepted_detail=focus_result, now=now)
+    same_inputs = (_EXPLORER_COMPOSE_MODEL is not None
+                   and _EXPLORER_COMPOSE_SNAPSHOT is snapshot
+                   and _EXPLORER_COMPOSE_DETAIL is focus_result
+                   and _EXPLORER_COMPOSE_GENERATION == _EXPLORER_GENERATION)
+    if same_inputs:
+        model = _EXPLORER_COMPOSE_MODEL
+    else:
+        view = _explorer_view(snapshot)
+        model = live.build_view_model(view, accepted_detail=focus_result, now=now)
     runtime = _explorer_runtime()
     model, readiness = runtime.prepare(
         snapshot, focus_result, vm=model, generation=_EXPLORER_GENERATION, now=now)
+    _EXPLORER_COMPOSE_SNAPSHOT = snapshot
+    _EXPLORER_COMPOSE_DETAIL = focus_result
+    _EXPLORER_COMPOSE_GENERATION = _EXPLORER_GENERATION
+    _EXPLORER_COMPOSE_MODEL = model
     _EXPLORER_READINESS = readiness
     _EXPLORER_MODEL = model
     drag = tuple(getattr(state, "drag", ()) or ())
@@ -7045,6 +7215,17 @@ def _explorer_compose(snapshot, cols, rows, state=None, focus_result=None, last_
         _EXPLORER_ORDER = list(cycle)
     _EXPLORER_STATE = state
     frame = explorer_frame.draw(model, state, cols, rows, beat=int(_BLINK_ON))
+    from dataclasses import replace
+    scrolls = dict(state.scroll)
+    for slot, layout in (("pane", frame.pane_scroll), ("tree", frame.tree_scroll)):
+        if len(layout) >= 5 and int(layout[4]):
+            scrolls[slot] = int(layout[4])
+        else:
+            scrolls.pop(slot, None)
+    normalized_scrolls = tuple(sorted(scrolls.items()))
+    if normalized_scrolls != state.scroll:
+        state = replace(state, scroll=normalized_scrolls)
+        _EXPLORER_STATE = state
     _EXPLORER_NAV_ROWS = _EXPLORER_ALL_ROWS = ()
     _SELECTABLE = []
     return frame
@@ -7127,6 +7308,536 @@ def _explorer_click_current(size, snapshot):
     """A click is adopted only for the paint it was aimed at: same size, same snapshot."""
     return bool(_HIT_VALID and _HIT_SIZE == tuple(size)
                 and _HIT_SNAPSHOT_ID == (id(snapshot) if snapshot is not None else None))
+
+
+def _explorer_apply_effects(effects, vm):
+    """Run typed explorer effects and publish immediate action feedback."""
+    from dataclasses import replace as _replace_state
+
+    effects = tuple(effects or ())
+    question_effects = tuple(effect for effect in effects
+                             if effect and isinstance(effect[0], str)
+                             and effect[0].startswith("questions."))
+    effects = tuple(effect for effect in effects
+                    if not (effect and isinstance(effect[0], str)
+                            and effect[0].startswith("questions.")))
+    for effect in question_effects:
+        _explorer_queue_question_effect(effect)
+    model_actions = tuple(effect for effect in effects
+                          if effect and effect[0] in ("models.apply", "alloc.apply"))
+    if _EXPLORER_REPLAY_ACTIVE:
+        effects = tuple(effect for effect in effects
+                        if not effect or effect[0] not in ("models.apply", "alloc.apply"))
+        result = None
+        if effects:
+            result = _explorer_runtime().apply_effects(effects, vm)
+        if model_actions:
+            result = {"model_action": True, "status": "read-only",
+                      "message": "MODELS is read-only in replay", "models": None}
+    else:
+        result = _explorer_runtime().apply_effects(effects, vm)
+    if not isinstance(result, Mapping) or not result.get("model_action"):
+        return result
+
+    global _EXPLORER_STATE, _EXPLORER_MODEL, _EXPLORER_PUBLISHED_MODEL
+    global _EXPLORER_COMPOSE_MODEL, _EXPLORER_RESULT
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    _EXPLORER_STATE = _replace_state(state, status=str(result.get("message") or "model set finished"))
+    refreshed = result.get("models")
+    if isinstance(refreshed, Mapping):
+        for name in ("_EXPLORER_MODEL", "_EXPLORER_PUBLISHED_MODEL", "_EXPLORER_COMPOSE_MODEL"):
+            current = globals()[name]
+            if current is not None:
+                try:
+                    globals()[name] = _replace_state(current, models=refreshed)
+                except (TypeError, ValueError):
+                    pass
+        if _EXPLORER_RESULT is not None:
+            if isinstance(_EXPLORER_RESULT, Mapping):
+                _EXPLORER_RESULT = dict(_EXPLORER_RESULT, config=refreshed)
+            elif hasattr(_EXPLORER_RESULT, "config"):
+                try:
+                    _EXPLORER_RESULT = _replace_state(_EXPLORER_RESULT, config=refreshed)
+                except (TypeError, ValueError):
+                    pass
+    return result
+
+
+def _explorer_question_status(value, fallback):
+    reason = value.get("reason") if isinstance(value, Mapping) else None
+    if isinstance(reason, str) and reason.strip():
+        return " ".join(reason.split())[:220]
+    return fallback
+
+
+def _explorer_same_question_request(left, right):
+    if not isinstance(left, Mapping) or not isinstance(right, Mapping):
+        return False
+    for key in ("id", "harness", "session_id", "request_id", "turn_id", "route_id",
+                "question_id", "gate_epoch"):
+        a, b = left.get(key), right.get(key)
+        if a != b or (key == "request_id" and type(a) is not type(b)):
+            return False
+    return left.get("native_ref") == right.get("native_ref")
+
+
+def _explorer_queue_question_effect(effect):
+    """Queue one exact selected-request action on the bounded background pump."""
+    global _EXPLORER_STATE, _EXPLORER_QUESTION_QUEUE
+    from dataclasses import replace as _replace_state
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    overlay = dict(state.question_overlay) if isinstance(state.question_overlay, Mapping) else {}
+    if _EXPLORER_REPLAY_ACTIVE or os.environ.get("FLEET_DEMO"):
+        overlay.update(state="unknown", pending=False,
+                       status="Direct answers are disabled in demo or replay; use a live native prompt.")
+        _EXPLORER_STATE = _replace_state(state, question_overlay=overlay)
+        return
+    if _EXPLORER_QUESTION_QUEUE is None or _EXPLORER_QUESTION_PUMP is None:
+        overlay.update(state="unknown", pending=False,
+                       status="Direct answer worker is unavailable; use the native prompt.")
+        _EXPLORER_STATE = _replace_state(state, question_overlay=overlay)
+        return
+    if effect[0] == "questions.draft":
+        overlay["status"] = "Saving private draft…"
+        _EXPLORER_STATE = _replace_state(state, question_overlay=overlay)
+    with _EXPLORER_QUESTION_QUEUE_LOCK:
+        if effect[0] == "questions.draft":
+            _EXPLORER_QUESTION_QUEUE = deque(
+                queued for queued in _EXPLORER_QUESTION_QUEUE
+                if not (queued[0] == "questions.draft" and len(queued) > 1
+                        and isinstance(queued[1], Mapping)
+                        and _explorer_same_question_request(queued[1], effect[1])))
+        if len(_EXPLORER_QUESTION_QUEUE) >= 16:
+            if effect[0] == "questions.submit":
+                overlay.update(state="open", pending=False,
+                               status="Action queue is busy; no response was sent. Submit again when ready.")
+            elif effect[0] == "questions.read":
+                overlay.update(state="unknown", pending=False,
+                               status="Action queue is busy; use the native prompt.")
+            else:
+                overlay.update(status="Draft save is delayed; edit remains on screen.")
+            _EXPLORER_STATE = _replace_state(state, question_overlay=overlay)
+            return
+        _EXPLORER_QUESTION_QUEUE.append(tuple(effect))
+    _EXPLORER_QUESTION_PUMP.request(force=True)
+
+
+def _explorer_question_worker():
+    if _EXPLORER_QUESTION_QUEUE is None:
+        return None
+    with _EXPLORER_QUESTION_QUEUE_LOCK:
+        if not _EXPLORER_QUESTION_QUEUE:
+            return None
+        effect = _EXPLORER_QUESTION_QUEUE.popleft()
+    ref = effect[1] if len(effect) > 1 and isinstance(effect[1], Mapping) else None
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    # A draft is a local save for its original envelope, even after navigation.
+    # Reads and responses still require the current visible selection.
+    if (_EXPLORER_REPLAY_ACTIVE or os.environ.get("FLEET_DEMO") or ref is None
+            or (effect[0] != "questions.draft" and (
+                state.view != "QUESTIONS"
+                or state.opened_for("qsel:QUESTIONS", "") != ref.get("id")
+                or not _explorer_question_ref_current(ref)))):
+        return {"effect": effect, "result": {
+            "state": "unknown", "reason": "selected request changed before the action ran"}}
+    from .explorer.runtime import ExplorerRuntime
+    return {"effect": effect, "result": ExplorerRuntime.execute_question_action(effect)}
+
+
+def _explorer_question_ref_current(ref):
+    model = _EXPLORER_MODEL
+    rows = getattr(model, "questions", ()) if model is not None else ()
+    row = next((item for item in rows if item.get("id") == ref.get("id")), None)
+    if row is None:
+        return False
+    current = row.get("ref")
+    if not isinstance(current, Mapping):
+        return False
+    selected_row = ref.get("_fleet_row_ref")
+    selected_row = selected_row if isinstance(selected_row, Mapping) else ref
+    for key in ("harness", "session_id", "request_id", "turn_id", "route_id",
+                "question_id", "gate_epoch"):
+        old, new = selected_row.get(key), current.get(key)
+        if ((old is not None or new is not None)
+                and (old != new or (key == "request_id" and type(old) is not type(new)))):
+            return False
+    return True
+
+
+def _explorer_question_has_workflow_binding(ref, envelope):
+    """Workflow requests have their own exact identity, rather than a native turn."""
+    native = envelope.get("native_ref")
+    selected = envelope.get("selected_id")
+    if ("turn_id" not in envelope or envelope["turn_id"] is not None
+            or not isinstance(native, Mapping) or not isinstance(selected, str)
+            or selected != ref.get("id") or envelope.get("request_id") != selected):
+        return False
+    transport = native.get("transport")
+    if transport == "hearting-answer-marker":
+        return (selected.startswith("S4:") and native.get("signal_id") == selected
+                and bool(native.get("seat_key"))
+                and envelope.get("question_id") == "marker-response")
+    if (native.get("source_id") != selected or not native.get("jobs_path")
+            or native.get("route_id") != envelope.get("route_id")
+            or not envelope.get("route_id")
+            or not isinstance(native.get("route_hash"), str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", native["route_hash"])
+            or not native.get("attempt_id")):
+        return False
+    if transport == "hearting-owner-input":
+        return (selected.startswith("S3:")
+                and native["attempt_id"] == envelope.get("item_id")
+                and isinstance(native.get("owner_binding"), Mapping)
+                and native["owner_binding"].get("attempt_id") == native["attempt_id"]
+                and envelope.get("question_id") == "owner-correction")
+    if transport == "hearting-human-gate":
+        raised = native.get("raised_at")
+        return (selected.startswith("S2:")
+                and envelope.get("source") == "S2"
+                and native.get("gate_id") == envelope.get("question_id")
+                and bool(native.get("gate_id"))
+                and type(native.get("gate_epoch")) is int and native["gate_epoch"] > 0
+                and envelope.get("gate_epoch") == native.get("gate_epoch")
+                and type(raised) in (int, float) and math.isfinite(raised))
+    return False
+
+
+def _explorer_opencode_form_binding(ref, envelope):
+    """Accept a turnless native form only with its exact OpenCode HTTP binding."""
+    row_ref = ref.get("_fleet_row_ref") if isinstance(ref, Mapping) else None
+    row_ref = row_ref if isinstance(row_ref, Mapping) else ref
+    native = envelope.get("native_ref")
+    request_id = envelope.get("request_id")
+    selected_id = envelope.get("selected_id")
+    if (not isinstance(row_ref, Mapping) or row_ref.get("harness") != "opencode"
+            or not isinstance(row_ref.get("id"), str)
+            or not row_ref["id"].startswith("S1:")
+            or selected_id != row_ref.get("id")
+            or type(request_id) is not str or not request_id.startswith("frm_")
+            or row_ref.get("request_id") != request_id
+            or not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"
+            or native.get("request_id") != request_id
+            or type(native.get("generation")) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", native["generation"])
+            or type(native.get("server_pid")) is not int or native["server_pid"] <= 0
+            or type(native.get("proc_start")) is not str
+            or not native["proc_start"].isdigit()
+            or not isinstance(native.get("socket_inodes"), list)
+            or not native["socket_inodes"]
+            or any(type(inode) is not str or not inode.isdigit()
+                   for inode in native["socket_inodes"])):
+        return False
+    if ((row_ref.get("route_id") is not None or envelope.get("route_id") is not None)
+            and row_ref.get("route_id") != envelope.get("route_id")):
+        return False
+    if (native.get("session_id") is not None
+            and native.get("session_id") != envelope.get("session_id")):
+        return False
+    detail = envelope.get("detail")
+    fields = detail.get("questions") if isinstance(detail, Mapping) else None
+    if fields is None and envelope.get("state") in {
+            "submitted", "received", "applied", "cancelled", "expired", "unknown"}:
+        return True
+    if (type(native.get("schema_binding")) is not str
+            or not re.fullmatch(r"[0-9a-f]{64}", native["schema_binding"])):
+        return False
+    field_keys = native.get("field_keys")
+    if (not isinstance(field_keys, list) or not field_keys
+            or any(type(key) is not str or not key for key in field_keys)
+            or len(set(field_keys)) != len(field_keys)):
+        return False
+    if not isinstance(fields, list) or not fields:
+        return False
+    seen = set()
+    fields_by_id = {}
+    supported_types = {"string", "number", "integer", "boolean", "multiselect"}
+    for field in fields:
+        if not isinstance(field, Mapping):
+            return False
+        field_id = field.get("id", field.get("key"))
+        field_type = field.get("field_type", field.get("type"))
+        if (type(field_id) is not str or not field_id or field_id in seen
+                or field_type not in supported_types
+                or type(field.get("required")) is not bool
+                or type(field.get("hidden")) is not bool
+                or field.get("hidden") and field.get("required")):
+            return False
+        conditions = field.get("when", [])
+        if not isinstance(conditions, list):
+            return False
+        for condition in conditions:
+            if (not isinstance(condition, Mapping)
+                    or condition.get("op") not in {"eq", "neq"}
+                    or condition.get("key") not in fields_by_id
+                    or "value" not in condition):
+                return False
+            target = fields_by_id[condition["key"]]
+            target_type = target.get("field_type", target.get("type"))
+            value = condition["value"]
+            if target_type == "boolean":
+                valid_condition = type(value) is bool
+            elif target_type in {"number", "integer"}:
+                try:
+                    valid_condition = (type(value) in (int, float, str)
+                                       and math.isfinite(float(value)))
+                except (TypeError, ValueError, OverflowError):
+                    valid_condition = False
+            else:
+                valid_condition = isinstance(value, str)
+                options = target.get("option_values", ())
+                if (valid_condition and target.get("options_present")
+                        and target.get("custom") is not True):
+                    valid_condition = value in options
+            if not valid_condition:
+                return False
+        seen.add(field_id)
+        fields_by_id[field_id] = field
+        choices = field.get("choices", field.get("options"))
+        if choices is not None:
+            if not isinstance(choices, list):
+                return False
+            values = []
+            for choice in choices:
+                if (not isinstance(choice, Mapping)
+                        or type(choice.get("value")) is not str
+                        or not choice["value"]
+                        or type(choice.get("label")) is not str):
+                    return False
+                values.append(choice["value"])
+            if len(set(values)) != len(values):
+                return False
+        if field_type == "multiselect":
+            minimum, maximum = field.get("min_items"), field.get("max_items")
+            if ((minimum is not None and (type(minimum) is not int or minimum < 0))
+                    or (maximum is not None and (type(maximum) is not int or maximum < 0))
+                    or (minimum is not None and maximum is not None and minimum > maximum)):
+                return False
+        elif field_type in {"number", "integer"}:
+            for bound in ("minimum", "maximum"):
+                value = field.get(bound)
+                if (value is not None and (type(value) not in (int, float)
+                                           or not math.isfinite(value))):
+                    return False
+            if (field.get("minimum") is not None and field.get("maximum") is not None
+                    and field["minimum"] > field["maximum"]):
+                return False
+        elif field_type == "boolean" and (
+                "default" in field and type(field.get("default")) is not bool):
+            return False
+    return field_keys == [field.get("id", field.get("key")) for field in fields]
+
+
+def _explorer_opencode_form_ui_supported(envelope):
+    """Accept only backend-approved native schemas the private form editor can express."""
+    detail = envelope.get("detail") if isinstance(envelope, Mapping) else None
+    native = envelope.get("native_ref") if isinstance(envelope, Mapping) else None
+    questions = detail.get("questions") if isinstance(detail, Mapping) else None
+    support = envelope.get("support") if isinstance(envelope, Mapping) else None
+    supported = (support is True or isinstance(support, Mapping)
+                 and support.get("supported") is True)
+    if (envelope.get("state") != "open" or not supported
+            or not isinstance(questions, list) or not questions
+            or not isinstance(native, Mapping)
+            or native.get("transport") != "opencode-http-v2"):
+        return False
+    return native.get("field_keys") == [question.get("id") for question in questions
+                                          if isinstance(question, Mapping)]
+
+
+def _explorer_question_envelope(ref, value):
+    if not isinstance(value, Mapping):
+        return None
+    envelope = value.get("request") if isinstance(value.get("request"), Mapping) else value
+    state = envelope.get("state")
+    if state not in ("open", "submitted", "received", "applied", "cancelled", "expired", "unknown"):
+        return None
+    expected = dict(ref)
+    row_ref = expected.get("_fleet_row_ref")
+    if isinstance(row_ref, Mapping):
+        expected.update({key: value for key, value in row_ref.items() if key not in expected})
+    if (expected.get("selected_id") and envelope.get("selected_id")
+            and expected["selected_id"] != envelope["selected_id"]):
+        return None
+    expected_native = ref.get("native_ref")
+    actual_native = envelope.get("native_ref")
+    if (isinstance(expected_native, Mapping) and actual_native is not None
+            and dict(expected_native) != actual_native):
+        return None
+    for key in ("request_id", "turn_id", "route_id", "question_id", "gate_epoch"):
+        expected_value, actual_value = expected.get(key), envelope.get(key)
+        if (expected_value is not None and actual_value is not None
+                and (expected_value != actual_value
+                     or (key == "request_id" and type(expected_value) is not type(actual_value)))):
+            return None
+        if state != "unknown" and expected_value is not None and actual_value != expected_value:
+            return None
+    if state != "unknown":
+        workflow = isinstance(ref.get("id"), str) and ref["id"].startswith(("S2:", "S3:", "S4:"))
+        if workflow:
+            turn_bound = _explorer_question_has_workflow_binding(ref, envelope)
+        elif envelope.get("turn_id") is None:
+            turn_bound = (envelope.get("harness") == "opencode"
+                          and _explorer_opencode_form_binding(ref, envelope))
+        else:
+            turn_bound = isinstance(envelope.get("turn_id"), str) and bool(envelope["turn_id"])
+        if (envelope.get("v") != 1 or envelope.get("harness") != ref.get("harness")
+                or envelope.get("session_id") != ref.get("session_id")
+                or type(envelope.get("request_id")) not in (str, int)
+                or envelope.get("request_id") == ""
+                or not turn_bound
+                or not envelope.get("kind") or "detail" not in envelope):
+            return None
+    return dict(envelope)
+
+
+def _explorer_accept_question_result(update):
+    """Adopt a private response only while its exact row and selection are current."""
+    global _EXPLORER_STATE, _EXPLORER_QUESTION_REFRESH_AT
+    if not isinstance(update, Mapping) or not isinstance(update.get("effect"), (tuple, list)):
+        return
+    effect = update["effect"]
+    result = update.get("result")
+    if len(effect) < 2 or not isinstance(effect[1], Mapping):
+        return
+    ref = dict(effect[1])
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    overlay = dict(state.question_overlay) if isinstance(state.question_overlay, Mapping) else {}
+    current_ref = overlay.get("ref")
+    if (not isinstance(current_ref, Mapping) or current_ref.get("id") != ref.get("id")
+            or state.opened_for("qsel:QUESTIONS", "") != ref.get("id")
+            or not _explorer_question_ref_current(ref)):
+        if isinstance(current_ref, Mapping) and dict(current_ref) == ref:
+            overlay.update(state="unknown", detail=None, pending=False,
+                           status="The selected request changed; reopen its current native prompt.")
+            from dataclasses import replace
+            _EXPLORER_STATE = replace(state, question_overlay=overlay)
+        return
+    operation = effect[0]
+    envelope = _explorer_question_envelope(ref, result)
+    if operation == "questions.read":
+        if envelope is None:
+            overlay.update(state="unknown", detail=None, pending=False,
+                           status=_explorer_question_status(
+                               result, "Exact current request unavailable; use the native prompt."))
+        else:
+            native_ref = envelope.get("native_ref")
+            if (envelope.get("harness") == "opencode" and envelope.get("turn_id") is None
+                    and isinstance(native_ref, Mapping)
+                    and native_ref.get("transport") == "opencode-http-v2"
+                    and envelope.get("state") == "open"
+                    and not _explorer_opencode_form_ui_supported(envelope)):
+                envelope = dict(envelope)
+                support = envelope.get("support")
+                support = dict(support) if isinstance(support, Mapping) else {}
+                support.update({"supported": False,
+                                "reason": "opencode-form-editor-capability-unavailable"})
+                envelope["support"] = support
+                envelope["actions"] = []
+            from .explorer.state import question_draft_from_backend, question_ui_detail
+            draft = question_draft_from_backend(envelope, envelope.get("draft"))
+            if draft is None:
+                draft = overlay.get("draft")
+            envelope = question_ui_detail(envelope, draft)
+            overlay.update(detail=envelope, draft=draft, state=envelope["state"],
+                           pending=False, editing=False,
+                           status=_explorer_question_status(
+                               result, "Selected request is ready." if envelope["state"] == "open"
+                               else "Request state: " + envelope["state"]))
+    elif operation == "questions.draft":
+        if envelope is not None and envelope.get("state") == "open":
+            from .explorer.state import question_draft_from_backend, question_ui_detail
+            draft = question_draft_from_backend(envelope, envelope.get("draft"))
+            if draft is None:
+                draft = overlay.get("draft")
+            envelope = question_ui_detail(envelope, draft)
+            overlay.update(detail=envelope, draft=draft,
+                           state="open", status="Private draft saved; submit explicitly to send.")
+        else:
+            overlay.update(state="unknown", pending=False,
+                           status=_explorer_question_status(
+                               result, "Draft remains on screen; persistence was not confirmed."))
+    elif operation == "questions.submit":
+        if envelope is not None:
+            from .explorer.state import question_draft_from_backend, question_ui_detail
+            draft = question_draft_from_backend(envelope, envelope.get("draft"))
+            if draft is None:
+                draft = overlay.get("draft")
+            envelope = question_ui_detail(envelope, draft)
+            overlay.update(detail=envelope, draft=draft,
+                           state=envelope["state"], pending=False, editing=False,
+                           status=_explorer_question_status(
+                               result, "Request state: " + envelope["state"]))
+            if isinstance(result, Mapping) and result.get("action_id"):
+                overlay["action_id"] = str(result["action_id"])
+        else:
+            overlay.update(state="unknown", pending=False, editing=False,
+                           status=_explorer_question_status(
+                               result, "Delivery is unknown; it will not be sent again automatically."))
+    from dataclasses import replace
+    _EXPLORER_STATE = replace(state, question_overlay=overlay)
+    _EXPLORER_QUESTION_REFRESH_AT = (
+        time.monotonic() + 1.0 if overlay.get("state") in ("submitted", "received") else 0.0)
+    if (operation == "questions.submit" and envelope is not None
+            and envelope.get("state") in ("submitted", "received", "applied")):
+        _explorer_queue_question_effect(("questions.read", ref))
+
+
+def _explorer_question_pump_tick():
+    global _EXPLORER_QUESTION_GENERATION, _EXPLORER_QUESTION_REFRESH_AT
+    pump = _EXPLORER_QUESTION_PUMP
+    if pump is None:
+        return
+    update = pump.poll(_EXPLORER_QUESTION_GENERATION)
+    if update is not None:
+        _EXPLORER_QUESTION_GENERATION, value = update
+        _explorer_accept_question_result(value)
+    with _EXPLORER_QUESTION_QUEUE_LOCK:
+        pending = bool(_EXPLORER_QUESTION_QUEUE)
+    if pending:
+        pump.request(force=True)
+    else:
+        state = _explorer_state_for(_EXPLORER_STATE, 0)
+        overlay = state.question_overlay if isinstance(state.question_overlay, Mapping) else {}
+        if state.view != "QUESTIONS" or overlay.get("state") not in ("submitted", "received"):
+            _EXPLORER_QUESTION_REFRESH_AT = 0.0
+            return
+        now = time.monotonic()
+        if not _EXPLORER_QUESTION_REFRESH_AT:
+            _EXPLORER_QUESTION_REFRESH_AT = now + 1.0
+        if now >= _EXPLORER_QUESTION_REFRESH_AT and not pump.running:
+            from .explorer.state import _question_action_ref
+            ref = _question_action_ref(overlay)
+            _EXPLORER_QUESTION_REFRESH_AT = now + 1.0
+            if _explorer_question_ref_current(ref):
+                _explorer_queue_question_effect(("questions.read", ref))
+
+
+def _explorer_stop_question_pump():
+    """Drain local drafts at shutdown without executing queued native actions."""
+    global _EXPLORER_QUESTION_QUEUE, _EXPLORER_QUESTION_PUMP, _EXPLORER_QUESTION_REFRESH_AT
+    if _EXPLORER_QUESTION_PUMP is not None:
+        _EXPLORER_QUESTION_PUMP.stop(join_timeout=1.0)
+    with _EXPLORER_QUESTION_QUEUE_LOCK:
+        drafts = [effect for effect in (_EXPLORER_QUESTION_QUEUE or ())
+                  if effect[0] == "questions.draft"]
+        _EXPLORER_QUESTION_QUEUE = _EXPLORER_QUESTION_PUMP = None
+    _EXPLORER_QUESTION_REFRESH_AT = 0.0
+    if _EXPLORER_REPLAY_ACTIVE or os.environ.get("FLEET_DEMO"):
+        return []
+    from .explorer.state import _question_action_ref, _question_draft_for_backend
+    state = _explorer_state_for(_EXPLORER_STATE, 0)
+    overlay = state.question_overlay if isinstance(state.question_overlay, Mapping) else {}
+    if isinstance(overlay.get("draft"), Mapping) and isinstance(overlay.get("detail"), Mapping):
+        drafts.append(("questions.draft", _question_action_ref(overlay),
+                       _question_draft_for_backend(overlay["draft"], overlay["detail"])))
+    latest = []
+    for effect in drafts:
+        latest = [old for old in latest
+                  if not _explorer_same_question_request(old[1], effect[1])]
+        latest.append(effect)
+    from .explorer.runtime import ExplorerRuntime
+    return [ExplorerRuntime.execute_question_action(effect) for effect in latest]
 
 
 def _explorer_reveal(state, rows):
@@ -9520,15 +10231,21 @@ def _plain(segs):
 
 
 def _collect_memory():
-    # F-19: best-effort — a collector import/read failure must never break the render.
+    return _collect_memory_observed()[0]
+
+
+def _collect_memory_observed(*, include_backlog=False):
+    # F-19: best-effort — source health is separate from a successful empty read.
     try:
         if os.environ.get("FLEET_DEMO"):
             from . import demo
-            return demo.memory_snapshot()
-        from .collectors import memory as memcol
-        return memcol.collect(include_summary=False)
+            value = demo.memory_snapshot()
+        else:
+            from .collectors import memory as memcol
+            value = memcol.collect(include_summary=False, include_backlog=include_backlog)
+        return value, "success" if value is not None else "absent"
     except Exception:
-        return None
+        return None, "failed"
 
 
 def _collect_governor():
@@ -10786,9 +11503,13 @@ def reset_scroll():
     _SHELL_TTY_MODE = None
     global _EXPLORER_STATE, _EXPLORER_RESULT, _EXPLORER_FRAME, _EXPLORER_SIZE
     global _EXPLORER_PUBLISHED_MODEL, _EXPLORER_REPLAY_ACTIVE, _EXPLORER_DETAIL_CONTINUATION
+    global _EXPLORER_COMPOSE_MODEL, _EXPLORER_COMPOSE_SNAPSHOT
+    global _EXPLORER_COMPOSE_DETAIL, _EXPLORER_COMPOSE_GENERATION
     global _EXPLORER_REMOTE_OBSERVATION
     _EXPLORER_STATE = _EXPLORER_RESULT = _EXPLORER_FRAME = _EXPLORER_SIZE = None
     _EXPLORER_PUBLISHED_MODEL = _EXPLORER_DETAIL_CONTINUATION = None
+    _EXPLORER_COMPOSE_MODEL = _EXPLORER_COMPOSE_SNAPSHOT = _EXPLORER_COMPOSE_DETAIL = None
+    _EXPLORER_COMPOSE_GENERATION = None
     _EXPLORER_REPLAY_ACTIVE = False
     _EXPLORER_REMOTE_OBSERVATION = None
 
@@ -10898,33 +11619,43 @@ def _draw(stdscr, sessions, jobs, section, malformed, memory=None, live_order=No
         elif loading:
             frame = runtime.loading_frame(w, h)
         else:
-            candidate_frame = _explorer_compose(current, w, h, state, _EXPLORER_RESULT)
-            candidate_model = _EXPLORER_MODEL
-            readiness = _EXPLORER_READINESS
-            complete = runtime.publication_ready(readiness)
-            # A partial basic/detail generation never replaces the last complete screen.
-            if complete:
-                _EXPLORER_REPLAY_ACTIVE = False
-                _EXPLORER_PUBLISHED_MODEL = candidate_model
-                _EXPLORER_MODEL = candidate_model
+            selected_model = (_explorer_selected_models(_EXPLORER_PUBLISHED_MODEL, _EXPLORER_RESULT)
+                              if state.view == "MODELS" else None)
+            if selected_model is not None:
+                # The selected local config read is independent of remote/basic
+                # readiness. It can repaint MODELS over the last complete base VM.
+                _EXPLORER_MODEL = selected_model
                 _EXPLORER_SHOWN = True
-                runtime.mark_published(readiness)
-                frame = candidate_frame
-                if runtime.all_new(readiness):
-                    runtime.persist_complete_async(candidate_model, readiness,
-                                                   _EXPLORER_DETAIL_CONTINUATION)
-            elif _EXPLORER_PUBLISHED_MODEL is not None:
-                _EXPLORER_MODEL = _EXPLORER_PUBLISHED_MODEL
-                if _EXPLORER_REPLAY_ACTIVE:
-                    frame = _explorer_frame_from_model(_EXPLORER_MODEL, state, w, h, beat=1)
-                else:
-                    from dataclasses import replace as _replace_model
-                    live_model = _replace_model(_EXPLORER_MODEL, clock=time.time())
-                    frame = _explorer_frame_from_model(live_model, state, w, h,
-                                                       beat=int(_BLINK_ON))
-                _EXPLORER_SHOWN = True
+                frame = _explorer_frame_from_model(selected_model, state, w, h,
+                                                   beat=int(_BLINK_ON))
             else:
-                frame = runtime.loading_frame(w, h)
+                candidate_frame = _explorer_compose(current, w, h, state, _EXPLORER_RESULT)
+                candidate_model = _EXPLORER_MODEL
+                readiness = _EXPLORER_READINESS
+                complete = runtime.publication_ready(readiness)
+                # A partial basic/detail generation never replaces the last complete screen.
+                if complete:
+                    _EXPLORER_REPLAY_ACTIVE = False
+                    _EXPLORER_PUBLISHED_MODEL = candidate_model
+                    _EXPLORER_MODEL = candidate_model
+                    _EXPLORER_SHOWN = True
+                    runtime.mark_published(readiness)
+                    frame = candidate_frame
+                    if runtime.all_new(readiness):
+                        runtime.persist_complete_async(candidate_model, readiness,
+                                                       _EXPLORER_DETAIL_CONTINUATION)
+                elif _EXPLORER_PUBLISHED_MODEL is not None:
+                    _EXPLORER_MODEL = _EXPLORER_PUBLISHED_MODEL
+                    if _EXPLORER_REPLAY_ACTIVE:
+                        frame = _explorer_frame_from_model(_EXPLORER_MODEL, state, w, h, beat=1)
+                    else:
+                        from dataclasses import replace as _replace_model
+                        live_model = _replace_model(_EXPLORER_MODEL, clock=time.time())
+                        frame = _explorer_frame_from_model(live_model, state, w, h,
+                                                           beat=int(_BLINK_ON))
+                    _EXPLORER_SHOWN = True
+                else:
+                    frame = runtime.loading_frame(w, h)
         _draw_explorer(stdscr, current, frame=frame)
         return
     stdscr.erase()
@@ -11150,44 +11881,89 @@ def _explorer_text_key(ch):
     return None
 
 
+def _explorer_question_refs():
+    questions = getattr(_EXPLORER_MODEL, "questions", ()) if _EXPLORER_MODEL is not None else ()
+    older_open = getattr(_EXPLORER_STATE, "opened_for", lambda *_: "")(
+        "qolder:QUESTIONS", "") == "open"
+    return tuple(dict(item.get("ref") or {}) for item in questions
+                 if isinstance(item, Mapping) and isinstance(item.get("ref"), Mapping)
+                 and (not item.get("older") or older_open))
+
+
+def _explorer_question_editing():
+    overlay = getattr(_EXPLORER_STATE, "question_overlay", None)
+    return bool(getattr(_EXPLORER_STATE, "view", None) == "QUESTIONS"
+                and isinstance(overlay, Mapping) and overlay.get("editing"))
+
+
+def _explorer_text_input():
+    """Typed characters are text, not commands: a question is being edited or the MODELS list filtered."""
+    from .explorer.state import models_finding
+    return _explorer_question_editing() or models_finding(_EXPLORER_STATE)
+
+
 def _explorer_handle(ch, mouse_event=None, size=None, snapshot=None):
     """Apply one decoded event to the explorer's view-local reducer."""
-    global _EXPLORER_STATE
+    global _EXPLORER_STATE, _EXPLORER_TEXT
     from .explorer.state import reduce
     state = _explorer_state_for(_EXPLORER_STATE, (size or (0, 100))[1])
     if ch == curses.KEY_MOUSE:
         mx, my, bstate = mouse_event if mouse_event is not None else _getmouse_event()
         if mx is not None and size is not None and _explorer_click_current(size, snapshot):
             if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
-                event = {"type": "wheel", "direction": 1, "x": mx, "y": my}
+                events = [{"type": "wheel", "direction": 1, "x": mx, "y": my}]
             elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
-                event = {"type": "wheel", "direction": -1, "x": mx, "y": my}
+                events = [{"type": "wheel", "direction": -1, "x": mx, "y": my}]
             elif bstate & _EXPLORER_MOUSE_MOTION:
-                event = {"type": "mouse", "phase": "press", "button": 0,
-                         "motion": True, "x": mx, "y": my}
+                events = [{"type": "mouse", "phase": "press", "button": 0,
+                           "motion": True, "x": mx, "y": my}]
             elif bstate & (getattr(curses, "BUTTON1_RELEASED", 0)):
-                event = {"type": "mouse", "phase": "release", "button": 0,
-                         "x": mx, "y": my}
+                events = [{"type": "mouse", "phase": "release", "button": 0,
+                           "x": mx, "y": my}]
             elif bstate & (getattr(curses, "BUTTON1_PRESSED", 0) |
                            getattr(curses, "BUTTON1_CLICKED", 0)):
-                event = {"type": "mouse", "phase": "press", "button": 0,
-                         "x": mx, "y": my}
+                click = getattr(curses, "BUTTON1_CLICKED", 0)
+                pressed = getattr(curses, "BUTTON1_PRESSED", 0)
+                events = [{"type": "mouse", "phase": "press", "button": 0,
+                           "x": mx, "y": my}]
+                # Some curses implementations report a complete click without
+                # separate press/release events. Tree rows start a drag on press,
+                # so close that same hit on release before another paint can age it.
+                if click and bstate & click and not (pressed and bstate & pressed):
+                    events.append({"type": "mouse", "phase": "release", "button": 0,
+                                   "x": mx, "y": my})
             else:
                 return
             from .explorer.runtime import tag_cycle
             order = tag_cycle(getattr(_EXPLORER_MODEL, "ordering", None))
             ordering = getattr(_EXPLORER_MODEL, "ordering", None) or {}
-            _EXPLORER_STATE, _effects = reduce(
-                state, {**event, "order": order, "ordering": ordering}, _EXPLORER_FRAME)
-            _explorer_runtime().apply_effects(_effects, _EXPLORER_MODEL)
+            _effects = []
+            for event in events:
+                state, effects = reduce(
+                    state, {**event, "order": order, "ordering": ordering}, _EXPLORER_FRAME)
+                _effects.extend(effects)
+            _EXPLORER_STATE = state
+            _explorer_apply_effects(_effects, _EXPLORER_MODEL)
         return
-    key = _explorer_key_name(ch)
+    from .explorer.state import models_finding
+    editing = (state.view == "QUESTIONS" and _explorer_question_editing()) or models_finding(state)
+    if editing and isinstance(ch, int) and (32 <= ch < 127 or 128 <= ch < 256):
+        key = _explorer_text_key(ch)
+    else:
+        key = _explorer_key_name(ch)
     if key:
         from .explorer.runtime import tag_cycle
         order = tag_cycle(getattr(_EXPLORER_MODEL, "ordering", None))
-        _EXPLORER_STATE, _effects = reduce(state, {"type": "key", "key": key,
-                                                    "order": order}, _EXPLORER_FRAME)
-        _explorer_runtime().apply_effects(_effects, _EXPLORER_MODEL)
+        event = {"type": "key", "key": key, "order": order,
+                 "question_refs": _explorer_question_refs()}
+        if key == "e" and state.view == "QUESTIONS":
+            _EXPLORER_TEXT = bytearray()
+        if key == "end" and _EXPLORER_MODEL is not None and size is not None:
+            from .explorer.frame import measure_pane_max
+            event["max_scroll"] = measure_pane_max(
+                _EXPLORER_MODEL, state, int(size[1]), int(size[0]))
+        _EXPLORER_STATE, _effects = reduce(state, event, _EXPLORER_FRAME)
+        _explorer_apply_effects(_effects, _EXPLORER_MODEL)
 
 
 def _explorer_note_earlier(before, key):
@@ -11212,6 +11988,16 @@ def _explorer_detail_callback(collector, *, optional=False):
             return callback, True
     callback = getattr(collector, "detail_refresh", None)
     return (callback, False) if callable(callback) else (None, False)
+
+
+def _explorer_optional_detail_key(identity, state):
+    """One optional detail read per base generation, plus each selected PEERS/MEMORY scope."""
+    if identity is None:
+        return None
+    state = _explorer_state_for(state, 0)
+    view = state.view if state.view in ("PEERS", "MEMORY") else None
+    scope = state.scope if view is not None else "-"
+    return identity, view, scope
 
 
 def _explorer_resume_continuation(collector, source, payload, details):
@@ -11247,9 +12033,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     global _EXPLORER_GENERATION, _EXPLORER_MODEL, _EXPLORER_PUBLISHED_MODEL
     global _EXPLORER_REPLAY_ACTIVE, _EXPLORER_SHOWN, _EXPLORER_DETAIL_CONTINUATION
     global _EXPLORER_READINESS, _EXPLORER_REMOTE_OBSERVATION
+    global _EXPLORER_QUESTION_QUEUE, _EXPLORER_QUESTION_PUMP, _EXPLORER_QUESTION_GENERATION
     curses.curs_set(0)
     _init_colors()
     if _EXPLORER_ENABLED:
+        global _EXPLORER_COMPOSE_MODEL, _EXPLORER_COMPOSE_SNAPSHOT
+        global _EXPLORER_COMPOSE_DETAIL, _EXPLORER_COMPOSE_GENERATION
+        _EXPLORER_COMPOSE_MODEL = _EXPLORER_COMPOSE_SNAPSHOT = _EXPLORER_COMPOSE_DETAIL = None
+        _EXPLORER_COMPOSE_GENERATION = None
         _EXPLORER_REMOTE_OBSERVATION = None
         runtime = _explorer_runtime()
         runtime.configure_persistence(hfilter, strict_readiness=not bool(os.environ.get("FLEET_DEMO")))
@@ -11344,7 +12135,17 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         if not required_only_pass:
             governor = _collect_governor()
             gitinfo.enrich_entities(value.sessions + value.jobs, schedule_ahead=True)
-            value.memory, value.governor = _collect_memory(), governor
+            value.memory, memory_state = _collect_memory_observed(include_backlog=_EXPLORER_ENABLED)
+            value.governor = governor
+            observations = dict(getattr(value, "observations", None) or {})
+            observations["optional:memory"] = {"state": memory_state,
+                                                "observed_at": time.time()}
+            database = value.memory.get("database") if isinstance(value.memory, Mapping) else None
+            database_state = (database.get("state") if isinstance(database, Mapping)
+                              else "unobserved" if not _EXPLORER_ENABLED else memory_state)
+            observations["optional:memory-db"] = {"state": database_state,
+                                                   "observed_at": time.time()}
+            value.observations = observations
             try:
                 from .display_snapshot import extend
                 value.display_snapshot = extend(value.display_snapshot, memory=value.memory)
@@ -11376,6 +12177,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
     install_generation, install_target = 0, None
     # Existing coalescing/last-good semantics, independent of basic refresh.
     detail_pump = RefreshPump(collect_details, interval, name="fleet-detail-refresh")
+    if _EXPLORER_ENABLED:
+        _EXPLORER_QUESTION_QUEUE = deque()
+        _EXPLORER_QUESTION_PUMP = RefreshPump(
+            _explorer_question_worker, 0.1, name="fleet-question-interaction")
+        _EXPLORER_QUESTION_GENERATION = 0
+    else:
+        _EXPLORER_QUESTION_QUEUE = _EXPLORER_QUESTION_PUMP = None
+        _EXPLORER_QUESTION_GENERATION = 0
     basic_snapshot = snapshot
     latest_detail = None
     compute_host_refresh = getattr(collect_all, "compute_hosts_refresh", None)
@@ -11445,8 +12254,9 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
         if not runtime.publication_ready(readiness):
             return
         identity = readiness.get("generation_identity") if isinstance(readiness, Mapping) else None
+        request_key = _explorer_optional_detail_key(identity, _EXPLORER_STATE)
         source = latest_view[0]
-        if identity is None or identity == optional_detail_identity[0] or source is None:
+        if request_key is None or request_key == optional_detail_identity[0] or source is None:
             return
         observations = getattr(source, "observations", None)
         basic = observations.get("basic") if isinstance(observations, Mapping) else None
@@ -11455,7 +12265,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 or basic.get("generation_identity", basic.get("identity")) != identity
                 or detail.get("generation_identity", detail.get("identity")) != identity):
             return
-        optional_detail_identity[0] = identity
+        optional_detail_identity[0] = request_key
         optional_detail_source[0] = source
         detail_pump.request(force=True)
 
@@ -11500,10 +12310,14 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     detail_pump.request(force=True)
             detail_update = detail_pump.poll(detail_generation)
             if detail_update is not None:
-                detail_generation, latest_detail = detail_update
-                if (_EXPLORER_ENABLED and isinstance(latest_detail, tuple)
-                        and len(latest_detail) == 2):
-                    latest_detail, _EXPLORER_DETAIL_CONTINUATION = latest_detail
+                detail_generation, next_detail = detail_update
+                if (_EXPLORER_ENABLED and isinstance(next_detail, tuple)
+                        and len(next_detail) == 2):
+                    next_detail, _EXPLORER_DETAIL_CONTINUATION = next_detail
+                if (_EXPLORER_ENABLED and latest_detail is not None and next_detail is not None):
+                    next_detail = details.retain_optional_last_good(latest_detail, next_detail)
+                latest_detail = next_detail
+            _explorer_question_pump_tick()
             _EXPLORER_GENERATION = generation
             if update is not None or detail_update is not None:
                 snapshot = details.merge(basic_snapshot, latest_detail)
@@ -11541,7 +12355,9 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _EXPLORER_RESULT = focus_result
                     _HIT_VALID = False
 
-            if ch in (ord("q"), ord("Q")) and not _explorer_searching():
+            question_editing = _explorer_text_input()
+            if (ch in (ord("q"), ord("Q")) and not _explorer_searching()
+                    and not question_editing):
                 return 0
             # Idle input boundary only: never discard a key or an in-flight action.
             if (install_target is not None and ch == curses.ERR
@@ -11588,7 +12404,8 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                     _EXPLORER_EARLIER = False
                     if selection_feed is not None:
                         selection_feed.pump.load_earlier()
-                if ch in (ord("r"), ord("R")) and not _explorer_searching():
+                if (ch in (ord("r"), ord("R")) and not _explorer_searching()
+                        and not question_editing):
                     pump.request(force=True)
                     if latest_basic[0] is not None:
                         detail_pump.request(force=True)
@@ -11656,6 +12473,7 @@ def _loop(stdscr, collect_all, hfilter, section, interval):
                 pass
         if selection_feed is not None:
             selection_feed.stop()
+        _explorer_stop_question_pump()
         pump.stop(join_timeout=1.0)
         detail_pump.stop(join_timeout=1.0)
         if compute_host_pump is not None:

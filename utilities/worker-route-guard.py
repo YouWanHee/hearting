@@ -72,7 +72,8 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
                             model_role: str | None = None,
                             model_profile: str | None = None,
                             enforce_model_binding: bool = False,
-                            launch_phase: str | None = None) -> tuple[dict, dict, dict]:
+                            launch_phase: str | None = None,
+                            jobs: str | Path | None = None) -> tuple[dict, dict, dict]:
     path = Path(route_path)
     if not path.is_absolute() or not path.is_file():
         raise _fail("route-record-missing", f"route path must be an existing absolute file: {path}")
@@ -130,6 +131,16 @@ def validate_route_contract(route_path: str | Path, node_id: str, cwd: str | Pat
             ("route-node-model-profile-mismatch", model_profile or None, node.get("model_profile")),
         ):
             if expected is not None and observed != expected:
+                if reason == "route-node-model-profile-mismatch" and current_attempt and jobs:
+                    from dispatch_contract import DispatchContractError
+                    from dispatch_replacement import read_profile_transition
+                    try:
+                        transition = read_profile_transition(
+                            jobs, route=route, node=node_id, attempt_id=current_attempt)
+                    except (DispatchContractError, OSError):
+                        transition = None
+                    if transition and transition["from"] == expected and transition["to"] == observed:
+                        continue
                 raise _fail(reason, f"expected={expected} observed={observed}", rid)
     if route["tracking"] == "tracked":
         gate = route["tracked_gate_evidence"]
@@ -191,6 +202,7 @@ def main() -> int:
     parser.add_argument("--unit", default=None,
                         help="catalog unit the caller intends to run; must match the sealed node")
     parser.add_argument("--current-attempt")
+    parser.add_argument("--jobs")
     parser.add_argument("--launch-phase", choices=("dry-run", "register", "start"))
     args = parser.parse_args()
     try:
@@ -198,7 +210,7 @@ def main() -> int:
             args.capability, args.intensity, args.write_scope, args.route_id, args.route_hash, args.registry_digest,
             current_attempt=args.current_attempt, model_role=args.model_role,
             model_profile=args.model_profile, enforce_model_binding=True,
-            launch_phase=args.launch_phase)
+            launch_phase=args.launch_phase, jobs=args.jobs)
         # Unit binding: a worker may not run a bare or substituted persona against a
         # sealed node (2026-07-22 verify finding). Empty/None observed == unbound claim.
         expected_unit = node.get("unit") or None

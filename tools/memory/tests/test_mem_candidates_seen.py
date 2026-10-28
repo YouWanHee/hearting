@@ -200,6 +200,28 @@ class DisplayHistoryTest(SeenTestCase):
         self.assertEqual(receipt["result_count"], len(receipt["result_ids"]))
         self.assertEqual(receipt["source"], "candidate-probe")
 
+    def test_a_deferred_probe_commits_only_when_the_caller_applies_it(self):
+        session = self.sid("deferred")
+        before = len(self.events())
+        result = self.mem("candidates", QUERY, "--session-id", session,
+                          "--runtime", "test", "--hook",
+                          env={"MEM_CANDIDATE_DEFER_COMMIT": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        pending = value["deferredCandidateReceipt"]
+        shown = ids_in(value["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(len(shown), 6)
+        self.assertIsNone(self.receipt(session), "the probe wrote its receipt before delivery")
+        self.assertEqual(len(self.events()), before, "the probe wrote its event before delivery")
+        again = self.mem("candidates", QUERY, "--session-id", session, "--runtime", "test")
+        self.assertEqual(ids_in(again.stdout), shown, "uncommitted IDs must stay eligible")
+        applied = self.mem("_apply-candidate-receipt", stdin=json.dumps(pending))
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(json.loads(applied.stdout), {"applied": True})
+        receipt = self.receipt(session)
+        self.assertEqual(receipt["result_ids"], shown)
+        self.assertEqual(ids_in(self.candidates(session)), [], "the applied IDs are now consumed")
+
     def test_concurrent_probes_of_one_session_never_share_an_id(self):
         session = self.sid("s")
         procs = [subprocess.Popen(
@@ -340,7 +362,9 @@ class ResetSignalTest(SeenTestCase):
                     for hook in group["hooks"]
                     if "mem.py" in hook["command"] and "inject --hook" in hook["command"]]
         self.assertEqual(len(commands), 1)
-        command = commands[0].replace('"$HOME/.claude/tools/memory/mem.py"', f'"{MEM}"')
+        command = commands[0].replace(
+            '"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/tools/memory/mem.py"',
+            f'"{MEM}"')
         self.assertIn(str(MEM), command)
         session = self.sid("real-command")
         self.candidates(session)

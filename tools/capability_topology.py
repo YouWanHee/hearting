@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
 import hashlib
 import json
 import re
@@ -45,6 +47,8 @@ _BLOCKING_VERDICT_TOKENS = frozenset({
     "failed", "FAILED", "needs_work", "killed", "conflicts-found",
 })
 _UNIT_CACHE: dict = {}
+_UNIT_CONTRACT_VIEW: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "unit_contract_view", default=None)
 
 
 class TopologyError(ValueError):
@@ -468,6 +472,9 @@ def _validate_model_profile(registry, profile, context, *, registered=True):
 
 def _unit_frontmatter(unit):
     """Read the few scalars the validator needs from a unit file (stdlib regex only)."""
+    view = _UNIT_CONTRACT_VIEW.get()
+    if view is not None and unit in view:
+        return dict(view[unit])
     key = (str(UNITS), unit)
     if key in _UNIT_CACHE:
         return _UNIT_CACHE[key]
@@ -476,6 +483,13 @@ def _unit_frontmatter(unit):
         text = path.read_text(encoding="utf-8")
     except OSError:
         raise TopologyError(f"unknown unit: {unit} (no roles/units/{unit}.md)")
+    fields = _parse_unit_frontmatter(unit, text)
+    _UNIT_CACHE[key] = fields
+    return fields
+
+
+def _parse_unit_frontmatter(unit, text):
+    """Parse unit contract fields from the same sealed frontmatter text used on disk."""
     match = re.match(r"\A---\n(.*?\n)---\n", text, re.DOTALL)
     if not match:
         raise TopologyError(f"unit {unit}: missing frontmatter block")
@@ -500,8 +514,18 @@ def _unit_frontmatter(unit):
         if verdict
         else []
     )
-    _UNIT_CACHE[key] = fields
     return fields
+
+
+@contextlib.contextmanager
+def _unit_contract_view(fields_by_unit):
+    """Temporarily expose authenticated historical fields without touching the cache."""
+    copied={unit:dict(fields) for unit,fields in fields_by_unit.items()}
+    token=_UNIT_CONTRACT_VIEW.set(copied)
+    try:
+        yield
+    finally:
+        _UNIT_CONTRACT_VIEW.reset(token)
 
 
 def _validate_unit_ref(recipe, node, registry):
@@ -1569,11 +1593,11 @@ def _validate_optional_part(registry, recipe, part_id, optional, owner_profile):
     stage = part_id.partition(":")[2]
     if not isinstance(node, dict) or node.get("id") != stage:
         raise TopologyError(f"part {part_id}: optional node id must equal the stage id")
-    resume = (part_id == "autopilot-lab:resume-run" and node.get("kind") == "resource-runner"
-              and node.get("resource_policy") == "verified-resume"
-              and node.get("resource_transport") == "detached-process"
-              and node.get("continuation") == {"kind": "supervised"})
-    if node.get("kind") not in ("pipeline-stage", "review-worker", "map-worker") and not resume:
+    # A detached, supervised resource is the one resource shape an optional part may take.
+    supervised_resource = (node.get("kind") == "resource-runner"
+                           and node.get("resource_transport") == "detached-process"
+                           and node.get("continuation") == {"kind": "supervised"})
+    if node.get("kind") not in ("pipeline-stage", "review-worker", "map-worker") and not supervised_resource:
         raise TopologyError(f"part {part_id}: optional part must be a pipeline, review, or map worker")
     known = {n["id"] for n in recipe["standard_plus"]["nodes"]} | {
         other for other, _row in recipe_optional_parts(registry, recipe)}
@@ -1581,15 +1605,33 @@ def _validate_optional_part(registry, recipe, part_id, optional, owner_profile):
         names = optional[key]
         if not isinstance(names, list) or not set(names) <= known - {stage}:
             raise TopologyError(f"part {part_id}: optional.{key} must name stages of its recipe")
+    capability = part_id.partition(":")[0]
+    modes = set(optional["modes"] or [])
+    targets = [other for other in registry.get("recipes", [])
+               if other.get("capability") == capability and modes & set(other.get("modes", []))
+               ] if supervised_resource else [recipe]
+    for target in targets:
+        _validate_optional_probe(registry, target, stage, node, supervised_resource, owner_profile)
+
+
+def _validate_optional_probe(registry, recipe, stage, node, supervised_resource, owner_profile):
+    """Validate the optional node alone, followed by the recipe's own check when it is a resource."""
     alone = json.loads(json.dumps(node))
     alone.update(depends_on=[], terminal=True, terminal_gate=alone.get("completion_gate"),
                  advance_class="model-required", model_required_reason="terminal-report")
     alone.pop("continuation", None)
     probe_nodes = [alone]
-    if resume:
+    if supervised_resource:
+        # A supervised resource is never terminal: its successor is the recipe's first
+        # review worker after the recipe's own resource node.
         alone = json.loads(json.dumps(node))
-        verification = json.loads(json.dumps(next(n for n in recipe["standard_plus"]["nodes"]
-                                                 if n["id"] == "run-verify")))
+        nodes = recipe["standard_plus"]["nodes"]
+        start = next((i for i, n in enumerate(nodes) if n.get("kind") == "resource-runner"), None)
+        successor = next((n for n in nodes[(start or 0) + 1:] if n.get("kind") == "review-worker"), None)
+        if start is None or successor is None:
+            raise TopologyError(f"part {recipe['capability']}:{stage}: a supervised resource needs "
+                                f"a review worker after the recipe's own resource node")
+        verification = json.loads(json.dumps(successor))
         verification.update(depends_on=[stage], terminal=True,
                             terminal_gate=verification["completion_gate"])
         verification.pop("continuation", None)
@@ -1646,7 +1688,7 @@ def _validate_part_catalog(registry, owner_profile):
         if (not isinstance(execution_needs, list)
                 or any(not isinstance(item, str) for item in execution_needs)
                 or len(execution_needs) != len(set(execution_needs))
-                or not set(execution_needs) <= {"compute-hosts"}):
+                or not set(execution_needs) <= {"compute-hosts", "host-process"}):
             raise TopologyError(f"part {part_id}: invalid execution_needs")
         summary = row.get("summary")
         if not isinstance(summary, str) or not summary.strip() or "\n" in summary:

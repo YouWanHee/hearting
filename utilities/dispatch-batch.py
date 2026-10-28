@@ -391,8 +391,95 @@ def partial_batch_input(jobs: Path, route: dict, nodes: list[dict], partial: dic
         raise BatchError("partial-continuation-source-manifest-invalid", str(exc)) from exc
 
 
+def producer_manifest_matches_generation(manifest, route, nodes, parent_attempt, generation):
+    """Whether a sealed plan batch's member identities belong to this revision."""
+    members = manifest.get("members") if isinstance(manifest, dict) else None
+    if not isinstance(members, list) or len(members) != len(nodes):
+        return False
+    by_id = {str(node.get("id")): node for node in nodes}
+    if {str(member.get("route_node")) for member in members if isinstance(member, dict)} != set(by_id):
+        return False
+    for member in members:
+        if not isinstance(member, dict):
+            return False
+        node_id = str(member.get("route_node"))
+        try:
+            expected = stable_attempt_id(
+                route, by_id[node_id], "", "", parent_attempt,
+                str(member["harness"]), int(member["fallback_ordinal"]),
+                producer_generation=generation,
+            )
+        except (KeyError, TypeError, ValueError, BatchError):
+            return False
+        if str(member.get("attempt_id")) != expected:
+            return False
+    return True
+
+
+def producer_prior_attempt_ids(jobs, route, nodes, group, parent_attempt, generation,
+                               current_attempt_ids=None):
+    """Prove earlier producer manifests before excluding their rows from replay."""
+    if not parent_attempt or not jobs.is_file():
+        return frozenset()
+    rows_by_manifest = {}
+    node_ids = {str(node["id"]) for node in nodes}
+    for line in jobs.read_text(encoding="utf-8", errors="replace").splitlines():
+        fields = line.split("\t")
+        if len(fields) != 6:
+            continue
+        metadata = parse_registry_metadata(fields[5])
+        if (metadata.get("route_id") == route.get("route_id")
+                and metadata.get("batch_group") == group
+                and metadata.get("parent_attempt_id") == parent_attempt
+                and metadata.get("batch_manifest_sha256")
+                and str(metadata.get("route_node")) in node_ids):
+            rows_by_manifest.setdefault(metadata["batch_manifest_sha256"], []).append(metadata)
+    if not rows_by_manifest:
+        return frozenset()
+    from recovery_history import RecoveryHistoryError, read_batch_input
+    prior = set()
+    current_ids = set((current_attempt_ids or {}).values())
+    for rows in rows_by_manifest.values():
+        try:
+            payload = read_batch_input(jobs, rows, source_route=route, group=group,
+                                       node_ids=node_ids)
+        except RecoveryHistoryError as exc:
+            raise BatchError(exc.reason, exc.detail) from exc
+        manifest, _digest, _leg_digests = verify_manifest(payload["manifest"])
+        member_ids = {str(member.get("attempt_id")) for member in manifest.get("members", [])}
+        current_match = bool(current_ids) and len(current_ids) == len(nodes) and member_ids == current_ids
+        generation_match = producer_manifest_matches_generation(
+            manifest, route, nodes, parent_attempt, generation,
+        )
+        if not (current_match or generation_match):
+            prior.update(member_ids)
+    return frozenset(prior)
+
+
+def _refuse_unfinished_prior_producer_generation(present, *, group):
+    """Do not strand live, unknown, or unsettled members when a revision advances."""
+    if not present:
+        raise BatchError("replacement-batch-source-drift", f"unfinished prior producer generation:{group}")
+    for fields, metadata in present:
+        attempt_id = str(metadata.get("attempt_id") or "")
+        if fields[1] in {"open", "running"}:
+            quiescence = attempt_process_quiescence(
+                metadata, terminal_receipt=metadata.get("terminal_event") is not None,
+            )
+            if quiescence.state == "live":
+                raise BatchError("prior-attempt-still-live", f"attempt={attempt_id}:{quiescence.reason}")
+            if quiescence.state == "unverifiable":
+                raise BatchError("prior-attempt-unverifiable", f"attempt={attempt_id}:{quiescence.reason}")
+            raise BatchError("round-unsettled", f"attempt={attempt_id}:open producer generation")
+        if fields[1] != "done" or metadata.get("note") != "completed-marker":
+            raise BatchError("round-unsettled", f"attempt={attempt_id}:prior producer generation")
+    raise BatchError("replacement-batch-source-drift", f"incomplete prior producer generation:{group}")
+
+
 def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
-                      parent_attempt: str, prompt: str, *, prior_attempt_ids=frozenset()):
+                      parent_attempt: str, prompt: str, *, prior_attempt_ids=frozenset(),
+                      producer_managed=False, producer_generation=None,
+                      current_attempt_ids=None):
     """Reuse a previously sealed launch input before applying current ranking.
 
     One exact registered member plus its verified immutable input proves the
@@ -405,6 +492,7 @@ def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
         return None
     from recovery_history import RecoveryHistoryError, read_batch_input
     candidates = []
+    candidate_rows = {}
     for line in jobs.read_text(encoding="utf-8").splitlines():
         fields = line.split("\t")
         if len(fields) != 6:
@@ -415,22 +503,43 @@ def prior_batch_input(jobs: Path, route: dict, nodes: list[dict], group: str,
                 and meta.get("parent_attempt_id") == parent_attempt
                 and meta.get("attempt_id") not in prior_attempt_ids
                 and meta.get("batch_manifest_sha256")):
-            candidates.append(meta)
-    if not candidates:
+            digest = meta["batch_manifest_sha256"]
+            candidate_rows.setdefault(digest, []).append(meta)
+    if not candidate_rows:
         return None
-    digests = {meta["batch_manifest_sha256"] for meta in candidates}
-    if len(digests) != 1:
-        raise BatchError("batch-prior-binding-ambiguous", group)
     try:
-        return read_batch_input(jobs, candidates, source_route=route, group=group,
-                                prompt=prompt, node_ids={node["id"] for node in nodes})
+        selected = []
+        node_ids = {str(node["id"]) for node in nodes}
+        current_ids = set((current_attempt_ids or {}).values())
+        for digest, rows in candidate_rows.items():
+            payload = read_batch_input(jobs, rows, source_route=route, group=group,
+                                       node_ids=node_ids)
+            if producer_managed:
+                manifest = payload.get("manifest") or {}
+                member_ids = {str(member.get("attempt_id")) for member in manifest.get("members", [])}
+                current_match = bool(current_ids) and member_ids == current_ids and len(current_ids) == len(nodes)
+                generation_match = producer_manifest_matches_generation(
+                    manifest, route, nodes, parent_attempt, producer_generation,
+                )
+                if not (current_match or generation_match):
+                    continue
+            selected.append((digest, rows))
+        if not selected:
+            return None
+        if len(selected) != 1:
+            raise BatchError("batch-prior-binding-ambiguous", group)
+        _digest, rows = selected[0]
+        return read_batch_input(jobs, rows, source_route=route, group=group,
+                                prompt=prompt, node_ids=node_ids)
     except RecoveryHistoryError as exc:
         raise BatchError(exc.reason, exc.detail) from exc
     except DispatchContractError as exc:
         raise BatchError("batch-prior-binding-invalid", str(exc)) from exc
 
 
-def unfinished_batch_input(jobs, route, nodes, group, parent_attempt, prompt, admissions, *, route_file):
+def unfinished_batch_input(jobs, route, nodes, group, parent_attempt, prompt, admissions, *, route_file,
+                           producer_managed=False, producer_generation=None,
+                           current_attempt_ids=None):
     """Restore sealed unfinished membership before selecting a fresh round.
 
     Registered members use the historical input reader. With no registered
@@ -438,7 +547,7 @@ def unfinished_batch_input(jobs, route, nodes, group, parent_attempt, prompt, ad
     Current row/process validation and admission of missing legs still follow.
     """
     from recovery_history import INPUT_SCHEMA, RecoveryHistoryError, _read, read_batch_input
-    if not admissions or not parent_attempt or not jobs.exists():
+    if (not admissions and not producer_managed) or not parent_attempt or not jobs.exists():
         return None
     rows = []
     for line in jobs.read_text(encoding="utf-8").splitlines():
@@ -464,31 +573,51 @@ def unfinished_batch_input(jobs, route, nodes, group, parent_attempt, prompt, ad
                 raise BatchError("replacement-batch-source-drift", "node census")
             members = manifest["members"]
             present = [by_id[m["attempt_id"]] for m in members if m["attempt_id"] in by_id]
-            if len(present) == len(members) and not any(
+            if producer_managed:
+                fully_settled = (len(present) == len(members) and all(
+                    fields[1] == "done" and meta.get("note") == "completed-marker"
+                    for fields, meta in present))
+                if fully_settled:
+                    continue
+            elif len(present) == len(members) and not any(
                     fields[1] == "open" and meta.get("launch_claimed") == "0"
                     for fields, meta in present):
                 continue
+
+            producer_generation_match = False
+            producer_current_match = False
+            if producer_managed:
+                producer_generation_match = producer_manifest_matches_generation(
+                    manifest, route, nodes, parent_attempt, producer_generation,
+                )
+                current_ids = set((current_attempt_ids or {}).values())
+                member_ids = {str(member.get("attempt_id")) for member in members}
+                producer_current_match = bool(current_ids) and len(current_ids) == len(nodes) and member_ids == current_ids
+                if not (producer_generation_match or producer_current_match):
+                    _refuse_unfinished_prior_producer_generation(present, group=group)
             # The common logical census selects history, including replacement
             # originals. A sealed file cannot revive a superseded physical id.
-            eligible = True
-            for member in members:
-                admission = admissions.get(member["route_node"])
-                if admission is None:
-                    eligible = False
-                    break
-                aid = member["attempt_id"]
-                if aid in by_id:
-                    if aid not in admission.current_attempt_ids:
+            eligible = producer_generation_match or producer_current_match
+            if not producer_managed:
+                eligible = True
+                for member in members:
+                    admission = admissions.get(member["route_node"])
+                    if admission is None:
                         eligible = False
                         break
-                else:
-                    node = next(n for n in nodes if n["id"] == member["route_node"])
-                    expected = stable_attempt_id(route, node, "", "", parent_attempt,
-                        member["harness"], member["fallback_ordinal"],
-                        review_round=admission.budget.next_round)
-                    if aid != expected:
-                        eligible = False
-                        break
+                    aid = member["attempt_id"]
+                    if aid in by_id:
+                        if aid not in admission.current_attempt_ids:
+                            eligible = False
+                            break
+                    else:
+                        node = next(n for n in nodes if n["id"] == member["route_node"])
+                        expected = stable_attempt_id(route, node, "", "", parent_attempt,
+                            member["harness"], member["fallback_ordinal"],
+                            review_round=admission.budget.next_round)
+                        if aid != expected:
+                            eligible = False
+                            break
             if not eligible:
                 continue
             options = payload.get("options", {})
@@ -1242,6 +1371,7 @@ def stable_attempt_id(
     parent_attempt_id: str, adapter: str, ordinal: int,
     superseding_recovery_discriminator: str = "",
     *, review_round: int = 1,
+    producer_generation: str | None = None,
 ) -> str:
     # Display labels are deliberately excluded. One exact parent generation,
     # route node, admitted review round and selected fallback tuple must always
@@ -1258,6 +1388,10 @@ def stable_attempt_id(
         # The shared admission census owns the generation, not prompt bytes
         # or display labels. Keep the historic first-round identity unchanged.
         payload["review_round"] = review_round
+    if producer_generation not in (None, "1"):
+        if not re.fullmatch(r"rev-[0-9a-f]{64}", str(producer_generation)):
+            raise BatchError("producer-revision-generation-invalid")
+        payload["producer_generation"] = str(producer_generation)
     if superseding_recovery_discriminator:
         if not DIGEST.fullmatch(superseding_recovery_discriminator):
             raise BatchError("partial-continuation-replacement-identity-invalid")
@@ -2634,6 +2768,8 @@ def node_launch_command(*, route_path, leg, parent, prompt_text, reviewed_eviden
         "--prompt-text", prompt_text,
         *(["--reviewed-evidence", reviewed_evidence] if reviewed_evidence else []),
         "--attempt-id", str(leg["attempt_id"]),
+        *( ["--producer-generation", str(leg["producer_generation"])]
+           if leg.get("producer_generation") is not None else []),
         *( ["--pair-model-profile", str(leg["pair_model_profile"])]
            if leg.get("pair_model_profile") else []),
         "--jobs", str(jobs),
@@ -2819,6 +2955,24 @@ def main(argv: list[str] | None = None) -> int:
         if partial is None and args.action == "start":
             continuation_record, partial = discover_unstarted_partial_group(
                 jobs, route, nodes, args.parallel_group)
+        producer_admission = {"managed": False, "generation": None,
+                              "pending": False, "current_attempt_ids": {}}
+        if partial is None:
+            try:
+                producer_admission = ROUTE_MODULE.producer_revision_admission(route, nodes, jobs)
+            except ValueError as exc:
+                raise BatchError(getattr(exc, "reason", str(exc)), str(exc)) from exc
+        producer_managed = bool(producer_admission.get("managed"))
+        producer_generation = (str(producer_admission["generation"])
+                                if producer_managed else None)
+        producer_current_attempt_ids = producer_admission.get("current_attempt_ids") or {}
+        producer_historical_attempts = frozenset()
+        if producer_managed and partial is None:
+            producer_historical_attempts = producer_prior_attempt_ids(
+                jobs, route, nodes, args.parallel_group,
+                os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), producer_generation,
+                producer_current_attempt_ids,
+            )
         if args.log_dir is not None:
             args.log_dir = validate_dispatch_log_dir(jobs, args.log_dir)
         args.review_inputs = {}
@@ -2884,7 +3038,10 @@ def main(argv: list[str] | None = None) -> int:
         unfinished_input = (None if partial is not None or reusable_peers else unfinished_batch_input(
             jobs, route, nodes, args.parallel_group,
             os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text,
-            round_admissions, route_file=route_path))
+            round_admissions, route_file=route_path,
+            producer_managed=producer_managed,
+            producer_generation=producer_generation,
+            current_attempt_ids=producer_current_attempt_ids))
         for node_id, error in round_errors.items():
             admission = round_admissions[node_id]
             if unfinished_input is not None and args.action == "start":
@@ -2915,11 +3072,14 @@ def main(argv: list[str] | None = None) -> int:
                 if unfinished_input is not None else
                 frozenset() if next_generation else admission.current_attempt_ids)
             for admission in round_admissions.values()
-        ))
+        )) | producer_historical_attempts
         prior_input = unfinished_input or (None if partial is not None or reusable_peers else prior_batch_input(
             jobs, route, nodes, args.parallel_group,
             os.environ.get("AGENT_DISPATCH_ATTEMPT_ID", ""), args.prompt_text,
-            prior_attempt_ids=historical_batch_attempts))
+            prior_attempt_ids=historical_batch_attempts,
+            producer_managed=producer_managed,
+            producer_generation=producer_generation,
+            current_attempt_ids=producer_current_attempt_ids))
         if prior_input is not None:
             assignments = prior_batch_assignments(prior_input, route, nodes, parent_identity)
             independence = "persona"
@@ -3131,6 +3291,7 @@ def main(argv: list[str] | None = None) -> int:
             ordinal,
             review_round=(round_admissions[node_id].budget.next_round
                           if node_id in round_admissions else 1),
+            producer_generation=producer_generation,
         )
         if prior_input is not None:
             attempt_id = next(member["attempt_id"] for member in prior_input["manifest"]["members"]
@@ -3154,6 +3315,8 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             ),
         }
+        if producer_managed and partial is None:
+            leg["producer_generation"] = producer_generation
         if node_id in pair_profiles:
             leg["pair_model_profile"] = pair_profiles[node_id]
         if "profile_selection" in node:

@@ -5,6 +5,7 @@ on one coalesced RefreshPump worker and can neither create rows nor change those
 observations. A slow filesystem read here leaves basic refresh independent.
 """
 from dataclasses import dataclass, replace
+from collections.abc import Mapping
 import copy
 import hashlib
 import json
@@ -19,6 +20,9 @@ from .refresh import _observation_identity, required_details_complete, set_requi
 _METADATA = ("campaign_label", "location_kind", "location_wt", "location_repo",
              "branch", "worktree_count", "branch_ahead", "branch_behind", "qa", "qa_source",
              "peer_last_recv", "peer_last_sent", "steward")
+# The steward relation lists travel with the scalar flag from the same optional
+# pass. They are display-only and never enter the scalar continuation payload.
+_STEWARD_RELATIONS = ("steward_targets", "steward_parents")
 
 
 def identity(row):
@@ -566,10 +570,66 @@ def _copy_for_enrichment(snapshot, *, required_only):
     return value
 
 
+def _apply_peer_observation(collect, sessions):
+    """Apply peer rows only when the collector can attest to a complete scan."""
+    import inspect
+
+    try:
+        parameters = inspect.signature(collect).parameters.values()
+        supports_health = any(parameter.name == "include_health"
+                              or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                              for parameter in parameters)
+    except (TypeError, ValueError):
+        supports_health = True
+    try:
+        result = collect(include_health=True) if supports_health else collect()
+        if isinstance(result, tuple) and len(result) == 2:
+            peer, health = result
+            state = health.get("state") if isinstance(health, Mapping) else getattr(health, "state", None)
+            state = str(state or "unknown").lower()
+            if state not in ("success", "failed", "unknown"):
+                state = "unknown"
+        else:
+            peer, state = result, "unknown"
+        if not isinstance(peer, Mapping):
+            return "failed"
+        records, by_session = peer.get("records"), peer.get("by_session")
+        if not isinstance(records, (list, tuple)) or not isinstance(by_session, Mapping):
+            return "failed"
+        if not (isinstance(result, tuple) and len(result) == 2):
+            # Compatibility for older collectors and mapping-only test doubles:
+            # positive rows are useful; an empty mapping cannot prove a clear.
+            state = "success" if records or by_session else "unknown"
+        if state != "success":
+            return state
+
+        fields = ("peer_last_recv", "peer_last_sent", "peer_sent_1h",
+                  "peer_recv_1h", "peer_obligations")
+        before = [{field: copy.deepcopy(getattr(session, field, None)) for field in fields}
+                  for session in sessions]
+        try:
+            for session in sessions:
+                session.peer_last_recv = None
+                session.peer_last_sent = None
+                session.peer_sent_1h = 0
+                session.peer_recv_1h = 0
+                session.peer_obligations = []
+            from .collectors import apply_peer_rows
+            apply_peer_rows(sessions, dict(by_session))
+        except Exception:
+            for session, values in zip(sessions, before):
+                for field, value in values.items():
+                    setattr(session, field, value)
+            return "failed"
+        return "success"
+    except Exception:
+        return "failed"
+
+
 def _enrich(snapshot, *, include_report_verification=True, required=True,
             required_only=False):
     """Fill copied rows with display detail; never rescan or reclassify work."""
-    from .collectors import dispatch, _adopt_child_titles, _enrich_steward, apply_peer_rows
+    from .collectors import dispatch, _adopt_child_titles
     from . import projection, route_chain, titles
     source_key = getattr(snapshot, "_continuation_source_key", None) or state_key(snapshot)
     continued = {identity(row) for row in snapshot.sessions + snapshot.jobs
@@ -678,13 +738,25 @@ def _enrich(snapshot, *, include_report_verification=True, required=True,
                 dispatch._candidate_jobs_paths())
         except Exception:
             value.pending_delivery = None
-        _enrich_steward(sessions)
+        try:
+            from .collectors import steward
+            steward.enrich(sessions)
+            steward_state = "success"
+        except Exception:
+            steward_state = "failed"
         try:
             from .collectors import peer_messages
-            peer = peer_messages.collect()
-            apply_peer_rows(sessions, (peer or {}).get("by_session") or {})
+            peer_state = _apply_peer_observation(peer_messages.collect, sessions)
         except Exception:
-            pass
+            peer_state = "failed"
+        observations = dict(getattr(value, "observations", None) or {})
+        observations["optional:steward"] = {"state": steward_state, "observed_at": time.time()}
+        observations["optional:peers"] = {
+            "state": peer_state,
+            "roster": tuple((identity(row), binding(row)) for row in sessions),
+            "observed_at": time.time(),
+        }
+        value.observations = observations
         # Pane metadata only: no runtime identity/lifecycle writes. The input was
         # published with basic rows; slow panes occupy this existing detail worker.
         from .herdr_projection import refresh_observed_tag_metadata
@@ -788,7 +860,7 @@ def merge(basic, detail):
                 continue
             previous = candidates[0]
             current = copy.copy(row)
-            for field in _METADATA:
+            for field in _METADATA + _STEWARD_RELATIONS:
                 observed = getattr(previous, field, None)
                 if observed is not None:
                     setattr(current, field, observed)
@@ -881,6 +953,10 @@ def merge(basic, detail):
         if (isinstance(required, dict) and basic_identity is not None
                 and _observation_identity(required) == basic_identity):
             observations["required-details"] = copy.deepcopy(required)
+        if isinstance(detail_observations, dict):
+            for name, item in detail_observations.items():
+                if str(name).startswith("optional:"):
+                    observations[str(name)] = copy.deepcopy(item)
         try:
             from .display_snapshot import merge as merge_display_snapshot
             display_snapshot = merge_display_snapshot(
@@ -893,3 +969,85 @@ def merge(basic, detail):
                    memory=value.memory, governor=value.governor,
                    hearting=value.hearting or basic.hearting,
                    display_snapshot=display_snapshot, observations=observations, **evidence)
+
+
+def retain_optional_last_good(previous, current):
+    """Carry optional data across absent detail passes without crossing row identities."""
+    if not isinstance(previous, DetailSnapshot) or not isinstance(current, DetailSnapshot):
+        return current
+    old, new = previous.snapshot, current.snapshot
+    old_observations = getattr(old, "observations", None) or {}
+    new_observations = dict(getattr(new, "observations", None) or {})
+
+    old_memory = old_observations.get("optional:memory", {})
+    new_memory = new_observations.get("optional:memory", {})
+    if (new_memory.get("state") not in ("success", "absent")
+            and old_memory.get("state") == "success"):
+        if new.memory is None:
+            new.memory = old.memory
+        new_observations["optional:memory"] = copy.deepcopy(old_memory)
+
+    old_db = old_observations.get("optional:memory-db", {})
+    new_db = new_observations.get("optional:memory-db", {})
+    if (new_db.get("state") is not None
+            and new_db.get("state") not in ("success", "absent", "unobserved")
+            and old_db.get("state") == "success"):
+        old_data = old.memory if isinstance(old.memory, dict) else {}
+        current_data = new.memory if isinstance(new.memory, dict) else old_data
+        old_database = old_data.get("database") if isinstance(old_data.get("database"), dict) else {}
+        current_database = current_data.get("database") if isinstance(current_data.get("database"), dict) else {}
+        current_database = dict(current_database)
+        current_database["state"] = str(new_db.get("state"))
+        current_database["last_good_by_repo"] = copy.deepcopy(old_database.get("by_repo") or {})
+        current_database["last_good"] = True
+        new.memory = dict(current_data, database=current_database)
+        new_db = dict(new_db, last_good=True)
+        new_observations["optional:memory-db"] = new_db
+
+    old_rows = {}
+    for row in old.sessions:
+        old_rows.setdefault((identity(row), binding(row)), []).append(row)
+
+    # Only the optional pass judges the steward role; a required pass leaves the
+    # model default False, which means "not judged here", never "not a steward".
+    old_steward = old_observations.get("optional:steward", {})
+    new_steward = new_observations.get("optional:steward", {})
+    if (new_steward.get("state") != "success"
+            and (old_steward.get("state") == "success" or old_steward.get("last_good"))):
+        for row in new.sessions:
+            matches = old_rows.get((identity(row), binding(row)), ())
+            if len(matches) != 1:
+                continue
+            prior = matches[0]
+            for field in ("steward", *_STEWARD_RELATIONS):
+                setattr(row, field, copy.deepcopy(getattr(prior, field, None)))
+        if new_steward.get("state") is None:
+            new_observations["optional:steward"] = copy.deepcopy(old_steward)
+        else:
+            new_observations["optional:steward"] = dict(
+                new_steward, last_good=True,
+                last_good_observed_at=old_steward.get("observed_at",
+                                                     old_steward.get("last_good_observed_at")))
+
+    old_peers = old_observations.get("optional:peers", {})
+    new_peers = new_observations.get("optional:peers", {})
+    if new_peers.get("state") != "success":
+        for row in new.sessions:
+            matches = old_rows.get((identity(row), binding(row)), ())
+            if len(matches) != 1:
+                continue
+            prior = matches[0]
+            for field in ("peer_last_recv", "peer_last_sent", "peer_sent_1h",
+                          "peer_recv_1h", "peer_obligations"):
+                setattr(row, field, copy.deepcopy(getattr(prior, field, None)))
+        if new_peers.get("state") is None:
+            if old_peers:
+                new_observations["optional:peers"] = copy.deepcopy(old_peers)
+        elif old_peers.get("state") == "success" or old_peers.get("last_good"):
+            new_observations["optional:peers"] = dict(
+                new_peers, last_good=True,
+                last_good_observed_at=old_peers.get("observed_at",
+                                                   old_peers.get("last_good_observed_at")))
+
+    new.observations = new_observations
+    return current

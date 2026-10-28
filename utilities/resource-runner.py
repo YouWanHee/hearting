@@ -7,7 +7,7 @@ import resource_run_evidence as RUN_EVIDENCE
 from resource_progress import environment as progress_environment
 import gpu_leases
 import route_authority
-from gpu_execution_sandbox import gpu_resource_nodes
+from gpu_execution_sandbox import assert_host_payload_access, gpu_resource_nodes, host_payload_nodes
 from resource_run_registry import (
     classify_identity,
     is_alive,
@@ -160,6 +160,547 @@ def launch_request(args):
     return request
 
 
+def _resource_payload_env(argv):
+    """Return explicit env assignments carried by the launched argv."""
+    import shlex
+
+    tokens = list(argv)
+    has_env = False
+    if tokens and Path(tokens[0]).name == "env":
+        tokens = tokens[1:]
+        has_env = True
+    elif len(tokens) >= 3 and Path(tokens[0]).name in {"bash", "sh"} and tokens[1] == "-c":
+        try:
+            tokens = shlex.split(tokens[2])
+        except ValueError:
+            return None
+        if tokens and tokens[0] == "exec":
+            tokens = tokens[1:]
+        if tokens and Path(tokens[0]).name == "env":
+            tokens = tokens[1:]
+            has_env = True
+    environment = {"inherit": True, "unset": [], "set": {}}
+    if not has_env:
+        return environment
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if token in {"-i", "--ignore-environment"}:
+            environment["inherit"] = False
+            index += 1
+            continue
+        if token in {"-u", "--unset"}:
+            if index + 1 >= len(tokens):
+                return None
+            environment["unset"].append(tokens[index + 1])
+            index += 2
+            continue
+        if isinstance(token, str) and token.startswith("--unset="):
+            environment["unset"].append(token.split("=", 1)[1])
+            index += 1
+            continue
+        if not isinstance(token, str) or "=" not in token:
+            break
+        name, value = token.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            if token.startswith("-"):
+                return None
+            break
+        environment["set"][name] = value
+        index += 1
+    return environment
+
+
+def _resource_payload_tokens(argv):
+    """Expose argv-level payload options inside a supported shell wrapper."""
+    import shlex
+
+    tokens = list(argv)
+    if (len(tokens) >= 3 and Path(tokens[0]).name in {"bash", "sh"}
+            and tokens[1] == "-c"):
+        try:
+            tokens = shlex.split(tokens[2])
+        except ValueError:
+            return None
+        if tokens and tokens[0] == "exec":
+            tokens = tokens[1:]
+    return tokens
+
+
+_COMPUTE_HOSTS_PARSER = None
+
+
+def _resource_compute_hosts_run(argv):
+    """Parse a remote compute-hosts invocation without launching it."""
+    global _COMPUTE_HOSTS_PARSER
+    if _COMPUTE_HOSTS_PARSER is None:
+        import importlib.util
+        path = Path(__file__).with_name("compute-hosts.py")
+        spec = importlib.util.spec_from_file_location("resource_compute_hosts_parser", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _COMPUTE_HOSTS_PARSER = module
+    try:
+        parsed = _COMPUTE_HOSTS_PARSER.parse_run_invocation(argv)
+    except (SystemExit, TypeError, ValueError):
+        return None
+    cwd = getattr(parsed, "cwd", None)
+    payload = getattr(parsed, "command", None)
+    if (not isinstance(cwd, str) or not Path(cwd).is_absolute()
+            or not isinstance(payload, list) or not payload
+            or not all(isinstance(part, str) for part in payload)):
+        return None
+    return parsed
+
+
+def _resource_input_sha256(path):
+    """Hash one stable, regular, non-symlink input file."""
+    try:
+        candidate = Path(path)
+        if not candidate.is_absolute() or candidate.is_symlink():
+            return None
+        before = candidate.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        raw = candidate.read_bytes()
+        after = candidate.lstat()
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            return None
+        return hashlib.sha256(raw).hexdigest()
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _resource_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate resource request key")
+        value[key] = item
+    return value
+
+
+def _resource_payload_input_hashes(request, launch_request_value, argv, command):
+    """Validate execution inputs; request bytes retain descriptive provenance."""
+    provenance = request.get("provenance")
+    if provenance is None:
+        provenance = {}
+    if not isinstance(provenance, dict):
+        return None
+    hashes = {}
+
+    def option_path(flag):
+        values = []
+        tokens = _resource_payload_tokens(argv)
+        if tokens is None:
+            return None
+        for index, value in enumerate(tokens):
+            if value == flag:
+                if index + 1 >= len(tokens):
+                    return None
+                values.append(tokens[index + 1])
+            elif isinstance(value, str) and value.startswith(flag + "="):
+                values.append(value[len(flag) + 1:])
+        return values[0] if len(values) == 1 else None
+
+    def add_hash(name, path, expected):
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            return False
+        if _resource_input_sha256(path) != expected:
+            return False
+        hashes[name] = expected
+        return True
+
+    for name in ("smoke_attestation", "config_manifest"):
+        path = request.get(name)
+        launch_path = launch_request_value.get(name)
+        expected = launch_request_value.get(name + "_sha256")
+        request_hash = request.get(name + "_sha256")
+        if path != launch_path:
+            return None
+        if path is None:
+            if expected is not None or request_hash is not None:
+                return None
+            continue
+        if not add_hash(name, path, expected) or (
+                request_hash is not None and request_hash != expected):
+            return None
+        provenance_hash = provenance.get(name + "_sha256")
+        if provenance_hash is not None and provenance_hash != expected:
+            return None
+
+    argv_hash_fields = {
+        "config_sha256": "--config",
+        "data_lock_sha256": "--data-lock",
+        "gpu_smoke_sha256": "--smoke",
+        "resume_checkpoint_sha256": "--resume",
+    }
+    for field, flag in argv_hash_fields.items():
+        expected = provenance.get(field)
+        if expected is not None:
+            path = option_path(flag)
+            if path is None or not add_hash(field, path, expected):
+                return None
+    for field in ("smoke_attestation_sha256", "config_manifest_sha256"):
+        expected = provenance.get(field)
+        if expected is not None:
+            path = request.get(field[:-7])
+            if path is None or _resource_input_sha256(path) != expected:
+                return None
+            hashes[field] = expected
+    bridge_base_hash = provenance.get("bridge_base_sha256")
+    if bridge_base_hash is not None:
+        if not add_hash("bridge_base_sha256", provenance.get("bridge_base"), bridge_base_hash):
+            return None
+    bridge_hash = provenance.get("bridge_sha256")
+    if bridge_hash is not None:
+        candidates = []
+        for token in command:
+            if not isinstance(token, str) or not token.endswith(".py"):
+                continue
+            digest = _resource_input_sha256(token)
+            if digest == bridge_hash:
+                candidates.append(token)
+        if len(candidates) != 1:
+            return None
+        hashes["bridge_sha256"] = bridge_hash
+
+    # Source-bridge/cache history is part of the exact request, not another
+    # executable input. Only hashes tied to the effective payload are checked
+    # above; arbitrary provenance names cannot add new launch requirements.
+    for field, expected in request.items():
+        if not field.endswith("_sha256") or field in {
+                "smoke_attestation_sha256", "config_manifest_sha256"}:
+            continue
+        path = request.get(field[:-7]) or request.get(field[:-7] + "_path")
+        if field == "resume_checkpoint_sha256":
+            selected = option_path("--resume")
+            if not selected or not path or Path(selected).resolve() != Path(path).resolve():
+                return None
+            if hashes.get(field) == expected:
+                continue
+        if not add_hash(field, path, expected):
+            return None
+    return hashes
+
+
+def supervisor_resource_watches(supervisor, ledger, node=None):
+    reader = getattr(supervisor, "read_resource_watches", None)
+    if callable(reader):
+        return reader(ledger, node)
+    return [row for row in supervisor.read_armed(ledger).values()
+            if row.get("predecessor_kind") == "resource"
+            and (node is None or row.get("node") == node)]
+
+
+def supervisor_resource_watch_for_run(supervisor, ledger, node, registry, run_id):
+    primary = supervisor.read_armed(ledger).get(node)
+    if (primary and primary.get("predecessor_id") == run_id
+            and str(Path(primary.get("resource_registry") or "").resolve(strict=False))
+                == str(Path(registry).resolve(strict=False))):
+        return primary
+    finder = getattr(supervisor, "resource_watch_for_run", None)
+    if callable(finder):
+        return finder(ledger, node, registry, run_id)
+    expected = (node, str(Path(registry).resolve(strict=False)), run_id)
+    rows = getattr(supervisor, "read_armed")(ledger).values()
+    return next((row for row in rows
+        if (row.get("node"), str(Path(row.get("resource_registry") or "").resolve(strict=False)),
+            row.get("predecessor_id")) == expected), None)
+
+
+def resource_operation_binding(route, route_file, node, run_id, command, cwd,
+                               launch_request_value, owner_wait, *, registry_path=None,
+                               log_path=None):
+    """Bind an existing operation request to this exact supervised launch.
+
+    The live sealed owner/controller selects an operation within the approved
+    route scope. Existing owner-input identity and turn state remain provenance;
+    the request bytes, local command/bridge, and parsed remote payload are bound
+    at their own execution layers. No operation JSON is required in freeform
+    owner-input text.
+    """
+    if not isinstance(owner_wait, dict):
+        return None
+    work_request = route.get("work_request")
+    if isinstance(work_request, dict) and isinstance(work_request.get("text"), str) \
+            and work_request["text"].strip():
+        work_request_sha256 = hashlib.sha256(json.dumps(
+            work_request, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False).encode("utf-8")).hexdigest()
+    else:
+        route_hash = route.get("route_hash")
+        if not isinstance(route_hash, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", route_hash):
+            return None
+        # Older sealed routes may predate work_request capture. Their exact
+        # route hash still binds the accepted owner input target; no route plan
+        # or checklist is required to retain ordinary resource compatibility.
+        work_request_sha256 = route_hash.split(":", 1)[1]
+    artifact_root = Path(route.get("artifact_root", "")).resolve(strict=True)
+    candidates = []
+    for token in command:
+        if not isinstance(token, str) or not token.lower().endswith(".json"):
+            continue
+        path = Path(token)
+        if not path.is_absolute() or path.is_symlink():
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(artifact_root):
+                continue
+            before = resolved.stat()
+            raw = resolved.read_bytes()
+            after = resolved.stat()
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+                raise ValueError("resource-operation-request-changed")
+            value = json.loads(raw, object_pairs_hook=_resource_json_object)
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(value, dict) and "user_direction_id" in value:
+            candidates.append((resolved, raw, value))
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        return None
+    request_path, request_bytes, request = candidates[0]
+    parent_attempt = owner_wait.get("parent_attempt_id")
+    if (not isinstance(parent_attempt, str) or request.get("parent_attempt_id") != parent_attempt
+            or request.get("run_id") != run_id
+            or not isinstance(request.get("requested_scope"), str)
+            or not request["requested_scope"].strip()
+            or not isinstance(request.get("user_direction_id"), str)
+            or not request["user_direction_id"]
+            or not isinstance(request.get("compute_argv"), list)
+            or not request["compute_argv"]):
+        return None
+    for name in ("smoke_attestation", "config_manifest"):
+        if request.get(name) != launch_request_value.get(name):
+            return None
+    provenance = request.get("provenance")
+    if provenance is not None:
+        if not isinstance(provenance, dict):
+            return None
+        for field, name in (("smoke_attestation_sha256", "smoke_attestation"),):
+            if (provenance.get(field) is not None
+                    and provenance[field] != launch_request_value.get(name + "_sha256")):
+                return None
+    compute_argv = request["compute_argv"]
+    if any(not isinstance(part, str) for part in compute_argv):
+        return None
+    compute_hosts = _resource_compute_hosts_run(compute_argv)
+    if compute_hosts is not None:
+        payload_argv = list(compute_hosts.command)
+        payload_cwd = compute_hosts.cwd
+        shell_environment = _resource_payload_env(payload_argv)
+        if shell_environment is None:
+            return None
+        payload_environment = {
+            "compute_host": compute_hosts.host,
+            "compute_env": compute_hosts.env,
+            "cwd": compute_hosts.cwd,
+            "gpus": compute_hosts.gpus,
+            "share": bool(compute_hosts.share),
+            "payload": shell_environment,
+        }
+    else:
+        # Keep the existing direct-command request form for local resource
+        # payloads. A bridge request with a different remote argv must parse as
+        # compute-hosts and cannot fall through to this path.
+        if compute_argv != list(command):
+            return None
+        cwd_indexes = [index for index, value in enumerate(compute_argv) if value == "--cwd"]
+        if (len(cwd_indexes) != 1 or cwd_indexes[0] + 1 >= len(compute_argv)
+                or str(Path(compute_argv[cwd_indexes[0] + 1]).resolve(strict=False))
+                    != str(Path(cwd).resolve(strict=True))):
+            return None
+        payload_argv = compute_argv
+        payload_cwd = str(Path(cwd).resolve(strict=True))
+        payload_environment = _resource_payload_env(payload_argv)
+        if payload_environment is None:
+            return None
+
+    command_record = None
+    command_record_path = None
+    command_record_bytes = None
+    # Existing artifact paths locate records for Dev, resume and other normal
+    # owner requests alike. They grant no authority: the exact request digest
+    # and command/options below still have to identify one matching record.
+    directories = {request_path.parent}
+    for value in request.values():
+        if not isinstance(value, str) or not Path(value).is_absolute():
+            continue
+        try:
+            directory = Path(value).resolve(strict=False).parent
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if directory.is_relative_to(artifact_root):
+            directories.add(directory)
+    command_records = []
+    for directory in sorted(directories):
+        for candidate_path in sorted(directory.glob("*resource-start-command.json")):
+            if candidate_path.is_symlink():
+                continue
+            try:
+                raw_record = candidate_path.read_bytes()
+                record_value = json.loads(raw_record, object_pairs_hook=_resource_json_object)
+            except (OSError, ValueError, TypeError):
+                continue
+            if (isinstance(record_value, dict)
+                    and record_value.get("request_path") == str(request_path)
+                    and record_value.get("request_sha256") == hashlib.sha256(request_bytes).hexdigest()
+                    and isinstance(record_value.get("argv"), list)):
+                command_records.append((candidate_path.resolve(strict=True), raw_record, record_value))
+    if len(command_records) == 1:
+        command_record_path, command_record_bytes, command_record = command_records[0]
+    if command_record is None:
+        return None
+    argv = command_record["argv"]
+    if not all(isinstance(part, str) for part in argv) or "--" not in argv:
+        return None
+    # The exact command record can point at a cached release. Its owner, route,
+    # request bytes and local argv are validated below; the path is provenance,
+    # not an independent execution authority.
+    if (len(argv) < 2 or not Path(argv[1]).is_absolute()
+            or Path(argv[1]).name != "resource-runner.py"
+            or Path(argv[1]).is_symlink() or not Path(argv[1]).is_file()):
+        return None
+    separator = argv.index("--")
+    def option_value(flag):
+        indexes = [index for index, value in enumerate(argv[:separator]) if value == flag]
+        return argv[indexes[0] + 1] if len(indexes) == 1 and indexes[0] + 1 < separator else None
+    expected_values = {
+        "--registry": str(Path(registry_path).resolve(strict=False)) if registry_path else None,
+        "--run-id": run_id,
+        "--cwd": str(Path(cwd).resolve(strict=True)),
+        "--log": str(Path(log_path).resolve(strict=False)) if log_path else None,
+        "--route": str(Path(route_file).resolve(strict=True)),
+        "--node": node,
+        "--parent-attempt-id": parent_attempt,
+        "--jobs": str(Path(owner_wait.get("jobs", "")).resolve(strict=True)),
+        "--smoke-attestation": launch_request_value.get("smoke_attestation"),
+        "--config-manifest": launch_request_value.get("config_manifest"),
+    }
+    if (argv[separator + 1:] != list(command)
+            or any(option_value(flag) != expected for flag, expected in expected_values.items())):
+        return None
+
+    import dispatch_owner_input as INPUT
+    jobs = Path(owner_wait.get("jobs", "")).resolve(strict=True)
+    with INPUT._locked(jobs, parent_attempt) as (_, value):
+        parent, target = INPUT._target(jobs, parent_attempt)
+        if (value is None or value.get("target") != target
+                or value.get("thread_id") != owner_wait.get("session_id")
+                or owner_wait.get("route_id") != route.get("route_id")
+                or owner_wait.get("route_hash") != route.get("route_hash")
+                or owner_wait.get("jobs") != str(jobs)
+                or parent.status not in {"open", "running"}
+                or str(owner_wait.get("owner_pid")) != parent.metadata.get("pid")
+                or owner_wait.get("owner_start") != parent.metadata.get("pid_start")
+                or (owner_wait.get("harness") is not None
+                    and owner_wait.get("harness") != parent.metadata.get("harness"))
+                or not INPUT.supervisor_lease_is_held(jobs, parent.metadata)):
+            return None
+        item = next((row for row in value.get("requests", [])
+                     if row.get("id") == request["user_direction_id"]), None)
+        if not isinstance(item, dict):
+            return None
+        events = item.get("events")
+        if not isinstance(events, list):
+            return None
+        accepted = {event.get("turn_id") for event in events
+                    if isinstance(event, dict) and event.get("state") == "accepted"}
+        completed = {event.get("turn_id") for event in events
+                     if isinstance(event, dict) and event.get("state") == "turn-completed"}
+        if (not isinstance(item.get("text"), str) or not item["text"].strip()
+                or INPUT._digest(item["text"]) != item.get("digest")
+                or item.get("state") != "turn-completed"
+                or not item.get("source_session")
+                or not (accepted & completed)):
+            return None
+    try:
+        import route_plan as ROUTE_PLAN
+        sealed_plan = route.get("route_plan")
+        if sealed_plan is None:
+            plan_digest = None
+        else:
+            ROUTE_PLAN.validate_sealed(sealed_plan)
+            binding = ROUTE_PLAN.read_route_plan(
+                f"{artifact_root / sealed_plan['decision']}#{sealed_plan['index']}", artifact_root)
+            if binding.get("digest") != sealed_plan.get("digest"):
+                raise ValueError("resource-operation-route-plan-changed")
+            plan_digest = binding["digest"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return None
+
+    input_hashes = _resource_payload_input_hashes(
+        request, launch_request_value, payload_argv, command)
+    if input_hashes is None:
+        return None
+
+    request_sha256 = hashlib.sha256(request_bytes).hexdigest()
+    input_binding = {"id": item["id"], "digest": item["digest"],
+                     "source_session": item["source_session"], "target": target,
+                     "turn_ids": sorted(accepted & completed)}
+    stable_request = dict(request)
+    for identity_field in ("user_direction_id", "run_id", "row_id", "compute_name",
+                           "requested_scope", "parent_attempt_id", "Dev_admission_evidence",
+                           "attention_file", "first_step_path", "first_step_report",
+                           "first_step_report_delivery", "first_step_report_hook",
+                           "first_step_report_hook_sha256", "sample_report_path",
+                           "supervision_timeout_basis", "supervision_timeout_s", "timing",
+                           "protected_processes"):
+        stable_request.pop(identity_field, None)
+    stable_argv = list(stable_request.get("compute_argv") or [])
+    if "--name" in stable_argv:
+        name_index = stable_argv.index("--name")
+        if name_index + 1 < len(stable_argv):
+            stable_argv[name_index + 1] = "<operation-name>"
+    stable_argv = ["<resource-operation-request>" if token == str(request_path) else token
+                   for token in stable_argv]
+    stable_request["compute_argv"] = stable_argv
+    stable_command = ["<resource-operation-request>" if token == str(request_path) else token
+                      for token in command]
+    stable_launch_request = {name + "_sha256": launch_request_value.get(name + "_sha256")
+                             for name in ("smoke_attestation", "config_manifest")}
+    resolved_cwd = str(Path(cwd).resolve(strict=True))
+    payload_binding = {"argv": stable_argv, "cwd": payload_cwd,
+                       "environment": payload_environment, "input_hashes": input_hashes}
+    operation_body = {"route_id": route["route_id"], "route_hash": route["route_hash"],
+        "node": node, "command": stable_command,
+        "cwd": resolved_cwd,
+        "approval_scope_sha256": hashlib.sha256(
+            request["requested_scope"].encode("utf-8")).hexdigest(),
+        "payload": payload_binding,
+        "launch_input_hashes": stable_launch_request, "request": stable_request}
+    operation_id = hashlib.sha256(json.dumps(
+        operation_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+    return {"schema_version": 1, "operation_id": operation_id,
+            "request_path": str(request_path), "request_sha256": request_sha256,
+            "command_record_path": str(command_record_path),
+            "command_record_sha256": hashlib.sha256(command_record_bytes).hexdigest(),
+            "requested_scope": request["requested_scope"],
+            "payload": {"argv_sha256": hashlib.sha256(json.dumps(
+                stable_argv, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest(),
+                "cwd": resolved_cwd,
+                "environment_sha256": hashlib.sha256(json.dumps(
+                    payload_environment, sort_keys=True, separators=(",", ":"),
+                    ensure_ascii=False).encode("utf-8")).hexdigest(),
+                "input_hashes": input_hashes},
+            "input": {**input_binding, "state": "turn-completed"},
+            "route_plan_digest": plan_digest,
+            "work_request_sha256": work_request_sha256,
+            "body_sha256": hashlib.sha256(json.dumps(
+                {"command": list(command), "cwd": operation_body["cwd"],
+                 "payload": payload_binding, "launch_request": launch_request_value},
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()}
+
+
 def controller_argv(registry, row):
     request = row["launch_request"]
     argv = ["--registry", str(registry), "start", "--run-id", row["run_id"],
@@ -217,6 +758,9 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     if inherited_jobs and Path(inherited_jobs).resolve(strict=True) != jobs:
         raise ValueError("resource-dispatch-jobs-conflict")
     owner_wait = placeholder.get("owner_wait")
+    intent_only = (bool(owner_wait)
+                   and owner_wait.get("launch_scope") == "codex-owner-controller"
+                   and controller is None)
     placeholder.update(resource_policy="supervised-owner" if owner_wait else "verified-resume",
                        route=str(route_file), jobs=str(jobs))
     if owner_wait:
@@ -226,7 +770,29 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         placeholder["launch_request"] = request
     keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
             "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
-            "resource_policy", "owner_wait", "launch_request", "share")
+            "resource_policy", "owner_wait", "launch_request", "resource_operation", "share")
+    # A restored input consumer is the same owner with a new PID/start; its
+    # earlier identity stays in the attempt lineage, read before any lock.
+    owner_lineage = set()
+    if owner_wait and owner_wait.get("parent_attempt_id"):
+        import dispatch_completion_join as JOIN
+        from dispatch_contract import attempt_identity_lineage
+        try:
+            owner_lineage = attempt_identity_lineage(
+                JOIN.exact_attempt_row(jobs, owner_wait["parent_attempt_id"]).metadata)
+        except JOIN.JoinContractError:
+            owner_lineage = set()
+
+    def same_owner_wait(recorded):
+        requested = placeholder.get("owner_wait")
+        if recorded == requested:
+            return True
+        identity = ("owner_pid", "owner_start")
+        if (not isinstance(recorded, dict) or not isinstance(requested, dict)
+                or {k: v for k, v in recorded.items() if k not in identity}
+                != {k: v for k, v in requested.items() if k not in identity}):
+            return False
+        return (str(recorded.get("owner_pid")), str(recorded.get("owner_start"))) in owner_lineage
     import dispatch_resource_wait as OWNER_RESOURCE
     import resource_run_registry as RR
     sup = OWNER_RESOURCE.supervisor()
@@ -250,12 +816,43 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     for armed_row, row in initial_history_pairs:
         if row.get("run_id") in captured_compute:
             captured_compute[row["run_id"]]["armed"] = armed_row
+
+    def exact_controller_history_self(armed_row, row):
+        return (controller is not None
+                and armed_row.get("predecessor_kind") == "resource"
+                and Path(armed_row.get("resource_registry", "")).resolve()
+                    == Path(registry).resolve()
+                and armed_row.get("predecessor_id") == args.run_id
+                and row == controller.expected)
+
     def reserve(data):
         if controller is not None:
             current = data["runs"].get(args.run_id)
             if (current != controller.expected or current.get("launch_state") != "queued"
                     or any(current.get(k) != placeholder.get(k) for k in keys)):
                 raise ValueError("resource-reservation-changed")
+            if ledger and sup.resource_stage_blocked(ledger, args.node):
+                raise ValueError("resource-watch-binding-conflict")
+            others = [row for key, row in data["runs"].items()
+                      if row.get("route") == str(route_file) and row.get("node") == args.node
+                      and not (key == args.run_id and row == current)]
+            for row in others:
+                execution = row.get("execution") if isinstance(row, dict) else None
+                if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
+                    captured = captured_compute.get(row.get("run_id"))
+                    if not captured or captured["row"] != row:
+                        raise ValueError("resource-reservation-changed")
+            prior_history = [row for armed_row, row in history_pairs
+                             if not exact_controller_history_self(armed_row, row)]
+            for previous in others:
+                if reboot_evidence(previous):
+                    settle(registry, previous["run_id"], previous, data=data)
+            from route_authority import require_resource_predecessors
+            if captured_compute:
+                require_resource_predecessors([*others, *prior_history], current,
+                                              observations=captured_compute)
+            else:
+                require_resource_predecessors([*others, *prior_history], current)
             claimed = {**current, "launch_state": "claimed", "launch_controller": controller.identity}
             data["runs"][args.run_id] = claimed
             return True, claimed
@@ -269,26 +866,62 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                     raise ValueError("resource-reservation-changed")
         current = data["runs"].get(args.run_id)
         if current is not None:
-            if any(current.get(k) != placeholder.get(k) for k in keys):
+            immutable_keys = tuple(k for k in keys if k not in ("resource_operation", "owner_wait"))
+            if (any(current.get(k) != placeholder.get(k) for k in immutable_keys)
+                    or not same_owner_wait(current.get("owner_wait"))):
                 raise ValueError("resource-route-body-conflict")
-            return False, current
+            operation = placeholder.get("resource_operation")
+            reprepare = (ledger is not None and owner_wait
+                and isinstance(operation, dict)
+                and current.get("resource_operation") in (None, operation)
+                and current.get("session") == placeholder.get("session")
+                and current.get("launch_state") == "not-started"
+                and current.get("payload_spawned") is not True
+                and not any(current.get(k) is not None for k in (
+                    "pid", "starttime", "command_hash", "process_group", "pid_namespace",
+                    "launch_controller", "launch_argv", "supervision", "execution"))
+                and RR.resource_never_started(current)
+                and supervisor_resource_watch_for_run(
+                    sup, ledger, args.node, registry, args.run_id) is None)
+            if not reprepare:
+                if current.get("resource_operation") != operation:
+                    raise ValueError("resource-route-body-conflict")
+                return False, current
+            # The launcher positively recorded no execution and never armed
+            # this run. Re-prepare its same reservation, not a replacement run.
+            matches = [row for row in matches if row is not current]
         for previous in matches:
             if reboot_evidence(previous):
                 settle(registry, previous['run_id'], previous, data=data)
         from route_authority import require_resource_predecessors
-        if captured_compute:
+        if intent_only:
+            sup.require_resource_intent_predecessors([*matches, *history], placeholder)
+        elif captured_compute:
             require_resource_predecessors([*matches, *history], placeholder,
                                           observations=captured_compute)
         else:
             require_resource_predecessors([*matches, *history], placeholder)
+        if current is not None:
+            ledger._append({"at": WS.now_iso(), "route_id": route["route_id"],
+                "route_hash": route.get("route_hash"), "actor": "resource-prelaunch-retry",
+                "evidence": {"previous_resource": current, "next_resource": args.run_id}})
         data["runs"][args.run_id] = placeholder
         return True, placeholder
     with ledger.lock() if ledger else contextlib.nullcontext():
+        if placeholder.get("resource_operation") is not None:
+            current_operation = resource_operation_binding(
+                route, route_file, args.node, args.run_id, placeholder["command"],
+                placeholder["cwd"], placeholder.get("launch_request") or {}, owner_wait,
+                registry_path=registry, log_path=placeholder.get("log"))
+            if current_operation != placeholder["resource_operation"]:
+                raise ValueError("resource-operation-authorization-changed")
         if ledger and sup.resource_continuation_cancelled(route, ledger):
             raise ValueError("resource-parent-close-requested")
         history_pairs = sup.resource_predecessors(ledger, args.node) if ledger else []
         history = [row for _, row in history_pairs]
         for armed_row, row in history_pairs:
+            if exact_controller_history_self(armed_row, row):
+                continue
             execution = row.get("execution") if isinstance(row, dict) else None
             if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
                 captured = captured_compute.get(row.get("run_id"))
@@ -298,8 +931,8 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         with controller.guard() if controller else contextlib.nullcontext():
             created, row = locked_update(registry, reserve)
     if not created:
-        armed = sup.read_armed(ledger).get(args.node)
-        if armed and armed.get("predecessor_id") == args.run_id:
+        armed = supervisor_resource_watch_for_run(sup, ledger, args.node, registry, args.run_id)
+        if armed:
             sup.reattach_resource_watch(route, ledger, armed)
             row = json.loads(Path(registry).read_text())["runs"][args.run_id]
         print(json.dumps({**row, "replayed": True, "payload_spawned": False,
@@ -310,6 +943,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
     proc = None
     release = None
     watch = None
+    queued = None
     payload_released = False
     lease_path, gpu_lease = None, None
     try:
@@ -318,8 +952,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         node = next((n for n in route.get("nodes", []) if n["id"] == args.node), {})
         # Native Codex tools record intent; their outer controller admits the
         # devices before arming/releasing the actual execution.
-        queued_intent = (owner_wait and owner_wait.get("launch_scope") == "codex-owner-controller"
-                         and controller is None)
+        queued_intent = intent_only
         if not queued_intent:
             lease_path, gpu_lease, gpu_env = gpu_leases.resource_admission(
                 node, placeholder["command"], gpu_scoped=args.node in gpu_resource_nodes(route),
@@ -337,24 +970,33 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         environment = {**os.environ, "AGENT_DISPATCH_JOBS": str(jobs)}
         continuation = (["--successor-external"] if owner_wait else
                         ["--successor-command", json.dumps(successor)])
-        subprocess.run([sys.executable, supervisor, "arm", "--route", str(route_file),
+        arm_argv = [sys.executable, supervisor, "arm", "--route", str(route_file),
             "--node", args.node, "--predecessor-kind", "resource", "--predecessor-id", args.run_id,
             "--resource-registry", str(registry), "--jobs", str(jobs),
             "--artifact-base", artifacts["AGENT_ARTIFACT_OUTPUT_DIR"],
             *continuation, "--successor-cwd", str(placeholder["cwd"]),
-            "--successor-log", str(runtime / "verification-start.log")],
-            check=True, env=environment, stdout=subprocess.DEVNULL, timeout=30)
-        with ledger.lock():
-            if sup.resource_continuation_cancelled(route, ledger):
-                raise ValueError("resource-parent-close-requested")
+            "--successor-log", str(runtime / "verification-start.log")]
         if queued_intent:
+            with ledger.lock():
+                if sup.resource_continuation_cancelled(route, ledger):
+                    raise ValueError("resource-parent-close-requested")
             queued = {**placeholder, "launch_state": "queued"}
             publish_verified_run(registry, args.run_id, placeholder, queued)
+            # Publish the old-readable launch view after the exact operation is
+            # queued, in this normal owner turn and before any controller can
+            # consume it. The parked wait never rewrites the flat view.
+            subprocess.run(arm_argv, check=True, env=environment,
+                           stdout=subprocess.DEVNULL, timeout=30)
             print(json.dumps({**queued, "payload_spawned": False, "supervisor_alive": False,
                               **output_receipt,
                               "required_action": "yield-owner-turn", "verification_admitted": False,
                               "workflow_complete": False}))
             return
+        subprocess.run(arm_argv, check=True, env=environment,
+                       stdout=subprocess.DEVNULL, timeout=30)
+        with ledger.lock():
+            if sup.resource_continuation_cancelled(route, ledger):
+                raise ValueError("resource-parent-close-requested")
         watch, supervision = start_watch(route_file, jobs, placeholder["cwd"], runtime)
         log = Path(placeholder["log"])
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -397,6 +1039,13 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
         with ledger.lock():
             if sup.resource_continuation_cancelled(route, ledger):
                 raise ValueError("resource-parent-close-requested")
+            if row.get("resource_operation") is not None:
+                current_operation = resource_operation_binding(
+                    route, route_file, args.node, args.run_id, row["command"],
+                    row["cwd"], row.get("launch_request") or {}, owner_wait,
+                    registry_path=registry, log_path=row.get("log"))
+                if current_operation != row["resource_operation"]:
+                    raise ValueError("resource-operation-authorization-changed")
             with controller.guard() if controller else contextlib.nullcontext():
                 publish_verified_run(registry, args.run_id, placeholder, row)
                 os.write(release, b"start\n")
@@ -429,7 +1078,8 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                     watch.wait(timeout=2)
             def mark_failed(data):
                 current = data["runs"].get(args.run_id)
-                if current != placeholder and current != row:
+                if (current != placeholder and current != row
+                        and (queued is None or current != queued)):
                     raise ValueError("resource-reservation-changed")
                 if isinstance(error, LaunchDeferred) and controller is not None:
                     data["runs"][args.run_id] = controller.expected
@@ -444,7 +1094,7 @@ def start_verified(registry, args, route, route_file, placeholder, *, controller
                 # Settle only this exact armed run through the normal failure
                 # consumer, without polling or starting unrelated successors.
                 with ledger.lock():
-                    armed = sup.read_armed(ledger).get(args.node)
+                    armed = supervisor_resource_watch_for_run(sup, ledger, args.node, registry, args.run_id)
                     if (armed and armed.get("predecessor_id") == args.run_id
                             and not sup.resource_continuation_cancelled(route, ledger)):
                         sup._evaluate(route, ledger, armed, [])
@@ -674,11 +1324,12 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                          retryable=False)
 
     ledger = sup.ledger_for(route, str(jobs))
-    armed_rows = sup.read_armed(ledger)
+    armed_rows = supervisor_resource_watches(sup, ledger)
     eligible = []
     differences = []
     refusal_reason = "resource-compute-contract-unavailable"
-    for node_id, armed in armed_rows.items():
+    for armed in armed_rows:
+        node_id = armed["node"]
         if (armed.get("predecessor_kind") != "resource"
                 or armed.get("resource_registry") != str(registry)
                 or armed.get("route_id") != route.get("route_id")
@@ -783,9 +1434,9 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
             differences.extend(current_differences)
             continue
         try:
-            if armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(original):
+            if not OWNER_RESOURCE.resource_binding_matches(armed, original):
                 differences.append({"field": "resource_binding",
-                                    "expected": OWNER_RESOURCE.resource_body_digest(original),
+                                    "expected": OWNER_RESOURCE.resource_legacy_body_digest(original),
                                     "actual": armed.get("resource_binding")})
                 refusal_reason = "resource-compute-binding-conflict"
                 continue
@@ -816,7 +1467,6 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
         # can converge before treating that successful row as a new baseline.
         replay_node_id = node_id
         replay_node = WS.route_node(route, replay_node_id) if isinstance(replay_node_id, str) else None
-        replay_armed = armed_rows.get(replay_node_id) if isinstance(replay_node_id, str) else None
         replay_rows = [row for row in (json.loads(registry.read_text(encoding="utf-8")).get("runs") or {}).values()
                        if isinstance(row, dict)
                        and identity is not None
@@ -826,12 +1476,16 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
                        and row.get("node") == replay_node_id and row.get("jobs") == str(jobs)
                        and row.get("compute_run_id") == compute_run_id
                        and (row.get("execution") or {}).get("run_root") == execution.get("run_root")
-                       and replay_armed is not None
-                       and replay_armed.get("predecessor_id") in {
-                           row.get("run_id"), (provenance.get("contract") or {}).get("run_id")}
                        and row.get("status") == "succeeded"]
-        if len(replay_rows) == 1 and isinstance(replay_node, dict):
-            eligible.append((replay_node_id, replay_armed, replay_node, replay_rows[0]))
+        replay_bound = []
+        if isinstance(replay_node, dict):
+            for replay_row in replay_rows:
+                replay_armed = supervisor_resource_watch_for_run(
+                    sup, ledger, replay_node_id, registry, replay_row.get("run_id"))
+                if replay_armed is not None:
+                    replay_bound.append((replay_node_id, replay_armed, replay_node, replay_row))
+        if len(replay_bound) == 1:
+            eligible.append(replay_bound[0])
     if len(eligible) != 1:
         if eligible:
             fail_compute("resource-compute-baseline-ambiguous")
@@ -901,7 +1555,8 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
             {"field": "compute_execution_identity.matches", "expected": 1, "actual": len(existing)}],
             next_action="resolve duplicate adopted rows through the existing resource owner")
     def arm_adopted(adopted_row):
-        current_armed = sup.read_armed(ledger).get(node_id)
+        current_armed = supervisor_resource_watch_for_run(
+            sup, ledger, node_id, registry, adopted_row.get("run_id"))
         if current_armed and current_armed.get("predecessor_id") == adopted_row.get("run_id"):
             return
         artifacts = __import__("artifact_producer").prepare_route_artifact_env(
@@ -958,7 +1613,9 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
         "sentinel": str(run_dir / "exit_code"), "execution": {**execution, "identity_key": identity},
         "compute_run_id": compute_run_id,
     })
-    adopted["resource_binding"] = OWNER_RESOURCE.resource_body_digest(adopted)
+    adopted["resource_binding"] = OWNER_RESOURCE.resource_legacy_body_digest(adopted)
+    if adopted.get("resource_operation") is not None:
+        adopted["resource_current_binding"] = OWNER_RESOURCE.resource_body_digest(adopted)
     if OWNER_RESOURCE.resource_evidence_paths_conflict(original, adopted):
         fail_compute("resource-compute-binding-conflict", differences=[
             {"field": "resource.evidence_paths", "expected": "no shared evidence path or inode",
@@ -971,7 +1628,8 @@ def adopt_compute_run(registry, args, route, route_file, compute_run_id):
             fail_compute("resource-compute-route-closed", differences=[
                 {"field": "route.state", "expected": "open", "actual": "closed or cancelled"}],
                 next_action="continue only after the route owner opens a new authorized route")
-        current_armed = sup.read_armed(ledger).get(node_id)
+        current_armed = supervisor_resource_watch_for_run(
+            sup, ledger, node_id, registry, armed.get("predecessor_id"))
         if current_armed != armed:
             fail_compute("resource-compute-binding-conflict", differences=[
                 {"field": "armed_row", "expected": hashlib.sha256(json.dumps(
@@ -1125,10 +1783,11 @@ def settle_queued_validation_failure(controller, error):
         current = json.loads(Path(controller.registry).read_text())["runs"].get(expected["run_id"])
         if current != expected:
             return
-        armed = sup.read_armed(ledger).get(expected["node"])
+        armed = supervisor_resource_watch_for_run(
+            sup, ledger, expected["node"], controller.registry, expected["run_id"])
         if (not armed or armed.get("predecessor_id") != expected["run_id"]
                 or armed.get("resource_registry") != str(Path(controller.registry).resolve())
-                or armed.get("resource_binding") != OWNER_RESOURCE.resource_body_digest(expected)
+                or not OWNER_RESOURCE.resource_binding_matches(armed, expected)
                 or sup.resource_continuation_cancelled(route, ledger)):
             return
         failed = {**expected, "status": "failed", "workflow_state": "FAILED_RETRYABLE",
@@ -1200,10 +1859,12 @@ def start_observer(registry, args, route, route_file, command):
                 if any(previous.get(key) != value for key, value in observer.items()):
                     raise ValueError("resource-route-body-conflict")
                 return False, previous
-            armed = sup.read_armed(ledger).get(args.node)
+            armed_rows = [armed for armed in supervisor_resource_watches(sup, ledger, args.node)
+                          if armed.get("resource_registry") == str(registry)]
+            armed_ids = {armed.get("predecessor_id") for armed in armed_rows}
             primaries = [row for row in rows.values() if row.get("route") == str(route_file)
                          and row.get("node") == args.node and row.get("resource_policy") != "observer"
-                         and (not armed or row.get("run_id") == armed.get("predecessor_id"))
+                         and (not armed_ids or row.get("run_id") in armed_ids)
                          and classify_identity(row)[0] == "working"]
             if len(primaries) != 1:
                 raise ValueError("resource-observer-requires-live-resource")
@@ -1386,7 +2047,16 @@ def _main(argv=None, *, controller=None):
             return
         resume = RESOURCE_RESUME.route_selected(route) and node.get("resource_policy") == "verified-resume"
         if resume and not SAFE_RUN_ID.fullmatch(args.run_id): fail("invalid --run-id")
-        if not args.smoke_attestation and not resume: fail("hash-bound smoke attestation required")
+        # A sealed GPU-free host payload carries no training attestation; it still passes
+        # the access check and every other launch guard below.
+        host_payload = args.node in host_payload_nodes(route)
+        if host_payload:
+            try:
+                assert_host_payload_access(route, args.node, jobs=getattr(args, "jobs", None))
+            except ValueError as exc:
+                fail(getattr(exc, "reason", None) or str(exc))
+        if not args.smoke_attestation and not resume and not host_payload:
+            fail("hash-bound smoke attestation required")
         if args.smoke_attestation:
             verify_launch_input([sys.executable,str(Path(__file__).parents[1]/"tools/smoke-attestation.py"),"verify","--attestation",args.smoke_attestation])
         provenance = {}
@@ -1457,6 +2127,15 @@ def _main(argv=None, *, controller=None):
                 if owner_wait.get("launch_scope") == "codex-owner-controller":
                     if controller is not None and placeholder["launch_request"] != controller.expected.get("launch_request"):
                         fail("resource-launch-request-changed")
+                try:
+                    operation = resource_operation_binding(
+                        route, route_file, args.node, args.run_id, command, cwd,
+                        placeholder["launch_request"], owner_wait,
+                        registry_path=registry, log_path=log)
+                except (OSError, ValueError, KeyError, TypeError):
+                    operation = None
+                if operation is not None:
+                    placeholder["resource_operation"] = operation
         if controller is not None and (not owner_wait or owner_wait.get("launch_scope") != "codex-owner-controller"):
             fail("resource-controller-scope-invalid")
         if resume or owner_wait:

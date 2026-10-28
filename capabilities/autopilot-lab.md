@@ -220,6 +220,20 @@ subtract admission samples or spans from elapsed time, or infer a rate or ETA
 from them. Existing lifecycle, optional-failure, recipient, and delivery-receipt
 semantics remain authoritative.
 
+The normal observer may additionally receive bounded optional `source_bindings`
+metadata for an independently written raw counter. A binding names its exact
+target run and row separately from the writer identity, source path, timestamp
+and counter JSON pointers, comparison eligibility, and bounded proof files with
+exact assertions. The common reader revalidates the proof on later polls and
+reattachment, and resumes legacy cursors without a manual recovery step. Partial
+listing/time slices continue on later polls; unrelated sibling changes leave a
+still-valid target binding intact. Public observation preserves the raw
+name, value, scope, source, writer, target, timestamp, and freshness. A
+non-comparable shared-results counter never supplies canonical progress, unit,
+total, rate, ETA, stagnation, or completion. Invalid or stale proof makes that
+source unknown while the existing lifecycle and outbox authority remains in
+force.
+
 For matrix plans, the default is to queue each completed row's decision-metric
 evaluation on the existing approved queue while the next row trains, then update
 the leaderboard artifact; successive halving is a default option for many rows.
@@ -280,6 +294,21 @@ completes the resource stage after its evidence is rechecked. The same rule
 applies when code borrows `full-run`. `full-run` carries
 the declared mark `start_approval: full-run`; it is data for the route card and
 the frame catalog, not a gate.
+
+`autopilot-lab:host-run` is the GPU-free counterpart: a shareable optional part
+(`setup` and `eval` graphs, also `autopilot-code`) for a long measurement, benchmark,
+browser test or memory-capped command. It is the same detached `supervised`
+resource-runner (`_kernel/resource`, `resource-exit`) but declares
+`execution_needs: host-process`, so it takes no GPU lease, no compute-hosts scope, no
+smoke or config attestation and no `start_approval`. Name it in the graph after the
+preparing stage and before the model verify/report successor, for example
+`--graph plan,plan-check,execute,autopilot-lab:host-run,impl-review,test,report`; the
+successor, never the resource exit, completes the stage. Its payload command owns the
+memory cap (`systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0 …`). On a
+Codex owner only that node's controller-built payload runs as a host process without
+OS file or network enforcement; the owner and model children stay `workspace-write`
+(see `docs/lab-execution-access.md`). It differs from `smoke`, `full-run` and
+`eval-run`, which keep the hash-bound attestation and provenance requirements.
 
 ### Eval execution topology (`standard+`)
 

@@ -153,9 +153,35 @@ def resource_body_digest(row):
     body = {key: row.get(key) for key in keys}
     if "launch_request" in row:
         body["launch_request"] = row["launch_request"]
+    if "resource_operation" in row:
+        body["resource_operation"] = row["resource_operation"]
     if "execution" in row:
         body["execution"] = row["execution"]
     return RESUME.row_digest(body)
+
+
+def resource_legacy_body_digest(row):
+    """Digest the projection that v3.53.2's flat reader validates."""
+    keys = ("run_id", "cwd", "log", "command", "route", "node", "parent_attempt_id", "jobs",
+            "config_ref", "config_sha256", "source_commit", "source_dirty", "source_git_state", "config_layout",
+            "resource_policy", "owner_wait")
+    body = {key: row.get(key) for key in keys}
+    if "launch_request" in row:
+        body["launch_request"] = row["launch_request"]
+    if "execution" in row:
+        body["execution"] = row["execution"]
+    return RESUME.row_digest(body)
+
+
+def resource_binding_matches(armed, row):
+    """Check the old reader projection and, when present, the full current row."""
+    legacy = resource_legacy_body_digest(row)
+    if armed.get("resource_binding") != legacy:
+        return False
+    current = armed.get("resource_current_binding")
+    if current is not None or row.get("resource_operation") is not None:
+        return current == resource_body_digest(row)
+    return True
 
 
 def resource_execution_finished(row):
@@ -205,9 +231,38 @@ def resource_key(row):
     return RESUME.row_digest(body)
 
 
+NONTERMINAL_RESOURCE_REASON = "resource-observation-unsettled"
+
+
+def resource_attention_delivery_key(key):
+    """Identify the one advisory receipt for an unsettled execution."""
+    return RESUME.row_digest({"kind": "nonterminal-resource-attention", "resource_key": key})
+
+
+def resource_needs_attention(row, evidence):
+    """Surface failures and uncertain observations without settling execution."""
+    if evidence.get("terminal") is True and evidence.get("quiescent") is True:
+        return False
+    if row.get("cancel_requested") or row.get("status") in {"failed", "cancelled"}:
+        return True
+    if evidence.get("terminal") is True:
+        # A terminal exit whose process group is not quiescent still has cleanup
+        # work outstanding and must not be reported as a settled result.
+        return True
+    liveness = evidence.get("liveness")
+    reason = evidence.get("reason")
+    if liveness == "working":
+        return False
+    if reason == "resource-launching" and liveness in {None, "working"}:
+        return False
+    # Missing or ambiguous liveness is an owner-facing attention condition.
+    return True
+
+
 def context(args, control):
     """Read only exact armed records under the current owner route and registry."""
     import owner_route_binding as OWNER
+    import dispatch_contract as DC
     from resource_run_registry import (
         compute_execution_identity, resource_never_started,
     )
@@ -218,14 +273,23 @@ def context(args, control):
     sup = supervisor()
     route = sup.load_route(route_file)
     ledger = sup.ledger_for(route, str(jobs))
-    armed_rows = sup.read_armed(ledger)
-    if not any(a.get("predecessor_kind") == "resource" for a in armed_rows.values()):
+    armed_rows = []
+    seen = set()
+    for node in route.get("nodes", []):
+        if not isinstance(node, dict) or node.get("kind") != "resource-runner":
+            continue
+        for armed, _row in sup.resource_predecessors(ledger, node.get("id")):
+            key = sup.resource_watch_key(armed)
+            if key not in seen:
+                seen.add(key)
+                armed_rows.append(armed)
+    if not armed_rows:
         return None
     binding = None
     result = []
-    for node, armed in armed_rows.items():
-        if armed.get("predecessor_kind") != "resource":
-            continue
+    for armed in sorted(armed_rows, key=lambda row: (str(row.get("node")),
+                                                     str(row.get("predecessor_id")))):
+        node = armed["node"]
         data = json.loads(Path(armed["resource_registry"]).read_text())
         row = data.get("runs", {}).get(armed["predecessor_id"])
         if not isinstance(row, dict) or row.get("resource_policy") != "supervised-owner":
@@ -240,6 +304,8 @@ def context(args, control):
                 raise JOIN.JoinContractError("resource-owner-route-changed")
         expected = {"parent_attempt_id": args.parent_attempt_id, "session_id": control.thread_id,
             "route_id": args.route_id, "route_hash": args.route_hash, "jobs": str(jobs)}
+        pinned_owner_identity = (str(owner.get("owner_pid", "")),
+                                 str(owner.get("owner_start", "")))
         remote_identity = compute_execution_identity(row)
         execution = row.get("execution") if isinstance(row, dict) else None
         identity_valid = (bool(remote_identity) and isinstance(execution, dict)
@@ -253,8 +319,7 @@ def context(args, control):
             raise JOIN.JoinContractError("resource-owner-not-open")
         OWNER._owner_row_proof(parent.raw.split("\t"), parent.metadata, route=route, environ={})
         if (any(owner.get(key) != value for key, value in expected.items())
-                or str(owner.get("owner_pid")) != parent.metadata.get("pid")
-                or owner.get("owner_start") != parent.metadata.get("pid_start")
+                or pinned_owner_identity not in DC.attempt_identity_lineage(parent.metadata)
                 or row.get("parent_attempt_id") != args.parent_attempt_id
                 or row.get("route") != binding.route_file or row.get("node") != node
                 or row.get("jobs") != str(jobs) or not row.get("command")
@@ -263,7 +328,7 @@ def context(args, control):
                     row["pid_namespace"] != os.readlink("/proc/self/ns/pid"))
                 or armed.get("route_id") != args.route_id or armed.get("route_hash") != args.route_hash
                 or armed.get("route_file") != binding.route_file or armed.get("jobs") != str(jobs)
-                or armed.get("resource_binding") != resource_body_digest(row)
+                or not resource_binding_matches(armed, row)
                 or armed.get("successor_external") is not True or armed.get("successor_command") is not None):
             raise JOIN.JoinContractError("resource-owner-binding-invalid")
         result.append((armed, row))
@@ -420,7 +485,12 @@ def acknowledge(path, parent, receipt_id):
         box = resource.get("outbox")
         if not box or box["receipt_id"] != receipt_id:
             return False
-        resource["delivered"] = resource["delivered"] + [box["key"]]
+        receipt = box["receipt"]
+        delivered_key = (resource_attention_delivery_key(box["key"])
+                         if receipt.get("reason") == NONTERMINAL_RESOURCE_REASON
+                         else box["key"])
+        if delivered_key not in resource["delivered"]:
+            resource["delivered"] = resource["delivered"] + [delivered_key]
         resource["outbox"] = None
         JOIN._write_supervisor_state_unlocked(path, parent, set(state.delivered_attempt_ids),
             phase="running-turn", outbox=state.outbox, resource=resource)
@@ -428,7 +498,7 @@ def acknowledge(path, parent, receipt_id):
 
 
 def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
-    """Admit queued owner intent once, then wait outside model turns/budgets."""
+    """Scan every exact resource and deliver one ready receipt through the existing outbox."""
     pending = pending_prompt(path, args.parent_attempt_id, args, control)
     if pending:
         return pending
@@ -439,86 +509,112 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
     if control.pending():
         return "Continue the same work using the pending user correction; preserve the resource request."
     for armed, row in candidates:
-        if controller_intent(row) and row.get("status") == "launching":
-            try:
-                admit_controller_launch(args, control, armed, row, delivered)
-            except sup.runner().LaunchDeferred as error:
-                if str(error) == "resource-model-child-pending":
-                    return None
-                return "Continue the same work using the pending user correction; preserve the resource request."
-            found = context(args, control)
-            sup, route, ledger, candidates = found
-            actual = next((r for _, r in candidates if r["run_id"] == row["run_id"]), None)
-            emit({"type": "dispatch.supervisor.resource-admitted", "node": armed["node"],
-                  "run_id": row["run_id"], "payload_spawned": bool(actual and actual.get("launch_state") == "started"),
-                  "verification_pass": False, "workflow_complete": False})
-            break
+        if (row.get("resource_policy") in {"verified-resume", "supervised-owner"}
+                and row.get("status") == "running"):
+            # The parked owner reuses the existing identity-bound observer
+            # recovery before waiting on the resource receipt or child set.
+            sup.reattach_resource_watch(route, ledger, armed)
     state = JOIN.read_supervisor_phase_state(path, args.parent_attempt_id)
     resource = dict(state.resource or {}) if state else {}
     if resource and resource["session_id"] != control.thread_id:
         raise JOIN.JoinContractError("resource-native-session-changed")
     resource = resource or {"session_id": control.thread_id, "delivered": [], "outbox": None}
-    candidates = [(a, r) for a, r in candidates if resource_key(r) not in resource["delivered"]]
-    if not candidates:
+    if not any(resource_key(row) not in resource["delivered"] for _, row in candidates):
         return None
-    # A model stage admits at most one next resource per receiving turn. Every
-    # additional exact resource stays armed and will be collected subsequently.
-    armed, original = candidates[0]
-    key = resource_key(original)
+
+    for armed, row in sorted(candidates, key=lambda pair: (str(pair[0].get("node")),
+                                                            str(pair[1].get("run_id")))):
+        if not controller_intent(row) or row.get("status") != "launching":
+            continue
+        try:
+            admit_controller_launch(args, control, armed, row, delivered)
+        except sup.runner().LaunchDeferred as error:
+            if str(error) == "resource-model-child-pending":
+                continue
+            return "Continue the same work using the pending user correction; preserve the resource request."
+        refreshed = context(args, control)
+        if refreshed is None:
+            raise JOIN.JoinContractError("resource-owner-context-lost")
+        actual = next((item for _, item in refreshed[3]
+                       if item.get("run_id") == row.get("run_id")), None)
+        emit({"type": "dispatch.supervisor.resource-admitted", "node": armed["node"],
+              "run_id": row["run_id"], "payload_spawned": bool(actual and actual.get("launch_state") == "started"),
+              "verification_pass": False, "workflow_complete": False})
+
+    refreshed = context(args, control)
+    if refreshed is None:
+        raise JOIN.JoinContractError("resource-owner-context-lost")
+    sup, route, ledger, candidates = refreshed
+    if any(controller_intent(row) and row.get("status") == "launching"
+           for _, row in candidates):
+        return None
     _write(path, args.parent_attempt_id, delivered, resource, "parked")
     emit({"type": "dispatch.supervisor.resource-parked", "parent_attempt_id": args.parent_attempt_id,
-          "node": armed["node"], "run_id": original["run_id"]})
+          "route_id": getattr(args, "route_id", route.get("route_id")),
+          "resource_count": len(candidates)})
+
     while True:
         if control.pending():
             return "Continue the same work using the pending user correction; preserve the active resource."
         current = context(args, control)
         if current is None:
             raise JOIN.JoinContractError("resource-owner-context-lost")
-        exact = next(((a, r) for a, r in current[3] if resource_key(r) == key), None)
-        if exact is None:
-            raise JOIN.JoinContractError("resource-owner-row-changed")
-        armed, row = exact
-        # Owner watches use the existing external successor surface. Polling can
-        # record/claim evidence, but cannot spawn the owner's next model leg.
-        if control.pending():
-            continue
-        for child in getattr(args, "resource_children", {}).get(key, ()):
-            child.poll()  # Only actual unreaped Popen children, never rediscovered PIDs.
+        sup, route, ledger, current_rows = current
+        outstanding = [(armed, row) for armed, row in current_rows
+                       if resource_key(row) not in resource["delivered"]]
+        if not outstanding:
+            return None
+        for armed, row in outstanding:
+            key = resource_key(row)
+            for child in getattr(args, "resource_children", {}).get(key, ()):
+                child.poll()  # Only actual unreaped Popen children, never rediscovered PIDs.
         sup.poll_once(route, ledger)
-        evidence = sup.resource_evidence(armed)
-        stage = ledger.state().get("nodes", {}).get(armed["node"], {})
-        lost_watch = not RESUME.supervisor_alive(row.get("supervision"))
-        if lost_watch and evidence.get("liveness") == "working":
-            recovery = sup.reattach_resource_watch(route, ledger, armed)
-            lost_watch = not (recovery and recovery.get("supervisor_alive"))
-        intermediate = (stage.get("state") == "RUNNING"
-                        and (stage.get("evidence") or {}).get("awaiting_next_resource") is True)
-        if intermediate or stage.get("state") == "STAGE_SUCCEEDED" or stage.get("state") in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} or lost_watch:
-            current_rows = context(args, control)[3]
-            receipt_row = next((r for _, r in current_rows if resource_key(r) == key), None)
-            if receipt_row is None:
-                raise JOIN.JoinContractError("resource-owner-row-changed")
-            artifact = sup.artifact_evidence(armed)
-            proven = (stage.get("state") == "STAGE_SUCCEEDED" and evidence.get("succeeded")
-                and evidence.get("liveness") == "exited" and evidence.get("exit_code") == 0
-                and sup.runner().read_sentinel(receipt_row.get("sentinel")) == 0
-                and (stage.get("evidence") or {}).get("resource_sha256") == RESUME.row_digest(receipt_row)
-                and not artifact.get("missing"))
-            execution_only = (intermediate and evidence.get("succeeded")
-                and resource_execution_succeeded(receipt_row)
-                and (stage.get("evidence") or {}).get("resource_sha256") == RESUME.row_digest(receipt_row))
-            outcome = ("cancelled" if receipt_row.get("cancel_requested") else
-                       "succeeded" if proven or execution_only else "needs-attention")
+        refreshed = context(args, control)
+        if refreshed is None:
+            raise JOIN.JoinContractError("resource-owner-context-lost")
+        ready = []
+        for armed, row in refreshed[3]:
+            key = resource_key(row)
+            if key in resource["delivered"]:
+                continue
+            evidence = sup.resource_evidence(armed)
+            settled = evidence.get("terminal") is True and evidence.get("quiescent") is True
+            attention = not settled and resource_needs_attention(row, evidence)
+            if not settled and not attention:
+                continue
+            if attention:
+                if resource_attention_delivery_key(key) in resource["delivered"]:
+                    continue
+                outcome = "cancelled" if row.get("cancel_requested") else "needs-attention"
+                reason = NONTERMINAL_RESOURCE_REASON
+                exit_code = None
+            else:
+                succeeded = resource_execution_succeeded(row)
+                artifacts = sup.artifact_evidence(armed)
+                outcome = ("cancelled" if row.get("cancel_requested") else
+                           "succeeded" if succeeded else "needs-attention")
+                operation_set = sup.read_resource_watches(ledger, armed["node"])
+                multi_operation = (len(operation_set) > 1
+                                   or row.get("resource_operation") is not None)
+                stage_state = ledger.state().get("nodes", {}).get(armed["node"], {}).get("state")
+                reason = (("awaiting-resource-operations" if multi_operation else "awaiting-next-resource")
+                          if succeeded and not artifacts.get("missing") else
+                          "declared-output-pending" if succeeded else
+                          stage_state if stage_state in {"FAILED_RETRYABLE", "FAILED_TERMINAL", "CANCELLED"} else
+                          row.get("failure_class") or row.get("status"))
+                exit_code = evidence.get("exit_code")
             receipt = {"type": "resource-completion", "parent_attempt_id": args.parent_attempt_id,
                 "session_id": control.thread_id, "route_id": args.route_id, "route_hash": args.route_hash,
                 "jobs": str(Path(args.jobs).resolve()), "node": armed["node"], "run_id": row["run_id"],
-                "resource_key": key, "resource_sha256": RESUME.row_digest(receipt_row), "state": outcome, "exit_code": evidence.get("exit_code"),
-                "reason": "awaiting-next-resource" if execution_only else
-                    "resource-watch-lost" if lost_watch and not evidence.get("terminal") else stage.get("state"),
-                **({"launch_error": receipt_row["launch_error"]} if receipt_row.get("launch_error") else {}),
+                "resource_key": key, "resource_sha256": RESUME.row_digest(row),
+                "state": outcome, "exit_code": exit_code, "reason": reason,
+                **({"launch_error": row["launch_error"]}
+                   if outcome == "needs-attention" and row.get("launch_error") else {}),
                 "verification_pass": False, "workflow_complete": False,
-                "experiment_result": _experiment_result_note(receipt_row),
-                "successors": list(armed["successors"]) if proven else []}
+                "experiment_result": _experiment_result_note(row), "successors": []}
+            ready.append((str(armed.get("node")), str(row.get("run_id")), key, receipt))
+        if ready:
+            _node, _run_id, key, receipt = sorted(ready, key=lambda item: (item[0], item[1]))[0]
             digest = RESUME.row_digest(receipt)
             resource["outbox"] = {"receipt_id": "resource-" + digest[:32], "digest": digest,
                                   "key": key, "receipt": receipt}

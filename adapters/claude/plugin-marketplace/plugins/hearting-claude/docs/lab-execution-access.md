@@ -117,6 +117,26 @@ Strict OS enforcement가 필요하면 기존 workspace 실행이나 compute-host
 경로를 이용한다. Compose/explain/start와 launch receipt에는 실제 선택·적용 수준이
 표시되며, 외부 sandbox와 관리된 runtime 제약은 계속 적용된다.
 
+### GPU 없는 host payload 부품
+
+GPU 없이 오래 걸리는 측정·benchmark·browser test·메모리 상한 명령은
+`autopilot-lab:host-run`을 빌려(`execute,autopilot-lab:host-run,test,report`) 등록된
+detached·supervised resource로 실행한다. 카탈로그 선언은
+`execution_needs: host-process`이며 compute 부품이 아니므로 GPU scope·lease·
+compute-hosts 저장소 접근과 smoke attestation·시작 승인을 요구하지 않는다.
+
+Codex owner와 모델 child는 계속 `workspace-write`다. 이 노드가 봉인된 route에서 host
+부품으로 확인될 때만 controller가 만든 payload 명령이 owner profile 밖(`-P
+:danger-full-access`)에서 실행되어, payload 안의 `systemd-run --user --scope -p
+MemoryMax=… -p MemorySwapMax=0 <명령>`이 사용자 systemd manager에 닿는다. 메모리
+상한은 이 payload 명령이 소유하며 Hearting은 별도 옵션이나 증명 파일을 만들지 않는다.
+이 payload에는 filesystem/network OS enforcement가 **없다**. Caller의 `--sandbox`,
+`CODEX_DISPATCH_SANDBOX`, `CODEX_DISPATCH_SANDBOX_FORCE`가 있으면 그 선택이 그대로
+적용되고, 이미 전달된 `enforcement_required=os-sandbox` 요청은 payload 시작 전에
+`execution-access-enforcement-unavailable`로 거부한다. `any`이거나 요청이 없으면 새 입력을
+요구하지 않는다. 이미 봉인된 이전 route에는 소급 적용되지 않는다. Claude·OpenCode는 같은
+부품을 쓰며 sandbox 분기는 추가되지 않는다.
+
 공식 문서도 full access가 파일·네트워크 경계를 제거한다고 설명한다.
 [Codex sandbox](https://learn.chatgpt.com/docs/sandboxing),
 [Codex permissions](https://learn.chatgpt.com/docs/permissions),

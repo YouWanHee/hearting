@@ -181,6 +181,13 @@ assert service.is_file() and timer.is_file()
 assert " update --auto" in service.read_text()
 assert "XDG_DATA_HOME=" + os.environ["XDG_DATA_HOME"] in service.read_text()
 assert "XDG_STATE_HOME=" + os.environ["XDG_STATE_HOME"] in service.read_text()
+timer_text = timer.read_text()
+assert "OnCalendar=daily\n" in timer_text
+assert "OnUnitActiveSec=24h\n" in timer_text
+assert "RandomizedDelaySec=2h\n" in timer_text
+assert "Persistent=true\n" in timer_text
+assert "OnBootSec=" not in timer_text
+assert d._owned_scheduler_state(timer, "systemd-timer").kind == "file"
 status = d.auto_update_status()
 assert status["status"] == "configured"
 assert status["health"] == "unknown"
@@ -472,6 +479,101 @@ assert not service.exists() and not timer.exists()
 enabled = d.auto_update("enable")
 assert enabled["status"] == "configured-manual"
 assert service.exists() and timer.exists()
+
+# The install path must re-arm an already-active timer, not just enable it.
+# `enable --now` does nothing for an active unit left in `elapsed`.
+scheduler_calls = []
+real_run_scheduler = d._run_scheduler
+def recording_scheduler(command):
+    scheduler_calls.append(tuple(command))
+    return True, "recorded"
+d._run_scheduler = recording_scheduler
+try:
+    rearmed = d.auto_update("enable")
+finally:
+    d._run_scheduler = real_run_scheduler
+assert rearmed["status"] == "active", rearmed
+assert scheduler_calls == [
+    ("systemctl", "--user", "daemon-reload"),
+    ("systemctl", "--user", "enable", "hearting-update.timer"),
+    ("systemctl", "--user", "restart", "hearting-update.timer"),
+], scheduler_calls
+
+# update() migrates an owned legacy timer to the daily template and leaves the
+# service bytes (and therefore its baked Environment=) untouched.
+legacy_timer = (
+    "[Unit]\n"
+    "Description=Check for Hearting updates daily\n\n"
+    "[Timer]\n"
+    "OnBootSec=10m\n"
+    "OnUnitActiveSec=24h\n"
+    "RandomizedDelaySec=2h\n"
+    "Persistent=true\n\n"
+    "[Install]\n"
+    "WantedBy=timers.target\n"
+)
+timer.write_text(legacy_timer)
+service_before = service.read_bytes()
+scheduler_calls.clear()
+d._run_scheduler = recording_scheduler
+try:
+    migrated = d.update()
+finally:
+    d._run_scheduler = real_run_scheduler
+assert migrated["status"] in ("repaired", "up-to-date"), migrated
+assert migrated["timer_refresh"]["status"] == "refreshed", migrated
+assert timer.read_text() == d._systemd_timer_body()
+assert "OnBootSec=" not in timer.read_text()
+assert service.read_bytes() == service_before
+assert scheduler_calls == [
+    ("systemctl", "--user", "daemon-reload"),
+    ("systemctl", "--user", "try-restart", "hearting-update.timer"),
+], scheduler_calls
+
+# The pinned --auto early return also migrates the timer it returns for.
+timer.write_text(legacy_timer)
+scheduler_calls.clear()
+d._run_scheduler = recording_scheduler
+try:
+    pinned_refresh = d.update(automatic=True)
+finally:
+    d._run_scheduler = real_run_scheduler
+assert pinned_refresh["status"] == "pinned", pinned_refresh
+assert pinned_refresh["timer_refresh"]["status"] == "refreshed", pinned_refresh
+assert timer.read_text() == d._systemd_timer_body()
+assert scheduler_calls == [
+    ("systemctl", "--user", "daemon-reload"),
+    ("systemctl", "--user", "try-restart", "hearting-update.timer"),
+], scheduler_calls
+
+# A foreign timer is preserved and a missing timer is not recreated; either
+# way the release update itself still succeeds.
+timer.write_text("foreign timer\n")
+service_before = service.read_bytes()
+scheduler_calls.clear()
+d._run_scheduler = recording_scheduler
+try:
+    foreign = d.update()
+finally:
+    d._run_scheduler = real_run_scheduler
+assert foreign["status"] in ("repaired", "up-to-date"), foreign
+assert foreign["timer_refresh"]["status"] == "skipped", foreign
+assert timer.read_text() == "foreign timer\n"
+assert service.read_bytes() == service_before
+assert scheduler_calls == []
+
+timer.unlink()
+scheduler_calls.clear()
+d._run_scheduler = recording_scheduler
+try:
+    absent = d.update()
+finally:
+    d._run_scheduler = real_run_scheduler
+assert absent["status"] in ("repaired", "up-to-date"), absent
+assert absent["timer_refresh"]["status"] == "absent", absent
+assert not timer.exists()
+assert scheduler_calls == []
+d._atomic_bytes(timer, d._systemd_timer_body().encode("utf-8"), 0o644)
 
 state_bytes = d.state_path().read_bytes()
 d.state_path().unlink()

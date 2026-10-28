@@ -240,7 +240,8 @@ cache는 소유하지 않습니다. 자세한 매핑은
 ## 모델 설정
 
 세 runtime은 profile model과 effort와 독립적인 요청 context operating budget을
-공유합니다. 기본값은 `800000` tokens이며 허용 범위는 `100000`부터
+공유합니다. 기본값은 Claude·OpenCode가 `800000` tokens, Codex가 `1000000`
+tokens(Codex가 선택한 모델의 최대치로 자름)이며 허용 범위는 `100000`부터
 `1000000`입니다. 활성화와 성공한 편집은 값을 Claude의 네이티브 환경
 설정과 Codex의 root config key에 투영합니다. OpenCode는 runtime 시작 때
 이미 불러온 provider의 catalog 모델 중 한도가 budget보다 큰 모델에 cap을

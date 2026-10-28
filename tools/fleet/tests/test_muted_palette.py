@@ -88,6 +88,55 @@ class MutedPaletteTest(unittest.TestCase):
         )
         self.assertEqual(init_color.call_args_list, expected)
 
+    def test_model_family_pairs_keep_default_background_after_all_pairs_init(self):
+        """The header bars once re-initialized pairs 15-17, which by then held
+        `fam_astra/luna/gpt`, so Astra text wore the chrome bar background.
+        Check the final (fg, bg) of every family pair after the whole init,
+        not the key names."""
+        previous = dict(render._COLOR)
+        old_tint = render._TINT_OK
+        self.addCleanup(lambda: (render._COLOR.clear(), render._COLOR.update(previous)))
+        self.addCleanup(setattr, render, "_TINT_OK", old_tint)
+        families = {"opus": ("cyan", "COLOR_CYAN"), "sonnet": ("blue", "COLOR_BLUE"),
+                    "haiku": ("green", "COLOR_GREEN"), "fable": ("magenta", "COLOR_MAGENTA"),
+                    "sol": ("yellow", "COLOR_YELLOW"), "astra": ("orange", "COLOR_YELLOW"),
+                    "luna": ("soft", "COLOR_WHITE"), "gpt": ("yellow", "COLOR_YELLOW")}
+        for colors in (256, 8):
+            with self.subTest(colors=colors):
+                final = {}
+                with mock.patch.multiple(
+                    render.curses,
+                    create=True,
+                    COLORS=colors,
+                    start_color=mock.Mock(),
+                    use_default_colors=mock.Mock(),
+                    can_change_color=mock.Mock(return_value=False),
+                    init_pair=mock.Mock(side_effect=lambda n, fg, bg: final.__setitem__(n, (fg, bg))),
+                    color_pair=mock.Mock(side_effect=lambda n: n << 8),
+                ):
+                    render._init_colors()
+                    expected = {fam: render._palette_fg(name, getattr(render.curses, fallback))
+                                for fam, (name, fallback) in families.items()}
+                family_pairs = set()
+                for fam, fg in expected.items():
+                    pair = render._COLOR["fam_" + fam] >> 8
+                    family_pairs.add(pair)
+                    self.assertEqual(final[pair], (fg, -1), fam)
+                    self.assertEqual(render._COLOR["famd_" + fam] >> 8 & 0xFF, pair, fam)
+                self.assertEqual(len(family_pairs), len(families))
+                structural = {render._COLOR[key] >> 8 & 0xFF
+                              for key in ("hdr_bar", "hdr_warn", "hdr_blk", "tag_steward")}
+                self.assertFalse(family_pairs & structural)
+                # The bars keep their own background; only the family text lost it.
+                self.assertEqual(final[render._COLOR["hdr_bar"] >> 8 & 0xFF][0],
+                                 render.curses.COLOR_BLACK)
+                self.assertNotEqual(final[render._COLOR["hdr_bar"] >> 8 & 0xFF][1], -1)
+                self.assertTrue(all(pair < 64 for pair in family_pairs | structural))
+                if colors == 256:
+                    tint_pairs = {value >> 8 for value in render._TINT_PAIR.values()}
+                    self.assertTrue(render._TINT_OK)
+                    self.assertFalse(tint_pairs & (family_pairs | structural))
+
     def test_semantic_hues_and_soft_focal_text_are_preserved(self):
         self.assertEqual(render._HUE_OF["g_work"][0], "g")
         self.assertEqual(render._HUE_OF["g_idle"][0], "y")

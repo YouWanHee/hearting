@@ -627,8 +627,14 @@ class ReviewAdapterWiringParityTest(unittest.TestCase):
         for harness in self.HARNESSES:
             path = PROJECT_ROOT / f"adapters/{harness}/bin/dispatch-headless.py"
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            main_nodes = [
+                node for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "main"
+            ]
+            self.assertEqual(len(main_nodes), 1, harness)
             spawn_nodes = [
-                node for node in ast.walk(tree)
+                node for node in ast.walk(main_nodes[0])
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node.name == "spawn_worker"
             ]

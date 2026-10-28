@@ -420,8 +420,8 @@ def _prompt_inventory_panes(agents):
             and isinstance(agent.get("pane_id"), str) and agent["pane_id"]}
 
 
-def _prompt_candidate_snapshot():
-    """Join the complete selected-endpoint pane census to herdr's agent list."""
+def _prompt_candidate_snapshot(target, *, wanted_tag=None):
+    """Discover address candidates before proving their exact native identities."""
     agents, inventory_error = _prompt_agent_inventory()
     census = herdr_observation.pane_census(session=_HERDR_SESSION)
     endpoint = herdr_observation.endpoint_name(_HERDR_SESSION)
@@ -484,33 +484,75 @@ def _prompt_candidate_snapshot():
             continue
         row = listed[0]
         census_session = item.get("agent_session")
+        census_sid, census_error = None, None
         if census_session is not None:
             if (not isinstance(census_session, dict)
                     or census_session.get("kind") not in (None, "id")):
-                unknown_panes.add(pane)
-                unknown_reason = unknown_reason or "pane-census-malformed"
-                continue
-            census_sid = peer_message.usable_session_id(census_session.get("value"))
-            if census_session.get("value") not in (None, "", "-") and not census_sid:
-                unknown_panes.add(pane)
-                unknown_reason = unknown_reason or "pane-census-malformed"
-                continue
-            if census_sid and row.get("session_id") and census_sid != row["session_id"]:
-                unknown_panes.add(pane)
-                unknown_reason = unknown_reason or "target-identity-changed"
-                continue
-        else:
-            census_sid = None
+                census_error = "pane-census-malformed"
+            else:
+                census_sid = peer_message.usable_session_id(census_session.get("value"))
+                if census_session.get("value") not in (None, "", "-") and not census_sid:
+                    census_error = "pane-census-malformed"
+
+        # Names, selected-pane metadata, and shared tags locate candidates. They
+        # do not establish identity; only matching panes reach native proof.
+        observed = _retire_target(pane)
+        observed_ident = (observed[1] if isinstance(observed, tuple)
+                          and len(observed) > 1 and isinstance(observed[1], dict) else {})
+        observed_sid = peer_message.usable_session_id(observed_ident.get("session_id"))
+        sid_hints = list(dict.fromkeys(
+            sid for sid in (census_sid, row.get("session_id"), observed_sid) if sid))
+        name_values = [row.get("name"), observed_ident.get("name"),
+                       item.get("display_agent"), item.get("title"),
+                       item.get("terminal_title_stripped")]
+        names = {value for value in name_values
+                 if isinstance(value, str) and value and value != "-"}
+        for sid_hint in sid_hints:
+            try:
+                registry_name = _from_name(harness, sid_hint)
+            except Exception:
+                registry_name = None
+            if isinstance(registry_name, str) and registry_name and registry_name != "-":
+                names.add(registry_name)
+
+        name_match = target in names
+        name_unresolved = not names and not sid_hints
+        tag_match, tag_unresolved = False, False
+        if wanted_tag is not None:
+            if not sid_hints:
+                tag_unresolved = True
+            for sid_hint in sid_hints:
+                current_tag, tag_error = _prompt_fleet_tag(
+                    harness, sid_hint, pane=pane,
+                    cwd=item.get("cwd") or item.get("foreground_cwd"))
+                if tag_error:
+                    tag_unresolved = True
+                elif current_tag == wanted_tag:
+                    tag_match = True
+        if (not name_match and not name_unresolved
+                and not tag_match and not tag_unresolved):
+            continue
+
+        if census_error:
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or census_error
+            continue
+        if (census_sid and row.get("session_id")
+                and census_sid != row["session_id"]):
+            unknown_panes.add(pane)
+            unknown_reason = unknown_reason or "target-identity-changed"
+            continue
         if row["harness"] != harness:
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or "target-identity-changed"
             continue
-        if row.get("session_id") and census_sid and row["session_id"] != census_sid:
+        expected_sid = census_sid or row.get("session_id") or observed_sid
+        if (observed_ident.get("harness") not in (None, harness)
+                or observed_ident.get("pane") not in (None, pane)
+                or (expected_sid and observed_sid and expected_sid != observed_sid)):
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or "target-identity-changed"
             continue
-        expected_sid = census_sid or row.get("session_id")
-        observed = _retire_target(pane)
         candidate, reason = _prompt_current_candidate(
             pane, expected_harness=harness, expected_sid=expected_sid,
             require_process_session=True, target_observation=observed)
@@ -518,19 +560,28 @@ def _prompt_candidate_snapshot():
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or reason or "target-identity-unverified"
             continue
-        names = {value for value in (row.get("name"), candidate.get("name"),
-                 item.get("display_agent"), item.get("title"),
-                 item.get("terminal_title_stripped"))
-                 if isinstance(value, str) and value and value != "-"}
+        if isinstance(candidate.get("name"), str) and candidate["name"] != "-":
+            names.add(candidate["name"])
         try:
             registry_name = _from_name(harness, candidate["session_id"])
         except Exception:
             registry_name = None
         if isinstance(registry_name, str) and registry_name and registry_name != "-":
             names.add(registry_name)
+        name_match = name_match or target in names
         if not names:
             unknown_panes.add(pane)
             unknown_reason = unknown_reason or "target-name-observation-unavailable"
+            continue
+        if wanted_tag is not None and (tag_match or tag_unresolved):
+            current_tag, tag_error = _prompt_fleet_tag(
+                candidate["harness"], candidate["session_id"], pane=candidate["pane"],
+                cwd=item.get("cwd") or item.get("foreground_cwd"))
+            if tag_error or current_tag != wanted_tag:
+                unknown_panes.add(pane)
+                unknown_reason = unknown_reason or tag_error or "target-identity-changed"
+                continue
+        elif not name_match:
             continue
         row_cwd = item.get("cwd") or item.get("foreground_cwd")
         rows.append({**candidate, "names": names, "cwd": row_cwd,
@@ -569,10 +620,11 @@ def _resolve_prompt_target(target):
         candidate, reason = _prompt_current_candidate(target)
         return (candidate, None, [target]) if candidate else (None, reason, [target])
 
-    rows, snapshot_error, unknown_panes = _prompt_candidate_snapshot()
+    wanted_tag = tag_match.group(1).lower() if is_tag else None
+    rows, snapshot_error, unknown_panes = _prompt_candidate_snapshot(
+        target, wanted_tag=wanted_tag)
     if rows is None:
         return None, snapshot_error or "target-observation-unavailable", unknown_panes
-    wanted_tag = tag_match.group(1).lower() if is_tag else None
     matches = {}
     uncertain = set(unknown_panes)
     uncertainty_reason = snapshot_error
@@ -797,7 +849,33 @@ def _interpret_payload(payload, target):
     }, 0, None
 
 
-def _mark_observed(to_harness, to_session_id, to_name, from_identity=None, *, pane=None):
+def _payload_cwd(payload):
+    """The target agent's cwd from a herdr payload, or None."""
+    try:
+        cwd = payload["result"]["agent"].get("cwd")
+    except (KeyError, TypeError, AttributeError):
+        return None
+    return cwd if isinstance(cwd, str) and cwd else None
+
+
+def _print_steward_limited(result):
+    """A refused steward grant never fails the command that asked for it; it only says so."""
+    if isinstance(result, dict) and result.get("status") == "limited":
+        print(peer_message.format_steward_limited(result), file=sys.stderr)
+
+
+def _ensure_steward_runner(result):
+    """A written grant carries a steward-check duty; the shared runner advances it with
+    no later input, so start it now instead of waiting for the next lifecycle event."""
+    if isinstance(result, dict) and result.get("written"):
+        try:
+            peer_obligations.ensure_normal_runner()
+        except Exception:
+            pass
+
+
+def _mark_observed(to_harness, to_session_id, to_name, from_identity=None, *, pane=None,
+                   target_cwd=None):
     """F-100c-2 — the ONE place `source=watch` steward evidence is written: after
     herdr answered about a real target (`wait` returned a typed state other than
     agent-not-found, or `watch` armed its watcher). The `kind=watch` ledger row itself
@@ -811,8 +889,10 @@ def _mark_observed(to_harness, to_session_id, to_name, from_identity=None, *, pa
           "session_id": sid,
           "name": to_name if isinstance(to_name, str) and to_name and to_name != "-" else None,
           "pane": pane if isinstance(pane, str) and pane and pane != "-" else None}
-    return peer_message.mark_steward(from_harness, from_sid, to, "watch", _utc_now(),
-                                     source="watch")
+    result = peer_message.grant_steward(from_harness, from_sid, to, "watch", _utc_now(),
+                                        source="watch", target_cwd=target_cwd)
+    _print_steward_limited(result)
+    return result
 
 
 def cmd_wait(args):
@@ -838,7 +918,7 @@ def cmd_wait(args):
                          _t_name if _t_name and _t_name != "-" else target)
         _mark_observed(agent["harness"] if agent["harness"] != "-" else t_harness,
                        agent["session_id"] if agent["session_id"] != "-" else t_sid,
-                       resolved_name, pane=agent["pane"])
+                       resolved_name, pane=agent["pane"], target_cwd=_payload_cwd(payload))
     print(_typed_line(state, agent["harness"], agent["session_id"], agent["name"], agent["pane"]))
     return code
 
@@ -1472,7 +1552,11 @@ def _seat_handover_locked(ident, own_sid, own_harness, pane, *, requester=None, 
             return "skipped:predecessor-unverified"
         row = handover.record_retire_handover(
             ident["session_id"], ident["harness"], own_sid, own_harness, env=os.environ, **booked)
-    except Exception:  # noqa: BLE001 - the retire itself already succeeded
+    except Exception as exc:  # noqa: BLE001 - the retire itself already succeeded
+        # Nothing was recorded because the registry could not be read, so this
+        # is not the verified-empty "none": keep the receipt unresolved.
+        if getattr(exc, "reason", "") == "registry-unreadable":
+            return "skipped:registry-unreadable"
         return "error"
     try:
         if row is not None and not retain_mark and _read_native_record(path) == record:
@@ -1698,10 +1782,12 @@ def _mark_started(args, sid, mode):
             summary_text=f"[start] {args.name} kind={args.kind} mode={mode}",
             to_session_id=sid)
     from_sid, from_harness = _current_session_identity()
-    peer_message.mark_steward(
+    result = peer_message.grant_steward(
         from_harness, from_sid,
         {"harness": args.kind, "session_id": sid, "name": args.name, "pane": args.pane},
-        "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start")
+        "start", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), source="start",
+        target_cwd=getattr(args, "cwd", None))
+    _print_steward_limited(result)
 
 
 def _placement_result(*argv):
@@ -1832,7 +1918,7 @@ def _start_in_pane(args):
         # still runs inside the workspace claim cmd_start holds.
         opened = terminal_surface.open_pane(
             near=terminal_surface.Near(_herdr_surface(), pane=None if workspace else args.beside,
-                                       workspace=workspace),
+                                       workspace=workspace, same_tab=not workspace),
             cwd=pane_cwd)
         if opened.pane is None:
             reason = opened.notes[0] if opened.notes else "pane-layout-unavailable"
@@ -3980,7 +4066,8 @@ def cmd_watch(args):
     # receipt, ledger and native wait; it remains the operator's accepted text.
     if _herdr_missing():
         return _unavailable("herdr-not-found")
-    state, agent, _code, reason = _interpret_payload(_run_herdr_get(target), target)
+    watch_payload = _run_herdr_get(target)
+    state, agent, _code, reason = _interpret_payload(watch_payload, target)
     if state == "agent-not-found":
         print(_typed_line("agent-not-found", "-", "-", target, "-"))
         return 2
@@ -4349,7 +4436,8 @@ def cmd_watch(args):
         # The watcher is armed on a target herdr resolved above: steward evidence.
         resolved_name = agent["name"] if agent["name"] != "-" else target
         _mark_observed(agent["harness"], agent["session_id"], resolved_name,
-                       from_identity=(steward_sid, steward_harness), pane=agent["pane"])
+                       from_identity=(steward_sid, steward_harness), pane=agent["pane"],
+                       target_cwd=_payload_cwd(watch_payload))
     finally:
         if claim_fd is not None:
             os.close(claim_fd)
@@ -8397,7 +8485,7 @@ def _runner_duties(store, duties=None):
         duties = store.list()
     selected = [duty for duty in duties
                 if (duty.get("intent", {}).get("kind") in {"message", "retire", "registered-batch",
-                                                             "run-notice",
+                                                             "run-notice", "steward-check",
                                                              shared_readiness.DUTY_KIND}
                     or duty.get("id", "").startswith(("message-", "delay-")))]
     seen = {duty.get("id") for duty in selected}
@@ -8624,6 +8712,12 @@ def _obligation_retry_fingerprint(duty):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _steward_check_module():
+    """The periodic steward-check schedule (lazy: a missing module only disables it)."""
+    import importlib
+    return importlib.import_module("steward_check")
+
+
 def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state=None):
     """Advance only the accepted duties owned by this runner."""
     if duties is None:
@@ -8655,6 +8749,8 @@ def _reconcile_obligations(store, duties=None, *, read_context=None, retry_state
                 _resume_registered_obligation(duty, store, read_context=read_context)
             elif kind == "run-notice":
                 _resume_ordinary_notice_obligation(duty, store)
+            elif kind == "steward-check":
+                _steward_check_module().advance(duty, store)
         except Exception:
             try:
                 store.update(duty["id"], observer_error="observer-unavailable")
@@ -8770,6 +8866,10 @@ def cmd_obligation_runner(args):
     duty_retry_state = {}
     terminal_handoff_scan = True
     terminal_handoff_duties = []
+    try:
+        _steward_check_module().reconcile_all(store)
+    except Exception:
+        pass
     while True:
         start_readiness_worker()
         if not _runner_lock_current(store, args.lock_fd):
@@ -8958,6 +9058,10 @@ def cmd_ensure_obligations(_args):
     if lock_fd is None:
         return 0
     try:
+        try:
+            _steward_check_module().reconcile_self(store)
+        except Exception:
+            pass
         try:
             lifecycle_root = getattr(_args, "lifecycle_root", None)
             peer_obligations.ensure_normal_runner(
@@ -10152,10 +10256,22 @@ def cmd_steward(args):
         return 1
     if args.state == "on":
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        ok = peer_message.mark_steward(harness, sid, {"harness": "unknown", "name": "-"},
-                                       "explicit", ts, source="explicit")
+        result = peer_message.grant_steward(harness, sid, {"harness": "unknown", "name": "-"},
+                                            "explicit", ts, source="explicit")
+        if result["status"] == "limited":
+            print(peer_message.format_steward_limited(result))
+            return 1
+        ok = result["written"]
+        _ensure_steward_runner(result)
         print(f"steward={'on' if ok else 'unchanged'} harness={harness} session_id={sid}")
         return 0 if ok else 1
+    if args.state == "check":
+        try:
+            check_module = _steward_check_module()
+        except ImportError:
+            print("steward-check=unavailable reason=module-missing")
+            return 1
+        return check_module.cmd_check(harness, sid)
     rc = peer_message.cmd_release(peer_message.argparse.Namespace(harness=harness, session_id=sid))
     print(f"steward=off harness={harness} session_id={sid}")
     return rc
@@ -10278,7 +10394,7 @@ def build_parser():
     p_continue.set_defaults(func=cmd_continue)
 
     p_mode = sub.add_parser("steward")
-    p_mode.add_argument("state", choices=("on", "off"))
+    p_mode.add_argument("state", choices=("on", "off", "check"))
     p_mode.set_defaults(func=cmd_steward)
 
     return parser

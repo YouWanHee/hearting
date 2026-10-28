@@ -328,7 +328,8 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
         run = {"run_id":"finished-resource","pid":555,"starttime":"201","command":["approved"],
                "node":"full-run","status":"succeeded","sentinel":"/fixture-exit"}
         stage = {"state":"STAGE_SUCCEEDED","evidence":{"resource_sha256":RESOURCE.RESUME.row_digest(run)}}
-        sup = SimpleNamespace(poll_once=mock.Mock(),resource_evidence=lambda _: {"terminal":True,"succeeded":True,"liveness":"exited","exit_code":0},
+        sup = SimpleNamespace(poll_once=mock.Mock(),read_resource_watches=lambda *_: [{"node":"full-run"}],
+            resource_evidence=lambda _: {"terminal":True,"quiescent":True,"succeeded":True,"liveness":"exited","exit_code":0},
             artifact_evidence=lambda _: {"checked":True,"missing":[]},runner=lambda:SimpleNamespace(read_sentinel=lambda _:0))
         ctx = (sup,route,SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}}),
                [({"node":"full-run","successors":["verify"]},run)])
@@ -414,10 +415,12 @@ class ClaudeSessionSupervisorTest(unittest.TestCase):
             events.append("runtime-poll")
             row.update(status="succeeded",exit_code=0)
             stage.update(state="STAGE_SUCCEEDED",evidence={"resource_sha256":RESOURCE.RESUME.row_digest(row)})
-        sup = SimpleNamespace(poll_once=poll,resource_evidence=lambda _: {"terminal":True,"succeeded":True,"liveness":"exited","exit_code":0},
+        armed = {"node":"full-run","successors":["verify"]}
+        sup = SimpleNamespace(poll_once=poll,read_resource_watches=lambda *_: [armed],
+            resource_evidence=lambda _: {"terminal":True,"quiescent":True,"succeeded":True,"liveness":"exited","exit_code":0},
             artifact_evidence=lambda _: {"checked":True,"missing":[]},runner=lambda:SimpleNamespace(read_sentinel=lambda _:0))
         ledger = SimpleNamespace(state=lambda:{"nodes":{"full-run":stage}})
-        ctx = (sup,route_value,ledger,[({"node":"full-run","successors":["verify"]},row)])
+        ctx = (sup,route_value,ledger,[(armed,row)])
         def turn(*a,**k):
             events.append("model-turn")
             prompt,session = a[2],a[1]

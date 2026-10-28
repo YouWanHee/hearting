@@ -40,6 +40,12 @@ You are a bounded worker, not the user-facing main session.
   carries gate authority and must land on a quality-peer harness.
 - Do not perform main-only entry confirmation, memory lifecycle, integration,
   merge, release, installation, cleanup, UI/status publication, or user-facing explanation.
+- Bind fixtures you create to their command lifetime with a private `TMPDIR`,
+  `TemporaryDirectory`, or shell trap. Preserve needed output in the canonical
+  artifact, then retire only your own scratch after its descendants are settled.
+  Keep it with diagnostics while an owned descendant is live or unreadable.
+  This normal finalization does not authorize cleanup of user worktrees, native
+  HOME, existing experiments, parent or sibling roots, or shared runtime state.
 - Stage, review, support, and frame workers do not publish task branches or PRs.
   The owner fragment defines task-branch publication capacity from the existing
   sealed complete scope; the owner performs publication only within the actual

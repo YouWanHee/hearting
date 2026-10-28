@@ -615,6 +615,147 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         state = PD.read(self.root, "sess-owner", "delivery-" + "a" * 32)["state"]
         self.assertEqual(state, "acked")
 
+    def test_non_codex_ack_never_resolves_a_queue_endpoint(self):
+        self._seed()
+        claimed, _ = SWEEP.sweep_deliver(self.root, "claude-parent-runtime", "sess-owner")
+        with mock.patch("codex_queue_dispatch.resolve_queue_socket") as resolve:
+            self.assertEqual(SWEEP.ack_delivered(
+                self.root, "sess-owner", claimed, acked_by="claude-hook"), 1)
+        resolve.assert_not_called()
+        self.assertEqual(PD.read(
+            self.root, "sess-owner", claimed[0]["delivery_id"])["state"], "acked")
+
+    def _native_batch_records(self, count=2):
+        serial = getattr(self, "_native_batch_serial", 0) + 1
+        self._native_batch_serial = serial
+        records = []
+        for index in range(count):
+            attempt = f"att-native-batch-{serial}-{index}"
+            delivery_id = f"delivery-native-batch-{serial}-{index}"
+            receipt = {"kind": "completion", "children": [{
+                "attempt_id": attempt, "status": "done", "reason": "completed",
+                "required_action": "advance-completed",
+                "delivery_classification": "success",
+            }], "job_registry": str(self.root / "jobs.log")}
+            record = PD.create(
+                root=self.root, recipient_kind="codex-native-queue", recipient_key="sess-owner",
+                delivery_id=delivery_id, session_generation="",
+                session_generation_supported="0", attempt_ids=[attempt],
+                parent_attempt_id="att-parent", route_id="rt-native-batch", route_node="execute",
+                receipt=receipt, receipt_digest=PD._canonical_receipt_digest(receipt),
+                row_revisions={attempt: "revision"})
+            records.append(PD.claim(
+                self.root, "sess-owner", delivery_id, claim_owner="native-batch-test",
+                lease_seconds=30.0, jobs=self.root / "jobs.log"))
+        return records
+
+    def _ack_native_with_fake_queue(self, records, queue, *, failure=None):
+        import codex_queue_delivery as delivery
+        socket_path = Path("/tmp/fake-native-batch.sock")
+        rpc_calls = []
+        def rpc(_path, method, params, **_kwargs):
+            rpc_calls.append((method, params))
+            if method == "thread/queue/list":
+                return {"data": list(queue)}
+            if method == "thread/queue/delete":
+                if failure == "delete-raise":
+                    raise delivery.QueueDeliveryError("fake-delete-failure")
+                if failure == "delete-false":
+                    return {"deleted": False}
+                queue[:] = [item for item in queue if item["id"] != params["queuedSubmissionId"]]
+                return {"deleted": True}
+            raise AssertionError(method)
+        resolver = (mock.patch("codex_queue_dispatch.resolve_queue_socket",
+                              side_effect=RuntimeError("resolve failed"))
+                    if failure == "resolve-raise" else
+                    mock.patch("codex_queue_dispatch.resolve_queue_socket", return_value=socket_path))
+        with resolver, \
+             mock.patch.object(delivery, "DeliverySession") as session_type, \
+             mock.patch.object(delivery, "_rpc", side_effect=rpc):
+            session_type.return_value.__enter__.return_value = object()
+            if failure == "connect-failure":
+                session_type.return_value.__enter__.side_effect = delivery.QueueDeliveryError(
+                    "fake-connect-failure")
+            count = SWEEP.ack_delivered(self.root, "sess-owner", records, acked_by="native-test")
+        return count, rpc_calls
+
+    def test_ack_delivered_retires_fully_acked_batch_and_partial_batch_after_last_ack(self):
+        import codex_queue_delivery as delivery
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "jobs.log").touch()
+        # Fully ACKed batch: the post-ACK drain sees no item.
+        full = self._native_batch_records()
+        body = delivery.native_batch_unit_body(self.root, "sess-owner", full)
+        full_id = delivery.native_client_message_id(
+            "sess-owner", [record["delivery_id"] for record in full], batch=True)
+        queue = [{"id": "submission-full", "clientUserMessageId": full_id,
+                  "input": [{"type": "text", "text": body, "text_elements": []}]}]
+        count, calls = self._ack_native_with_fake_queue(full, queue)
+        self.assertEqual(count, 2)
+        self.assertEqual(queue, [])
+        self.assertEqual([call[1]["threadId"] for call in calls], ["sess-owner", "sess-owner"])
+
+        # One sibling ACK cannot remove the shared batch; the final ACK can.
+        partial = self._native_batch_records()
+        body = delivery.native_batch_unit_body(self.root, "sess-owner", partial)
+        client_id = delivery.native_client_message_id(
+            "sess-owner", [record["delivery_id"] for record in partial], batch=True)
+        queue = [{"id": "submission-partial", "clientUserMessageId": client_id,
+                  "input": [{"type": "text", "text": body, "text_elements": []}]}]
+        count, calls = self._ack_native_with_fake_queue(partial[:1], queue)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(calls[0][1]["threadId"], "sess-owner")
+        count, calls = self._ack_native_with_fake_queue(partial[1:], queue)
+        self.assertEqual(count, 1)
+        self.assertEqual(queue, [])
+        self.assertEqual(calls[-1][1]["threadId"], "sess-owner")
+
+    def test_ack_retirement_failures_preserve_ack_count_state_and_acknowledger(self):
+        import codex_queue_delivery as delivery
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "jobs.log").touch()
+        for failure in ("delete-false", "delete-raise", "resolve-raise", "connect-failure"):
+            record = self._native_batch_records(count=1)[0]
+            body = delivery.native_batch_unit_body(self.root, "sess-owner", [record])
+            client_id = delivery.native_client_message_id(
+                "sess-owner", [record["delivery_id"]], batch=True)
+            queue = [{"id": f"submission-{failure}", "clientUserMessageId": client_id,
+                      "input": [{"type": "text", "text": body, "text_elements": []}]}]
+            count, _calls = self._ack_native_with_fake_queue([record], queue, failure=failure)
+            stored = PD.read(self.root, "sess-owner", record["delivery_id"])
+            self.assertEqual(count, 1, failure)
+            self.assertEqual(stored["state"], "acked", failure)
+            self.assertEqual(stored["acked_by"], "native-test", failure)
+            self.assertEqual(len(queue), 1, failure)
+
+    def test_ack_retirement_preserves_edited_wrong_digest_and_duplicate_client_items(self):
+        import codex_queue_delivery as delivery
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "jobs.log").touch()
+        for mutation in ("edited-body", "wrong-digest", "duplicate-client-id"):
+            record = self._native_batch_records(count=1)[0]
+            body = delivery.native_batch_unit_body(self.root, "sess-owner", [record])
+            client_id = delivery.native_client_message_id(
+                "sess-owner", [record["delivery_id"]], batch=True)
+            if mutation == "edited-body":
+                body += " edited"
+            elif mutation == "wrong-digest":
+                lines = body.splitlines()
+                marker_index = next(i for i, line in enumerate(lines)
+                                    if line.startswith("HEARTING_RECEIPT_V1 "))
+                marker = lines[marker_index].split()
+                marker[-1] = "0" * 64 if marker[-1] != "0" * 64 else "1" * 64
+                lines[marker_index] = " ".join(marker)
+                body = "\n".join(lines)
+            item = {"id": f"submission-{mutation}", "clientUserMessageId": client_id,
+                    "input": [{"type": "text", "text": body, "text_elements": []}]}
+            queue = [item, dict(item, id=f"duplicate-{mutation}")] \
+                if mutation == "duplicate-client-id" else [item]
+            count, _calls = self._ack_native_with_fake_queue([record], queue)
+            self.assertEqual(count, 1, mutation)
+            self.assertTrue(queue, mutation)
+
     def test_two_carriers_recheck_after_exact_receipt_at_final_output_barrier(self):
         import dispatch_recipient_receipt as recipient_receipt
         self._seed()
@@ -1153,7 +1294,7 @@ class SweepTest(IsolatedRootMixin, unittest.TestCase):
         with mock.patch.object(bridge, "load_payload", return_value={"session_id": "sess-owner",
                 "source": "resume"}), mock.patch.object(bridge, "is_worker_session", return_value=False), \
                 mock.patch.object(bridge, "forget_shown_candidates"), \
-                mock.patch.object(bridge, "card_context", return_value=("", "")), \
+                mock.patch.object(bridge, "card_context", return_value=("", "", None)), \
                 mock.patch.object(bridge, "local_evidence_context", return_value=""), \
                 mock.patch.object(dispatch_contract, "dispatch_state_roots", return_value=[self.root]), \
                 mock.patch.object(dispatch_contract, "resolve_agent_home", return_value=ROOT), \
@@ -2593,7 +2734,7 @@ class AdapterRecoveryRequestTest(IsolatedRootMixin, unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(bridge, "load_payload", return_value={"session_id": "codex-root-error"}), \
              mock.patch.object(bridge, "is_worker_session", return_value=False), \
-             mock.patch.object(bridge, "card_context", return_value=("fixture context", "")), \
+             mock.patch.object(bridge, "card_context", return_value=("fixture context", "", None)), \
              mock.patch.object(bridge, "local_evidence_context", return_value=""), \
              mock.patch.object(dispatch_contract, "resolve_agent_home", return_value=ROOT), \
              mock.patch.object(dispatch_contract, "dispatch_state_roots",

@@ -24,7 +24,17 @@ import time
 
 
 MAX_BYTES = 65536
+# Private read limit only (observation state and older public records); the
+# public record is written under MAX_PUBLIC_RUN_RECORD_WRITE_BYTES.
 MAX_PUBLIC_RUN_RECORD_BYTES = 4 * 1024 * 1024
+MAX_PUBLIC_RUN_RECORD_WRITE_BYTES = 16 * 1024
+MAX_PUBLIC_METRIC_DECLARATIONS = 16
+MAX_ROUTE_FILE_BYTES = 1024 * 1024
+MAX_SOURCE_BINDINGS = 8
+MAX_SOURCE_BINDING_BYTES = 64 * 1024
+MAX_SOURCE_BINDING_PROOFS = 8
+MAX_SOURCE_BINDING_COUNTERS = 8
+MAX_SOURCE_BINDING_ASSERTIONS = 8
 MAX_ARMS = 32
 OBSERVATION_VERSION = 2
 CHECKPOINT_INTERVAL = 12 * 60 * 60
@@ -325,6 +335,23 @@ def public_run_record(run, *, status=None, observation=None, metrics=None,
     declared = run.get("observation") if isinstance(run.get("observation"), dict) else {}
     decision_metric = run.get("decision_metric", declared.get("decision_metric"))
     proxy = run.get("proxy", declared.get("proxy"))
+    source_observations = (observation.get("source_observations")
+                           if isinstance(observation.get("source_observations"), list) else [])
+    source_descriptors = []
+    descriptor_keys = set()
+    for item in source_observations:
+        if not isinstance(item, dict):
+            continue
+        descriptor = {key: item.get(key) for key in
+            ("source_path", "writer_run_id", "target_run_id", "row_key", "scope",
+             "source_generation")}
+        descriptor["format"] = "independent-counter"
+        descriptor["keys"] = [item.get("name")] if isinstance(item.get("name"), str) else []
+        identity = json.dumps(descriptor, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=False)
+        if identity not in descriptor_keys:
+            descriptor_keys.add(identity)
+            source_descriptors.append(descriptor)
     result = {
         "schema_version": 1,
         "run_id": run.get("run_id"),
@@ -340,10 +367,12 @@ def public_run_record(run, *, status=None, observation=None, metrics=None,
         "ended_at": ended_at if ended_at is not None else run.get("ended_at"),
         "progress": {"reached": observation.get("reached", progress.get("completed")),
                      "total": observation.get("total", progress.get("total")),
-                     "unit": observation.get("unit", progress.get("unit"))},
+                     "unit": observation.get("unit", progress.get("unit")),
+                     "observed_counters": observation.get("source_observations", [])},
         "eta": observation.get("eta_seconds"),
         "planned_seconds": observation.get("planned_seconds", run.get("planned_seconds")),
         "metrics": record_metrics,
+        "sources": source_descriptors,
         "admission": observation.get("admission"),
         "stagnation": observation.get("stagnation"),
         "decision_metric": decision_metric,
@@ -372,7 +401,12 @@ def public_run_record(run, *, status=None, observation=None, metrics=None,
     verdict = run.get("reviewer_verdict")
     if isinstance(verdict, str) and verdict.strip():
         result["verdict"] = verdict
-    return result
+    result["output_dir_state"], result["output_dir_reason"] = _public_output_state(
+        run, result["output_dir"], binding_given=False)
+    try:
+        return _compact_public_record(result)
+    except (ValueError, TypeError, OverflowError):
+        return result
 
 
 def _public_metric_point(point):
@@ -382,6 +416,327 @@ def _public_metric_point(point):
     finite = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
     return {"epoch": point.get("epoch"), "value": float(value) if finite else None,
             "nonfinite": not finite, "path": point.get("path")}
+
+
+_TRAINING_OUTPUTS = {"experiment-artifact", "logs/**", "checkpoints/**"}
+_ROW_DETAIL_KEYS = ("admission", "stagnation", "observed_counters", "eta", "clock_scope")
+_ROW_KEYS = ("row_id", "started_at", "ended_at", "clock_scope", "output_dir",
+             "last_checkpoint", "metric_summary", "elapsed_seconds", "planned_seconds",
+             "eta", "admission", "stagnation", "observed_counters")
+_SKELETON_IDENTITY = ("schema_version", "run_id", "observer_of", "campaign_id", "cycle_id",
+                      "route_id", "node", "host", "output_dir", "output_dir_state",
+                      "output_dir_reason", "status", "started_at", "ended_at")
+_SKELETON_STRING_LIMIT = 600
+
+
+def _public_output_state(run, output_dir, *, binding_given):
+    """Tell present/none/unknown apart; never invents an output folder."""
+    if isinstance(output_dir, str) and output_dir:
+        return "present", None
+    if binding_given:
+        return "unknown", "declared-unresolved"
+    try:
+        route = run.get("route") or run.get("route_file") if isinstance(run, dict) else None
+        node_id = (run.get("node") or run.get("route_node")) if isinstance(run, dict) else None
+        if isinstance(route, str) and isinstance(node_id, str) and os.path.isabs(route):
+            info = os.lstat(route)
+            if stat.S_ISREG(info.st_mode) and info.st_size <= MAX_ROUTE_FILE_BYTES:
+                fd = os.open(route, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                with os.fdopen(fd, "rb") as source:
+                    nodes = json.loads(source.read(MAX_ROUTE_FILE_BYTES + 1)).get("nodes")
+                for node in nodes if isinstance(nodes, list) else []:
+                    if isinstance(node, dict) and node.get("id") == node_id:
+                        outputs = node.get("outputs")
+                        if (node.get("kind") == "resource-runner" and isinstance(outputs, list)
+                                and not _TRAINING_OUTPUTS.intersection(
+                                    item for item in outputs if isinstance(item, str))):
+                            return "none", "node-declares-no-training-output"
+                        break
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return "unknown", "not-declared"
+
+
+def _public_metric_declarations(incoming, existing=(), *, check_existing=False):
+    """Fold metric declarations to one per (format, location).
+
+    Returns (list, displaced, never_kept): `displaced` counts declarations that were in
+    the existing record and are now dropped (overflow or vanished location); they leave
+    the record, so they are counted once. `never_kept` counts dropped incoming
+    declarations the existing record did not hold; the same input can offer them again
+    on every update, so callers must not add it up across writes.
+    """
+    def fold(items):
+        folded = []
+        for item in items if isinstance(items, (list, tuple)) else ():
+            if not isinstance(item, dict) or not isinstance(item.get("format"), str):
+                continue
+            path = item.get("path")
+            if isinstance(path, list):
+                paths = [entry for entry in path if isinstance(entry, str) and entry]
+                if item["format"] == "epochs-jsonl":
+                    groups = {entry: 1 for entry in paths}
+                else:
+                    groups = {}
+                    for entry in paths:
+                        folder = os.path.dirname(entry)
+                        groups[folder] = groups.get(folder, 0) + 1
+                folded.extend({**item, "path": location, "file_count": count}
+                              if item["format"] != "epochs-jsonl"
+                              else {**item, "path": location}
+                              for location, count in groups.items() if location)
+            elif isinstance(path, str) and path:
+                folded.append(item)
+        return folded
+
+    merged, new_keys = {}, set()
+    existing_keys = {(item["format"], item["path"]) for item in fold(existing)}
+    for origin, items in (("new", fold(incoming)), ("old", fold(existing))):
+        for item in items:
+            key = (item["format"], item["path"])
+            previous = merged.get(key)
+            keys = {name for name in item.get("keys") or ()
+                    if isinstance(name, str) and 1 <= len(name) <= 128}
+            counts = [value for value in (item.get("file_count"),
+                      (previous or {}).get("file_count")) if type(value) is int]
+            declaration = {**(previous or {}), **item}
+            if keys or "keys" in item or (previous and "keys" in previous):
+                declaration["keys"] = sorted(keys | set((previous or {}).get("keys") or ()))
+            if counts:
+                declaration["file_count"] = max(counts)
+            merged[key] = declaration
+            if origin == "new":
+                new_keys.add(key)
+    ordered = [key for key in merged if key in new_keys] + [key for key in merged if key not in new_keys]
+    kept, displaced, never_kept = [], 0, 0
+    for key in ordered:
+        declaration = merged[key]
+        if len(kept) >= MAX_PUBLIC_METRIC_DECLARATIONS:
+            if key in existing_keys:
+                displaced += 1
+            else:
+                never_kept += 1
+            continue
+        if check_existing and key not in new_keys:
+            try:
+                mode = os.lstat(key[1]).st_mode
+            except OSError:
+                mode = None
+            wanted = stat.S_ISREG if key[0] == "epochs-jsonl" else stat.S_ISDIR
+            if mode is None or not wanted(mode):
+                displaced += 1
+                continue
+        kept.append(declaration)
+    return sorted(kept, key=lambda item: (item["format"], item["path"])), displaced, never_kept
+
+
+def _public_summary(summary, *, drop_path, max_keys):
+    if not isinstance(summary, dict):
+        return summary
+
+    def point(value):
+        if drop_path and isinstance(value, dict):
+            return {key: item for key, item in value.items() if key != "path"}
+        return value
+
+    result = dict(summary)
+    for key in ("latest", "best"):
+        if key in result:
+            result[key] = point(result[key])
+    for key in ("latest_metrics", "best_metrics"):
+        if isinstance(result.get(key), dict):
+            names = sorted(result[key], key=lambda name: (name != summary.get("metric"), str(name)))
+            result[key] = {name: point(result[key][name]) for name in names[:max_keys]}
+    if isinstance(result.get("nonfinite"), list):
+        result["nonfinite"] = result["nonfinite"][:4]
+    return result
+
+
+def _public_row(row, *, max_keys=8):
+    result = {key: row[key] for key in _ROW_KEYS if key in row}
+    if "metric_summary" in result:
+        result["metric_summary"] = _public_summary(result["metric_summary"],
+                                                   drop_path=True, max_keys=max_keys)
+    return result
+
+
+def _number(value):
+    return (float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) else None)
+
+
+def _encoded_size(value):
+    return len(json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                          separators=(",", ":")).encode("utf-8")) + 1
+
+
+def _bounded_scalar(value):
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value if _number(value) is not None and len(repr(value)) <= 32 else None
+    if isinstance(value, str):
+        return value if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) \
+            <= _SKELETON_STRING_LIMIT else None
+    return None
+
+
+def _skeleton(value, declarations):
+    result, oversize = {}, []
+    for key in _SKELETON_IDENTITY:
+        if key in value:
+            result[key] = _bounded_scalar(value[key])
+            if result[key] is None and value[key] is not None:
+                oversize.append(key)
+    progress = value.get("progress") if isinstance(value.get("progress"), dict) else {}
+    result["progress"] = {key: _bounded_scalar(progress.get(key)) for key in ("reached", "total", "unit")}
+    summary = value.get("metric_summary") if isinstance(value.get("metric_summary"), dict) else {}
+    result["metric_summary"] = {"metric": _bounded_scalar(summary.get("metric")),
+                                "trend": _bounded_scalar(summary.get("trend"))}
+    for key in ("latest", "best"):
+        point = summary.get(key) if isinstance(summary.get(key), dict) else None
+        result["metric_summary"][key] = None if point is None else {
+            name: _bounded_scalar(point.get(name)) for name in ("epoch", "value", "nonfinite")}
+    result["rows"], result["metrics"] = [], []
+    result["compaction"] = {}
+    return result, oversize
+
+
+def _compact_public_record(value, existing=None, *, incoming_row_ids=(), check_existing=False):
+    """Project a public record into the 16 KiB budget; idempotent and deterministic."""
+    value = dict(value)
+    existing = existing if isinstance(existing, dict) else {}
+    own = value.get("compaction") if isinstance(value.get("compaction"), dict) else {}
+    prior = existing.get("compaction") if isinstance(existing.get("compaction"), dict) else {}
+
+    def count(*items):
+        return max([item for item in items if type(item) is int and item >= 0] or [0])
+
+    # output folder state: a present folder is carried over a later unknown.
+    state, reason = value.get("output_dir_state"), value.get("output_dir_reason")
+    if state not in ("present", "none", "unknown"):
+        state, reason = (("present", None) if isinstance(value.get("output_dir"), str)
+                         and value["output_dir"] else ("unknown", "not-declared"))
+    old_dir = existing.get("output_dir")
+    old_present = (isinstance(old_dir, str) and old_dir
+                   and existing.get("output_dir_state", "present") == "present")
+    if state != "present" and old_present:
+        value["output_dir"], state, reason = old_dir, "present", None
+    if state != "present":
+        value["output_dir"] = None
+    value["output_dir_state"] = state
+    value["output_dir_reason"] = None if state == "present" else reason
+
+    declarations, displaced, never_kept = _public_metric_declarations(
+        value.get("metrics"), existing.get("metrics"), check_existing=check_existing)
+    value["metrics"] = declarations
+    # metrics_omitted: declarations this file has left out. Ones pushed out of the
+    # existing record add once; ones merely offered again by the same input do not grow
+    # it (the carried count is a floor, raised only by a larger current shortfall).
+    carried = count(own.get("metrics_omitted"), prior.get("metrics_omitted"))
+    metrics_omitted = displaced + max(carried, never_kept)
+
+    if "source_warnings" in value:
+        value["source_warnings"] = sorted(item for item in set(value["source_warnings"] or ())
+                                          if isinstance(item, str))[:16]
+    if isinstance(value.get("last_checkpoint"), dict) \
+            and isinstance(value["last_checkpoint"].get("rule_fired"), list):
+        value["last_checkpoint"] = {**value["last_checkpoint"],
+                                    "rule_fired": value["last_checkpoint"]["rule_fired"][:16]}
+    value["metric_summary"] = _public_summary(value.get("metric_summary"),
+                                              drop_path=False, max_keys=16)
+
+    incoming = set(incoming_row_ids)
+    by_id = {}
+    for row in [*(existing.get("rows") or []), *(value.get("rows") or [])]:
+        if isinstance(row, dict) and isinstance(row.get("row_id"), str):
+            by_id[row["row_id"]] = row
+    rows_omitted = count(own.get("rows_omitted"), prior.get("rows_omitted"))
+    if by_id or "rows" in value:
+        def order(row):
+            recent = next((n for n in (_number((row.get("last_checkpoint") or {}).get("at"))
+                           if isinstance(row.get("last_checkpoint"), dict) else None,
+                           _number(row.get("ended_at")), _number(row.get("started_at")))
+                           if n is not None), float("-inf"))
+            return (row["row_id"] not in incoming, row.get("ended_at") is not None,
+                    -recent, row["row_id"])
+        rows = sorted((_public_row(row) for row in by_id.values()), key=order)
+        rows_omitted += max(0, len(rows) - MAX_ARMS)
+        value["rows"] = rows[:MAX_ARMS]
+    else:
+        order = None
+
+    def stage1(record):
+        record["metric_summary"] = _public_summary(record["metric_summary"], drop_path=True, max_keys=3)
+        record["rows"] = [_public_row(row, max_keys=3) for row in record["rows"]]
+
+    def stage2(record):
+        for row in record["rows"]:
+            for key in _ROW_DETAIL_KEYS:
+                row.pop(key, None)
+            if isinstance(row.get("last_checkpoint"), dict):
+                row["last_checkpoint"] = {"at": row["last_checkpoint"].get("at")}
+            for key in [key for key, item in row.items() if item is None]:
+                del row[key]
+
+    def stage3(record):
+        for row in record["rows"]:
+            row.pop("output_dir", None)
+            summary = row.get("metric_summary")
+            if isinstance(summary, dict):
+                row["metric_summary"] = {key: summary[key] for key in
+                                         ("metric", "latest", "best", "trend") if key in summary}
+
+    def stage4(record):
+        live = [row for row in record["rows"] if row.get("ended_at") is None]
+        done = [row for row in record["rows"] if row.get("ended_at") is not None]
+        record["rows"] = live + done[:1]
+        record["rows"].sort(key=order)
+
+    def stage6(record):
+        record["metrics"] = [{key: item for key, item in declaration.items() if key != "keys"}
+                             for declaration in record["metrics"]]
+        record["source_warnings"] = []
+        if isinstance(record.get("progress"), dict):
+            record["progress"] = {**record["progress"], "observed_counters": []}
+        if isinstance(record.get("last_checkpoint"), dict):
+            record["last_checkpoint"] = {**record["last_checkpoint"], "rule_fired": []}
+
+    def finish(record, level, omitted_rows, oversize=()):
+        record["compaction"] = {"budget_bytes": MAX_PUBLIC_RUN_RECORD_WRITE_BYTES,
+                                "level": max(level, count(own.get("level"))),
+                                "rows_omitted": rows_omitted + omitted_rows,
+                                "metrics_omitted": metrics_omitted}
+        oversize_all = {*oversize, *(own.get("oversize_fields") or ())}
+        if oversize_all:
+            record["compaction"]["oversize_fields"] = sorted(oversize_all)
+        return record
+
+    omitted = 0
+    for level, step in ((0, None), (1, stage1), (2, stage2), (3, stage3), (4, stage4)):
+        if step and "rows" in value:
+            before = len(value["rows"]); step(value)
+            omitted += before - len(value["rows"])
+        if _encoded_size(finish(value, level, omitted)) <= MAX_PUBLIC_RUN_RECORD_WRITE_BYTES:
+            return value
+    while any(row["row_id"] not in incoming for row in value.get("rows") or []):
+        value["rows"].remove([row for row in value["rows"] if row["row_id"] not in incoming][-1])
+        omitted += 1
+        if _encoded_size(finish(value, 5, omitted)) <= MAX_PUBLIC_RUN_RECORD_WRITE_BYTES:
+            return value
+    stage6(value)
+    if _encoded_size(finish(value, 6, omitted)) <= MAX_PUBLIC_RUN_RECORD_WRITE_BYTES:
+        return value
+    skeleton, oversize = _skeleton(value, declarations)
+    omitted += len(value.get("rows") or [])
+    finish(skeleton, 7, omitted, oversize)
+    for declaration in sorted(declarations, key=lambda item: _encoded_size(item)):
+        trial = {**skeleton, "metrics": [*skeleton["metrics"], declaration]}
+        if _encoded_size(trial) <= MAX_PUBLIC_RUN_RECORD_WRITE_BYTES:
+            skeleton = trial
+    skeleton["compaction"]["metrics_omitted"] = displaced + max(
+        carried, never_kept + len(declarations) - len(skeleton["metrics"]))
+    return skeleton
 
 
 def _observation_state_path(run, registry, row_key, *, create=True):
@@ -683,6 +1038,15 @@ def _admission_summary(previous, decoded, now, run_id, row_key, started_at):
     previous = previous if isinstance(previous, dict) else {}
     decoded = decoded if isinstance(decoded, dict) else {}
     counts = dict(previous.get("admission_counts", {}))
+    if (decoded.get("generation") is not None
+            and decoded.get("generation") != previous.get("admission_generation")):
+        # A replacement exact source starts a new sample population. Do not
+        # carry counts/latest freshness across a different run/row/source.
+        counts = {}
+        previous = {**previous, "admission_from_at": None,
+                    "admission_to_at": None, "admission_latest": None,
+                    "admission_current_state": None,
+                    "admission_wait_episode_id": None}
     for key in ("admitted", "denied", "unknown"):
         counts[key] = max(0, int(counts.get(key, 0))) if type(counts.get(key, 0)) is int else 0
     observed_from, observed_to = previous.get("admission_from_at"), previous.get("admission_to_at")
@@ -733,13 +1097,197 @@ def _admission_summary(previous, decoded, now, run_id, row_key, started_at):
             if current == "waiting" and latest else [],
         "wait_duration_seconds": None, "time_ratio": None,
         "episode_id": episode, "generation": generation}
+    generation_for_state = (generation if generation is not None else
+                            previous.get("admission_generation"))
     return summary, {"admission_counts": counts,
         "admission_from_at": observed_from, "admission_to_at": observed_to,
-        "admission_generation": generation,
+        "admission_generation": generation_for_state,
         "admission_current_state": current,
         "admission_wait_episode_id": episode,
         "admission_cursor": decoded.get("cursor", previous.get("admission_cursor")),
         "admission_warnings": decoded.get("warnings", [])}
+
+
+def _json_pointer(value, pointer):
+    if not isinstance(pointer, str) or not pointer.startswith("/") or len(pointer) > 512:
+        raise ValueError("source-pointer-invalid")
+    current = value
+    for token in pointer[1:].split("/"):
+        if re.search(r"~(?![01])", token):
+            raise ValueError("source-pointer-escape-invalid")
+        token = token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and token in current:
+            current = current[token]
+        elif (isinstance(current, list)
+              and (token == "0" or re.fullmatch(r"[1-9][0-9]*", token))
+              and int(token) < len(current)):
+            current = current[int(token)]
+        else:
+            raise ValueError("source-pointer-missing")
+    return current
+
+
+def _bounded_source_file(raw_path, remaining, path_namespace=None):
+    if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 4096:
+        raise ValueError("source-path-invalid")
+    declared = Path(raw_path)
+    path, _mapped = _reverse_namespace_path(declared, path_namespace)
+    if not declared.is_absolute() or not path.is_absolute() or _path_has_symlink(path):
+        raise ValueError("source-path-invalid")
+    path = Path(os.path.abspath(path))
+    root = path.parent
+    try:
+        raw, info = __import__("resource_metric_sources")._read_file(
+            path, root, min(MAX_SOURCE_BINDING_BYTES, max(0, int(remaining))))
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        raise ValueError("source-file-unavailable") from exc
+    return path, raw, info
+
+
+def _observe_source_bindings(bindings, run_id, row_key, now, path_namespace=None):
+    """Validate caller-declared exact provenance without importing its writer."""
+    if not isinstance(bindings, list):
+        return [], [], ["source-bindings-invalid"]
+    if len(bindings) > MAX_SOURCE_BINDINGS:
+        return [], [], ["source-bindings-limit"]
+    observations, retained, warnings = [], [], []
+    total_bytes = metadata_bytes = 0
+    for raw_binding in bindings:
+        if not isinstance(raw_binding, dict):
+            warnings.append("source-binding-invalid")
+            continue
+        binding = {key: raw_binding.get(key) for key in
+            ("target_run_id", "row_key", "path", "writer_run_id", "timestamp_pointer",
+             "scope", "counters", "proofs")}
+        try:
+            binding_bytes = len(json.dumps(binding, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            if binding_bytes > MAX_SOURCE_BINDING_BYTES \
+                    or metadata_bytes + binding_bytes > MAX_SOURCE_BINDING_BYTES:
+                raise ValueError("source-binding-metadata-limit")
+            metadata_bytes += binding_bytes
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+            warnings.append("source-binding-unknown:" + str(exc)[:96])
+            continue
+        retained.append(binding)
+        name = None
+        first_counter = (binding.get("counters", [None])[0]
+                         if isinstance(binding.get("counters"), list)
+                         and binding.get("counters") else None)
+        if isinstance(first_counter, dict) and isinstance(first_counter.get("name"), str):
+            name = first_counter["name"][:128]
+        base = {"name": name, "value": None, "source_path": binding.get("path"),
+                "json_pointer": first_counter.get("pointer")
+                    if isinstance(first_counter, dict) else None,
+                "writer_run_id": binding.get("writer_run_id"),
+                "target_run_id": binding.get("target_run_id"),
+                "row_key": binding.get("row_key"),
+                "scope": binding.get("scope"), "comparison_eligible": False,
+                "observed_at": None, "source_generation": None,
+                "freshness": "unknown", "state": "unknown"}
+        try:
+            if (binding.get("target_run_id") != run_id
+                    or binding.get("row_key") != str(row_key)
+                    or not isinstance(binding.get("writer_run_id"), str)
+                    or not binding.get("writer_run_id")
+                    or len(binding["writer_run_id"]) > 256
+                    or binding.get("writer_run_id") == run_id
+                    or not isinstance(binding.get("scope"), str)
+                    or len(binding["scope"]) > 128):
+                raise ValueError("source-binding-target-mismatch")
+            counters = binding.get("counters")
+            proofs = binding.get("proofs")
+            if (not isinstance(counters, list) or not counters
+                    or len(counters) > MAX_SOURCE_BINDING_COUNTERS
+                    or not isinstance(proofs, list)
+                    or not proofs or len(proofs) > MAX_SOURCE_BINDING_PROOFS):
+                raise ValueError("source-binding-shape-invalid")
+            source_path, source_raw, source_info = _bounded_source_file(
+                binding.get("path"), MAX_SOURCE_BINDING_BYTES - total_bytes,
+                path_namespace)
+            total_bytes += len(source_raw)
+            source_doc = __import__("resource_metric_sources")._admission_json_object(source_raw)
+            if not isinstance(source_doc, dict):
+                raise ValueError("source-json-not-object")
+            observed_at = _json_pointer(source_doc, binding.get("timestamp_pointer"))
+            if (not isinstance(observed_at, (int, float)) or isinstance(observed_at, bool)
+                    or not math.isfinite(float(observed_at))):
+                raise ValueError("source-timestamp-invalid")
+            proof_hashes = []
+            asserted_identity_values = set()
+            for proof in proofs:
+                if not isinstance(proof, dict) or not isinstance(proof.get("sha256"), str):
+                    raise ValueError("source-proof-invalid")
+                expected_hash = proof["sha256"].lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+                    raise ValueError("source-proof-hash-invalid")
+                assertions = proof.get("assertions", [])
+                if (not isinstance(assertions, list)
+                        or len(assertions) > MAX_SOURCE_BINDING_ASSERTIONS):
+                    raise ValueError("source-proof-assertions-invalid")
+                _proof_path, proof_raw, _proof_info = _bounded_source_file(
+                    proof.get("path"), MAX_SOURCE_BINDING_BYTES - total_bytes,
+                    path_namespace)
+                total_bytes += len(proof_raw)
+                if total_bytes > MAX_SOURCE_BINDING_BYTES:
+                    raise ValueError("source-proof-byte-limit")
+                actual_hash = hashlib.sha256(proof_raw).hexdigest()
+                if actual_hash != expected_hash:
+                    raise ValueError("source-proof-changed")
+                if assertions:
+                    proof_doc = __import__("resource_metric_sources")._admission_json_object(proof_raw)
+                    for assertion in assertions:
+                        if not isinstance(assertion, dict) or "equals" not in assertion:
+                            raise ValueError("source-proof-assertion-invalid")
+                        proved = _json_pointer(proof_doc, assertion.get("pointer"))
+                        expected = assertion["equals"]
+                        if type(proved) is not type(expected) or proved != expected:
+                            raise ValueError("source-proof-assertion-mismatch")
+                        if (isinstance(expected, str)
+                                and expected in {binding["target_run_id"],
+                                                 binding["writer_run_id"]}):
+                            asserted_identity_values.add(expected)
+                proof_hashes.append(actual_hash)
+            required_identity_values = {binding["target_run_id"], binding["writer_run_id"]}
+            if not required_identity_values.issubset(asserted_identity_values):
+                raise ValueError("source-proof-identity-incomplete")
+            generation_material = {"run_id": run_id, "row_key": str(row_key),
+                "writer_run_id": binding["writer_run_id"], "path": binding.get("path"),
+                "timestamp_pointer": binding["timestamp_pointer"],
+                "scope": binding["scope"],
+                "counters": [{"name": item.get("name"), "pointer": item.get("pointer"),
+                              "comparison_eligible": item.get("comparison_eligible")}
+                    for item in counters if isinstance(item, dict)],
+                "proofs": sorted(proof_hashes)}
+            generation = hashlib.sha256(json.dumps(generation_material, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()[:24]
+            for counter in counters:
+                if (not isinstance(counter, dict)
+                        or not isinstance(counter.get("name"), str)
+                        or len(counter["name"]) > 128
+                        or not isinstance(counter.get("comparison_eligible"), bool)):
+                    raise ValueError("source-counter-invalid")
+                value = _json_pointer(source_doc, counter.get("pointer"))
+                if (not (value is None or isinstance(value, (str, int, float, bool)))
+                        or isinstance(value, float) and not math.isfinite(value)
+                        or isinstance(value, str) and len(value) > 256):
+                    raise ValueError("source-counter-value-invalid")
+                age = float(now) - float(observed_at)
+                fresh = 0 <= age <= 600
+                observations.append({**base, "name": counter["name"], "value": value,
+                    "source_path": binding.get("path"), "read_path": str(source_path),
+                    "json_pointer": counter["pointer"],
+                    "comparison_eligible": counter["comparison_eligible"],
+                    "observed_at": float(observed_at), "source_generation": generation,
+                    "source_stat_generation": f"{source_info.st_dev}:{source_info.st_ino}",
+                    "freshness_seconds": age if fresh else None,
+                    "freshness": "fresh" if fresh else "stale", "state": "observed" if fresh else "unknown"})
+        except (OSError, ValueError, TypeError, UnicodeError, OverflowError,
+                RecursionError) as exc:
+            reason = str(exc) if isinstance(exc, ValueError) else "source-proof-unavailable"
+            warnings.append("source-binding-unknown:" + reason[:96])
+            observations.append({**base, "reason": reason[:96]})
+    return observations, retained, sorted(set(warnings))
 
 
 def _notice_targets(run):
@@ -859,6 +1407,15 @@ def _notice_texts(run, event_kind, observation, record_path, sources):
             admission_line += "; observed blockers=" + " | ".join(labels)
     if admission.get("sample_count", 0) or admission.get("coverage") != "unknown":
         entries.append(admission_line)
+    for counter in observation.get("source_observations", [])[:3]:
+        if not isinstance(counter, dict):
+            continue
+        value = counter.get("value") if counter.get("state") == "observed" else "unknown"
+        entries.append("raw counter=" + str(counter.get("name") or "unknown")
+            + ":" + str(value) + " scope=" + str(counter.get("scope") or "unknown")
+            + " writer=" + str(counter.get("writer_run_id") or "unknown")
+            + " target=" + str(counter.get("target_run_id") or "unknown")
+            + " at=" + str(counter.get("observed_at") or "unknown"))
     if stagnation.get("state") == "stagnant":
         anchor = ("last actual increase" if stagnation.get("since") == "last-increase"
                   else "first comparable observation")
@@ -969,8 +1526,21 @@ def read_experiment_observation(run, registry, row_key):
         if (value.get("run_id") != run.get("run_id")
                 or value.get("row_key") != str(row_key)):
             return None
+        counts = value.get("admission_counts")
+        has_admission_history = (
+            isinstance(value.get("admission_cursor"), dict)
+            and bool(value["admission_cursor"])) or (
+            isinstance(counts, dict) and any(type(counts.get(key)) is int
+                and counts[key] > 0 for key in ("admitted", "denied", "unknown"))) or (
+            isinstance(value.get("admission_latest"), dict)
+            or isinstance(value.get("admission_summary"), dict)
+            or isinstance(value.get("admission_generation"), str)
+            and bool(value["admission_generation"]))
+        source_observations = value.get("source_observations")
         return {"available": True, "observation": value.get("observation"),
                 "metrics": value.get("sources", []), "metric_root": None,
+                "has_persisted_observation": bool(has_admission_history
+                    or isinstance(source_observations, list) and source_observations),
                 "record_path": None, "delivery": [], "warnings": value.get("warnings", []),
                 "state_path": str(path)}
     except (OSError, ValueError, TypeError, RuntimeError):
@@ -1032,11 +1602,16 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                 previous = {}
         except (OSError, ValueError, TypeError):
             previous = {}
+        declared_observation = (run.get("observation")
+            if isinstance(run.get("observation"), dict) else {})
+        incoming_source_bindings = declared_observation.get("source_bindings")
         previous_poll = previous.get("last_observer_poll_at")
         if (not final and isinstance(previous_poll, (int, float))
                 and not isinstance(previous_poll, bool)
                 and float(now) - float(previous_poll) < max(1.0, float(poll_interval_seconds))
-                and status == previous.get("public_status")):
+                and status == previous.get("public_status")
+                and not (isinstance(incoming_source_bindings, list)
+                         and incoming_source_bindings)):
             cached_observation = dict(previous.get("observation") or {})
             cached_observation["checkpoint_due"] = False
             cached_observation["due_checkpoint_at"] = None
@@ -1107,6 +1682,19 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             ("state", "coverage", "admitted_samples", "denied_samples", "unknown_samples",
              "denied_sample_ratio", "observed_from_at", "observed_to_at", "latest_at",
              "reasons", "priority_blockers", "episode_id", "generation"))
+        source_bindings = (incoming_source_bindings if isinstance(incoming_source_bindings, list)
+                           else previous.get("source_bindings", []))
+        source_observations, retained_bindings, source_binding_warnings = _observe_source_bindings(
+            source_bindings, run_id, str(identity), now, run.get("path_namespace"))
+        warnings.extend(source_binding_warnings)
+        previous_counters = previous.get("source_observations", [])
+        old_counter_identity = [(item.get("name"), item.get("value"),
+            item.get("source_generation"), item.get("state")) for item in previous_counters
+            if isinstance(item, dict)] if isinstance(previous_counters, list) else []
+        new_counter_identity = [(item.get("name"), item.get("value"),
+            item.get("source_generation"), item.get("state")) for item in source_observations]
+        source_observations_changed = source_observations != previous_counters
+        source_signal_changed = old_counter_identity != new_counter_identity
         samples = _merge_samples(previous.get("samples"), new_samples)
         sources = _merge_metric_sources(previous.get("sources"), sources, samples)
         clock_known = started is not None
@@ -1178,6 +1766,15 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             stagnation = {"state": "unknown"}
         observation["admission"] = admission_summary
         observation["stagnation"] = stagnation
+        observation["source_observations"] = source_observations
+        if source_signal_changed and source_observations:
+            for item in source_observations[:MAX_SOURCE_BINDINGS * MAX_SOURCE_BINDING_COUNTERS]:
+                observation["attention"].append({"kind": "source-observation",
+                    "generation": item.get("source_generation"),
+                    "source_value_hash": hashlib.sha256(json.dumps(
+                        item.get("value"), sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False, allow_nan=False).encode()).hexdigest()[:16]
+                        if item.get("state") == "observed" else "unknown"})
         if stagnation.get("state") == "stagnant" and stagnation.get("episode_id"):
             observation["attention"].append({"kind": "progress-stagnation",
                 "episode_id": stagnation["episode_id"],
@@ -1199,10 +1796,11 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
         event_specs = []
         if notify_events and final:
             event_specs.append(("final", f"final:{identity}"))
-        elif notify_events and observation["attention"]:
+        if (notify_events and observation["attention"]
+                and (not final or source_signal_changed and source_observations)):
             attention_identity = [{key: item.get(key) for key in
                 ("kind", "metric", "epoch", "op", "threshold", "episode_id",
-                 "generation", "since")}
+                 "generation", "since", "source_value_hash")}
                 for item in observation["attention"]]
             attention_digest = hashlib.sha256(json.dumps(attention_identity, sort_keys=True,
                 separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()[:16]
@@ -1250,6 +1848,8 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                       "admission_latest": admission_decoded.get("latest"),
                       "admission_coverage": admission_decoded.get("coverage", "unknown"),
                       "admission_summary": admission_summary,
+                      "source_bindings": retained_bindings,
+                      "source_observations": source_observations,
                       "last_checkpoint_at": (float(now) if observation["checkpoint_due"]
                                              else previous.get("last_checkpoint_at")),
                       "last_public_write_at": previous.get("last_public_write_at"),
@@ -1265,6 +1865,7 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
             or status != previous.get("public_status")
             or observation["checkpoint_due"] or new_event
             or bool(new_samples) or sources != previous.get("sources", [])
+            or source_observations_changed
             or admission_changed or stagnation_changed
             or should_read_admission and bool(admission_summary.get("sample_count"))))
         if publish_public:
@@ -1277,7 +1878,7 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                          "started_at": float(started) if clock_known else None,
                          "clock_scope": "row" if clock_known else "unknown",
                          "output_dir": str(metric_root) if metric_root else None,
-                         "metrics": next_state["sources"],
+                         "observed_counters": source_observations,
                          "last_checkpoint": record["last_checkpoint"],
                          "metric_summary": record["metric_summary"],
                          "elapsed_seconds": observation.get("elapsed_seconds"),
@@ -1288,8 +1889,9 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                          "admission": admission_summary,
                          "stagnation": stagnation}
             record["rows"] = [row_entry]
-            if metric_root is not None:
-                record["output_dir"] = str(metric_root)
+            record["output_dir"] = str(metric_root) if metric_root is not None else None
+            record["output_dir_state"], record["output_dir_reason"] = _public_output_state(
+                run, record["output_dir"], binding_given=bool(root_value) and metric_root is None)
             record_path = write_public_run_record(artifact_root, run_id, record)
             if record_path:
                 next_state["last_public_write_at"] = float(now)
@@ -1299,6 +1901,7 @@ def observe_experiment(run, registry, now, *, root=None, row_key=None,
                               or sources != previous.get("sources", []))
                          or next_progress != previous.get("progress_sample")
                          or admission_changed or stagnation_changed
+                         or source_observations_changed
                          or should_read_admission
                          or observation["checkpoint_due"] or final
                          or warnings != []
@@ -1402,8 +2005,9 @@ def write_public_run_record(artifact_root, run_id, record):
     value = dict(record)
     value["run_id"] = run_id
     value.setdefault("metrics", [])
-    value.setdefault("last_checkpoint", {"at": None, "trend": None,
-                                         "rule_fired": [], "eta_vs_plan": None})
+    if "compaction" not in value:
+        value.setdefault("last_checkpoint", {"at": None, "trend": None,
+                                             "rule_fired": [], "eta_vs_plan": None})
     name = None
     directory_fd = None
     try:
@@ -1416,28 +2020,18 @@ def write_public_run_record(artifact_root, run_id, record):
         existing = read_public_run_record(artifact_root, run_id)
         if isinstance(existing, dict):
             identity_fields = ("campaign_id", "cycle_id", "route_id", "node", "host",
-                               "output_dir", "started_at", "verdict")
+                               "started_at", "verdict")
             for key in identity_fields:
                 if value.get(key) in (None, "") and existing.get(key) not in (None, ""):
                     value[key] = existing[key]
-            metric_rows = {}
-            for item in [*(existing.get("metrics") or []), *(value.get("metrics") or [])]:
-                if not isinstance(item, dict) or not isinstance(item.get("format"), str):
-                    continue
-                source_key = (item["format"], json.dumps(item.get("path"), sort_keys=True))
-                previous_item = metric_rows.get(source_key, {})
-                metric_rows[source_key] = {**previous_item, **item,
-                    "keys": sorted(set(previous_item.get("keys", [])) | set(item.get("keys", [])))}
-            value["metrics"] = list(metric_rows.values())
-            row_map = {row.get("row_id"): row for row in existing.get("rows", [])
-                       if isinstance(row, dict) and isinstance(row.get("row_id"), str)}
-            row_map.update({row.get("row_id"): row for row in value.get("rows", [])
-                            if isinstance(row, dict) and isinstance(row.get("row_id"), str)})
-            value["rows"] = list(row_map.values())
+        value = _compact_public_record(
+            value, existing, check_existing=True,
+            incoming_row_ids=[row["row_id"] for row in record.get("rows") or []
+                              if isinstance(row, dict) and isinstance(row.get("row_id"), str)])
         encoded = json.dumps(value, ensure_ascii=False, allow_nan=False,
                              sort_keys=True, separators=(",", ":"))
-        if len(encoded.encode("utf-8")) > MAX_PUBLIC_RUN_RECORD_BYTES:
-            return None
+        if len(encoded.encode("utf-8")) + 1 > MAX_PUBLIC_RUN_RECORD_WRITE_BYTES:
+            return None  # unreachable: the compaction ladder ends in a bounded skeleton
         fd, name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             output.write(encoded + "\n")

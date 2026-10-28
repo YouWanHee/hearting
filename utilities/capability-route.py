@@ -2,7 +2,7 @@
 """Compile, verify, and complete immutable capability routes."""
 from __future__ import annotations
 
-import argparse, base64, contextlib, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, stat, subprocess, sys, tempfile, uuid
+import argparse, base64, contextlib, copy, fcntl, functools, hashlib, importlib.util, json, locale, os, re, shlex, shutil, stat, subprocess, sys, tempfile, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -2751,13 +2751,59 @@ def _validation_basis():
 
 def unit_catalog_digest(units_root=None):
     """Digest of unit frontmatter blocks (machine contracts); unit BODY prose stays un-hashed."""
+    return _unit_blocks_digest(_capture_unit_frontmatter(units_root))
+
+
+def _capture_unit_frontmatter(units_root=None):
+    """Capture the exact hashed blocks, retaining malformed files as None."""
     units_root=Path(units_root) if units_root else ROOT/"roles"/"units"
-    blocks=[]
+    captured={}
     for path in sorted(units_root.glob("*/*.md")):
         if path.name.startswith("_"): continue
         match=re.match(r"\A---\n.*?\n---\n", path.read_text(encoding="utf-8"), re.DOTALL)
-        if match: blocks.append(f"{path.relative_to(units_root)}\n{match.group(0)}")
+        captured[path.relative_to(units_root).as_posix()] = match.group(0) if match else None
+    return captured
+
+
+def _unit_blocks_digest(captured):
+    blocks=[f"{path}\n{block}" for path,block in sorted(captured.items()) if block is not None]
     return "sha256:"+hashlib.sha256("\n".join(blocks).encode()).hexdigest()
+
+
+SD160_REGISTRY_DIGEST = "sha256:4260c26aebc1ab2f5bbb722d1b77a0d3fe555504a4122ec5dd3c891dd8071f10"
+SD160_UNIT_CATALOG_DIGEST = "sha256:a565c51b6d07e301836027295e3e49d01dcb2b2bdacb98845441711c73188314"
+SD160_SNAPSHOT_DIR = ROOT / "utilities" / "legacy-route-snapshots"
+
+
+def _sd160_snapshot_path(digest):
+    """Map a sealed sha256 digest to its Windows-safe snapshot filename."""
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise ValueError("invalid SD-160 snapshot digest")
+    return SD160_SNAPSHOT_DIR / f"sha256-{digest.split(':', 1)[1]}.json"
+
+
+def _load_sd160_snapshots():
+    """Load the immutable registry and parsed unit contracts for sealed SD-160 routes."""
+    try:
+        registry_path = _sd160_snapshot_path(SD160_REGISTRY_DIGEST)
+        units_path = _sd160_snapshot_path(SD160_UNIT_CATALOG_DIGEST)
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        blocks = json.loads(units_path.read_text(encoding="utf-8"))
+        registry_digest = TOPO.registry_digest(registry)
+        units_digest = _unit_blocks_digest(blocks)
+        registry_filename_digest = "sha256:" + registry_path.stem.removeprefix("sha256-")
+        units_filename_digest = "sha256:" + units_path.stem.removeprefix("sha256-")
+        if registry_digest != registry_filename_digest or units_digest != units_filename_digest:
+            return None
+        if registry_digest != SD160_REGISTRY_DIGEST or units_digest != SD160_UNIT_CATALOG_DIGEST:
+            return None
+        fields = {}
+        for path, block in blocks.items():
+            unit = path[:-3]
+            fields[unit] = TOPO._parse_unit_frontmatter(unit, block)
+        return registry, registry_digest, units_digest, fields
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 def compile_route(capability, capability_mode, requested_intensity, cwd, artifact_root,
                   predicates=(), signals=(), transport=None,
@@ -5063,6 +5109,12 @@ def compose_card(route, plan=None, plan_source=None, *, owner_harness=None, rout
     if plan:
         suffix = " (상속)" if plan_source == "inherited" else ""
         card += f"\n  계획 {' › '.join(plan)}{suffix}"
+    leg_plan = ROUTE_PLAN.leg_plan(route)
+    parallel = (leg_plan or {}).get("leg", {}).get("parallel") or []
+    if parallel:
+        card += "\n  승인된 분할: " + " · ".join(parallel[:3])
+        if len(parallel) > 3:
+            card += f"; 외 {len(parallel) - 3}개(route·owner 지시문에 전부)"
     if route_plan_unreadable:
         card += "\n  경로 계획을 읽지 못함"
     notice = _compose_spec_read_notice(route)
@@ -5472,8 +5524,7 @@ def classify_validation_basis(route, *, registry_digest_now, units_digest_now,
             "verdict": "skew",
             "message": (
                 f"{skew_reason}(compiled={sealed_digest}@{sealed_root}, "
-                f"validator={own_digest}@{own_root}); re-run via the tooling "
-                f"under {sealed_root} (the root that created the row)"
+                f"validator={own_digest}@{own_root})"
             ),
         }
     verdict, message = "current", None
@@ -5490,24 +5541,6 @@ def _validate_campaign_selection(key, value):
     pattern = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}" if key == "campaign_key" else r"cyc_[a-f0-9]{32}"
     if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
         raise ValueError(f"route-{key.replace('_', '-')}-invalid")
-
-
-def _sd160_legacy_registry(registry):
-    """Reconstruct only the immediately preceding cross-harness declaration.
-
-    This is an exact digest bridge, never a general stale-registry exemption.
-    Any changed node, width, budget, role or other registry byte changes its
-    digest and remains refused. Old sealed documents themselves are untouched.
-    """
-    legacy = json.loads(json.dumps(registry))
-    changed = False
-    for recipe in legacy["recipes"]:
-        for graph in (v for v in recipe.values() if isinstance(v, dict)):
-            for group in graph.get("parallel_groups", []):
-                if group.get("independence_axes") == ["model-profile", "perspective"]:
-                    group["independence_axes"] = ["cross-harness", "model-profile", "perspective"]
-                    changed = True
-    return legacy if changed else None
 
 
 def _entry_scope_legacy_registry(registry):
@@ -5705,34 +5738,30 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         # An unsupported basis_version is a legitimate newer harness's route;
         # closure records it honestly as unproven rather than stranding it.
         return dict(route, _registry_current=False)
-    registry=TOPO.load_registry()
+    persona_version = route.get("persona_independence_contract_version")
+    if persona_version is not None and (type(persona_version) is not int or persona_version != 1):
+        raise ValueError("unsupported-persona-independence-contract-version")
+    legacy_unit_view=None
+    snapshot_pair=(persona_version is None
+                   and route.get("registry_digest")==SD160_REGISTRY_DIGEST
+                   and route.get("unit_catalog_digest")==SD160_UNIT_CATALOG_DIGEST)
+    snapshots=_load_sd160_snapshots() if snapshot_pair else None
+    if snapshots is not None:
+        registry, registry_digest_now, current_units_digest, legacy_unit_view = snapshots
+    else:
+        registry=TOPO.load_registry()
+        registry_digest_now=TOPO.registry_digest(registry)
+        current_units_digest=unit_catalog_digest()
     capability_digest_now=None
     if isinstance(route.get("capability_registry_digest"), str) and isinstance(route.get("capability"), str):
         extra=[route["composed_recipe"]] if route.get("composed") and isinstance(route.get("composed_recipe"), dict) else ()
         capability_digest_now=TOPO.capability_registry_digest(registry, route["capability"], extra)
     classification=classify_validation_basis(
-        route, registry_digest_now=TOPO.registry_digest(registry),
-        units_digest_now=unit_catalog_digest(),
+        route, registry_digest_now=registry_digest_now,
+        units_digest_now=current_units_digest,
         registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
         capability_digest_now=capability_digest_now,
     )
-    persona_version = route.get("persona_independence_contract_version")
-    if persona_version is not None and (type(persona_version) is not int or persona_version != 1):
-        raise ValueError("unsupported-persona-independence-contract-version")
-    if (classification["registry"]["verdict"] != "current"
-            and classification["unit_catalog"]["verdict"] == "current"
-            and persona_version is None):
-        legacy_registry = _sd160_legacy_registry(registry)
-        if (legacy_registry is not None
-                and route.get("registry_digest") == TOPO.registry_digest(legacy_registry)):
-            # Reconstruct the old graph under its exact authenticated declaration;
-            # launch/receipt consumers apply SD-160's effective persona policy.
-            registry = legacy_registry
-            classification = classify_validation_basis(
-                route, registry_digest_now=TOPO.registry_digest(registry),
-                units_digest_now=unit_catalog_digest(),
-                registry_root_now=TOPO.ROOT, unit_catalog_root_now=ROOT,
-            )
     if (classification["registry"]["verdict"] != "current"
             and classification["unit_catalog"]["verdict"] == "current"):
         legacy_registry = _entry_scope_legacy_registry(registry)
@@ -5761,7 +5790,8 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         if not allow_stale_registry:
             if gates_on():
                 raise ValueError(classification["message"])
-            same_work_or_refuse("route-registry-stale", classification["message"])
+            # Catalog drift is expected across releases. Default continuation
+            # uses the current tooling without prescribing an unverified old runtime.
             _validate_output_scopes(route.get("nodes", []))
         # A stale/skewed sealed graph cannot be re-derived from the current registry, so
         # every check that compares against it is skipped rather than guessed at.
@@ -5781,10 +5811,12 @@ def verify_route(route, expected_cwd=None, *, allow_stale_registry=False):
         composed_recipe=route.get("composed_recipe")
         if not isinstance(composed_recipe, dict):
             raise ValueError("composed route lacks embedded composed_recipe")
-        TOPO._validate_recipe(
-            composed_recipe, registry,
-            registry["owner_profile_by_intensity"]["standard"],
-        )
+        with (TOPO._unit_contract_view(legacy_unit_view)
+              if legacy_unit_view is not None else contextlib.nullcontext()):
+            TOPO._validate_recipe(
+                composed_recipe, registry,
+                registry["owner_profile_by_intensity"]["standard"],
+            )
         _validate_compose_owner_close(registry, composed_recipe, route["effective_intensity"])
         if resume_recipe and not _versioned_subgraph(registry, composed_recipe):
             raise ValueError("resume recipe differs from the declared catalog")
@@ -9699,6 +9731,153 @@ def _node_revision_records(route, node_id, jobs=None):
             revisions.append(marker.get("revision") or {})
     return revisions
 
+
+def producer_revision_admission(route, nodes, jobs):
+    """Resolve the approved generation for one atomic plan-author group.
+
+    A generation changes only when the existing producer revision writer has
+    recorded a new, basis-verified revision. The returned token is derived
+    from immutable marker history; it is not a new approval or history store.
+    """
+    nodes = list(nodes or ())
+    if (not nodes or any(node.get("unit") != "plan/plan-author" for node in nodes)
+            or len({str(node.get("id")) for node in nodes}) != len(nodes)):
+        return {"managed": False, "generation": None, "pending": False,
+                "current_attempt_ids": {}}
+    group_ids = {node.get("parallel_group") or node.get("replica_group") for node in nodes}
+    if len(group_ids) != 1 or None in group_ids:
+        raise ValueError("producer-revision-group-invalid")
+    if jobs is None:
+        raise ValueError("producer-revision-jobs-required")
+    jobs = Path(jobs).resolve()
+    directory = completion_dir(route["route_id"], jobs=jobs)
+    if not jobs.is_file():
+        if directory.exists() or directory.is_symlink():
+            raise ValueError("producer-revision-registry-unreadable")
+        return {"managed": True, "generation": "1", "pending": False,
+                "current_attempt_ids": {},
+                "basis": [{"node_id": str(node["id"]), "sequence": 0} for node in nodes]}
+    generation_basis = []
+    current_attempt_ids = {}
+    pending = False
+    any_revision = False
+    for node in nodes:
+        node_id = str(node["id"])
+        prefix = f"{node_id}."
+        revision_markers = []
+        numeric_paths = []
+        if directory.is_dir():
+            for path in directory.glob(f"{node_id}.*.json"):
+                middle = path.name[len(prefix):-5]
+                if middle.isdigit():
+                    numeric_paths.append((int(middle), path))
+        numeric_paths.sort()
+        for sequence, path in numeric_paths:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("producer-revision-history-invalid")
+            try:
+                raw = path.read_bytes()
+                marker = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("producer-revision-history-invalid") from exc
+            if (not isinstance(marker, dict) or marker.get("sequence") != sequence
+                    or marker.get("route_id") != route.get("route_id")
+                    or marker.get("route_hash") != route.get("route_hash")
+                    or marker.get("node_id") != node_id):
+                raise ValueError("producer-revision-history-invalid")
+            if marker.get("stage_authority") != "revision":
+                continue
+            revision = marker.get("revision")
+            evidence = marker.get("evidence")
+            if not isinstance(revision, dict) or not isinstance(evidence, dict):
+                raise ValueError("producer-revision-history-invalid")
+            prior_sequence = revision.get("of_sequence")
+            if not isinstance(prior_sequence, int) or prior_sequence < 1 or prior_sequence >= sequence:
+                raise ValueError("producer-revision-history-invalid")
+            prior_path = directory / f"{node_id}.{prior_sequence}.json"
+            try:
+                prior_bytes = prior_path.read_bytes()
+                prior_marker = json.loads(prior_bytes.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("producer-revision-history-invalid") from exc
+            prior_sha = hashlib.sha256(prior_bytes).hexdigest()
+            if (revision.get("of_marker_sha256") != prior_sha
+                    or revision.get("of_evidence_sha256") != (prior_marker.get("evidence") or {}).get("sha256")
+                    or revision.get("evidence_sha256") != evidence.get("sha256")):
+                raise ValueError("producer-revision-history-invalid")
+            try:
+                revision_basis_verdict(
+                    route, node, revision.get("basis"), revision.get("answers") or (),
+                    jobs=jobs, direction=revision.get("direction"), reason=revision.get("reason"),
+                )
+            except ValueError as exc:
+                raise ValueError(f"producer-revision-basis-unverified:{node_id}:{exc}") from exc
+            revision_markers.append((sequence, raw, marker))
+
+        canonical_path = directory / f"{node_id}.json"
+        if canonical_path.is_symlink():
+            raise ValueError("producer-revision-canonical-invalid")
+        if canonical_path.is_file():
+            try:
+                canonical_raw = canonical_path.read_bytes()
+                canonical = json.loads(canonical_raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError("producer-revision-canonical-invalid") from exc
+            if not isinstance(canonical, dict):
+                raise ValueError("producer-revision-canonical-invalid")
+            sequence = canonical.get("sequence")
+            if not isinstance(sequence, int) or sequence < 1:
+                raise ValueError("producer-revision-canonical-invalid")
+            history_path = directory / f"{node_id}.{sequence}.json"
+            if (canonical.get("route_id") != route.get("route_id")
+                    or canonical.get("route_hash") != route.get("route_hash")
+                    or canonical.get("node_id") != node_id
+                    or history_path.is_symlink() or not history_path.is_file()
+                    or history_path.read_bytes() != canonical_raw):
+                raise ValueError("producer-revision-canonical-history-conflict")
+            currency = gate_currency(route, node, canonical_path, canonical,
+                                     observe=True, jobs=jobs)
+            if currency.state != "current":
+                raise ValueError(f"producer-revision-marker-{currency.state}:{node_id}:{currency.reason}")
+            latest_revision = revision_markers[-1] if revision_markers else None
+            if (latest_revision and canonical.get("stage_authority") == "revision"
+                    and canonical.get("sequence") == latest_revision[0]):
+                pending = True
+            elif (canonical.get("stage_authority") != "revision"
+                    and not canonical.get("state") and canonical.get("attempt_id")):
+                current_attempt_ids[node_id] = str(canonical["attempt_id"])
+        elif numeric_paths:
+            raise ValueError("producer-revision-canonical-missing")
+
+        if revision_markers:
+            any_revision = True
+            sequence, raw, marker = revision_markers[-1]
+            revision = marker["revision"]
+            generation_basis.append({
+                "node_id": node_id,
+                "sequence": sequence,
+                "marker_sha256": hashlib.sha256(raw).hexdigest(),
+                "basis": revision.get("basis"),
+                "answers": revision.get("answers") or [],
+                "direction": revision.get("direction"),
+                "reason": revision.get("reason"),
+                "author_attempt_id": revision.get("author_attempt_id"),
+                "evidence_sha256": (marker.get("evidence") or {}).get("sha256"),
+            })
+        else:
+            generation_basis.append({"node_id": node_id, "sequence": 0})
+
+    generation = "1"
+    if any_revision:
+        encoded = json.dumps(generation_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        generation = "rev-" + hashlib.sha256(encoded).hexdigest()
+    if pending:
+        # A revision marker is the approval for a new generation. The prior
+        # completed producer attempts remain history, not peers in this batch.
+        current_attempt_ids = {}
+    return {"managed": True, "generation": generation, "pending": pending,
+            "current_attempt_ids": current_attempt_ids, "basis": generation_basis}
+
 def _supersession_records(route, node_id, jobs=None):
     """The node's canonical marker when an upstream revision tombstoned it,
     as a `supersedes` entry: its verdict no longer covers the revised input,
@@ -12717,6 +12896,7 @@ def main():
                                        for n in route["nodes"]],
                               "human_gates":route.get("human_gates"),"parallel_groups":route.get("parallel_groups"),
                               "campaign":_campaign_for_card,
+                              **({"route_plan":route["route_plan"]} if route.get("route_plan") else {}),
                               "advisories":OWNER_WRITE_ADVISORY.advisories(route, owner_harness=owner_pin),
                               "tracked_gate_evidence":route.get("tracked_gate_evidence"),
                               **compose_observations(route)},sort_keys=True))
@@ -12757,7 +12937,8 @@ def main():
         if attempt!=a.attempt_id:
             result["redirected_from"]=a.attempt_id
         from dispatch_owner_input import blocked_owner_answers
-        if a.message_file and (result.get("retained") or blocked_owner_answers(jobs,attempt)):
+        if (a.message_file and not result.get("consumer_recovery")
+                and (result.get("retained") or blocked_owner_answers(jobs,attempt))):
             # The owner had ended BLOCKED (also when it ended just after this answer was
             # queued): the answer continues the route now, in the same call, through the
             # one shared start (a replacement owner receives it).

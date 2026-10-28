@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""Periodic steward check: fake-clock schedule, idle rule, retirement and reactivation.
+
+Every test injects ``now``; nothing sleeps, no input or Stop hook runs, and the
+real ``session_notice`` carrier writes into a private jobs root.
+"""
+import importlib.util
+import io
+import json
+import os
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(ROOT / "tools"))
+
+import dispatch_pending_delivery as pending_delivery  # noqa: E402
+import dispatch_session_sweep as sweep  # noqa: E402
+import peer_obligations  # noqa: E402
+import session_notice  # noqa: E402
+import steward_check as SC  # noqa: E402
+
+REAL_OBSERVE = SC._observe_role
+REAL_ROLE_HELD = SC._role_held
+REAL_HUMAN_WAIT = SC._human_wait_open
+REAL_ROLE_FLAGGED = SC._role_flagged
+T0 = 1_000_000.0
+INTERVAL = 7200
+HARNESS = "claude"
+SID = "sid-steward-A"
+CARRIER = "claude-parent-runtime"
+
+
+def target(name="worker", state="working", liveness="live", harness="claude", sid=None):
+    return {"name": name, "harness": harness, "session_id": sid or f"sid-{name}",
+            "state": state, "liveness": liveness}
+
+
+class CheckBase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        (self.tmp / "jobs.log").write_text("")
+        self.config = self.tmp / "dispatch-defaults.yaml"
+        env = {"AGENT_PEER_LEDGER_ROOT": str(self.tmp), "AGENT_DISPATCH_JOBS": str(self.tmp / "jobs.log"),
+               "DISPATCH_DEFAULTS_CONFIG": str(self.config)}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        SC._POLICY.update(signature=None, interval=SC.DEFAULT_INTERVAL_SECONDS, warnings=[])
+        SC._THROTTLE.clear()
+        self.store = peer_obligations.ObligationStore(self.tmp)
+        self.role = {"held": True, "reason": None, "successor": None}
+        self.seen = {"targets": [target()], "pending_messages": 0}
+        self.liveness = "live"
+        self.human_wait = False
+        self.flagged = True
+        for name, replacement in (
+                ("_role_held", lambda h, s: dict(self.role)),
+                ("_role_flagged", lambda h, s: self.flagged),
+                ("_observe_role", lambda h, s: {"targets": list(self.seen["targets"]),
+                                                "pending_messages": self.seen["pending_messages"]}),
+                ("_session_liveness", lambda h, s, agents=None: self.liveness),
+                ("_human_wait_open", lambda h, s, now: self.human_wait),
+                ("_agents", lambda: [])):
+            patch = mock.patch.object(SC, name, side_effect=replacement)
+            patch.start()
+            self.addCleanup(patch.stop)
+        for name in ("ensure_normal_runner", "request_dispatch_reconciliation"):
+            patch = mock.patch.object(peer_obligations, name, return_value=False)
+            patch.start()
+            self.addCleanup(patch.stop)
+        spy = mock.patch.object(session_notice, "notify", wraps=session_notice.notify)
+        self.notify = spy.start()
+        self.addCleanup(spy.stop)
+
+    # helpers -------------------------------------------------------------
+    def write_config(self, seconds):
+        shipped = (ROOT / "profiles" / "dispatch-defaults.yaml").read_text(encoding="utf-8")
+        text = re.sub(r"check_interval_seconds: \d+", f"check_interval_seconds: {seconds}", shipped)
+        self.config.write_text(text, encoding="utf-8")
+        stat = self.config.stat()
+        os.utime(self.config, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    def register(self, now=T0, **kwargs):
+        return SC.register(HARNESS, SID, now=now, store=self.store, ensure_runner=False, **kwargs)
+
+    def duty(self):
+        return self.store.get(SC.duty_id(HARNESS, SID))
+
+    def step(self, now):
+        SC.advance(self.duty(), self.store, now=now)
+        return self.duty()
+
+    def obs(self):
+        return self.duty()["observation"]
+
+    def notice(self, index=-1):
+        """The receipt of the nth ``notify`` call, read back from the stored record."""
+        call = self.notify.call_args_list[index]
+        return call.kwargs
+
+    def record(self):
+        return SC._notice_record(SID, self.obs()["notice_delivery_id"])
+
+    def deliver_and_ack(self):
+        claimed, _count = sweep.sweep_deliver(self.tmp, CARRIER, SID)
+        self.assertEqual(sweep.ack_delivered(self.tmp, SID, claimed, acked_by="test"), len(claimed))
+        return claimed
+
+    def check(self, now):
+        out = io.StringIO()
+        self.assertEqual(SC.cmd_check(HARNESS, SID, now=now, out=out), 0)
+        return out.getvalue()
+
+
+class StewardCheckScheduleTest(CheckBase):
+    def test_default_interval_is_two_hours(self):
+        self.assertEqual(SC.interval_seconds(), INTERVAL)
+
+    def test_one_notice_at_due_then_busy_and_undelivered_merge(self):
+        self.register()
+        self.step(T0 + INTERVAL - 1)
+        self.assertEqual(self.notify.call_count, 0)
+        duty = self.step(T0 + INTERVAL)
+        self.assertEqual(self.notify.call_count, 1)
+        self.assertEqual(duty["observation"]["phase"], "notified")
+        self.assertEqual(self.notice()["required_action"], "run-steward-check")
+        self.assertEqual(self.record()["state"], "pending")
+        for later in (T0 + 2 * INTERVAL, T0 + 3 * INTERVAL, T0 + 10 * INTERVAL):
+            self.step(later)
+        self.assertEqual(self.notify.call_count, 1)  # undelivered: merged, never stacked
+
+    def test_five_hour_gap_after_check_sends_exactly_one(self):
+        self.register()
+        self.step(T0 + INTERVAL)
+        self.deliver_and_ack()
+        self.step(T0 + INTERVAL + 120)
+        self.assertEqual(self.obs()["phase"], "scheduled")
+        t1 = T0 + INTERVAL + 600
+        self.check(t1)
+        self.assertEqual(self.obs()["last_checked"], t1)
+        self.assertEqual(self.obs()["anchor"], t1)
+        gap = t1 + 5 * 3600
+        self.step(gap)
+        self.assertEqual(self.notify.call_count, 2)
+        for later in (gap + 60, gap + 120, gap + 3600):
+            self.step(later)
+        self.assertEqual(self.notify.call_count, 2)  # no catch-up for the missed intervals
+
+    def test_long_silence_without_a_check_still_sends_one(self):
+        self.register()
+        self.step(T0 + 5 * 3600)
+        self.assertEqual(self.notify.call_count, 1)
+        self.step(T0 + 5 * 3600 + 60)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_a_notice_alone_does_not_record_last_checked(self):
+        self.register()
+        self.step(T0 + INTERVAL)
+        self.deliver_and_ack()
+        self.step(T0 + INTERVAL + 100)
+        self.assertIsNone(self.obs()["last_checked"])
+        self.assertEqual(self.obs()["anchor"], T0 + INTERVAL + 100)
+
+    def test_release_stops_every_later_notice(self):
+        self.register()
+        self.step(T0 + INTERVAL)
+        SC.settle_session(HARNESS, SID, reason="role-released", store=self.store)
+        self.assertEqual(self.duty()["state"], "complete")
+        self.assertEqual(self.store.list(kinds=[SC.DUTY_KIND]), [])  # not a runner duty any more
+        for later in (T0 + 2 * INTERVAL, T0 + 9 * INTERVAL, T0 + 30 * INTERVAL):
+            self.step(later)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_register_is_idempotent_for_a_pending_duty(self):
+        first = self.register()
+        again = self.register(now=T0 + 500)
+        self.assertEqual(first["observation"]["epoch"], again["observation"]["epoch"])
+        self.assertEqual(again["observation"]["anchor"], T0)
+
+
+class StewardCheckIntervalTest(CheckBase):
+    def test_user_interval_is_read_and_used(self):
+        self.write_config(3600)
+        self.assertEqual(SC.interval_seconds(), 3600)
+        self.register()
+        self.step(T0 + 3599)
+        self.assertEqual(self.notify.call_count, 0)
+        self.step(T0 + 3600)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_rewritten_file_is_read_again_by_stat(self):
+        self.write_config(3600)
+        self.assertEqual(SC.interval_seconds(), 3600)
+        self.write_config(7200)
+        self.assertEqual(SC.interval_seconds(), 7200)
+        self.write_config(600)
+        self.assertEqual(SC.interval_seconds(), 600)
+
+    def test_changed_interval_applies_from_the_next_pass_without_accumulation(self):
+        self.register()
+        self.step(T0 + 3700)
+        self.assertEqual(self.notify.call_count, 0)
+        self.write_config(3600)
+        self.step(T0 + 3800)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_corrupt_file_falls_back_to_the_default_with_a_warning(self):
+        self.config.write_text("garbage: [\n", encoding="utf-8")
+        self.assertEqual(SC.interval_seconds(), INTERVAL)
+        self.assertTrue(any("steward-settings-unreadable" in item for item in SC.policy_warnings()))
+
+    def test_missing_file_uses_the_shipped_default_quietly(self):
+        self.assertEqual(SC.interval_seconds(), INTERVAL)
+        self.assertEqual(SC.policy_warnings(), [])
+
+    def test_shipped_yaml_default_matches_the_runtime_default(self):
+        spec = importlib.util.spec_from_file_location("_dd", str(HERE / "dispatch-defaults.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        policy, warnings = module.load_steward_policy(
+            config_path=str(ROOT / "profiles" / "dispatch-defaults.yaml"))
+        self.assertEqual(policy["check_interval_seconds"], INTERVAL)
+        self.assertEqual(warnings, [])
+
+
+class StewardCheckIdleTest(CheckBase):
+    def due(self, index):
+        return T0 + (index + 1) * INTERVAL + index * 200
+
+    def test_no_target_sends_one_short_release_reminder_then_no_turn(self):
+        self.seen = {"targets": [], "pending_messages": 0}
+        self.register()
+        self.step(T0 + INTERVAL)
+        self.assertEqual(self.notify.call_count, 1)
+        sent = self.notice()
+        self.assertEqual(sent["required_action"], "release-if-idle")
+        self.assertLessEqual(len(sent["text"]), session_notice.MAX_TEXT)
+        self.assertIn("peer-steward steward off", sent["text"])
+        self.deliver_and_ack()
+        acked_at = T0 + INTERVAL + 100
+        self.step(acked_at)
+        for index in (1, 2):
+            now = acked_at + index * INTERVAL
+            duty = self.step(now)
+            self.assertEqual(self.notify.call_count, 1)  # no model turn for an unchanged idle role
+            self.assertEqual(duty["observation"]["skipped"], index)
+            self.assertEqual(duty["observation"]["anchor"], now)
+            self.assertIsNone(duty["observation"]["last_checked"])
+            self.assertEqual(duty["state"], "pending")  # the role is never revoked here
+        self.seen = {"targets": [target()], "pending_messages": 0}
+        self.step(acked_at + 3 * INTERVAL)
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertEqual(self.notice()["required_action"], "run-steward-check")
+
+    def test_pending_peer_message_is_not_idle(self):
+        self.seen = {"targets": [], "pending_messages": 2}
+        self.register()
+        self.step(T0 + INTERVAL)
+        self.assertEqual(self.notice()["required_action"], "run-steward-check")
+
+    def test_all_finished_targets_send_one_tidy_reminder(self):
+        self.seen = {"targets": [target("a", state="done"), target("b", liveness="ended")],
+                     "pending_messages": 0}
+        self.register()
+        self.step(T0 + INTERVAL)
+        sent = self.notice()
+        self.assertEqual(sent["required_action"], "tidy-and-release")
+        self.assertIn("all 2 of your targets", sent["text"])
+        self.assertLessEqual(len(sent["text"]), session_notice.MAX_TEXT)
+        self.deliver_and_ack()
+        self.step(T0 + INTERVAL + 100)
+        self.step(T0 + 2 * INTERVAL + 100)
+        self.assertEqual(self.notify.call_count, 1)
+        self.assertEqual(self.obs()["reason"], "quiet-no-change")
+
+    def test_a_state_change_sends_the_reminder_again(self):
+        self.seen = {"targets": [target("a", state="done")], "pending_messages": 0}
+        self.register()
+        self.step(T0 + INTERVAL)
+        self.deliver_and_ack()
+        self.step(T0 + INTERVAL + 100)
+        self.seen = {"targets": [target("a", state="done"), target("b", state="done")],
+                     "pending_messages": 0}
+        self.step(T0 + 2 * INTERVAL + 100)
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertEqual(self.notice()["required_action"], "tidy-and-release")
+
+    def test_a_working_target_is_checked_every_interval(self):
+        self.register()
+        self.step(T0 + INTERVAL)
+        self.deliver_and_ack()
+        self.step(T0 + INTERVAL + 100)
+        self.step(T0 + 2 * INTERVAL + 100)
+        self.assertEqual(self.notify.call_count, 2)  # same state still checks: stall is the point
+        self.assertIn("peer-steward steward check", self.notice()["text"])
+
+    def test_long_target_lists_stay_within_the_notice_limit(self):
+        self.seen = {"targets": [target("x" * 40 + str(i), state="done") for i in range(12)],
+                     "pending_messages": 0}
+        self.register()
+        self.step(T0 + INTERVAL)
+        text = self.notice()["text"]
+        self.assertLessEqual(len(text), session_notice.MAX_TEXT)
+        self.assertIn("peer-steward steward off", text)
+
+
+class StewardCheckOwnTargetsTest(CheckBase):
+    """The real role_targets winner rule: each steward sees only the targets it wins."""
+
+    def setUp(self):
+        super().setUp()
+        from fleet.collectors import steward
+        self.steward = steward
+        repo = self.tmp / "repo"
+        (repo / ".git").mkdir(parents=True)
+        self.cwd = str(repo)
+
+    def marker(self, sid, targets):
+        return {"schema_version": 1, "harness": "claude", "session_id": sid,
+                "generation": "gen-" + sid, "targets": {
+                    name: {"harness": "claude", "session_id": f"sid-{name}", "name": name,
+                           "kind": "watch", "source": "watch", "ts": ts}
+                    for name, ts in targets.items()}}
+
+    def test_cmd_check_lists_only_the_targets_this_steward_wins(self):
+        markers = {("claude", "sid-A"): self.marker("sid-A", {"t1": "2026-10-27T01:00:00Z",
+                                                              "t3": "2026-10-27T01:00:00Z"}),
+                   ("claude", "sid-B"): self.marker("sid-B", {"t1": "2026-10-27T05:00:00Z",
+                                                              "t2": "2026-10-27T05:00:00Z"})}
+        rows = [SimpleNamespace(harness="claude", session_id=sid, cwd=self.cwd, runtime_name=None)
+                for sid in ("sid-A", "sid-B", "sid-t1", "sid-t2", "sid-t3")]
+        patches = [
+            mock.patch.object(SC, "_observe_role", side_effect=REAL_OBSERVE),
+            mock.patch.object(self.steward, "read_markers", return_value=markers),
+            mock.patch.object(self.steward, "read_relations", return_value=[]),
+            mock.patch.object(self.steward, "_projection_sessions", return_value=rows),
+            mock.patch.object(self.steward, "_native_role_sessions", return_value=[])]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        outputs = {}
+        for sid in ("sid-A", "sid-B"):
+            out = io.StringIO()
+            self.assertEqual(SC.cmd_check("claude", sid, now=T0, out=out), 0)
+            outputs[sid] = out.getvalue()
+        names = lambda text: sorted(re.findall(r"^target name=(\S+)", text, re.M))
+        self.assertEqual(names(outputs["sid-A"]), ["t3"])
+        self.assertEqual(names(outputs["sid-B"]), ["t1", "t2"])
+        self.assertIn("role=yes", outputs["sid-A"])
+        self.assertIn("next_due_in_minutes=120", outputs["sid-A"])
+
+    def test_not_a_steward_prints_role_no_and_records_nothing(self):
+        self.role = {"held": False, "reason": "role-released", "successor": None}
+        self.assertEqual(self.check(T0).strip(), "steward-check role=no")
+        self.assertIsNone(self.duty())
+
+    def test_changes_none_when_the_observation_is_unchanged(self):
+        self.seen = {"targets": [target("a"), target("b")], "pending_messages": 0}
+        self.register()
+        first = self.check(T0 + 10)
+        self.assertIn("changes=2", first)
+        self.assertIn("changes=none", self.check(T0 + 20))
+        self.seen = {"targets": [target("a", state="done"), target("b")], "pending_messages": 0}
+        self.assertIn("changes=1", self.check(T0 + 30))
+
+    def test_no_target_check_is_two_lines_with_the_release_hint(self):
+        self.seen = {"targets": [], "pending_messages": 0}
+        self.register()
+        lines = self.check(T0 + 10).strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("targets=none changes=none", lines[0])
+        self.assertIn("peer-steward steward off", lines[1])
+
+    def test_check_retires_an_undelivered_notice_and_records_the_check(self):
+        self.register()
+        self.step(T0 + INTERVAL)
+        delivery_id = self.obs()["notice_delivery_id"]
+        self.assertEqual(SC._notice_record(SID, delivery_id)["state"], "pending")
+        out = self.check(T0 + INTERVAL + 5)
+        self.assertIn("undelivered_notices=1", out)
+        self.assertEqual(SC._notice_record(SID, delivery_id)["state"], "rejected")
+        self.assertEqual(self.obs()["phase"], "scheduled")
+        self.assertEqual(self.obs()["last_checked"], T0 + INTERVAL + 5)
+
+
+class StewardCheckRetireTest(CheckBase):
+    def peer_steward(self):
+        spec = importlib.util.spec_from_file_location("_peer_steward_for_retire",
+                                                      str(HERE / "peer-steward.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def notified(self):
+        self.register()
+        self.step(T0 + INTERVAL)
+        return self.obs()["notice_delivery_id"]
+
+    def test_release_rejects_the_notice_and_closes_its_run_notice_duty(self):
+        delivery_id = self.notified()
+        SC.settle_session(HARNESS, SID, reason="role-released", store=self.store)
+        self.assertEqual(SC._notice_record(SID, delivery_id)["state"], "rejected")
+        run_notice = self.store.list(kinds=["run-notice"])
+        self.assertEqual(len(run_notice), 1)
+        steward = self.peer_steward()
+        with mock.patch.object(steward, "_herdr_agent_list", create=True) as listed, \
+             mock.patch("subprocess.run") as run:
+            steward._resume_ordinary_notice_obligation(run_notice[0], self.store)
+        self.assertEqual(run.call_count, 0)
+        self.assertEqual(listed.call_count, 0)
+        self.assertEqual(self.store.get(run_notice[0]["id"])["state"], "complete")
+        self.assertEqual(self.store.list(kinds=["run-notice"]), [])
+        self.assertEqual(sweep.sweep_deliver(self.tmp, CARRIER, SID)[0], [])
+
+    def test_holder_change_moves_the_schedule_to_the_successor(self):
+        self.register(now=T0)
+        delivery_id = self.notified()
+        self.role = {"held": False, "reason": "holder-changed", "successor": ("claude", "sid-succ")}
+        self.step(T0 + INTERVAL + 100)  # first notified pass after the throttle window
+        self.assertEqual(self.duty()["state"], "complete")
+        self.assertEqual(self.obs()["reason"], "holder-changed")
+        self.assertEqual(SC._notice_record(SID, delivery_id)["state"], "rejected")
+        successor = self.store.get(SC.duty_id("claude", "sid-succ"))
+        self.assertEqual(successor["state"], "pending")
+        self.assertEqual(successor["observation"]["anchor"], T0)  # the old duty's schedule is inherited
+        self.assertEqual(self.store.list(kinds=["steward-check"])[0]["id"], successor["id"])
+
+    def test_an_existing_successor_duty_is_left_alone(self):
+        SC.register("claude", "sid-succ", now=T0 + 50, store=self.store, ensure_runner=False)
+        epoch = self.store.get(SC.duty_id("claude", "sid-succ"))["observation"]["epoch"]
+        self.register()
+        self.role = {"held": False, "reason": "holder-changed", "successor": ("claude", "sid-succ")}
+        self.step(T0 + INTERVAL)
+        successor = self.store.get(SC.duty_id("claude", "sid-succ"))
+        self.assertEqual(successor["observation"]["epoch"], epoch)
+        self.assertEqual(successor["observation"]["anchor"], T0 + 50)
+
+    def test_proven_session_end_retires_the_duty_and_its_notice(self):
+        delivery_id = self.notified()
+        self.liveness = "ended"
+        self.step(T0 + INTERVAL + 100)
+        self.assertEqual(self.duty()["state"], "complete")
+        self.assertEqual(self.obs()["reason"], "session-ended")
+        self.assertEqual(SC._notice_record(SID, delivery_id)["state"], "rejected")
+
+    def test_ended_session_before_due_is_retired_at_due(self):
+        self.register()
+        self.liveness = "ended"
+        self.step(T0 + INTERVAL)
+        self.assertEqual(self.obs()["reason"], "session-ended")
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_unknown_liveness_keeps_the_duty_and_the_notice(self):
+        delivery_id = self.notified()
+        self.liveness = "unknown"
+        self.step(T0 + INTERVAL + 100)
+        self.assertEqual(self.duty()["state"], "pending")
+        self.assertEqual(SC._notice_record(SID, delivery_id)["state"], "pending")
+
+    def test_notice_is_current_follows_the_duty_through_session_notice(self):
+        delivery_id = self.notified()
+        record = SC._notice_record(SID, delivery_id)
+        self.assertTrue(session_notice.notice_is_current(record))  # real delegation, lazy import
+        self.role = {"held": False, "reason": "holder-changed", "successor": None}
+        self.assertFalse(session_notice.notice_is_current(record))
+        self.role = {"held": True, "reason": None, "successor": None}
+        self.assertTrue(session_notice.notice_is_current(record))
+        SC.settle_session(HARNESS, SID, reason="role-released", store=self.store)
+        self.assertFalse(session_notice.notice_is_current(record))
+
+    def test_a_stale_epoch_notice_is_not_current(self):
+        delivery_id = self.notified()
+        record = SC._notice_record(SID, delivery_id)
+        SC.settle_session(HARNESS, SID, reason="role-released", store=self.store)
+        self.register(now=T0 + 10)
+        self.assertFalse(session_notice.notice_is_current(record))  # an older life of the duty
+
+    def test_other_notice_keys_stay_current_and_failures_stay_recoverable(self):
+        other = session_notice.notify(HARNESS, "sid-other", key="run:host-1", subject="s", text="t",
+                                      jobs=self.tmp / "jobs.log")
+        self.assertTrue(session_notice.notice_is_current(other))
+        self.notified()
+        record = SC._notice_record(SID, self.obs()["notice_delivery_id"])
+        with mock.patch.object(SC, "_store", side_effect=RuntimeError("store down")):
+            self.assertTrue(session_notice.notice_is_current(record))
+
+    def test_a_carrier_claim_drops_a_notice_the_duty_no_longer_vouches_for(self):
+        self.notified()
+        self.role = {"held": False, "reason": "holder-changed", "successor": None}
+        claimed, _count = sweep.sweep_deliver(self.tmp, CARRIER, SID)
+        self.assertEqual(claimed, [])
+        self.assertEqual(self.record()["state"], "rejected")
+
+    def test_role_held_reads_the_real_relation_ledger(self):
+        marker = self.tmp / "peer-steward" / HARNESS / "sid-real.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "schema_version": 1, "harness": HARNESS, "session_id": "sid-real", "generation": "g-real",
+            "targets": {"-": {"harness": "unknown", "name": "-", "session_id": None,
+                              "kind": "explicit", "source": "explicit", "ts": "2026-10-27T01:00:00Z"}}}),
+            encoding="utf-8")
+        environ = {"XDG_STATE_HOME": str(self.tmp / "state"), "HOME": str(self.tmp / "home")}
+        with mock.patch.dict(os.environ, environ):
+            self.assertEqual(REAL_ROLE_HELD(HARNESS, "sid-real")["held"], True)
+            released = REAL_ROLE_HELD(HARNESS, "sid-absent")
+        self.assertEqual((released["held"], released["reason"]), (False, "role-released"))
+
+    def test_settle_without_a_duty_is_a_noop(self):
+        self.assertIsNone(SC.settle_session(HARNESS, SID, reason="role-released", store=self.store))
+
+
+class StewardCheckReactivationTest(CheckBase):
+    def test_register_after_settle_reactivates_with_a_fresh_epoch(self):
+        self.register()
+        old_epoch = self.obs()["epoch"]
+        self.step(T0 + INTERVAL)
+        first_delivery = self.obs()["notice_delivery_id"]
+        self.deliver_and_ack()
+        SC.settle_session(HARNESS, SID, reason="role-released", store=self.store)
+        self.assertEqual(self.duty()["state"], "complete")
+        revived = self.register(now=T0 + 5000)
+        self.assertEqual(revived["state"], "pending")
+        self.assertEqual(revived["id"], SC.duty_id(HARNESS, SID))
+        self.assertNotEqual(revived["observation"]["epoch"], old_epoch)
+        self.assertEqual(revived["observation"]["cycle"], 0)
+        self.assertEqual(revived["observation"]["anchor"], T0 + 5000)
+        self.assertEqual(revived["observation"]["reason"], "reactivated")
+        self.assertEqual(self.store.list(kinds=["steward-check"])[0]["id"], revived["id"])
+        self.step(T0 + 5000 + INTERVAL)
+        self.assertEqual(self.notify.call_count, 2)
+        self.assertNotEqual(self.obs()["notice_delivery_id"], first_delivery)
+
+    def test_reactivation_may_inherit_a_schedule_and_keeps_last_checked(self):
+        self.register()
+        self.check(T0 + 100)
+        SC.settle_session(HARNESS, SID, reason="role-released", store=self.store)
+        revived = self.register(now=T0 + 9000, anchor=T0 + 300)
+        self.assertEqual(revived["observation"]["anchor"], T0 + 300)
+        self.assertEqual(revived["observation"]["last_checked"], T0 + 100)
+
+    def test_a_pruned_record_registers_as_new(self):
+        self.register()
+        old_epoch = self.obs()["epoch"]
+        os.unlink(self.store._record_path(SC.duty_id(HARNESS, SID)))
+        fresh = self.register(now=T0 + 20)
+        self.assertEqual(fresh["state"], "pending")
+        self.assertNotEqual(fresh["observation"]["epoch"], old_epoch)
+
+    def test_unknown_harness_and_empty_identity_register_nothing(self):
+        self.assertIsNone(SC.register("other", SID, store=self.store, ensure_runner=False))
+        self.assertIsNone(SC.register(HARNESS, "", store=self.store, ensure_runner=False))
+
+    def marker(self, sid=SID):
+        path = self.tmp / "peer-steward" / HARNESS / f"{sid}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        return path
+
+    def test_reconcile_self_registers_an_existing_steward_once(self):
+        ident = SimpleNamespace(harness=HARNESS, session_id=SID)
+        SC.reconcile_self(self.store, identity=ident)  # no marker, no duty: nothing
+        self.assertIsNone(self.duty())
+        self.marker()
+        SC.reconcile_self(self.store, identity=ident)
+        self.assertEqual(self.duty()["state"], "pending")
+        epoch = self.obs()["epoch"]
+        SC.reconcile_self(self.store, identity=ident)
+        self.assertEqual(self.obs()["epoch"], epoch)
+
+    def test_reconcile_self_retires_a_duty_whose_marker_is_gone(self):
+        self.register()
+        self.role = {"held": False, "reason": "role-released", "successor": None}
+        SC.reconcile_self(self.store, identity=SimpleNamespace(harness=HARNESS, session_id=SID))
+        self.assertEqual(self.duty()["state"], "complete")
+
+    def test_reconcile_all_registers_holders_and_leaves_orphans_to_their_due(self):
+        orphan = SC.register("claude", "sid-orphan", now=T0, store=self.store, ensure_runner=False)
+        relations = [{"released": False, "origin": {"harness": "claude", "sid": SID},
+                      "holder": {"harness": "claude", "sid": SID}, "targets": [{"name": "w"}]},
+                     {"released": False, "origin": {"harness": "claude", "sid": "sid-ended"},
+                      "holder": {"harness": "claude", "sid": "sid-ended"}, "targets": [{"name": "w"}]}]
+        with mock.patch.object(SC, "_relations", return_value=relations), \
+             mock.patch.object(SC, "_session_liveness",
+                               side_effect=lambda h, s, agents=None: "ended" if s == "sid-ended" else "live"), \
+             mock.patch.object(peer_obligations.ObligationStore, "list",
+                               side_effect=AssertionError("no store listing at runner start")):
+            SC.reconcile_all(self.store)
+        self.assertEqual(self.duty()["state"], "pending")
+        self.assertIsNone(self.store.get(SC.duty_id("claude", "sid-ended")))
+        self.assertEqual(self.store.get(orphan["id"])["state"], "pending")
+        self.role = {"held": False, "reason": "role-released", "successor": None}
+        SC.advance(self.store.get(orphan["id"]), self.store, now=T0 + INTERVAL)
+        self.assertEqual(self.store.get(orphan["id"])["state"], "complete")
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_reconcile_all_without_holders_touches_nothing(self):
+        with mock.patch.object(SC, "_relations", return_value=[]), \
+             mock.patch.object(SC, "_agents", side_effect=AssertionError("no herdr call")), \
+             mock.patch.object(peer_obligations.ObligationStore, "get",
+                               side_effect=AssertionError("no record read")):
+            SC.reconcile_all(self.store)
+
+
+class StewardCheckEscTest(CheckBase):
+    def test_an_interrupted_idle_session_still_gets_the_notice(self):
+        # Esc leaves no steward-side signal: an idle pane is checked like any other.
+        self.seen = {"targets": [target(state="idle")], "pending_messages": 0}
+        self.register()
+        self.step(T0 + INTERVAL)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_an_open_question_defers_and_the_closed_one_sends_once(self):
+        self.register()
+        self.human_wait = True
+        self.step(T0 + INTERVAL)
+        self.assertEqual(self.notify.call_count, 0)
+        self.assertEqual(self.obs()["reason"], "human-wait-deferred")
+        self.assertEqual(self.obs()["anchor"], T0)  # schedule kept, not pushed forward
+        self.step(T0 + INTERVAL + 30)  # within the recheck window: nothing is even read
+        self.human_wait = False
+        self.step(T0 + INTERVAL + 40)
+        self.assertEqual(self.notify.call_count, 0)  # still inside the 60 s recheck throttle
+        self.step(T0 + INTERVAL + 61)
+        self.assertEqual(self.notify.call_count, 1)
+        self.step(T0 + INTERVAL + 200)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_human_wait_signal_is_read_for_this_session_only(self):
+        signals = [{"harness": "claude", "session_id": "other", "stale": False},
+                   {"harness": "claude", "session_id": SID, "stale": True}]
+        import human_wait_state
+        with mock.patch.object(human_wait_state, "read_signals", return_value=signals):
+            self.assertFalse(REAL_HUMAN_WAIT(HARNESS, SID, T0))
+            signals.append({"harness": "claude", "session_id": SID, "stale": False})
+            self.assertTrue(REAL_HUMAN_WAIT(HARNESS, SID, T0))
+
+
+
+class StewardCheckRoleFlagTest(CheckBase):
+    """Only a session Fleet flags as steward receives the periodic request."""
+
+    def test_foreign_repository_evidence_sends_nothing_and_keeps_the_duty(self):
+        self.register()
+        self.flagged = False
+        duty = self.step(T0 + INTERVAL)
+        self.assertEqual(self.notify.call_count, 0)
+        self.assertEqual(duty["observation"]["reason"], "no-steward-flag")
+        self.assertEqual(duty["observation"]["anchor"], T0 + INTERVAL)
+        self.assertIsNone(duty["observation"]["last_checked"])
+        self.assertTrue(SC._active(duty))
+        self.step(T0 + INTERVAL * 4)
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_flag_raised_later_gets_one_request_at_the_next_due(self):
+        self.register()
+        self.flagged = False
+        self.step(T0 + INTERVAL)
+        self.flagged = True
+        self.step(T0 + INTERVAL * 2 - 1)
+        self.assertEqual(self.notify.call_count, 0)
+        self.step(T0 + INTERVAL * 2)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_real_flag_seam_reads_the_fleet_role_flag(self):
+        collector = SimpleNamespace(role_flag=mock.Mock(return_value=False))
+        with mock.patch.object(SC, "_collector", return_value=collector):
+            self.assertFalse(REAL_ROLE_FLAGGED(HARNESS, SID))
+        collector.role_flag.assert_called_once_with(HARNESS, SID)
+        with mock.patch.object(SC, "_collector", return_value=None):
+            self.assertTrue(REAL_ROLE_FLAGGED(HARNESS, SID))
+
+
+def _load_peer_steward():
+    spec = importlib.util.spec_from_file_location("peer_steward_wiring", str(HERE / "peer-steward.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class StewardCheckRunnerWiringTest(CheckBase):
+    """The real peer-steward runner path advances the duty with no input or Stop hook."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.peer_steward = _load_peer_steward()
+
+    def selected(self):
+        return [duty["id"] for duty in self.peer_steward._runner_duties(self.store)]
+
+    def runner_pass(self, now):
+        with mock.patch.object(SC, "_now", return_value=now):
+            self.peer_steward._reconcile_obligations(
+                self.store, self.peer_steward._runner_duties(self.store))
+
+    def test_runner_pass_sends_one_notice_at_due_and_merges_after(self):
+        self.register()
+        self.assertIn(SC.duty_id(HARNESS, SID), self.selected())
+        self.runner_pass(T0 + INTERVAL - 1)
+        self.assertEqual(self.notify.call_count, 0)
+        self.runner_pass(T0 + INTERVAL)
+        self.assertEqual(self.notify.call_count, 1)
+        self.runner_pass(T0 + INTERVAL * 3)
+        self.assertEqual(self.notify.call_count, 1)
+
+    def test_released_role_leaves_the_runner_selection(self):
+        self.register()
+        SC.settle_session(HARNESS, SID, reason="role-released", store=self.store)
+        self.assertNotIn(SC.duty_id(HARNESS, SID), self.selected())
+        self.runner_pass(T0 + INTERVAL * 5)
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_lifecycle_reconcile_moves_an_existing_steward_onto_the_schedule(self):
+        marker = self.tmp / "peer-steward" / HARNESS / f"{SID}.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        self.assertIsNone(self.duty())
+        SC.reconcile_self(self.store, identity=SimpleNamespace(harness=HARNESS, session_id=SID))
+        self.assertTrue(SC._active(self.duty()))
+        self.assertIn(SC.duty_id(HARNESS, SID), self.selected())
+
+    def test_written_grant_starts_the_shared_runner(self):
+        self.peer_steward._ensure_steward_runner({"status": "granted", "written": True})
+        self.assertEqual(peer_obligations.ensure_normal_runner.call_count, 1)
+        self.peer_steward._ensure_steward_runner({"status": "limited", "written": False})
+        self.assertEqual(peer_obligations.ensure_normal_runner.call_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

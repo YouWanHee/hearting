@@ -143,6 +143,45 @@ class RegistryLinesCacheTest(unittest.TestCase):
                 self.assertIsNot(first, second)
                 self.assertIs(CACHE.registry_view(self.jobs, append_only=True), second)
 
+    def test_scoped_text_lines_keep_splitlines_across_full_and_append_generations(self):
+        row = "t\topen\t/repo\t/wt\tslug-{0}\tattempt_id=att-{0},note=한글\n"
+        generations = [
+            (row.format(0) + "\n" + row.format(1) + "partial-한").encode("utf-8"),
+            "글 tail\n".encode("utf-8") + row.format(2).encode("utf-8"),
+            b"malformed\n" + row.format(3).encode("utf-8") + "끝".encode("utf-8")[:2],
+        ]
+        data = b""
+        for appended in generations:
+            data += appended
+            with self.jobs.open("ab") as handle:
+                handle.write(appended)
+            with CACHE.registry_read_scope():
+                self.assertEqual(CACHE.registry_text_lines(self.jobs),
+                                 tuple(data.decode("utf-8", errors="replace").splitlines()))
+        self.assertEqual(CACHE.metrics_snapshot()["append_reuses"], 2)
+
+    def test_append_observation_transient_stays_near_one_registry_image(self):
+        import tracemalloc
+        row = "t\tdone\t/repo\t/wt\tslug-{0}\tattempt_id=att-{0},note=" + "한글메모" * 50 + "\n"
+        self.jobs.write_text("".join(row.format(index) for index in range(6000)), encoding="utf-8")
+        with CACHE.registry_read_scope():
+            CACHE.registry_text_lines(self.jobs)
+        with self.jobs.open("a", encoding="utf-8") as handle:
+            handle.write(row.format("appended"))
+        size = self.jobs.stat().st_size
+        gc.collect()
+        tracemalloc.start()
+        self.addCleanup(tracemalloc.stop)
+        base = tracemalloc.get_traced_memory()[0]
+        with CACHE.registry_read_scope():
+            lines = CACHE.registry_text_lines(self.jobs)
+        peak = tracemalloc.get_traced_memory()[1] - base
+        self.assertEqual(lines, tuple(self.jobs.read_text(encoding="utf-8").splitlines()))
+        self.assertEqual(CACHE.metrics_snapshot()["append_reuses"], 1)
+        # A joined copy, whole-file revalidation decode and full text decode
+        # used to stack about four registry images on every appended pass.
+        self.assertLess(peak, 2 * size)
+
     def test_scope_pins_alias_across_retarget_and_next_scope_observes_new_target(self):
         other = self.jobs.with_name("other.log")
         alias = self.jobs.with_name("alias.log")
@@ -514,14 +553,20 @@ class RegistryLinesCacheTest(unittest.TestCase):
         self.assertEqual(metrics["cache_entries"], CACHE._CACHE_MAX_PATHS)
         self.assertEqual(metrics["cache_evictions"], 1)
 
-    def test_registry_cache_bytes_are_bounded_even_for_one_oversized_path(self):
+    def test_one_oversized_path_stays_cached_and_older_paths_leave_first(self):
+        other = Path(self.tmp.name) / "other.log"
+        other.write_text("o\topen\t/repo\ttime\towner\tf=1\n", encoding="utf-8")
         with mock.patch.object(CACHE, "_CACHE_MAX_BYTES", 8):
+            CACHE.registry_view(other)
             self.jobs.write_text("large\topen\t/repo\ttime\towner\tf=1\n", encoding="utf-8")
             view = CACHE.registry_view(self.jobs)
             self.assertEqual(view.lines[0].split("\t", 1)[0], "large")
-            self.assertEqual(view._fd, -1)
-            self.assertEqual(CACHE.metrics_snapshot()["cache_entries"], 0)
-            self.assertEqual(CACHE.metrics_snapshot()["cache_bytes"], 0)
+            self.assertGreaterEqual(view._fd, 0)
+            metrics = CACHE.metrics_snapshot()
+            self.assertEqual(metrics["cache_entries"], 1)
+            self.assertEqual(metrics["cache_evictions"], 1)
+            self.assertIs(CACHE.registry_view(self.jobs), view)
+            self.assertEqual(CACHE.metrics_snapshot()["cache_hits"], 1)
 
     def test_cached_raw_content_is_included_in_budget_and_released_on_clear(self):
         content = b"a\tb\tc\td\te\tf=1\n"
@@ -871,6 +916,101 @@ class RegistryLinesCacheTest(unittest.TestCase):
             with CACHE.registry_read_scope():
                 CACHE.current_registry_view(self.jobs)
         self.assertEqual(constructed, [0])
+
+
+class LightRegistryViewTest(unittest.TestCase):
+    OWNER = "attempt_id=att-{n},attempt_schema_version=2,parent_sid=sid,worker_type=owner"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.jobs = Path(self.tmp.name) / "jobs.log"
+        CACHE.clear_cache()
+        CACHE.reset_metrics()
+
+    def _rows(self, statuses):
+        return "".join(f"t\t{status}\t/repo\t/wt\towner\t{self.OWNER.format(n=n)}\n"
+                       for n, status in enumerate(statuses))
+
+    def test_terminal_rows_parse_lazily_and_open_rows_keep_their_pairs(self):
+        self.jobs.write_text(self._rows(["done", "open", "running", "killed"]), encoding="utf-8")
+        view = CACHE.registry_view(self.jobs)
+        self.assertEqual([bool(row._completion_pairs) for row in view.records],
+                         [False, True, True, False])
+        self.assertEqual([bool(row._handover_pairs) for row in view.records],
+                         [False, True, True, False])
+        done = view.records[0]
+        self.assertEqual(done.completion_metadata()["attempt_id"], "att-0")
+        self.assertEqual(done.handover_metadata()["parent_sid"], "sid")
+        self.assertEqual(view.completion_attempt("att-0")[0], done)
+        self.assertEqual(view.handover_attempt("att-0")[1]["parent_sid"], "sid")
+        self.assertEqual(sorted(view.handover_latest()), ["att-0", "att-1", "att-2", "att-3"])
+
+    def test_lazy_lookup_cache_is_small_and_cleared_with_the_generation(self):
+        self.assertEqual(CACHE._completion_metadata.cache_info().maxsize, 256)
+        self.assertEqual(CACHE._handover_metadata.cache_info().maxsize, 256)
+        self.jobs.write_text(self._rows(["done", "done"]), encoding="utf-8")
+        view = CACHE.registry_view(self.jobs)
+        view.records[0].completion_metadata()
+        view.records[1].handover_metadata()
+        self.assertGreater(CACHE._completion_metadata.cache_info().currsize, 0)
+        self.assertGreater(CACHE._handover_metadata.cache_info().currsize, 0)
+        staged = self.jobs.with_name("jobs.replacement")
+        staged.write_text(self._rows(["done"]), encoding="utf-8")
+        os.replace(staged, self.jobs)
+        CACHE.registry_view(self.jobs)
+        self.assertEqual(CACHE._completion_metadata.cache_info().currsize, 0)
+        self.assertEqual(CACHE._handover_metadata.cache_info().currsize, 0)
+
+    def test_append_reuse_keeps_the_lookup_cache(self):
+        self.jobs.write_text(self._rows(["done"]), encoding="utf-8")
+        view = CACHE.registry_view(self.jobs, append_only=True)
+        view.records[0].completion_metadata()
+        with self.jobs.open("a", encoding="utf-8") as stream:
+            stream.write(self._rows(["done"]).replace("att-0", "att-1"))
+        CACHE.registry_view(self.jobs, append_only=True)
+        self.assertEqual(CACHE.metrics_snapshot()["append_reuses"], 1)
+        self.assertGreater(CACHE._completion_metadata.cache_info().currsize, 0)
+        CACHE.clear_cache()
+        self.assertEqual(CACHE._completion_metadata.cache_info().currsize, 0)
+
+    def test_scope_without_text_request_keeps_no_text_copy_and_lines_match(self):
+        raw = ("t\tdone\t/repo\t/wt\towner\ta=1\n\nmalformed\n"
+               "t\topen\t/repo\t/wt\towner\ta=2")
+        self.jobs.write_bytes(raw.encode())
+        with CACHE.registry_read_scope():
+            view = CACHE.current_registry_view(self.jobs)
+            entry = CACHE._pinned_generation(CACHE._READ_SCOPE.get(), self.jobs)
+            self.assertIsNone(entry[1])
+            lines = CACHE.registry_text_lines(self.jobs)
+            self.assertIs(CACHE.registry_text_lines(self.jobs), lines)
+            self.assertIs(entry[0], view)
+            snapshot = CACHE.registry_snapshot(self.jobs)
+        self.assertEqual(lines, tuple(raw.splitlines()))
+        self.assertEqual(snapshot.lines, tuple(raw.splitlines()))
+
+    def test_scope_keeps_plain_text_lines_for_non_lf_separators(self):
+        raw = b"a\tb\tc\td\te\tf=1\r\nnotes\xe2\x80\xa8\xff\n"
+        self.jobs.write_bytes(raw)
+        with CACHE.registry_read_scope():
+            CACHE.current_registry_view(self.jobs)
+            entry = CACHE._pinned_generation(CACHE._READ_SCOPE.get(), self.jobs)
+            self.assertIsNotNone(entry[1])
+            self.assertEqual(CACHE.registry_text_lines(self.jobs),
+                             tuple(raw.decode("utf-8", errors="replace").splitlines()))
+
+    def test_streamed_lines_equal_splitlines_for_edge_shapes(self):
+        shapes = [b"a\tb\tc\td\te\tf=1", b"a\tb\tc\td\te\tf=1\n",
+                  b"a\tb\tc\td\te\tf=1\n\n\nz\tb\tc\td\te\tf=2\n",
+                  b"a\tb\tc\td\te\tf=1\n\nzz", b"\n", b"", b"x\n\n"]
+        for number, raw in enumerate(shapes):
+            path = Path(self.tmp.name) / f"shape-{number}.log"
+            path.write_bytes(raw)
+            view = CACHE.registry_view(path)
+            expected = tuple(raw.decode().splitlines())
+            self.assertEqual(view.line_count, len(expected), raw)
+            self.assertEqual(view.lines, expected, raw)
+            self.assertEqual(view.has_partial_tail, bool(raw) and not raw.endswith(b"\n"))
 
 
 if __name__ == "__main__":

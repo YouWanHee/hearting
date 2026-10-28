@@ -48,13 +48,20 @@ yield to explicit choices (`compose --profile light` needs no demand JSON).
 
 ## Mode Routing
 
-- `dev`: add features, refactor, or implement. `direct|quick` shorten the full pipeline; `standard+` uses framing, `code-plan`, durable `plan-check`, optional `code-refine`, `code-execute`, `impl-review`, `code-test`, and `code-report`.
+- `dev`: add features, refactor, or implement. `direct|quick` shorten the full pipeline; `standard+` uses framing, `code-plan`, the compiled graph's selected `plan-check`, optional `code-refine`, `code-execute`, selected `impl-review`, `code-test`, and `code-report`.
 - `debug`: diagnose the root cause before planning a fix. Proceed when the cause is clear; ask for a choice only when materially different causes remain plausible.
 - `audit`: inspect a codebase or app comprehensively and apply low-risk fixes. Keep review fan-out read-only; make and verify changes in a worktree based on current HEAD before harvest.
 
 ## Critical Gates
 
-Before merge/commit: (1) run `python3 tools/generate.py`, (2) record new `utilities/*` and `tools/*` in the projected/deferred census, (3) run `python3 tools/generate.py --check`, and (4) run `./tools/check-adaptation-boundary.sh`. Step 4 is not redundant: `generate.py` fills Claude counterparts only for `loops/`, `scaffolds/`, `tools/memory`, `tools/install`, `tools/integrations`, and `tools/fleet`, so a new **top-level** `tools/<file>` passes `--check` and still fails the boundary guard — and `pre-push` runs both. Stage generated output with source; do not edit projections manually.
+Before committing assembled source, the integration owner runs `python3 tools/generate.py`, updates the projected/deferred census for new `utilities/*` or `tools/*`, then runs `python3 tools/generate.py --check` and `./tools/check-adaptation-boundary.sh`. Reuse applicable results when the assembled source and projection inputs are unchanged; later review, test, report, publication, or parent handoff does not require another run. Stage generated output with source; do not edit projections manually.
+
+The boundary check covers gaps outside `generate.py`: Claude counterparts are
+automatically filled only for `loops/`, `scaffolds/`, `tools/memory`,
+`tools/install`, `tools/integrations`, and `tools/fleet`, so a new top-level
+`tools/<file>` still needs its counterpart. Existing git-state, commit, push,
+and pre-push guards remain active. Normal hooks may run their declared checks;
+record their results rather than bypassing or manually triggering them early.
 
 1. Resolve the artifact root (CONVENTIONS §5.1).
 2. Run git-state preflight and remember starting `HEAD`.

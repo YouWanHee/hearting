@@ -133,6 +133,7 @@ def remove_retired_hooks(data: dict) -> bool:
                 # Match owned path spellings, not a user script with the same basename.
                 owned = any(token in command for token in (
                     '/.claude/hooks/', '/adapters/codex/hooks/',
+                    '${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/',
                     '$AGENT_HOME/hooks/', '${AGENT_HOME}/hooks/',
                     '$root/adapters/codex/hooks/run-hook.sh',
                 )) or bool(_OWNED_ROOT_HOOK_PATH.search(command))

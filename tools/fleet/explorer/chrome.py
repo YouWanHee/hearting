@@ -8,9 +8,97 @@ from .tables import repo_label
 NAV_WIDTH = 32
 
 
+class _TreeRow:
+    def __init__(self, grid, y):
+        self.grid, self.y = grid, y
+
+    def __getitem__(self, column):
+        row = self.grid._row(self.y)
+        if row is None:
+            if isinstance(column, slice):
+                return [(" ", None, None)] * len(range(*column.indices(self.grid.cols)))
+            return (" ", None, None)
+        return row[column]
+
+    def __setitem__(self, column, value):
+        row = self.grid._row(self.y)
+        if row is not None:
+            row[column] = value
+
+
+class _TreeRows:
+    def __init__(self, grid):
+        self.grid = grid
+
+    def __getitem__(self, y):
+        return _TreeRow(self.grid, y)
+
+    def __setitem__(self, y, value):
+        row = self.grid._row(y)
+        if row is not None:
+            row[:] = value
+
+
+class _TreeViewport:
+    """Map logical tree rows into the visible session viewport without dropping identities."""
+
+    def __init__(self, grid, top, bottom, offset, total):
+        self.base = grid
+        self.top, self.bottom = int(top), int(bottom)
+        self.offset, self.total = int(offset), int(total)
+        self.rows, self.cols = grid.rows, grid.cols
+        self.cells = _TreeRows(self)
+
+    def _screen_y(self, y):
+        y = int(y)
+        if y < self.top or y >= self.top + self.total:
+            return None
+        screen_y = y - self.offset
+        return screen_y if self.top <= screen_y < self.bottom else None
+
+    def _row(self, y):
+        screen_y = self._screen_y(y)
+        return self.base.cells[screen_y] if screen_y is not None else None
+
+    def put(self, x, y, *args, **kwargs):
+        screen_y = self._screen_y(y)
+        return x if screen_y is None else self.base.put(x, screen_y, *args, **kwargs)
+
+    def fill(self, x0, x1, y, *args, **kwargs):
+        screen_y = self._screen_y(y)
+        if screen_y is not None:
+            self.base.fill(x0, x1, screen_y, *args, **kwargs)
+
+    def add_hit(self, y, x0, x1, action):
+        screen_y = self._screen_y(y)
+        if screen_y is not None:
+            self.base.add_hit(screen_y, x0, x1, action)
+
+
 def count_word(count, word, plural=None):
     """``1 question`` / ``2 questions``: the reference's ``nof`` for every count word on the screen."""
     return f"{count} {word if count == 1 else (plural or word + 's')}"
+
+
+def _view_label(view):
+    return "RESOURCES" if view == "COMPUTE" else str(view)
+
+
+def _answer_wait_summary(vm):
+    system = vm.system if isinstance(vm.system, Mapping) else {}
+    summary = system.get("answer_waits")
+    if isinstance(summary, Mapping):
+        return summary
+    # Scrubbed viewer fixtures predate the live safe-cache summary.
+    return {"state": "complete", "total": len(vm.questions or ()), "older": 0}
+
+
+def _peer_observation_summary(vm):
+    system = vm.system if isinstance(vm.system, Mapping) else {}
+    summary = system.get("peer_observation")
+    if isinstance(summary, Mapping):
+        return summary
+    return {"state": "success", "last_good": False}
 
 
 def _clip(text, width):
@@ -380,7 +468,7 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
         grid.put(NAV_WIDTH, title_y, "┌", "line")
         grid.put(NAV_WIDTH + 1, title_y, "─", "line")
         grid.put(NAV_WIDTH + 2, title_y, " { ", "dim")
-        title_text = str(state.title or state.view)
+        title_text = _view_label(state.title or state.view)
         grid.put(NAV_WIDTH + 5, title_y, title_text, "head", limit=width - 1)
         title_end = NAV_WIDTH + 5 + cell_width(title_text)
         grid.put(title_end, title_y, " ", "dim", limit=width - 1)
@@ -419,17 +507,29 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
                       f"{count_word(sum(1 for item in routes if item.get('state') == 'dead'), 'stopped leg')}")
         elif state.view == "QUESTIONS":
             total = (system.get("answered_total") if isinstance(system, Mapping) else None)
+            waits = _answer_wait_summary(vm)
+            current = waits.get("total") if waits.get("state") == "complete" else None
+            waiting = str(current) if current is not None else "?"
+            older = waits.get("older") if waits.get("state") == "complete" else None
+            older_text = f" · older waits {older}" if isinstance(older, int) and older > 0 else ""
             records = total if total is not None else len(questions)
-            status = f"{len(questions)} waiting · {count_word(records, 'decision record')} today"
+            suffix = "" if waits.get("state") == "complete" else " · observation " + str(waits.get("state"))
+            status = f"{waiting} waiting{older_text} · {count_word(records, 'decision record')} today{suffix}"
         elif state.view == "HISTORY":
             seats = tuple(vm.seats or ())
             status = (f"{count_word(len(seats), 'seat')} · "
                       f"{count_word(sum(int(seat[2]) for seat in seats if len(seat) > 2), 'generation')}")
         elif state.view == "PEERS":
             edges = tuple(vm.peer_edges.get("links", ())) if isinstance(vm.peer_edges, Mapping) else ()
-            status = (f"{count_word(len(edges), 'link')} · "
-                      f"{count_word(sum(1 for item in sessions if item.get('steward')), 'steward')} · "
-                      f"{count_word(sum(1 for edge in edges if len(edge) > 2 and edge[2] == 'handover'), 'handover')}")
+            observation = _peer_observation_summary(vm)
+            if observation.get("state") == "success":
+                status = (f"{count_word(len(edges), 'link')} · "
+                          f"{count_word(sum(1 for item in sessions if item.get('steward')), 'steward')} · "
+                          f"{count_word(sum(1 for edge in edges if len(edge) > 2 and edge[2] == 'handover'), 'handover')}")
+            else:
+                links = count_word(len(edges), "link") if observation.get("last_good") else "? links"
+                freshness = "last good · " if observation.get("last_good") else ""
+                status = f"{links} · {freshness}observation {observation.get('state', 'unknown')}"
         elif state.view == "COMPUTE":
             hosts = tuple(vm.compute or ())
             busy = sum(1 for host in hosts for gpu in (host[5] if len(host) > 5 else ())
@@ -461,7 +561,7 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
             status = ""
         grid.fill(0, width, height - 1, " ")
         cursor = grid.put(1, height - 1, "hearting ›", "dim", limit=width - 1)
-        cursor = grid.put(cursor, height - 1, " " + str(state.title or state.view),
+        cursor = grid.put(cursor, height - 1, " " + _view_label(state.title or state.view),
                           "title_dim", limit=width - 1)
         grid.put(cursor, height - 1, "  " + str(status), "dim", limit=width - 1)
     if height >= 3:
@@ -482,13 +582,14 @@ def draw_chrome(grid: CellGrid, vm, state, beat=1):
     if height >= 2:
         grid.fill(0, width, height - 2, " ")
     x = 1
-    legend = [("↑↓", "move"), ("←→", "focus"), ("⏎", "go to pane"), ("Tab", "next view"),
-              ("/", "filter"), ("u", "usage"), ("F", "feed"), ("q", "quit")]
+    legend = [("↑↓", "move"), ("←→", "focus"), ("PgUp/Dn·Home/End·wheel", "scroll"),
+              ("⏎", "pane"), ("Tab", "view"), ("/", "filter"),
+              ("u", "usage"), ("F", "feed"), ("q", "quit")]
     for key, label in legend:
         if x > 1:
-            x = grid.put(x, height - 2, " · ", "line")
-        x = grid.put(x, height - 2, key, "hearting")
-        x = grid.put(x + 1, height - 2, label, "dim")
+            x = grid.put(x, height - 2, " · ", "line", limit=width - 1)
+        x = grid.put(x, height - 2, key, "hearting", limit=width - 1)
+        x = grid.put(x + 1, height - 2, label, "dim", limit=width - 1)
     return grid
 
 
@@ -511,14 +612,24 @@ def _tree_row_count(vm, sessions):
     return total
 
 
+def _faint_rule(grid, y, width):
+    for xx in range(1, width - 1):
+        grid.put(xx, y, "┈", "line")
+
+
 def draw_explorer(grid: CellGrid, vm, state):
     width, height = min(NAV_WIDTH, grid.cols), grid.rows - 3
     if width <= 0 or height <= 0:
         return
     scope_kind, _, scope_id = str(getattr(state, "scope", "-") or "-").partition(":")
-    counts = {"PEERS": len(vm.peer_edges.get("links", ())),
+    waits = _answer_wait_summary(vm)
+    question_count = waits.get("total") if waits.get("state") == "complete" else None
+    peers = _peer_observation_summary(vm)
+    peer_count = (len(vm.peer_edges.get("links", ()))
+                  if peers.get("state") == "success" else None)
+    counts = {"PEERS": peer_count,
               "ROUTES": sum(1 for route in vm.routes if route.get("state") != "done"),
-              "QUESTIONS": len(vm.questions or ()), "HISTORY": len(vm.seats or ())}
+              "QUESTIONS": question_count, "HISTORY": len(vm.seats or ())}
     views = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE")
     y = 6 if getattr(state, "usage_open", False) else 4
     for view in views:
@@ -528,12 +639,21 @@ def draw_explorer(grid: CellGrid, vm, state):
         if selected:
             grid.fill(0, width, y, " ", tint=236)
         key = "head" if selected else "loc_repo" if page_scope and view == "OVERVIEW" else "soft"
-        grid.put(1, y, view, key, tint=236 if selected else None,
+        grid.put(1, y, _view_label(view), key, tint=236 if selected else None,
                  limit=width - 1)
         count = counts.get(view, len(vm.compute or ()) if view == "COMPUTE" else 0)
-        if view != "OVERVIEW" and count:
-            count_key = "blocked" if view == "QUESTIONS" else "dim"
+        if view == "QUESTIONS" and count is None:
+            shown_count, count_key = "?", "dim"
+        elif view == "QUESTIONS":
+            shown_count, count_key = str(count), "blocked" if count else "dim"
+        elif view == "PEERS" and count is None:
+            shown_count, count_key = "?", "dim"
+        elif count:
+            count_key = "dim"
             shown_count = f"{count}/{count}" if view == "COMPUTE" else str(count)
+        else:
+            shown_count = None
+        if view != "OVERVIEW" and shown_count is not None:
             grid.put(width - len(shown_count) - 1, y, shown_count, count_key,
                      limit=width - 1)
         if selected:
@@ -557,32 +677,48 @@ def draw_explorer(grid: CellGrid, vm, state):
                 grid.cells[y][xx] = (glyph, key, 236)
         x += len(view) + 3
     y += 1
-    # r14 separates the utility tabs from the SESSIONS band with a blank row.
-    y += 1
     sessions = tuple(vm.sessions or ())
+    hosts = tuple(vm.compute or ())
+    shown_hosts = hosts[:5]
+    footer_start = max(0, grid.rows - 4)
+    compute_rows = 2 + len(shown_hosts)
+    compute_y = max(0, footer_start - compute_rows)
+    # r14's blank row between the utility tabs and the SESSIONS band carries one faint
+    # rule, so the fixed menu reads apart from the scrolling session tree.
+    if y < compute_y:
+        _faint_rule(grid, y, width)
+    y += 1
     working = sum(1 for item in sessions if item.get("state") == "working")
     idle = sum(1 for item in sessions if item.get("state") == "idle")
     blocked = sum(1 for item in sessions if item.get("state") == "blocked")
-    grid.fill(0, width, y, " ", "dim", tint=234)
-    grid.put(1, y, "SESSIONS ", "title_dim", tint=234)
-    count_x = max(1, width - 12)
-    grid.put(count_x, y, " ", "branch_s", tint=234)
-    grid.put(count_x + 1, y, "  ", None, tint=234)
-    grid.put(count_x + 3, y, f"⠏{working}", "g_spin", tint=234)
-    grid.put(count_x + 5, y, " ", "g_work_off", tint=234)
-    grid.put(count_x + 6, y, f"●{idle}", "g_work_off", tint=234)
-    grid.put(count_x + 8, y, " ", "g_blocked", tint=234)
-    grid.put(count_x + 9, y, f"●{blocked}", "g_blocked", tint=234)
-    grid.put(width - 1, y, " ", None, tint=234)
-    y += 1
-    tree_bottom = min(height - 1, 34)
+    if y < compute_y:
+        grid.fill(0, width, y, " ", "dim", tint=234)
+        grid.put(1, y, "SESSIONS ", "title_dim", tint=234)
+        count_x = max(1, width - 12)
+        grid.put(count_x, y, " ", "branch_s", tint=234)
+        grid.put(count_x + 1, y, "  ", None, tint=234)
+        grid.put(count_x + 3, y, f"⠏{working}", "g_spin", tint=234)
+        grid.put(count_x + 5, y, " ", "g_work_off", tint=234)
+        grid.put(count_x + 6, y, f"●{idle}", "g_work_off", tint=234)
+        grid.put(count_x + 8, y, " ", "g_blocked", tint=234)
+        grid.put(count_x + 9, y, f"●{blocked}", "g_blocked", tint=234)
+        grid.put(width - 1, y, " ", None, tint=234)
+        y += 1
+        tree_top = y
+    else:
+        # At the shortest usage-open geometry the complete COMPUTE block owns
+        # the remaining rows, so the sessions caption and tree yield space.
+        tree_top = compute_y
+    # A second faint rule closes the tree above the anchored RESOURCES block when a tree
+    # row is left for it; the tree viewport, its wheel region and its hits end above it.
+    rule_y = compute_y - 1 if tree_top < compute_y - 1 else None
+    tree_bottom = compute_y if rule_y is None else rule_y
     tree_total = _tree_row_count(vm, sessions)
-    cut, tree_top = tree_bottom, y
-    if y + tree_total > tree_bottom:
-        # A tree taller than its pane stops above COMPUTE and says so on its last row; the rows
-        # it hides are neither drawn nor clickable.
-        cut = tree_bottom - 1
-        hidden_rows = y + tree_total - cut
+    tree_visible = max(0, tree_bottom - tree_top)
+    tree_max = max(0, tree_total - tree_visible)
+    offsets = dict(getattr(state, "scroll", ()) or ())
+    tree_offset = max(0, min(tree_max, int(offsets.get("tree", 0))))
+    cut = tree_top + tree_total
     route_scope = (next((item for item in vm.routes if str(item.get("id")) == scope_id), None)
                    if scope_kind == "route" else None)
     listed = {str(route.get("id")) for session in sessions for route in vm.routes
@@ -593,6 +729,9 @@ def draw_explorer(grid: CellGrid, vm, state):
     tree_repos = [repo for repo in vm.repos
                   if any(session.get("repo_id", session.get("repo")) == repo.get("id", repo.get("name", "·"))
                          for session in sessions)]
+    base_grid = grid
+    grid = _TreeViewport(base_grid, tree_top, tree_bottom, tree_offset, tree_total)
+    tree_indices = {}
     for repo_index, repo in enumerate(tree_repos):
         name = repo_label(repo.get("name", "·"))
         repo_id = repo.get("id", repo.get("name", "·"))
@@ -605,12 +744,13 @@ def draw_explorer(grid: CellGrid, vm, state):
         flat = not name
         shift = 3 if flat else 0
         if not flat:
+            tree_indices["repo:" + str(repo_id)] = y - tree_top
             grid.add_hit(y, 0, width, ("scope", "repo:" + str(repo_id)))
             repo_lit = ((scope_kind == "repo" and str(repo_id) == scope_id) or
                         (hidden and not lit_tag and str(repo_id) == str((route_scope or {}).get("repo"))))
             if repo_lit:
                 grid.fill(0, width, y, " ", tint=236)
-            grid.put(1, y, "┗━ " if last_repo else "┣━ ", "line")
+            grid.put(1, y, "└─ " if last_repo else "├─ ", "line")
             grid.put(4, y, _clip(name + "/", width - 6), "soft", limit=width - 1)
             if repo_lit:
                 for col in range(width):
@@ -629,19 +769,21 @@ def draw_explorer(grid: CellGrid, vm, state):
             if y >= cut:
                 break
             tag = str(session.get("tag") or "·")
+            tree_indices[tag] = y - tree_top
+            tree_indices["session:" + tag] = y - tree_top
             last_session = session_index == len(children) - 1
-            stem = "   " if last_repo else "┃  "
+            stem = "   " if last_repo else "│  "
             grid.add_hit(y, 0, width, ("scope", tag))
             session_lit = (scope_kind == "session" and tag == scope_id) or (hidden and tag == lit_tag)
             if session_lit:
                 grid.fill(0, width, y, " ", tint=236)
             if flat:
                 last_session = last_session and last_repo
-                stem = "   " if last_session else "┃  "
-                grid.put(1, y, "┗━ " if last_session else "┣━ ", "line")
+                stem = "   " if last_session else "│  "
+                grid.put(1, y, "└─ " if last_session else "├─ ", "line")
             else:
                 grid.put(1, y, stem, "line")
-                grid.put(4, y, "┗━ " if last_session else "┣━ ", "line")
+                grid.put(4, y, "└─ " if last_session else "├─ ", "line")
             grid.put(7 - shift, y, "[", "dim")
             grid.put(8 - shift, y, tag, "steward" if session.get("steward") else "soft")
             grid.put(8 - shift + len(tag), y, "]", "dim")
@@ -651,6 +793,10 @@ def draw_explorer(grid: CellGrid, vm, state):
             marker, marker_key = {"working": ("⠏", "g_spin_dim"), "blocked": ("●", "lvl_r_dim"),
                                   "dead": ("✕", "dead"), "done": ("✓", "done")}.get(
                                       status, ("●", "idle"))
+            if session.get("answer_wait_marker") == "●":
+                marker, marker_key = "●", "lvl_r_dim"
+            elif session.get("answer_wait_marker") == "◑":
+                marker, marker_key = "◑", "lvl_y"
             grid.put(hx + 1, y, marker, marker_key)
             if session_lit:
                 for col in range(width):
@@ -672,6 +818,7 @@ def draw_explorer(grid: CellGrid, vm, state):
             for route_index, route in enumerate(session_routes):
                 if y >= cut:
                     break
+                tree_indices.setdefault("route:" + str(route.get("id")), y - tree_top)
                 grid.add_hit(y, 0, width, ("route", route.get("id"), tag))
                 if scope_kind == "route" and str(route.get("id")) == scope_id:
                     grid.fill(0, width, y, " ", tint=236)
@@ -683,10 +830,10 @@ def draw_explorer(grid: CellGrid, vm, state):
                     grid.put(7, y, "  ", None)
                     branch_x = 9
                 else:
-                    grid.put(4, y, "┃  ", "line")
+                    grid.put(4, y, "│  ", "line")
                     grid.put(7, y, "  ", None)
                     branch_x = 9
-                grid.put(branch_x, y, "┗━ " if route_index == len(session_routes) - 1 else "┣━ ", "line")
+                grid.put(branch_x, y, "└─ " if route_index == len(session_routes) - 1 else "├─ ", "line")
                 label = route.get("tree_label") or route.get("title") or "·"
                 rh = route.get("harness") or "·"
                 label_x = branch_x + 3
@@ -714,9 +861,9 @@ def draw_explorer(grid: CellGrid, vm, state):
                     grid.add_hit(y, 0, width, ("route", route.get("id"), tag))
                     grid.put(1, y, stem, "line")
                     if not flat:
-                        grid.put(4, y, "   " if last_session else "┃  ", "line")
+                        grid.put(4, y, "   " if last_session else "│  ", "line")
                     grid.put(9 - shift, y, "   ", "line")
-                    grid.put(12 - shift, y, "┗━ ", "line")
+                    grid.put(12 - shift, y, "└─ ", "line")
                     sub_label = str(name) + ": "
                     grid.put(15 - shift, y, sub_label, "dim", limit=width - 1)
                     grid.put(15 - shift + len(sub_label), y, str(who), "h_" + str(who), limit=width - 1)
@@ -726,19 +873,20 @@ def draw_explorer(grid: CellGrid, vm, state):
     drag = tuple(getattr(state, "drag", ()) or ())
     if y < cut and len(drag) >= 9 and drag[0] == "tree" and drag[8] and drag[7] and drag[6] == "end":
         grid.put(1, y, "↳", "accent", limit=width - 1)
-    if cut < tree_bottom and cut >= tree_top:
-        grid.put(4, cut, f"… {hidden_rows} more rows", "dim", limit=width - 1)
+    grid = base_grid
+    if rule_y is not None:
+        _faint_rule(grid, rule_y, width)
+        if tree_offset < tree_max:                  # more session rows wait below the viewport
+            grid.put(width - 9, rule_y, " ↓ more ", "dim", limit=width - 1)
 
-    # COMPUTE is a fixed explorer section. Percentages are source facts; draw the
-    # compact host summary from the immutable fixture without probing resources.
-    compute_y = 34
-    if compute_y < height:
-        hosts = tuple(vm.compute or ())
+    # The whole COMPUTE summary is anchored above the shared footer. The menu tab
+    # remains in the VIEWS list; this compact block is a separate destination.
+    if compute_y < footer_start:
         grid.add_hit(compute_y, 0, width, ("root", "COMPUTE"))
-        for hit_y in range(compute_y + 1, grid.rows - 4):
+        for hit_y in range(compute_y + 1, footer_start):
             grid.add_hit(hit_y, 0, width, ("root", "COMPUTE"))
         grid.fill(0, width, compute_y, " ", "dim", tint=234)
-        grid.put(1, compute_y, "COMPUTE ",
+        grid.put(1, compute_y, "RESOURCES ",
                  "head" if state.view == "COMPUTE" and getattr(state, "scope", "-") == "-" else "title_dim",
                  tint=234)
         compute_count = f"{len(hosts)}/{len(hosts)}"
@@ -750,9 +898,9 @@ def draw_explorer(grid: CellGrid, vm, state):
         grid.put(20, compute_y + 1, "gpu0", "dim")
         grid.put(27, compute_y + 1, "gpu1", "dim")
         host_labels = tuple(vm.hosts or ())
-        for offset, host in enumerate(hosts[:5]):
+        for offset, host in enumerate(shown_hosts):
             row_y = compute_y + 2 + offset
-            if row_y >= grid.rows - 4:
+            if row_y >= footer_start:
                 break
             _name, base, cpu, _memory, _disk, gpus = (tuple(host) + (None,) * 6)[:6]
             gpus = tuple(gpus or ())
@@ -779,3 +927,5 @@ def draw_explorer(grid: CellGrid, vm, state):
                     grid.put(gx, row_y, f" {pct:2d}%", key)
                 if gpu_index == 0:
                     grid.put(gx + 5, row_y, "●", "spin" if gpu_state == "working" else "idle")
+    return (0, tree_top, width, tree_bottom, tree_offset, tree_max,
+            tree_total, tree_visible, tree_indices)

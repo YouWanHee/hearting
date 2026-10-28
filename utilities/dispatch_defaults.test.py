@@ -259,6 +259,10 @@ class DispatchDefaultsV3Tests(unittest.TestCase):
         self.assertEqual(D.validate(config, capmap), [])
         self.assertEqual(D.policy_warnings(config), [])
         self.assertEqual(D.normalize_policy(config), config)
+        self.assertEqual(D.query_owners(config), ["opencode"])
+        for profile in ("deep", "balanced-deep", "balanced", "light", "mini"):
+            with self.subTest(profile=profile):
+                self.assertEqual(D.query_profile_policy(config, profile)["primary"], ["opencode"])
 
     def test_recommendation_findings_are_normalized_not_rejected(self):
         capmap = D.load_topology_capabilities(D.default_topology_path())
@@ -577,6 +581,122 @@ class DispatchDefaultsV4Tests(unittest.TestCase):
         self.assertEqual(D.validate(parsed, capmap), [])
         self.assertEqual(D.query_confirmation_mode(parsed), "hybrid")
         self.assertEqual(D.query_steward_child_permission_mode(parsed), "bypass")
+
+    def test_steward_policy_defaults_match_the_shipped_file(self):
+        defaults = {
+            "child_permission_mode": "bypass",
+            "check_interval_seconds": 7200,
+            "max_supervisors_per_repo": 2,
+        }
+        self.assertEqual(D.query_steward_policy({}), defaults)
+        self.assertEqual(D.query_steward_policy(self.v3_config()), defaults)
+        with open(D.SHIPPED_CONFIG_PATH, encoding="utf-8") as f:
+            shipped = D.parse_yaml_subset(f.read())
+        self.assertEqual(D.validate(shipped, self.capmap), [])
+        self.assertEqual(D.query_steward_policy(shipped), defaults)
+        self.assertEqual(shipped["steward"]["check_interval_seconds"], 7200)
+        self.assertEqual(shipped["steward"]["max_supervisors_per_repo"], 2)
+
+    def steward_errors(self, key, value):
+        config = self.v4_config()
+        config["steward"] = {key: value}
+        return D.validate(config, self.capmap)
+
+    def test_check_interval_seconds_bounds(self):
+        message = "steward.check_interval_seconds must be an integer from 600 to 86400"
+        for bad in (599, 86401, 0, -1, True, False, "7200", 7200.0):
+            errors = self.steward_errors("check_interval_seconds", bad)
+            self.assertIn(message, errors, bad)
+        for good in (600, 3600, 86400):
+            self.assertEqual(self.steward_errors("check_interval_seconds", good), [], good)
+            config = self.v4_config()
+            config["steward"] = {"check_interval_seconds": good}
+            self.assertEqual(D.query_steward_policy(config)["check_interval_seconds"], good)
+
+    def test_max_supervisors_per_repo_bounds(self):
+        message = "steward.max_supervisors_per_repo must be an integer from 1 to 8"
+        for bad in (0, 9, -1, True, False, "2", 2.0):
+            errors = self.steward_errors("max_supervisors_per_repo", bad)
+            self.assertIn(message, errors, bad)
+        for good in (1, 3, 8):
+            self.assertEqual(self.steward_errors("max_supervisors_per_repo", good), [], good)
+            config = self.v4_config()
+            config["steward"] = {"max_supervisors_per_repo": good}
+            self.assertEqual(D.query_steward_policy(config)["max_supervisors_per_repo"], good)
+
+    def test_invalid_steward_values_never_leak_through_the_query(self):
+        config = self.v4_config()
+        config["steward"] = {"check_interval_seconds": 5, "max_supervisors_per_repo": True}
+        policy = D.query_steward_policy(config)
+        self.assertEqual(policy["check_interval_seconds"], 7200)
+        self.assertEqual(policy["max_supervisors_per_repo"], 2)
+
+    def write_user_config(self, path, interval, limit):
+        shipped = Path(D.SHIPPED_CONFIG_PATH).read_text(encoding="utf-8")
+        shipped = shipped.replace("check_interval_seconds: 7200", f"check_interval_seconds: {interval}")
+        shipped = shipped.replace("max_supervisors_per_repo: 2", f"max_supervisors_per_repo: {limit}")
+        path.write_text(shipped, encoding="utf-8")
+
+    def test_load_steward_policy_reads_back_the_written_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dispatch-defaults.yaml"
+            self.write_user_config(path, 3600, 3)
+            policy, warnings = D.load_steward_policy(config_path=str(path))
+            self.assertEqual(warnings, [])
+            self.assertEqual(policy["check_interval_seconds"], 3600)
+            self.assertEqual(policy["max_supervisors_per_repo"], 3)
+            # a rewrite is picked up by the next call (no cached value)
+            self.write_user_config(path, 1800, 4)
+            policy, warnings = D.load_steward_policy(config_path=str(path))
+            self.assertEqual(warnings, [])
+            self.assertEqual(policy["check_interval_seconds"], 1800)
+            self.assertEqual(policy["max_supervisors_per_repo"], 4)
+            # the DISPATCH_DEFAULTS_CONFIG override is the default reader path
+            with mock.patch.dict(os.environ, {"DISPATCH_DEFAULTS_CONFIG": str(path)}):
+                policy, warnings = D.load_steward_policy()
+            self.assertEqual((policy["check_interval_seconds"], warnings), (1800, []))
+
+    def test_load_steward_policy_falls_back_with_one_warning(self):
+        defaults = D.query_steward_policy({})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dispatch-defaults.yaml"
+            path.write_text("schema_version: 4\nmystery: [\n", encoding="utf-8")
+            policy, warnings = D.load_steward_policy(config_path=str(path))
+            self.assertEqual(policy, defaults)
+            self.assertEqual(len(warnings), 1)
+            self.assertTrue(warnings[0].startswith("steward-settings-unreadable: "), warnings)
+            # an out-of-range value makes the file invalid -> defaults + warning
+            self.write_user_config(path, 599, 2)
+            policy, warnings = D.load_steward_policy(config_path=str(path))
+            self.assertEqual(policy, defaults)
+            self.assertEqual(len(warnings), 1)
+            policy, warnings = D.load_steward_policy(config_path=str(Path(tmp) / "missing.yaml"))
+            self.assertEqual(policy, defaults)
+            self.assertEqual(len(warnings), 1)
+
+    def test_steward_cli_prints_the_three_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dispatch-defaults.yaml"
+            self.write_user_config(path, 3600, 3)
+            result = subprocess.run(
+                [sys.executable, str(MODULE), "steward", "--config", str(path)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout.splitlines(),
+                [
+                    "child_permission_mode=bypass",
+                    "check_interval_seconds=3600",
+                    "max_supervisors_per_repo=3",
+                ],
+            )
+            self.write_user_config(path, 599, 3)
+            broken = subprocess.run(
+                [sys.executable, str(MODULE), "steward", "--config", str(path)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(broken.returncode, 65)
 
 
 class ShippedBaselineMergeTests(unittest.TestCase):

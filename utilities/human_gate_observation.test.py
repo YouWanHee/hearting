@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest import mock
 from types import SimpleNamespace
+from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import human_gate_observation as H  # noqa: E402
@@ -251,7 +252,7 @@ class PendingWaitTest(unittest.TestCase):
         dropped = H.read_answer_waits(jobs_paths=[self.jobs], now=300 + 7 * 86400)
         self.assertEqual((dropped["items"], dropped["total"], dropped["stale_total"]), ([], 0, 0))
 
-    def test_s2_72_hour_and_seven_day_projection_boundaries(self):
+    def test_s2_72_hour_and_older_projection_boundaries(self):
         route, _attempt, _lease, metadata = self._blocked_owner_fixture()
         self.jobs.write_text("100\topen\t/repo\t/wt\towner\t" + metadata + "\n",
                              encoding="utf-8")
@@ -270,8 +271,80 @@ class PendingWaitTest(unittest.TestCase):
             older = H.read_answer_waits(jobs_paths=[self.jobs], now=instant)
             self.assertEqual((older["total"], older["stale_total"]), (0, 1))
             pending.since = instant - 7 * 86400 - 1
-            expired = H.read_answer_waits(jobs_paths=[self.jobs], now=instant)
-            self.assertEqual((expired["items"], expired["total"], expired["stale_total"]),
+            older = H.read_answer_waits(jobs_paths=[self.jobs], now=instant)
+            self.assertEqual((older["total"], older["stale_total"],
+                              [item["source"] for item in older["items"]]),
+                             (0, 1, ["S2"]))
+
+    def test_unresolved_requests_survive_older_window(self):
+        project_root = str(Path(__file__).resolve().parents[1])
+        if project_root not in sys.path:
+            sys.path.insert(0, project_root)
+        from tools.fleet import interaction
+        from tools.fleet.collectors.interaction import enrich
+        import human_wait_state
+
+        route, _attempt, _lease, metadata = self._blocked_owner_fixture()
+        now = time.time()
+        waiting_since = now - 9 * 86400
+        self.jobs.write_text(f"{waiting_since}\topen\t/repo\t/wt\towner\t{metadata}\n",
+                             encoding="utf-8")
+        ledger = self.root / "workflow" / route["route_id"] / "journal.jsonl"
+        ledger.write_text(json.dumps({
+            "at": datetime.fromtimestamp(waiting_since, timezone.utc).isoformat(),
+            "route_id": route["route_id"], "route_hash": route["route_hash"],
+            "workflow_state": "BLOCKED_HUMAN_GATE",
+            "evidence": {"gate": "frame-review", "artifact": str(self.interview)},
+        }) + "\n", encoding="utf-8")
+
+        interaction_root = self.root / "interaction"
+        xdg_state = self.root / "xdg-state"
+        with mock.patch.dict("os.environ", {
+            "FLEET_INTERACTION_STATE_DIR": str(interaction_root),
+            "XDG_STATE_HOME": str(xdg_state),
+        }):
+            self.assertTrue(interaction.set_wait(
+                "native-older", "codex", "decision", "codex-appserver",
+                now=waiting_since, request_id="request-older", turn_id="turn-older"))
+            signal = human_wait_state.signal_value(
+                "codex", "signal-older", "seat-older", "[답변 필요] older fixture",
+                sequence=1, now=waiting_since)
+            self.assertIsNotNone(signal)
+            self.assertTrue(human_wait_state.write_signal(signal))
+            self.assertEqual(len(H.pending_human_waits(route, jobs=self.jobs)), 1)
+
+            session = SimpleNamespace(
+                harness="codex", session_id="native-older",
+                started_at=waiting_since - 100, _interaction_activity=None,
+                interaction_state=None,
+            )
+            enrich(session, now=now)
+            self.assertIsNotNone(session.interaction_state)
+            self.assertEqual(session.interaction_state["waiting_since"], waiting_since)
+
+            result = H.read_answer_waits(jobs_paths=[self.jobs], now=now)
+            self.assertEqual({item["source"] for item in result["items"]}, {"S1", "S2", "S4"},
+                             repr(result))
+            self.assertEqual((result["total"], result["stale_total"], result["by_session"]),
+                             (0, 3, {}))
+            self.assertTrue(all(item["stale"] for item in result["items"]))
+            self.assertTrue(human_wait_state.publish_cache(result))
+            projection = human_wait_state._read_cache_file()
+            fleet_cache = json.loads(human_wait_state._fleet_cache_path().read_text(encoding="utf-8"))
+            self.assertEqual((projection["total"], projection["older"], projection["by_session"]),
+                             (0, 3, {}))
+            self.assertEqual((fleet_cache["total"], fleet_cache["older"]), (0, 3))
+            self.assertTrue(all("question" not in item for item in fleet_cache["items"]))
+
+            self.assertTrue(interaction.clear_wait("native-older", "codex"))
+            self.assertTrue(human_wait_state.close_signal("seat-older", sequence=1))
+            ledger.write_text(json.dumps({
+                "at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                "route_id": route["route_id"], "route_hash": route["route_hash"],
+                "workflow_state": "CANCELLED",
+            }) + "\n", encoding="utf-8")
+            cleared = H.read_answer_waits(jobs_paths=[self.jobs], now=now + 1)
+            self.assertEqual((cleared["items"], cleared["total"], cleared["stale_total"]),
                              ([], 0, 0))
 
     def test_unbound_legacy_blocked_owner_is_not_an_unknown_wait(self):

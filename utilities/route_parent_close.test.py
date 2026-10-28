@@ -547,6 +547,43 @@ class ParentCloseTest(unittest.TestCase):
                 finally:
                     fixture.doCleanups()
 
+    def test_owner_pin_moved_by_the_handed_over_parent_is_handoff_authority(self):
+        """After a seat handover the effective parent pins; the registered parent is gone."""
+        import artifact_identity
+        import artifact_producer as PRODUCER
+        import route_authority as AUTH
+
+        fixture = ParentCloseTest()
+        fixture.setUp()
+        try:
+            ids = artifact_identity.IdAllocator()
+            PRODUCER.activate(fixture.artifacts, repository_id=ids.allocate("repository"),
+                              artifact_root_id=ids.allocate("artifact_root"),
+                              w7={"campaign_id": ids.allocate("campaign")})
+            owner = fixture.process("seat-handover-owner")
+            metadata = fixture.row("seat-handover-owner", process=owner, harness="codex",
+                                   capability_mode=fixture.route.get("capability_mode", "dev"))
+            PRODUCER.begin(fixture.artifacts, route_file=fixture.path,
+                           capability=fixture.route["capability"],
+                           intensity=fixture.route["effective_intensity"],
+                           jobs=fixture.jobs, owner_attempt_id=metadata["attempt_id"])
+            self.assertNotEqual(metadata.get("parent_sid"), "seat-successor-parent")
+            AUTH.record_pin_change(
+                fixture.route, target="owner", pin={"harness": "claude", "model": None, "effort": None},
+                by={"harness": "claude", "session_id": "seat-successor-parent"},
+                source="fixture", tuples=[], candidates=[])
+            outcome = CLOSE.close(fixture.route, fixture.path, jobs=fixture.jobs,
+                                  summary=work_start.PIN_HANDOFF_SUMMARY)
+            self.assertEqual(outcome["state"], "cancelled", outcome)
+            def owns(meta, session, jobs, **_):
+                return session == "seat-successor-parent"
+            with mock.patch.object(AUTH, "owns", side_effect=owns):
+                self.assertIsNotNone(CLOSE.verified_owner_pin_handoff_close(fixture.route, jobs=fixture.jobs))
+            with mock.patch.object(AUTH, "owns", return_value=False):
+                self.assertIsNone(CLOSE.verified_owner_pin_handoff_close(fixture.route, jobs=fixture.jobs))
+        finally:
+            fixture.doCleanups()
+
     def test_owner_pin_handoff_summary_without_recorded_pin_move_is_not_authority(self):
         import artifact_identity
         import artifact_producer as PRODUCER

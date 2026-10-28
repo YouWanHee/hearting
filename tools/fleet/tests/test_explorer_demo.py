@@ -129,7 +129,7 @@ class DemoDetailSweep(unittest.TestCase):
 
 
 class TreeOverflow(unittest.TestCase):
-    """A session tree taller than its pane ends with ``… N more rows``; the rows it hides are not clickable."""
+    """The tree scrolls above the anchored COMPUTE block; hidden rows have no hit."""
 
     def test_cut_rows_are_counted_and_unclickable_at_every_height(self):
         from dataclasses import replace
@@ -138,21 +138,47 @@ class TreeOverflow(unittest.TestCase):
         for cols in WIDTHS:
             for rows in (36, 45, 60):
                 frame = draw(many, NavState(), cols, rows)
-                text = frame.text_rows()
-                limit = min(rows - 3 - 1, 34)
                 with self.subTest(cols=cols, rows=rows):
-                    note = text[limit - 1][4:20]
-                    self.assertRegex(note, r"^… \d+ more rows")
-                    hidden = int(note.split()[1])
-                    needed = sum(1 + sum(1 + len([r for r in vm.routes if r.get("session_tag") == s["tag"]
-                                                  and r.get("state") not in ("done", "dead")])
+                    _x0, top, width, bottom, offset, maximum, total, visible = frame.tree_scroll[:8]
+                    compute_top = rows - 4 - (2 + min(5, len(vm.compute)))
+                    # A faint rule row closes the tree above RESOURCES when the tree has a row.
+                    self.assertEqual(bottom, compute_top - 1 if top < compute_top - 1 else compute_top)
+                    self.assertEqual(visible, max(0, bottom - top))
+                    needed = sum(1 + sum(1 + sum(2 if r.get("subworker") else 1
+                                                  for r in vm.routes if r.get("session_tag") == s["tag"]
+                                                  and r.get("state") not in ("done", "dead"))
                                          for s in vm.sessions if s.get("repo_id") == repo["id"])
                                  for repo in many.repos
                                  if any(s.get("repo_id") == repo["id"] for s in vm.sessions))   # no session, no row
-                    self.assertEqual(hidden, 13 + needed - limit + 1)
-                    for hit in frame.hits:
-                        if hit.action[0] in ("scope", "route") and hit.x0 < 32:
-                            self.assertLess(hit.y, limit - 1, hit)
+                    self.assertEqual(total, needed)
+                    self.assertEqual(offset, 0)
+                    self.assertEqual(maximum, max(0, total - visible))
+                    self.assertGreater(maximum, 0)
+                    end = draw(many, NavState(scroll=(("tree", maximum),)), cols, rows)
+                    self.assertEqual(end.tree_scroll[4], maximum)
+                    self.assertTrue(any(hit.y == bottom - 1 and hit.x0 < width
+                                        and hit.action[0] in ("scope", "route") for hit in end.hits))
+                    for painted in (frame, end):
+                        for hit in painted.hits:
+                            if hit.action[0] in ("scope", "route") and hit.x0 < width:
+                                self.assertGreaterEqual(hit.y, top, hit)
+                                self.assertLess(hit.y, bottom, hit)
+
+    def test_page_trace_still_detects_real_overwrites(self):
+        from unittest.mock import patch
+        from tools.fleet.explorer import frame as renderer
+
+        original = renderer._draw_page
+
+        def clobber(grid, vm, state):
+            original(grid, vm, state)
+            grid.put(40, 5, "A", "soft")
+            grid.put(40, 5, "B", "soft")
+
+        with patch.object(renderer, "_draw_page", side_effect=clobber):
+            frame, trace = ef.trace_draw(draw, ef.demo_model(), NavState(), 140, ROWS)
+        self.assertTrue(any("'B' overwrites 'A'" in problem
+                            for problem in ef.frame_violations(frame, trace, 140, ROWS)))
 
     def test_a_tree_that_fits_has_no_note(self):
         text = "\n".join(draw(ef.demo_model(), NavState(), 140, 60).text_rows())

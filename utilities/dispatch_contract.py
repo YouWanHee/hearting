@@ -392,6 +392,8 @@ ATTEMPT_TERMINAL_EVIDENCE_KEYS = {
     "detected_by",
     "failure_class",
     "process_exit",
+    "quota_model_scope",
+    "quota_window",
     "reconcile_reason",
     "reset",
     "terminal_event",
@@ -4410,6 +4412,22 @@ def attempt_governed_process_quiescence(
     return _attempt_process_quiescence_impl(metadata)
 
 
+def attempt_identity_lineage(metadata: Mapping[str, str]) -> set[tuple[str, str]]:
+    """Return exact current and predecessor PID/start identities for one attempt."""
+    identities: set[tuple[str, str]] = set()
+    current_pid, current_start = str(metadata.get("pid", "")), str(metadata.get("pid_start", ""))
+    if current_pid.isdigit() and current_start.isdigit():
+        identities.add((current_pid, current_start))
+    raw = metadata.get("owner_identity_lineage", "")
+    if not isinstance(raw, str):
+        return identities
+    for entry in raw.split("+"):
+        pid, separator, start = entry.partition(":")
+        if separator and pid.isdigit() and start.isdigit():
+            identities.add((pid, start))
+    return identities
+
+
 def _attempt_process_quiescence_impl(metadata: dict[str, str]) -> ProcessQuiescence:
     """Classify the exact governed process without PID-namespace guessing.
 
@@ -5421,14 +5439,14 @@ def spawn_claimed_attempt(
     preclaim: Callable[[list[str]], None] | None = None,
     pre_release: Callable[[dict[str, str]], dict[str, str] | None] | None = None,
     post_claim: Callable[[dict[str, str]], dict[str, str] | PostClaimAdmission | None] | None = None,
+    respawn_of: tuple[str, str] | None = None,
 ) -> tuple[subprocess.Popen, dict[str, str]]:
     """Claim one registered attempt while publishing its fenced process.
 
-    The row stays ``launch_claimed=0`` until a complete fenced PID identity is
-    ready. The same registry replacement publishes the identity and transitions
-    the claim to 1. A launcher killed before spawn therefore leaves a retryable
-    registered row, while a launcher killed after spawn leaves either a blocked
-    fence or a fully attributable process group. ``pre_release`` may attach a
+    A new row stays ``launch_claimed=0`` until a complete fenced PID identity is
+    ready. A same-attempt Codex respawn instead requires the exact prior identity,
+    a quiescent governed process and a free supervisor lease, then atomically
+    republishes the identity with its predecessor lineage. ``pre_release`` may attach a
     bounded observer to that exact identity; its metadata is committed in the
     same replacement and any failure aborts the still-fenced worker.
     ``post_claim`` is the narrow jobs-unlocked producer-admission seam. Its
@@ -5459,10 +5477,28 @@ def spawn_claimed_attempt(
             raise DispatchContractError("cancelled-by-parent")
         if child_fields[1] not in {"open", "running"}:
             raise DispatchContractError("attempt-not-open", attempt_id)
-        if child_meta.get("launch_claimed") == "1":
-            raise DispatchContractError("attempt-launch-already-claimed", attempt_id)
-        if child_meta.get("launch_claimed") != "0":
-            raise DispatchContractError("attempt-launch-claim-invalid", attempt_id)
+        if respawn_of is None:
+            if child_meta.get("launch_claimed") == "1":
+                raise DispatchContractError("attempt-launch-already-claimed", attempt_id)
+            if child_meta.get("launch_claimed") != "0":
+                raise DispatchContractError("attempt-launch-claim-invalid", attempt_id)
+        else:
+            expected_identity = (str(respawn_of[0]), str(respawn_of[1]))
+            if (parent_binding is not None or child_meta.get("worker_type") != "owner"
+                    or child_meta.get("dispatch_depth") != "1"
+                    or child_meta.get("harness") != "codex"
+                    or child_meta.get("launch_claimed") != "1"
+                    or child_meta.get("launch_started") != "1"
+                    or (child_meta.get("pid", ""), child_meta.get("pid_start", ""))
+                       != expected_identity):
+                raise DispatchContractError("attempt-respawn-identity-changed", attempt_id)
+            governed = attempt_governed_process_quiescence(child_meta)
+            if governed.state != "quiescent":
+                reason = ("attempt-respawn-consumer-live" if governed.state == "live"
+                          else "attempt-respawn-consumer-unverifiable")
+                raise DispatchContractError(reason, governed.reason)
+            if supervisor_lease_is_held(jobs, child_meta):
+                raise DispatchContractError("attempt-respawn-lease-held", attempt_id)
 
         if parent_binding is not None:
             parent_matches = []
@@ -5509,17 +5545,18 @@ def spawn_claimed_attempt(
                     "parent-attempt-not-live", parent_binding.attempt_id
                 )
 
-        from dispatch_replacement import admission as replacement_admission
-        replacement_admission(jobs, lines, child_meta)
-        from review_input import validate_launch as validate_review_input
-        validate_review_input(jobs, child_meta)
-        from review_source_subject import SourceSubjectError, validate_attempt as validate_review_subject
-        try:
-            validate_review_subject(jobs, child_fields, child_meta)
-        except SourceSubjectError as exc:
-            raise DispatchContractError(exc.reason, exc.detail) from exc
-        if preclaim is not None:
-            preclaim(lines)
+        if respawn_of is None:
+            from dispatch_replacement import admission as replacement_admission
+            replacement_admission(jobs, lines, child_meta)
+            from review_input import validate_launch as validate_review_input
+            validate_review_input(jobs, child_meta)
+            from review_source_subject import SourceSubjectError, validate_attempt as validate_review_subject
+            try:
+                validate_review_subject(jobs, child_fields, child_meta)
+            except SourceSubjectError as exc:
+                raise DispatchContractError(exc.reason, exc.detail) from exc
+            if preclaim is not None:
+                preclaim(lines)
 
         gate_read, gate_write = os.pipe()
         try:
@@ -5623,26 +5660,38 @@ def spawn_claimed_attempt(
                             if key != "resolved_model"}
                 new_meta = {key: value for key, value in fresh_meta.items()
                             if key != "resolved_model"}
+                expected_claim = "0" if respawn_of is None else "1"
+                identity_matches = (fresh_meta.get("pid", ""), fresh_meta.get("pid_start", "")) == (
+                    str(respawn_of[0]), str(respawn_of[1])) if respawn_of is not None else True
                 if (fresh_fields[1] not in {"open", "running"}
                         or fresh_fields[2:5] != child_fields[2:5]
                         or fresh_meta.get("attempt_id") != attempt_id
-                        or fresh_meta.get("launch_claimed") != "0"
-                        or new_meta != old_meta):
+                        or fresh_meta.get("launch_claimed") != expected_claim
+                        or not identity_matches or new_meta != old_meta):
                     changed_reason = "attempt-pre-release-identity-changed"
                 else:
                     import route_parent_close
                     if route_parent_close.row_requested(fresh_meta, jobs):
                         changed_reason = "cancelled-by-parent"
                     else:
-                        try:
-                            replacement_admission(jobs, fresh_lines, fresh_meta)
-                            validate_review_input(jobs, fresh_meta)
-                            validate_review_subject(jobs, fresh_fields, fresh_meta)
-                        except SourceSubjectError as exc:
-                            changed_reason, changed_detail = exc.reason, exc.detail
-                        except DispatchContractError as exc:
-                            changed_reason, changed_detail = exc.reason, exc.detail
+                        if respawn_of is not None:
+                            governed = attempt_governed_process_quiescence(fresh_meta)
+                            if governed.state != "quiescent":
+                                changed_reason = ("attempt-respawn-consumer-live" if governed.state == "live"
+                                                  else "attempt-respawn-consumer-unverifiable")
+                                changed_detail = governed.reason
+                            elif supervisor_lease_is_held(jobs, fresh_meta):
+                                changed_reason = "attempt-respawn-lease-held"
                         else:
+                            try:
+                                replacement_admission(jobs, fresh_lines, fresh_meta)
+                                validate_review_input(jobs, fresh_meta)
+                                validate_review_subject(jobs, fresh_fields, fresh_meta)
+                            except SourceSubjectError as exc:
+                                changed_reason, changed_detail = exc.reason, exc.detail
+                            except DispatchContractError as exc:
+                                changed_reason, changed_detail = exc.reason, exc.detail
+                        if changed_reason == "attempt-pre-release-row-not-unique":
                             if parent_binding is not None:
                                 parent_matches = []
                                 for line in fresh_lines:
@@ -5708,6 +5757,20 @@ def spawn_claimed_attempt(
             )
         identity.update(provided_metadata)
         identity.update(observer_metadata)
+        if respawn_of is not None:
+            lineage: list[str] = []
+            raw_lineage = child_meta.get("owner_identity_lineage", "")
+            for entry in raw_lineage.split("+") if isinstance(raw_lineage, str) else ():
+                pid, separator, start = entry.partition(":")
+                if separator and pid.isdigit() and start.isdigit():
+                    value = f"{pid}:{start}"
+                    if value not in lineage:
+                        lineage.append(value)
+            previous_pid, previous_start = str(respawn_of[0]), str(respawn_of[1])
+            previous = f"{previous_pid}:{previous_start}"
+            if previous not in lineage:
+                lineage.append(previous)
+            identity["owner_identity_lineage"] = "+".join(lineage)
         try:
             replace_keys = {*identity, "launch_claimed"}
             parts = [
@@ -10926,6 +10989,42 @@ def recover_unstarted_attempt(jobs: Path, attempt_id: str) -> bool:
         return True
 
 
+def _retry_parent_matches(source, candidate, jobs, lines) -> bool:
+    """An existing owner replacement may continue its predecessor's child.
+
+    Called under the registry lock. These existing lineage and route readers
+    take no locks and preserve the original owner/child rows.
+    """
+    previous, current = source.get("parent_attempt_id"), candidate.get("parent_attempt_id")
+    if previous == current:
+        return True
+    if not jobs or not previous or not current:
+        return False
+    if any(row.get("dispatch_depth") != "2" for row in (source, candidate)):
+        return False
+    route = (source.get("route_id"), source.get("route_hash"))
+    if (not all(route) or not source.get("route_node")
+            or route != (candidate.get("route_id"), candidate.get("route_hash"))):
+        return False
+    from dispatch_replacement import _rows, effective_attempts
+    from owner_route_binding import OwnerRouteBindingError, resolve_owner_route_lifecycle
+    rows = _rows(lines)
+    try:
+        for parent in (previous, current):
+            owner = rows.get(parent, (None, {}))[1]
+            if (owner.get("worker_type") != "owner" or owner.get("dispatch_depth") != "1"
+                    or owner.get("registered_worker") != "1"):
+                return False
+            binding, _ = resolve_owner_route_lifecycle(
+                jobs, owner_attempt_id=parent, registry_rows=list(rows.values()))
+            if binding is None or (binding.route_id, binding.route_hash) != route:
+                return False
+        effective, lineage = effective_attempts(jobs, {previous})
+    except (OSError, OwnerRouteBindingError):
+        return False
+    return effective == {current} and bool(lineage)
+
+
 def _automatic_retry_admission(lines: list[str], metadata: dict[str, str], *, jobs: Path | None = None) -> None:
     """The jobs lock arbitrates retries against the committed predecessor.
 
@@ -10980,7 +11079,8 @@ def _automatic_retry_admission(lines: list[str], metadata: dict[str, str], *, jo
                 or metadata.get("replacement_family_id") != family):
             raise DispatchContractError("automatic-replacement-exhausted", prior)
         return
-    if any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node", "parent_attempt_id")):
+    if (any(source.get(k) != metadata.get(k) for k in ("route_id", "route_node"))
+            or not _retry_parent_matches(source, metadata, jobs, lines)):
         raise DispatchContractError("retry-predecessor-binding-mismatch", prior)
     proof = attempt_process_quiescence(source, terminal_receipt=status in {"done", "killed", "cancelled"})
     decision = decide_attempt(status, source, process_state=proof.state, process_reason=proof.reason)

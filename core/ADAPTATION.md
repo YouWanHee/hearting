@@ -449,6 +449,15 @@ or application.
   Pending or consumed items suppress resend. The durable Hearting ledger remains
   open until exact consumption or explicit parent harvest is proven; queue
   acceptance alone never means the parent processed a result.
+- After a prompt fallback has rendered and durably ACKed its exact records, the
+  ACK carrier may best-effort delete the matching pending Hearting queue item.
+  Deletion requires the exact receiver thread, stable storage-key-derived
+  client ID, unique listed submission ID, complete producer body and immutable
+  receipt markers, and every member ACKed. It runs after ACK locks are released;
+  missing, changed, ambiguous, unsupported, or timed-out evidence preserves the
+  item and does not change the ACK result. ACK and queue deletion are not atomic,
+  so a crash or concurrent queue consumption can still leave an at-least-once
+  duplicate; this cleanup does not claim exactly-once delivery.
 - An interrupted parent is restarted with `thread/queue/start` only for one
   unambiguous pending Hearting item. Human-only queues are untouched. A refusal
   remains pending and visible for recovery; the sidecar never calls
