@@ -4770,7 +4770,7 @@ class FrameCapacityFlow:
         case.assertNotIn(record['replacement_attempt_id'], fx.rows())
 
     def run_undeclared_profile(self):
-        """An effective user config without opt-in `top` cannot create a frame launch."""
+        """Claude/Codex still require an effective user config to opt in to `top`."""
         case = self.case
         fx = self.fixture({'note': 'dead-capacity', 'failure_class': 'capacity'})
         shipped = self.wrapper.ROOT/'adapters'/self.harness/'config/models.conf'
@@ -4782,6 +4782,67 @@ class FrameCapacityFlow:
         case.assertEqual(refused.exception.reason, 'invalid-dispatch-model-profile')
         case.assertIn('does not declare CFG_MODEL_PROFILE_TOP', str(refused.exception))
         case.assertNotIn('att-unsupported', fx.rows())
+        case.assertFalse((R._directory(fx.jobs)/'claims').exists())
+
+    def run_opencode_undeclared_profile(self):
+        """OpenCode's old whole-file config resolves TOP in memory; launch guards still apply."""
+        case = self.case
+        case.assertEqual(self.harness, 'opencode')
+        fx = self.fixture({'note': 'dead-capacity', 'failure_class': 'capacity'})
+        shipped = self.wrapper.ROOT/'adapters/opencode/config/models.conf'
+        fx.model_config_path = fx.root/'models-without-top.conf'
+        fx.model_config_path.write_text('\n'.join(line for line in shipped.read_text().splitlines()
+            if not line.startswith(('CFG_MODEL_PROFILE_TOP=', 'CFG_MODEL_PROFILE_GRANULARITY_TOP=')))+'\n')
+        config_before, route_before, jobs_before = (
+            fx.model_config_path.read_bytes(), fx.path.read_bytes(), fx.jobs.read_bytes())
+        args = self.args(fx, self.cli(fx, 'att-undeclared-top', 'top'))
+        # Resolve the comparison through the same parser and actual user-file
+        # reader, rather than hard-coding the shipped provider/model.
+        balanced = self.args(fx, self.cli(fx, 'att-balanced-read', 'balanced-deep'))
+        settings = args.resolved_model_settings
+        case.assertEqual((settings['profile'], settings['tier'], settings['granularity']),
+                         ('top', 'balanced-deep', 'collapsed-top-to-balanced-deep'))
+        case.assertEqual((settings['model'], settings['variant']),
+                         (balanced.resolved_model_settings['model'], balanced.resolved_model_settings['variant']))
+        import model_profile
+        case.assertEqual(model_profile.selection_receipt(args)['profile_selection_source'], 'explicit')
+        case.assertEqual(self.guard(fx, args), 0)
+        case.assertEqual(json.loads(args.route_validation)['status'], 'ok')
+        # Resolution alone does not register or authorize a process spawn.
+        case.assertNotIn(args.attempt_id, fx.rows())
+        with case.assertRaises(D.DispatchContractError) as refused:
+            self.spawn(fx, args.attempt_id)
+        case.assertEqual(refused.exception.reason, 'attempt-row-not-unique')
+        wrong = self.args(fx, self.cli(fx, 'att-wrong-profile', 'deep'))
+        case.assertEqual(self.guard(fx, wrong), 65)
+        for extra, reason in ((('--model', settings['model'], '--variant', settings['variant']),
+                               'model-profile-override-forbidden'),
+                              (('--capacity-retry', '1', '--model', settings['model'], '--variant', settings['variant']),
+                               'profile-top-override-forbidden')):
+            with case.subTest(extra=extra), case.assertRaises(self.wrapper.ModelSelectionError) as refused:
+                self.args(fx, self.cli(fx, 'att-forged-model', 'top', *extra))
+            case.assertEqual(refused.exception.reason, reason)
+        case.assertEqual(fx.model_config_path.read_bytes(), config_before)
+        # Explicit invalid TOP remains invalid; absence alone admits collapse.
+        fx.model_config_path.write_bytes(config_before + b'CFG_MODEL_PROFILE_TOP=missing:xhigh\n')
+        invalid_before = fx.model_config_path.read_bytes()
+        with case.assertRaises(self.wrapper.ModelSelectionError) as refused:
+            self.args(fx, self.cli(fx, 'att-invalid-top', 'top'))
+        case.assertEqual(refused.exception.reason, 'invalid-dispatch-model-profile')
+        case.assertIn('names tier', str(refused.exception))
+        case.assertEqual(fx.model_config_path.read_bytes(), invalid_before)
+        case.assertEqual(fx.path.read_bytes(), route_before)
+        case.assertEqual(fx.jobs.read_bytes(), jobs_before)
+        case.assertFalse((R._directory(fx.jobs)/'claims').exists())
+        # The route-authorized ordinary TOP launch is still admitted through
+        # the real registry/spawn guard, using the collapsed model. Capacity
+        # replacements and claimless DEEP remain covered by run/run_claimless.
+        fx.model_config_path.write_bytes(config_before)
+        case.assertTrue(self.register(fx, args))
+        row = fx.rows()[args.attempt_id][1]
+        case.assertEqual((row['model_profile'], row['model']), ('top', settings['model']))
+        case.assertEqual(self.spawn(fx, args.attempt_id), [args.attempt_id])
+        case.assertEqual(fx.model_config_path.read_bytes(), config_before)
         case.assertFalse((R._directory(fx.jobs)/'claims').exists())
 
 

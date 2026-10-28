@@ -1904,7 +1904,7 @@ def _parse_claude_stream_tail(path):
         return cached[1]
     disk_key = parse_cache.key("claude-attempt", path, cache_key,
                                (_CLAUDE_STREAM_HEAD_BYTES, _CLAUDE_STREAM_TAIL_BYTES,
-                                _CLAUDE_SUPERVISOR_HEAD_BYTES, "native-context-policy-v1"))
+                                _CLAUDE_SUPERVISOR_HEAD_BYTES, "native-context-policy-v2"))
     parsed = parse_cache.load(disk_key)
     if isinstance(parsed, dict):
         _CLAUDE_STREAM_CACHE[path] = (cache_key, parsed)
@@ -1991,11 +1991,7 @@ def _parse_claude_stream_tail(path):
                     if max_output:
                         model_max_output[model_id] = max_output
     window = model_windows.get(latest_model)
-    if window is None and len(model_windows) == 1:
-        window = next(iter(model_windows.values()))
     max_output = model_max_output.get(latest_model)
-    if max_output is None and len(model_max_output) == 1:
-        max_output = next(iter(model_max_output.values()))
     active = None
     if latest_usage is not None:
         parts = [_counter(latest_usage.get(key)) for key in (
@@ -2521,7 +2517,7 @@ def _parse_opencode_attempt_tail(path):
     if cached and cached[0] == cache_key:
         return cached[1]
     disk_key = parse_cache.key("opencode-attempt", path, cache_key,
-                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES, "native-session-v3"))
+                               (_CLAUDE_STREAM_TAIL_BYTES, _CLAUDE_SUPERVISOR_HEAD_BYTES, "native-session-v4"))
     parsed = parse_cache.load(disk_key)
     if isinstance(parsed, dict):
         _OPENCODE_ATTEMPT_CACHE[path] = (cache_key, parsed)
@@ -2580,7 +2576,7 @@ def _parse_opencode_attempt_tail(path):
         total = _counter(tokens.get("total"))
         parts = [_counter(tokens.get("input")), _counter(tokens.get("output")),
                  _counter(cache.get("read")), _counter(cache.get("write"))]
-        if total:
+        if total is not None:
             active = total
         elif any(value is not None for value in parts):
             active = sum(value or 0 for value in parts)     # native fallback; last step wins
@@ -2736,9 +2732,11 @@ def _enrich_opencode_attempt_session(job, fast_first=False):
     if parsed.get("session_id") and job.attempt_id and _native_home_admitted(job):
         try:
             from ..context_policy import read_policy
-            record = read_policy(
-                harness="opencode", session_id=parsed["session_id"],
-                attempt_id=job.attempt_id)
+            model = getattr(job, "resolved_model", None) or getattr(job, "model", None)
+            if isinstance(model, str) and model:
+                record = read_policy(
+                    harness="opencode", session_id=parsed["session_id"],
+                    attempt_id=job.attempt_id, model=model)
         except Exception:
             record = None
     policy_data = record.get("policy") if isinstance(record, dict) else None
