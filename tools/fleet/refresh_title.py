@@ -591,13 +591,23 @@ def _task_context_text(entries):
                if role == "assignment" or (role == "user" and _human_language_text(text))]
     if not intents:
         return ""
-    # Retain the origin and recent turns, leaving semantic topic changes to the
-    # same provider call rather than a keyword classifier or a permanent pin.
-    selected = intents if len(intents) <= 4 else [intents[0], *intents[-3:]]
-    cap = ANCHOR_TEXT_CAP // len(selected) - 40
-    return "\n\n".join("%s %s:\n%s" % (
-        "EARLIER" if i == 0 else "LATER", role.upper(), _bounded_data_text(text, cap))
-        for i, (role, text) in enumerate(selected))[:ANCHOR_TEXT_CAP]
+    # Keep every fitting intent; only overflow favors recent input. The provider
+    # still decides which requests change the objective and which continue it.
+    selected = []
+    remaining = ANCHOR_TEXT_CAP
+    for i in range(len(intents) - 1, -1, -1):
+        role, text = intents[i]
+        label = "%s %s:\n" % ("EARLIER" if i == 0 else "LATER", role.upper())
+        separator = 2 if selected else 0
+        room = remaining - len(label) - separator
+        if room <= 0:
+            break
+        text = _bounded_data_text(text, room)
+        if not text:
+            continue
+        selected.append(label + text)
+        remaining -= len(selected[-1]) + separator
+    return "\n\n".join(reversed(selected))
 
 
 def read_task_context(transcript, harness="claude"):
@@ -617,7 +627,9 @@ def read_task_context(transcript, harness="claude"):
                     tail_entries = [(role, text) for role, text, _ in _dialogue_records(tail, harness)]
                     intents = [text for role, text in tail_entries if role == "assignment"
                                or (role == "user" and _human_language_text(text))]
-                    if len(intents) >= 4 or window >= min(MAX_SCAN, size):
+                    # Several short follow-ups need little model input. Keep
+                    # looking within the existing scan bound for their purpose.
+                    if sum(map(len, intents)) >= ANCHOR_TEXT_CAP or window >= min(MAX_SCAN, size):
                         if start < ANCHOR_SCAN_CAP:
                             handle.seek(0)
                             raw = handle.read(size).decode("utf-8", "replace")

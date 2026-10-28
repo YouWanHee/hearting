@@ -1670,6 +1670,73 @@ class DispatchAnchorTest(unittest.TestCase):
 
 class ValidatorHardeningTest(unittest.TestCase):
 
+    def test_task_context_keeps_every_fitting_intent_without_equal_turn_quotas(self):
+        goal = "GPU 귀속을 바꾸고 세션별 관측을 보존해줘. " * 25
+        entries = [("user", "Repair Fleet history"), ("assistant", "INTERNAL"),
+                   ("user", goal), *[("user", "계속해")] * 10]
+        context = rt._task_context_text(entries)
+        self.assertLess(len(context), rt.ANCHOR_TEXT_CAP)
+        self.assertIn(goal.strip(), context)
+        self.assertEqual(context.count("LATER USER:\n계속해"), 10)
+        self.assertNotIn("INTERNAL", context)
+
+    def test_task_context_overflow_prefers_recent_intents_over_long_origin(self):
+        for role in ("user", "assignment"):
+            with self.subTest(origin_role=role):
+                entries = [(role, "OLD_ORIGIN " * rt.ANCHOR_TEXT_CAP),
+                           ("user", "Now repair GPU attribution"),
+                           *[("user", "continue")] * 8]
+                context = rt._task_context_text(entries)
+                self.assertLessEqual(len(context), rt.ANCHOR_TEXT_CAP)
+                self.assertIn("Now repair GPU attribution", context)
+                self.assertEqual(context.count("LATER USER:\ncontinue"), 8)
+                self.assertLess(context.index("Now repair GPU attribution"),
+                                context.index("continue"))
+                self.assertLess(context.count("OLD_ORIGIN"), rt.ANCHOR_TEXT_CAP)
+
+    def test_task_context_scan_stays_within_existing_head_and_max_tail_bounds(self):
+        reads = []
+        real_open = open
+
+        def tracking_open(*args, **kwargs):
+            handle = real_open(*args, **kwargs)
+            proxy = mock.MagicMock(wraps=handle)
+            proxy.__enter__.return_value = proxy
+            proxy.__exit__.side_effect = handle.__exit__
+
+            def read(size=-1):
+                reads.append((handle.tell(), size))
+                return handle.read(size)
+
+            proxy.read.side_effect = read
+            return proxy
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bounded.jsonl"
+            with path.open("w") as handle:
+                for role, text in [("user", "Visible origin"),
+                                   ("assistant", "x" * rt.ANCHOR_SCAN_CAP),
+                                   ("user", "OUTSIDE SCAN BOUND"),
+                                   ("assistant", "x" * (rt.MAX_SCAN + rt.ANCHOR_SCAN_CAP)),
+                                   *[("user", "continue")] * 4]:
+                    handle.write(json.dumps({"type": role, "message": {
+                        "role": role, "content": text}}) + "\n")
+            size = path.stat().st_size
+            with mock.patch.object(rt, "open", side_effect=tracking_open, create=True):
+                context = rt.read_task_context(str(path))
+        self.assertIn("Visible origin", context)
+        self.assertNotIn("OUTSIDE SCAN BOUND", context)
+        self.assertEqual(context.count("LATER USER:\ncontinue"), 4)
+        self.assertEqual(reads[0], (0, rt.ANCHOR_SCAN_CAP))
+        self.assertGreater(len(reads), 2)
+        self.assertEqual(max(count for _, count in reads), rt.MAX_SCAN)
+        for start, count in reads[1:]:
+            self.assertGreaterEqual(start, size - rt.MAX_SCAN)
+            self.assertLessEqual(start + count, size)
+            self.assertGreater(count, 0)
+        self.assertEqual((rt.ANCHOR_SCAN_CAP, rt.MAX_SCAN, rt.ANCHOR_TEXT_CAP, rt.TEXT_CAP),
+                         (65536, 4 << 20, 2000, 2000))
+
     def test_origin_prefers_first_user_over_bootstrap_and_assistant(self):
         raw = "\n".join([
             json.dumps({"type": "assistant", "message": "bootstrap noise"}),

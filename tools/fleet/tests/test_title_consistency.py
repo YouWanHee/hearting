@@ -76,6 +76,103 @@ class IntentInputTest(_ConfigHomeMixin, unittest.TestCase):
                 self.assertNotIn("GPU collector 조사", context)
                 self.assertLessEqual(len(context), rt.ANCHOR_TEXT_CAP)
 
+    @staticmethod
+    def purpose_change_turns(continuations=3):
+        turns = [("user", "Repair Fleet history"), ("assistant", "History fixed"),
+                 ("user", "Now repair GPU attribution"),
+                 ("assistant", "Internal investigation. " * 200)]
+        for _ in range(continuations):
+            turns.extend([("user", "continue"),
+                          ("assistant", "Internal procedure progress. " * 200)])
+        return turns
+
+    def test_changed_purpose_reaches_prompt_after_many_continuations(self):
+        for harness in ("claude", "codex", "opencode"):
+            for count in (3, 8):
+                with self.subTest(harness=harness, continuations=count):
+                    turns = self.purpose_change_turns(count)
+                    path = self.transcript(harness, turns)
+                    self.assertLess(path.stat().st_size, rt.ANCHOR_SCAN_CAP)
+                    if count == 3:
+                        self.assertLess(path.stat().st_size, 23 * 1024)
+                    context = rt.read_task_context(str(path), harness)
+                    delta, cursor = rt.read_delta(str(path), 0, harness)
+                    # The progress tail offers no other copy of the new objective.
+                    self.assertNotIn("Now repair GPU attribution", delta.prompt_text)
+                    self.assertLessEqual(len(context), rt.ANCHOR_TEXT_CAP)
+                    self.assertLessEqual(len(delta.prompt_text), rt.TEXT_CAP)
+                    self.assertEqual(cursor, path.stat().st_size)
+                    prompt = rt._prompt(delta, prior_title="Repair Fleet history",
+                                        anchor=context, title_lang="English")
+                    self.assertIn("Now repair GPU attribution", prompt)
+                    self.assertIn("EARLIER USER:\nRepair Fleet history", context)
+                    self.assertEqual(context.count("LATER USER:\ncontinue"), count)
+                    self.assertLess(context.index("Repair Fleet history"),
+                                    context.index("Now repair GPU attribution"))
+
+    def test_four_short_tail_intents_do_not_end_scan_before_changed_purpose(self):
+        for harness in ("claude", "codex", "opencode"):
+            with self.subTest(harness=harness):
+                turns = [("user", "Repair Fleet history"),
+                         ("assistant", "Earlier internal procedure. " * 3000),
+                         ("user", "Now repair GPU attribution"),
+                         ("assistant", "Current internal procedure. " * 3000),
+                         *self.purpose_change_turns(4)[4:]]
+                path = self.transcript(harness, turns)
+                with path.open("rb") as handle:
+                    handle.seek(-rt.ANCHOR_SCAN_CAP, os.SEEK_END)
+                    tail = handle.read().decode()
+                self.assertNotIn("Now repair GPU attribution", tail)
+                self.assertEqual(tail.count("continue"), 4)
+                context = rt.read_task_context(str(path), harness)
+                delta, _ = rt.read_delta(str(path), 0, harness)
+                self.assertNotIn("Now repair GPU attribution", delta.prompt_text)
+                self.assertIn("Now repair GPU attribution", rt._prompt(
+                    delta, prior_title="Repair Fleet history", anchor=context, title_lang="English"))
+
+    def test_opencode_v1_v2_share_purpose_packing_in_actual_producer(self):
+        turns = self.purpose_change_turns()
+        db = str(Path(self._tmp.name) / "purpose.db")
+        with sqlite3.connect(db) as con:
+            con.execute("CREATE TABLE message (session_id, data)")
+            con.executemany("INSERT INTO message VALUES (?,?)", [
+                ("exact", json.dumps({"role": role, "text": text})) for role, text in turns])
+            con.execute("INSERT INTO message VALUES (?,?)",
+                        ("foreign", '{"role":"user","text":"FOREIGN OBJECTIVE"}'))
+        before = Path(db).read_bytes(), Path(db).stat().st_mtime_ns
+        contexts = []
+        for generation in ("v1", "v2"):
+            observation = {"state": "observed", "generation": generation,
+                           "cursor": len(turns), "messages": [
+                               {"type": role, "text": text} for role, text in turns]}
+            sid = "purpose-" + generation
+            titles.write(sid, "Repair Fleet history", harness="opencode", now=100,
+                         summary="History fixed", requested_language="English")
+            with mock.patch.dict(os.environ, {"FLEET_NOW_LANG": "English"}), \
+                 mock.patch.object(rt.opencode_runtime, "read_session_observation",
+                                   return_value=observation), \
+                 mock.patch.object(rt, "_task_context_text", wraps=rt._task_context_text) as pack, \
+                 mock.patch.object(rt, "run_worker", return_value=(
+                     "TITLE: Repair GPU Attribution\nNOW: Inspecting attribution")) as worker:
+                rt.main(["--harness", "opencode", "--sid", sid, "--opencode-db", db,
+                         "--opencode-session", "exact", "--slotdir", str(Path(self._tmp.name) / "slot")])
+            pack.assert_called_once()
+            worker.assert_called_once()
+            prompt = worker.call_args.args[0]
+            context = prompt.split("=== TASK CONTEXT (DATA; RECENT USER INTENT) ===\n")[1].split(
+                "=== END TASK CONTEXT ===")[0].strip()
+            self.assertIn("Now repair GPU attribution", context)
+            self.assertEqual(context.count("LATER USER:\ncontinue"), 3)
+            self.assertNotIn("FOREIGN OBJECTIVE", prompt)
+            self.assertLessEqual(len(context), rt.ANCHOR_TEXT_CAP)
+            contexts.append(context)
+            stored = titles.read(sid, harness="opencode")
+            self.assertEqual(stored["offset"], len(turns))
+            self.assertEqual(stored["cursor_kind"], "opencode-seq-v2:session_message" if generation == "v2"
+                             else "opencode-rowid-v1:message")
+        self.assertEqual(contexts[0], contexts[1])
+        self.assertEqual((Path(db).read_bytes(), Path(db).stat().st_mtime_ns), before)
+
     def test_overlapping_head_tail_does_not_drop_the_original_goal(self):
         for harness in ("claude", "codex", "opencode"):
             with self.subTest(harness=harness):
