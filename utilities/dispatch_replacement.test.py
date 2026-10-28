@@ -3065,6 +3065,12 @@ class ReplacementTest(unittest.TestCase):
 
 
     def test_d5_automatic_owner_replacement_public_start_never_launches_disabled_codex(self):
+        self._d5_owner_replacement_public_start()
+
+    def test_d5_owner_replacement_continues_admitted_pin_disabled_since_admission(self):
+        self._d5_owner_replacement_public_start(pin='codex')
+
+    def _d5_owner_replacement_public_start(self, pin=None):
         spec=importlib.util.spec_from_file_location('d5_replacement_owner_fixture',Path(__file__).with_name('dispatch_owner.test.py'))
         suite=importlib.util.module_from_spec(spec);spec.loader.exec_module(suite)
         self._blocked_owner();self._answer()
@@ -3077,13 +3083,13 @@ class ReplacementTest(unittest.TestCase):
             for command in (["git","init","-q",str(self.root)],
                             ["git","-C",str(self.root),"-c","user.name=Fixture","-c","user.email=fixture@example.com","commit","--allow-empty","-qm","fixture"]):
                 subprocess.run(command,check=True,capture_output=True)
-            path,route=suite.d5_public_route(self.root,cwd=self.root)
+            path,route=suite.d5_public_route(self.root,cwd=self.root,pin=pin)
             # Keep the existing replacement family/claim and original task. The
             # selector consumes this real verified stale route at its public seam.
             self.route.update(route);self.path.write_text(json.dumps(self.route))
             source_before=self.jobs.read_bytes();route_before=self.path.read_bytes()
             suite.d5_defaults(self.root)
-            launched=[];commands=[]
+            launched=[];commands=[];outputs=[]
             def run(command,**kwargs):
                 commands.append(command)
                 self.assertEqual(Path(command[1]).name,'dispatch-owner.py')
@@ -3091,6 +3097,7 @@ class ReplacementTest(unittest.TestCase):
                 self.assertNotIn('--adapter',command)
                 out=io.StringIO()
                 with contextlib.redirect_stdout(out):code=suite.OWNER.main(command[2:])
+                outputs.append(out.getvalue())
                 return SimpleNamespace(returncode=code,stdout=out.getvalue(),stderr='')
             with mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None), \
                  mock.patch.object(suite.OWNER,'_usage',return_value={h:'ok' for h in ('claude','codex','opencode')}) as usage, \
@@ -3100,8 +3107,10 @@ class ReplacementTest(unittest.TestCase):
                 result=R.advance(self.jobs,'att-source',run=run,authority_check=lambda *_:True,resume_capacity=True)
             self.assertEqual(len(commands),1,result)
             self.assertEqual(len(launched),1,result)
-            self.assertEqual(Path(launched[0][0]).parts[-3],'claude')
-            self.assertEqual(usage.call_args.args[1],'deep')
+            self.assertEqual(Path(launched[0][0]).parts[-3],pin or 'claude')
+            self.assertEqual(usage.call_args.args[1],None if pin else 'deep')
+            if pin:
+                self.assertEqual(outputs[0].count('policy_note=disabled-since-admission'),1)
             self.assertIn('--automatic-retry-of',launched[0])
             self.assertIn('att-source',launched[0])
             self.assertEqual(self.path.read_bytes(),route_before)
@@ -3116,17 +3125,22 @@ class ReplacementTest(unittest.TestCase):
                 self.assertEqual(current[aid][0][:5],fields[:5])
                 for key,value in meta.items():self.assertEqual(current[aid][1][key],value)
 
-    def test_d5_disabled_fixed_replay_returns_policy_attention_before_claim_and_spawn(self):
+    def test_d5_disabled_fixed_replay_launches_exact_source_with_policy_note(self):
         spec=importlib.util.spec_from_file_location('d5_fixed_replay_fixture',Path(__file__).with_name('dispatch_owner.test.py'))
         suite=importlib.util.module_from_spec(spec);spec.loader.exec_module(suite)
         config=suite.d5_defaults(self.root)
-        before=self.jobs.read_bytes()
+        self.meta.update(launch_started='1', launch_outcome='spawned')
+        self.write(self.meta)
+        commands=[]; diagnostic=io.StringIO()
         with mock.patch.dict(os.environ,{'DISPATCH_DEFAULTS_CONFIG':str(config)}), \
-             mock.patch.object(R,'claim',side_effect=AssertionError('policy refusal must precede a new claim')), \
-             mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None):
-            result=R.advance(self.jobs,'att-source',run=lambda *a,**k:self.fail('no wrapper may run'),authority_check=lambda *_:True)
-        self.assertEqual((result['state'],result['reason']),('needs-attention','explicit-adapter-disabled-by-user-policy'),result)
-        self.assertEqual(self.jobs.read_bytes(),before)
+             mock.patch('dispatch_capacity_evidence.harness_hold',return_value=None), \
+             contextlib.redirect_stderr(diagnostic):
+            result=R.advance(self.jobs,'att-source',run=lambda command,**kw:(commands.append(command) or
+                SimpleNamespace(returncode=0,stdout='',stderr='')),authority_check=lambda *_:True)
+        self.assertEqual(len(commands),1,result)
+        self.assertEqual(Path(commands[0][1]).parts[-3],'codex')
+        self.assertIn('--automatic-retry-of',commands[0])
+        self.assertEqual(diagnostic.getvalue().count('policy_note=disabled-since-admission'),1)
 
     def test_gpu_lab_correction_prepares_compute_defaults_instead_of_replaying_old_access(self):
         import execution_access as EA

@@ -1058,7 +1058,8 @@ def assign_harnesses(
                     pool = (route.get("dispatch_allocation") or {}).get("harness_order")
             except DISPATCH_NODE.DispatchNodeError as exc:
                 raise BatchError(exc.reason, str(exc.fields)) from exc
-        if worker_pin and worker_pin not in enabled:
+        admitted_pin = DISPATCH_NODE.ROUTE_AUTHORITY.harness_admitted(route, worker_pin, node=node)
+        if worker_pin and worker_pin not in enabled and not admitted_pin:
             raise BatchError("explicit-adapter-disabled-by-user-policy", worker_pin)
         unstarted = (excluded or {}).get(str(node.get("id")), set())
         from dispatch_capacity_evidence import active_limits
@@ -1071,7 +1072,8 @@ def assign_harnesses(
             if isinstance(node_policy, dict) else None
         )
         for adapter in SUPPORTED_BATCH_HARNESSES:
-            if adapter not in enabled or (adapter != worker_pin and isinstance(pool, list) and adapter not in pool):
+            if ((adapter not in enabled and not (adapter == worker_pin and admitted_pin))
+                    or (adapter != worker_pin and isinstance(pool, list) and adapter not in pool)):
                 exclusions.setdefault(adapter, set()).add("disabled-by-user-policy")
                 node_exclusions.setdefault(adapter, set()).add("disabled-by-user-policy")
                 continue
@@ -3683,10 +3685,20 @@ def main(argv: list[str] | None = None) -> int:
         except DISPATCH_NODE.DispatchNodeError as exc:
             return fail(exc.reason, 65, admitted=0, spawned=0, detail=str(exc.fields))
         pin = sealed_pin_harness(route, worker_type="stage")
+        policy_note = False
         for leg in pending_legs:
-            if leg["adapter"] not in enabled or (pin and pin not in enabled):
+            node = next(n for n in nodes if n["id"] == leg["node"])
+            admitted_pin = DISPATCH_NODE.ROUTE_AUTHORITY.harness_admitted(route, pin, node=node)
+            replay = bool(partial and partial.get("automatic_replacement_evidence")
+                          and leg["node"] == partial["gap_leg_id"])
+            if ((pin and pin not in enabled and not admitted_pin)
+                    or (leg["adapter"] not in enabled
+                        and not (leg["adapter"] == pin and admitted_pin) and not replay)):
                 return fail("explicit-adapter-disabled-by-user-policy", 65, admitted=0, spawned=0,
                             detail=f"node={leg['node']} harness={leg['adapter']}")
+            policy_note |= leg["adapter"] not in enabled
+        if policy_note:
+            print("policy_note=disabled-since-admission", file=sys.stderr)
     for leg in pending_legs:
         limits = active_limits(jobs, profile=leg.get("model_profile"),
                                recheck=args.action == "start" and leg["adapter"] == "claude")

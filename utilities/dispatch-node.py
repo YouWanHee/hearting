@@ -751,18 +751,19 @@ def current_launch_defaults():
 
 
 def current_launch_harnesses():
-    """Current launch ceiling; never used by historical evidence readers."""
+    """Current automatic selection ceiling; not a revocation of admitted targets."""
     return ROUTE.DEFAULTS.current_enabled_harnesses(current_launch_defaults())
 
 
 def pin_harness_available(route, node, harness, jobs, recheck=True):
     """Whether the route's sealed worker pin can run this node now.
 
-    An enabled explicit target uses its checked evidence for this parent even
-    outside the original bands/pool. Active usage limits still hold it; the
+    An enabled or previously admitted target uses its checked evidence for
+    this parent. Active usage limits still hold it; the
     soft usage gate does not. Historical tuple readers remain policy-free.
     """
-    if harness not in current_launch_harnesses():
+    if (harness not in current_launch_harnesses()
+            and not ROUTE_AUTHORITY.harness_admitted(route, harness, node=node)):
         return False
     from dispatch_capacity_evidence import active_limits
     if harness in active_limits(jobs, profile=node.get("model_profile"), recheck=recheck and harness == "claude"):
@@ -1099,8 +1100,14 @@ def main():
  try:
   enabled=current_launch_harnesses()
   pin=ROUTE_AUTHORITY.sealed_pin_harness(route,worker_type=worker_type)
-  if a.adapter not in enabled or (pin and pin not in enabled):
+  # replacement_task already verified the exact claim, route, node and harness;
+  # a retry flag alone is not that historical admission.
+  if pin and pin not in enabled and original_task is None and not ROUTE_AUTHORITY.harness_admitted(route,pin,node=node):
    raise DispatchNodeError("explicit-adapter-disabled-by-user-policy",adapter=a.adapter)
+  if a.adapter not in enabled:
+   if original_task is None and not ROUTE_AUTHORITY.harness_admitted(route,a.adapter,node=node):
+    raise DispatchNodeError("explicit-adapter-disabled-by-user-policy",adapter=a.adapter)
+   print("policy_note=disabled-since-admission")
   result = run_launcher(argv,a.action,lifecycle)
  except DispatchNodeError as exc:
   print("check=failed"); print(f"reason={exc.reason}"); print("child_spawned=0")

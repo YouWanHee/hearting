@@ -2312,7 +2312,7 @@ def d5_defaults(directory, enabled=("claude", "opencode"), version=4):
     return path
 
 
-def d5_public_route(directory, *, text="Continue approved work", owner=None, cwd=None):
+def d5_public_route(directory, *, text="Continue approved work", owner=None, cwd=None, pin=None):
     """Real compose/verify/binding; only runtime probes are supplied fixture evidence."""
     import owner_route_binding as binding
     router=binding.ROUTE
@@ -2330,7 +2330,8 @@ def d5_public_route(directory, *, text="Continue approved work", owner=None, cwd
     route=router.compose_route(capability="autopilot-code",capability_mode="dev",shape="staged",
         graph="plan,plan-check,execute,impl-review,test,report",slug="d5-public",cwd=cwd,artifact_root=artifact,
         spec_read="fixture",drift_verdict="fixture",unassigned=True,dispatch_evidence={"tuples":rows},
-        work_request={"text":text,"owner_harness":owner})
+        work_request={"text":text,"owner_harness":owner},
+        selection_pins={"owner": {"harness": pin, "model": None, "effort": None}} if pin else None)
     router.verify_route(route,cwd)
     path=Path(directory)/"public-route.json";path.write_text(json.dumps(route))
     return path,route
@@ -2357,9 +2358,32 @@ class D5LiveOwnerPolicyTest(unittest.TestCase):
                     self.assertNotEqual(limited.rc, 0, limited.out)
                     self.assertEqual(limited.calls, [])
                     for pin in (None, "codex"):
-                        denied = self._launch(self._route(pin=pin), "codex" if pin is None else None)
-                        self.assertIn("explicit-adapter-disabled-by-user-policy", denied.out)
-                        self.assertEqual(denied.calls, [])
+                        continued = self._launch(self._route(pin=pin), "codex" if pin is None else None)
+                        self.assertEqual(continued.wrapper, "codex", continued.out)
+                        self.assertEqual(continued.out.count("policy_note=disabled-since-admission"), 1)
+
+    def test_disabled_target_absent_at_admission_is_refused_despite_checked_tuple(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = d5_defaults(td)
+            with mock.patch.dict(os.environ, {"DISPATCH_DEFAULTS_CONFIG": str(config)}):
+                for pin in (None, "codex"):
+                    path = self._route(pin=pin)
+                    route = json.loads(path.read_text())
+                    route["dispatch_allocation"]["harness_order"] = ["claude"]
+                    route["owner_harness_policy"].update(primary=["claude"], relief=[], last_resort=[])
+                    path.write_text(json.dumps(route))
+                    got = self._launch(path, "codex" if pin is None else None)
+                    self.assertEqual(got.calls, [])
+                    self.assertIn("explicit-adapter-disabled-by-user-policy", got.out)
+
+    def test_disabled_admitted_pin_still_yields_to_usage_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            config = d5_defaults(td)
+            with mock.patch.dict(os.environ, {"DISPATCH_DEFAULTS_CONFIG": str(config)}):
+                got = self._launch(self._route(pin="codex"), None,
+                                   usage={"codex": "limited", "claude": "ok", "opencode": "ok"})
+            self.assertEqual(got.rc, 0, got.out)
+            self.assertNotEqual(got.wrapper, "codex", got.out)
 
     def test_route_document_and_worker_frame_pin_do_not_suppress_model_provider_eligibility(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2403,14 +2427,19 @@ class D5LiveOwnerPolicyTest(unittest.TestCase):
                     self.assertEqual(got.wrapper, "opencode" if checked else None, got.out)
                     self.assertEqual(path.read_bytes(), before)
 
-    def test_policy_changed_between_selection_and_wrapper_launch_is_rechecked(self):
+    def test_policy_changed_after_selection_only_stops_automatic_choice(self):
         with tempfile.TemporaryDirectory() as td:
             config = d5_defaults(td, enabled=("claude", "codex", "opencode"))
             def states(*args, **kwargs):
-                d5_defaults(td)  # selected explicit Codex was enabled at the first read
+                d5_defaults(td)
                 return {"claude": "ok", "codex": "ok", "opencode": "ok"}
             with mock.patch.dict(os.environ, {"DISPATCH_DEFAULTS_CONFIG": str(config)}):
-                got = self._launch(self._route(), "codex", usage=states)
+                exact = self._launch(self._route(), "codex", usage=states)
+                self.assertEqual(exact.wrapper, "codex", exact.out)
+                self.assertIn("policy_note=disabled-since-admission", exact.out)
+                d5_defaults(td, enabled=("claude", "codex", "opencode"))
+                got = self._launch(self._route(), None, usage=states,
+                                   scores={"claude": 80, "codex": 99, "opencode": 70})
             self.assertEqual(got.calls, [])
             self.assertIn("explicit-adapter-disabled-by-user-policy", got.out)
 

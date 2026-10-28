@@ -2330,7 +2330,11 @@ def _capacity_hold(jobs, source, model=None, *, allow_frame_peer=False):
     pin = sealed_pin_harness(route_authority.route_in_force(route), worker_type=source.get('worker_type'))
     harness = source.get('harness') or source.get('owner_harness')
     enabled = _current_launch_harnesses()
-    if pin and pin not in enabled:
+    node = next((row for row in route.get('nodes', [])
+                 if row.get('id') == source.get('route_node')), None)
+    if (pin and pin not in enabled
+            and not route_authority.harness_admitted(route, pin, node=node)
+            and pin != launch_input(jobs, source.get('attempt_id'), source).get('harness')):
         raise DC.DispatchContractError('explicit-adapter-disabled-by-user-policy', pin)
     if source.get('worker_type') == 'owner':
         # The ordinary selector judges all candidates; the old owner's limit or
@@ -2342,7 +2346,8 @@ def _capacity_hold(jobs, source, model=None, *, allow_frame_peer=False):
     if harness not in enabled:
         if allow_frame_peer and source.get('worker_type') == 'frame' and not pin:
             return None  # the ordinary frame selector chooses an enabled checked target
-        raise DC.DispatchContractError('explicit-adapter-disabled-by-user-policy', str(harness))
+        # This is the exact source's replay, already admitted on this route.
+        # Its real usage hold still applies below.
     hold = harness_hold(jobs, harness, model=model or source.get('model'), recheck=True)
     if hold:
         if allow_frame_peer and source.get('worker_type') == 'frame':
@@ -2566,9 +2571,8 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
             foreground, timeout = _launcher_budget(command, source)
             if (len(command) > 1 and Path(command[1]).name == 'dispatch-headless.py'
                     and replay['harness'] not in _current_launch_harnesses()):
-                # Direct replay keeps its original harness. Policy failure is
-                # handed to the existing controller, never silently rerouted.
-                raise DC.DispatchContractError('explicit-adapter-disabled-by-user-policy', replay['harness'])
+                # launch_input/claim already bind this exact historical harness.
+                print('policy_note=disabled-since-admission', file=sys.stderr)
             if foreground and run is subprocess.run:
                 from dispatch_lifecycle import run_forwarding_termination
                 completed = run_forwarding_termination(command, env=env, capture=True,

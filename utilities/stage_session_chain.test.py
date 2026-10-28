@@ -547,7 +547,9 @@ class PlanSlicesTest(unittest.TestCase):
             for policy in ({"primary": ["claude", "codex"]}, {"primary": ["codex"], "relief": ["opencode"]}):
                 with self.subTest(version=version, policy=policy):
                     self.assertEqual(planned(version=version, policy=policy, enabled=("codex", "opencode")),
-                                     ["codex", "codex"])  # a sealed pin cannot revive a disabled target
+                                     ["claude", "claude"] if "claude" in policy["primary"] else ["codex", "codex"])
+                    # An admitted pin continues; a target absent from both the
+                    # sealed pool and node policy remains unavailable.
 
     def test_plan_slices_cli_keeps_enabled_pin_distinct_from_automatic_pool(self):
         """Public planning honors the pin without rewriting the pool or granting a disabled exception."""

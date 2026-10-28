@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "utilities"))
 from model_config import ModelConfigError, resolve_config  # noqa: E402
-from route_authority import decide_continuation, new_owner_request, retry_predecessor, route_in_force, sealed_pin_harness  # noqa: E402
+from route_authority import decide_continuation, harness_admitted, new_owner_request, retry_predecessor, route_in_force, sealed_pin_harness  # noqa: E402
 
 
 def _unit_role(unit):
@@ -138,7 +138,7 @@ def outer_subprocess_timeout(
     return bounded_foreground_timeout(foreground_timeout) + 10.0
 
 
-def run_wrapper(args: argparse.Namespace, command: list[str]):
+def run_wrapper(args: argparse.Namespace, command: list[str], *, route=None, node=None, replay_harness=None):
     """One adapter-wrapper launch for this chain.
 
     A foreground-scoped ``--start`` hosts the worker inside this call, so a
@@ -154,8 +154,13 @@ def run_wrapper(args: argparse.Namespace, command: list[str]):
         reason, detail = None, ""
         try:
             if harness not in DISPATCH_NODE.current_launch_harnesses():
-                reason = "explicit-adapter-disabled-by-user-policy"
-                detail = harness
+                pin = sealed_pin_harness(route, worker_type="stage")
+                if (harness == replay_harness or
+                        harness == pin and harness_admitted(route, harness, node=node)):
+                    print("policy_note=disabled-since-admission", file=sys.stderr)
+                else:
+                    reason = "explicit-adapter-disabled-by-user-policy"
+                    detail = harness
         except DISPATCH_NODE.DispatchNodeError as exc:
             reason, detail = exc.reason, compact_diagnostic(str(exc.fields))
         if reason:
@@ -573,7 +578,7 @@ def ordered_fallback_hops(
             and isinstance(allocation.get("harness_order"), list)):
         allowed.intersection_update(allocation["harness_order"])
     worker_pin = sealed_pin_harness(route, worker_type="stage")
-    if worker_pin in enabled:
+    if worker_pin in enabled or harness_admitted(route, worker_pin, node=node):
         allowed.add(worker_pin)  # only its existing checked rows, not other automatic candidates
     hops = []
     for hop in node["fallback_hops"]:
@@ -1978,7 +1983,8 @@ def capacity_retry(
             args, route, node, row, ordinal, retry_id,
             (alt_model, alt_paired), failed,
         )
-        retry = run_wrapper(args, retry_command)
+        retry = run_wrapper(args, retry_command, route=route, node=node,
+                            replay_harness=harness if failed.get("attempt_id") else None)
     except subprocess.TimeoutExpired:
         attempts.append(f"{ordinal}:{key}:capacity-retry-timeout:attempt-{retry_id}")
         if registry_has_attempt(args.jobs, retry_id):
@@ -2568,7 +2574,7 @@ def _dispatch(observation: "LAUNCH_TUPLE.ReportOnlyObservation") -> int:
                     )
                 try:
                     command = wrapper_command(args, route, node, row, ordinal, attempt_id)
-                    result = run_wrapper(args, command)
+                    result = run_wrapper(args, command, route=route, node=node)
                     relay_wrapper_stderr(result)
                     output = (result.stdout or "").strip()
                     fields = wrapper_fields(result)

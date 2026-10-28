@@ -2588,6 +2588,9 @@ class DispatchBatchTest(unittest.TestCase):
             route=self._pinned_balanced_route()
             rows,_,_=self._assign_gated(route)
             self.assertNotIn("codex",{row[1] for row in rows})
+            route=self._pinned_balanced_route(pin="codex")
+            rows,_,_=self._assign_gated(route)
+            self.assertEqual({row[1] for row in rows},{"codex"})
             # A checked enabled pin can select outside the original allocation
             # and bands. Removing it must immediately restore the original pool.
             route=self._pinned_balanced_route(pin="opencode")

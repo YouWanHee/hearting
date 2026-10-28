@@ -15,7 +15,7 @@ from owner_route_binding import OwnerRouteBindingError, validate_owner_route_bin
 from dispatch_mode_contract import DispatchModeContractError, resolve_qa
 from dispatch_contract import (DispatchContractError, frame_harness_admission,
                                parse_registry_metadata, record_frame_launch_degradation)
-from route_authority import pinned_launch_harness, route_in_force, sealed_pin_harness
+from route_authority import harness_admitted, pinned_launch_harness, route_in_force, sealed_pin_harness
 from dispatch_lifecycle import (
     FOREGROUND_NOTICE,
     FOREGROUND_SCOPED,
@@ -862,9 +862,14 @@ def main(argv):
             pinned = sealed_pin_harness(pin_doc, worker_type=values["--worker-type"])
             if pinned and pinned != explicit and (sealed is None or pinned in sealed):
                 explicit = pinned
-        if pinned and pinned not in enabled:
+        admission_route = ({"dispatch_allocation": sealed_context.get("allocation"),
+                            "owner_harness_policy": sealed_context.get("policy")}
+                           if sealed_context else {})
+        def admitted(harness):
+            return harness_admitted(admission_route, harness)
+        if pinned and pinned not in enabled and not admitted(pinned):
             raise OwnerError("explicit-adapter-disabled-by-user-policy")
-        if explicit is not None and explicit not in enabled:
+        if explicit is not None and explicit not in enabled and not admitted(explicit):
             raise OwnerError("explicit-adapter-disabled-by-user-policy")
         if explicit is not None and explicit not in configured:
             explicit_policy = "outside-profile-bands"
@@ -903,13 +908,13 @@ def main(argv):
         if pin_doc is not None:
             choice, overridden = pinned_launch_harness(
                 pin_doc, worker_type=values["--worker-type"], requested=requested,
-                available=lambda h: h in enabled and (sealed is None or h in sealed) and _eligible(states.get(h, "unknown")))
+                available=lambda h: (h in enabled or admitted(h)) and (sealed is None or h in sealed) and _eligible(states.get(h, "unknown")))
             pin_chosen = choice is not None and choice != requested
             if choice != explicit:  # the pinned harness is limited: the request, with today's checks
                 explicit = choice
                 if explicit is not None and sealed is not None and explicit not in sealed:
                     raise OwnerError("explicit-adapter-outside-route-evidence")
-        if explicit is not None and explicit not in enabled:
+        if explicit is not None and explicit not in enabled and not admitted(explicit):
             raise OwnerError("explicit-adapter-disabled-by-user-policy")
         explicit_policy = "outside-profile-bands" if explicit is not None and explicit not in configured else None
         allocation = (
@@ -1202,8 +1207,10 @@ def main(argv):
         # Selection and launch are separate boundaries: policy may change while
         # binding artifacts or waiting for the first frame leg.
         launch_enabled = _defaults.current_enabled_harnesses()
-        if selected not in launch_enabled or (pinned and pinned not in launch_enabled):
-            raise OwnerError("explicit-adapter-disabled-by-user-policy")
+        if selected not in launch_enabled:
+            if source not in {"explicit", "route-pin"} or not admitted(selected):
+                raise OwnerError("explicit-adapter-disabled-by-user-policy")
+            print("policy_note=disabled-since-admission")
         result = run_owner_wrapper([str(wrapper), *forwarded], child_env)
         if result == 0 and frame_degradation and "--start" in forwarded:
             route, first_attempt_id, first_harness, degradation_reason, detail = frame_degradation

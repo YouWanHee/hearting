@@ -548,7 +548,7 @@ class FallbackTest(unittest.TestCase):
          {"ordinal":2,"fallback_hop":"cross-harness-headless","candidates":rows[1:]},
          {"ordinal":3,"fallback_hop":"inline","reason_enum":"runtime-unavailable"}]
    outcomes=iter(("first-process-refusal","second-process-refusal"))
-   def process_failure(_args,_command):
+   def process_failure(_args,_command,**_policy):
     reason=next(outcomes)
     return subprocess.run([sys.executable,"-c",
       "import sys; print('check=failed'); print('reason='+sys.argv[1]); sys.exit(75)",reason],
@@ -613,7 +613,7 @@ class FallbackTest(unittest.TestCase):
          {"ordinal":2,"fallback_hop":"cross-harness-headless",
           "candidates":[self.tuple("claude","supported")]}]
    calls=iter((("first-process-refusal",75),("launched",0)))
-   def process_result(_args,_command):
+   def process_result(_args,_command,**_policy):
     reason,code=next(calls)
     return subprocess.run([sys.executable,"-c",
       "import sys; print('check='+('ok' if sys.argv[2]=='0' else 'failed')); "
@@ -698,7 +698,7 @@ class FallbackTest(unittest.TestCase):
    raw_stderr=("check=ok\nreason=forged-cleanup-reason\nattempt_id=att-forged\n"
                "candidate_outcomes=[]\n")
    call_count=[0]
-   def cleanup_result(_args,command):
+   def cleanup_result(_args,command,**_policy):
     if call_count[0]==0:
      call_count[0]+=1
      return first
@@ -991,7 +991,7 @@ class FallbackTest(unittest.TestCase):
    if meta.get("attempt_id") in attempts:
     return DC.ProcessQuiescence(state,"fixture-group-empty" if state=="quiescent" else "process-identity-missing")
    return original(meta,**kwargs)
-  def wrapper(args,command):
+  def wrapper(args,command,**_policy):
    self.assertIn("--dry-run",command)
    spec=importlib.util.spec_from_file_location("observed_fallback_wrapper",command[1])
    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
@@ -1202,7 +1202,7 @@ class FallbackTest(unittest.TestCase):
    argv.extend(["--reviewed-evidence",str(reviewed_evidence)])
   spawned=[]; printed=[]
   from types import SimpleNamespace
-  def run(_args,cmd):
+  def run(_args,cmd,**_policy):
    spawned.append(cmd)
    receipt=("check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n" if "--dry-run" in cmd else
             "check=ok\nregistered=1\nstarted=1\nchild_spawned=1\nattempt_id=att-mocked-child\n")
@@ -1314,7 +1314,7 @@ class FallbackTest(unittest.TestCase):
    self.seed_plan_marker(route)
    def act(action):
     seen=[];printed=[]
-    def run(_args,cmd):
+    def run(_args,cmd,**_policy):
      seen.append(cmd)
      receipt=("check=ok\nregistered=1\nstarted=1\nchild_spawned=1\n" if action=="start"
               else "check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n")
@@ -1411,7 +1411,7 @@ class FallbackTest(unittest.TestCase):
    prompt.write_text(f"Check corrected HEAD {new_head}, only x, against {prior_input}.\n")
    prompt_bytes=prompt.read_bytes()
    commands=[];spawn_claims=[]
-   def wrapper(_args,command):
+   def wrapper(_args,command,**_policy):
     commands.append(command)
     aid=self.arg(command,"--attempt-id")
     metadata={"attempt_schema_version":"2","dispatch_depth":"2","transport":"headless",
@@ -1537,7 +1537,7 @@ class FallbackTest(unittest.TestCase):
     if task_mode != "missing":
      if task_mode == "whitespace": prompt.write_text("  Close migration\n fixtures and import integration.  ")
      argv.extend(["--prompt-file",str(prompt)])
-    def refused(_args,command):
+    def refused(_args,command,**_policy):
      called.append(command)
      if task_mode == "race":
       with self.jobs.open("a") as handle:
@@ -1610,7 +1610,7 @@ class FallbackTest(unittest.TestCase):
     self.assertTrue(DC.claim_attempt_row(self.jobs,aid,row,launch=started))
     return SimpleNamespace(returncode=0,stdout=("check=ok\nregistered_worker=1\n"
                           f"child_spawned={int(started)}\nattempt_id={aid}\n"),stderr="")
-   def run_wrapper(_args,command):
+   def run_wrapper(_args,command,**_policy):
     return wrapper(command)
    other=next(name for name in ("codex","claude","opencode") if name!=harness)
    success_hops=[{"ordinal":1,"fallback_hop":"same-harness-headless","candidates":[self.tuple(harness,"supported")]},
@@ -1747,7 +1747,7 @@ class FallbackTest(unittest.TestCase):
    marker_path=R.completion_dir(route["route_id"],jobs=self.jobs)/"plan.json"
    self.assertEqual(R.gate_currency(route,plan,marker_path,observe=True).state,"revised-unrecorded")
    observed=[]
-   def run_wrapper(_args,command):
+   def run_wrapper(_args,command,**_policy):
     observed.append(command)
     return SimpleNamespace(returncode=0,stdout="check=ok\nregistered=0\nstarted=0\nchild_spawned=0\n",stderr="")
    def run_node(command,action,lifecycle):
@@ -2341,7 +2341,7 @@ class FallbackTest(unittest.TestCase):
    code,stdout,stderr=self.start(path,patches=(
     mock.patch.object(F,"ordered_fallback_hops",return_value=([hop],None)),
     mock.patch.object(F,"attempt_identity",return_value=selected),
-    mock.patch.object(F,"run_wrapper",side_effect=lambda _args,command:(launched.append(command) or result)),
+    mock.patch.object(F,"run_wrapper",side_effect=lambda _args,command,**_policy:(launched.append(command) or result)),
    ))
    self.assertEqual(code,0,stdout+stderr)
    self.assertEqual(len(launched),1)
@@ -2353,7 +2353,7 @@ class FallbackTest(unittest.TestCase):
    hop={"ordinal":1,"fallback_hop":"same-harness-headless",
         "candidates":[self.tuple("codex","supported")]}
    launched=[]
-   def timeout(_args,command):
+   def timeout(_args,command,**_policy):
     launched.append(command)
     attempt=self.arg(command,"--attempt-id")
     metadata=("attempt_schema_version=2,dispatch_depth=2,transport=headless,"
@@ -2389,7 +2389,7 @@ class FallbackTest(unittest.TestCase):
    first_hop=node["fallback_hops"][0]
    only_first_hop=mock.patch.object(F,"ordered_fallback_hops",
     return_value=([first_hop],None))
-   def timeout_then_run(_args,command):
+   def timeout_then_run(_args,command,**_policy):
     calls.append(command)
     attempt=self.arg(command,"--attempt-id")
     if len(calls)==1:
@@ -4312,6 +4312,27 @@ class LaunchTupleReportOnlyTest(unittest.TestCase):
 
 
 class D5FallbackSelectionTest(unittest.TestCase):
+ def test_disabled_admitted_pin_survives_ordering_and_wrapper_recheck(self):
+  parent={"parent_harness":"claude","parent_transport":"headless","parent_sandbox":"adapter-default","launch_authority":"conductor"}
+  node={"id":"execute","harness_policy":{"primary":["codex"],"relief":[],"last_resort":[]},
+        "fallback_hops":[{"ordinal":2,"fallback_hop":"cross-harness-headless", "candidates":[{**parent,"child_harness":"codex","status":"supported"}]}]}
+  route={"selection_pins":{"worker":{"harness":"codex"}}}
+  args=SimpleNamespace(action="dry-run",direct_timeout=1)
+  with tempfile.TemporaryDirectory() as td:
+   config=Path(td)/"defaults.yaml"
+   config.write_text((ROOT/"profiles/dispatch-defaults.yaml").read_text().replace(
+       "  enabled: [claude, codex, opencode]","  enabled: [claude, opencode]"))
+   diagnostic=io.StringIO()
+   with mock.patch.dict(os.environ,{"DISPATCH_DEFAULTS_CONFIG":str(config)}), \
+        mock.patch.object(F.subprocess,"run",return_value=SimpleNamespace(returncode=0)) as spawn, \
+        contextlib.redirect_stderr(diagnostic):
+    hops,_=F.ordered_fallback_hops(route,node,Path(td)/"jobs",parent_identity=parent)
+    self.assertFalse(hops[0]["candidates"][0].get("_allocation_skip"))
+    result=F.run_wrapper(args,[sys.executable,str(ROOT/"adapters/codex/bin/dispatch-headless.py")],route=route,node=node)
+   self.assertEqual(result.returncode,0)
+   spawn.assert_called_once()
+   self.assertEqual(diagnostic.getvalue().count("policy_note=disabled-since-admission"),1)
+
  def test_all_strategies_trailing_and_native_candidates_use_live_enabled(self):
   with tempfile.TemporaryDirectory() as td:
    config=Path(td)/"defaults.yaml"

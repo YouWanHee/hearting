@@ -795,7 +795,7 @@ def query_owners(config):
 
 
 def current_enabled_harnesses(config=None):
-    """Current launch ceiling, independent of a route's sealed quality order.
+    """Current automatic selection ceiling, separate from prior exact admission.
 
     Call only for new choices/launches, never for historical evidence readers.
     Legacy schemas have no disabled-harness declaration: their owner ordering

@@ -146,18 +146,11 @@ class ReplacementBatchTest(unittest.TestCase):
                 'AGENT_DISPATCH_CURRENT_HARNESS': 'codex', 'AGENT_DISPATCH_CURRENT_TRANSPORT': 'headless',
                 'AGENT_DISPATCH_CURRENT_SANDBOX': 'workspace-write'}))
             output = io.StringIO()
-            before=self.jobs.read_bytes()
             config.write_text(baseline.replace('  enabled: [claude, codex, opencode]','  enabled: [opencode]'))
-            with contextlib.redirect_stdout(output):
-                denied=BATCH.main(command[2:])
-            self.assertEqual(denied,65,output.getvalue())
-            self.assertIn('explicit-adapter-disabled-by-user-policy',output.getvalue())
-            self.assertEqual(self.jobs.read_bytes(),before)
-            self.assertEqual(spawned,[]);reserve.assert_not_called()
-            config.write_text(baseline.replace('  enabled: [claude, codex, opencode]','  enabled: [claude, opencode]'))
-            output.seek(0);output.truncate(0)
-            with contextlib.redirect_stdout(output):
+            diagnostic=io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(diagnostic):
                 rc = BATCH.main(command[2:])
+            self.assertEqual(diagnostic.getvalue().count('policy_note=disabled-since-admission'),1)
         self.assertEqual(rc, 0, output.getvalue())
         self.assertEqual(len(spawned), 1)
         allocator.assert_not_called()
