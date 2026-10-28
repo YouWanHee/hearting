@@ -6680,6 +6680,13 @@ class RouteLineageBindingTest(ProducerTestBase):
             tracking="tracked", tracked_gate_evidence=gate_evidence(), slug=slug,
         )
 
+    def _ran(self, *routes):
+        """A started attempt of each route: an executed branch, not only a published one."""
+        with self.jobs.open("a") as out:
+            for route in routes:
+                out.write(f"2026-10-09\topen\t{R.ROOT}\t{R.ROOT}\tchild\troute_id={route['route_id']},"
+                          f"attempt_id=att-{route['route_id']},launch_started=1\n")
+
     def test_closed_unused_candidate_keeps_execution_and_unknown_evidence_attached(self):
         begin = self._root_route("unused-candidate-boundaries")
         self._publish_root(begin)
@@ -6794,6 +6801,7 @@ class RouteLineageBindingTest(ProducerTestBase):
         # ambiguous. The finish binding must defer to D-120 and refuse it,
         # rather than treating the matching finish tuple as cycle ownership.
         sibling = self._continuation(begin, reason="inline-binding-sibling")
+        self._ran(sibling)
         self.assertEqual(
             P.cycle_route_admission(self.root, record, continuation, finalize=True).reason,
             "cycle-route-binding-mismatch:lineage-fork",
@@ -6956,7 +6964,7 @@ class RouteLineageBindingTest(ProducerTestBase):
 
         with self.subTest("lineage-fork"):
             R.bind_continuation_cycle(self.root, a, b)
-            self._continuation(a, reason="explicit-cycle-refusal-sibling")
+            self._ran(self._continuation(a, reason="explicit-cycle-refusal-sibling"))
             denied_without_mutation("cycle-route-binding-mismatch:lineage-fork")
 
         with self.subTest("changed-material-input"):
@@ -7400,6 +7408,7 @@ class RouteLineageBindingTest(ProducerTestBase):
         b = self._continuation(a)
         R.bind_continuation_cycle(self.root, a, b)
         bprime = self._continuation(a, reason="lineage-fixture-prime")  # a second, sibling continuation of A
+        self._ran(b, bprime)
         fork_bind = R.bind_continuation_cycle(self.root, a, bprime)
         self.assertFalse(fork_bind["bound"])
         self.assertEqual(fork_bind["advisory"], "cycle-lineage-fork")
@@ -7412,6 +7421,31 @@ class RouteLineageBindingTest(ProducerTestBase):
         self.assertEqual(P.cycle_route_admission(self.root, record, b, finalize=True).reason,
                          "cycle-route-binding-mismatch:lineage-fork")
         self.assertTrue(P.cycle_route_admission(self.root, record, a).allow)  # A's own late write still allows
+
+    def test_a25_10_never_run_sibling_does_not_block_a_handoff_successor(self):
+        """A parent-close handoff successor is not forked by a sibling that never ran."""
+        import route_parent_close
+        a = self._root_route("lineage-a10-unused")
+        self._publish_root(a)
+        begun = self._begin(a)
+        unused = self._continuation(a, reason="published-never-run")
+        successor = self._continuation(a, reason="owner-pin-handoff")
+        record = P.read_cycle_record(self.root, begun["cycle_id"])
+        # Without a verified handoff the two continuations of an open source stay a fork.
+        self.assertEqual(P.cycle_route_admission(self.root, record, successor).reason,
+                         "cycle-route-binding-mismatch:lineage-fork")
+        def handoff(route, *, jobs=None):
+            return {"successor": successor} if route["route_id"] == a["route_id"] else None
+        with mock.patch.object(route_parent_close, "verified_owner_pin_handoff_close",
+                               side_effect=handoff):
+            self.assertTrue(P.cycle_route_admission(self.root, record, successor).allow)
+            self.assertTrue(P.cycle_route_admission(self.root, record, successor, finalize=True).allow)
+            # The unused sibling is not the handed-off route; it stays refused.
+            self.assertEqual(P.cycle_route_admission(self.root, record, unused).reason,
+                             "cycle-route-binding-mismatch:lineage-fork")
+            self._ran(unused)
+            self.assertEqual(P.cycle_route_admission(self.root, record, successor).reason,
+                             "cycle-route-binding-mismatch:lineage-fork")
 
     # -- A-25.11 ----------------------------------------------------------
     def test_a25_11_superseded_route_cannot_seal(self):
@@ -7500,6 +7534,7 @@ class RouteLineageBindingTest(ProducerTestBase):
         self._publish_root(a)
         x = self._continuation(a, reason="fork-x")
         y = self._continuation(a, reason="fork-y")
+        self._ran(x, y)
         first = self._begin(a)
         record = P.read_cycle_record(self.root, first["cycle_id"])
         P._write_cycle_record(self.root, dict(record, state="abandoned"), exclusive=False)

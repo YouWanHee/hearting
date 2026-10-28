@@ -1177,18 +1177,24 @@ def _indexed_route_children(root: Path, route_id: str, route_hash_value: str):
 
 
 def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> bool:
-    """A closed, unused candidate cannot take an executed predecessor's cycle.
+    """A closed, unused candidate cannot take an executed predecessor's cycle."""
+    outcome = _read_json(route_lineage.canonical_route_path(root, route["route_id"]).with_suffix(".outcome.json"))
+    if (not isinstance(outcome, dict)
+            or outcome.get("route_id") != route["route_id"]
+            or outcome.get("route_hash") != route["route_hash"]
+            or outcome.get("terminal_gate_proven") is not False):
+        return False
+    return _unexecuted_continuation(root, route)
+
+
+def _unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> bool:
+    """No attempt of this continuation ever started, and nothing continues it.
 
     Audit bindings and unconsumed registrations are history, not execution.
     Read the exact route registry and markers afresh; missing or unreadable
     evidence stays unknown. Started or unresolved launches stay attached.
     """
-    outcome = _read_json(route_lineage.canonical_route_path(root, route["route_id"]).with_suffix(".outcome.json"))
-    if (not isinstance(outcome, dict)
-            or outcome.get("route_id") != route["route_id"]
-            or outcome.get("route_hash") != route["route_hash"]
-            or outcome.get("terminal_gate_proven") is not False
-            or _indexed_route_children(root, route["route_id"], route["route_hash"])):
+    if _indexed_route_children(root, route["route_id"], route["route_hash"]):
         return False
     try:
         module = artifact_lifecycle._load_capability_route()
@@ -1222,6 +1228,21 @@ def _closed_unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> boo
         return True
     except (OSError, ValueError, TypeError, KeyError):
         return False
+
+
+def _closed_for_successor(source: Mapping[str, Any], successor: Mapping[str, Any]) -> bool:
+    """``source`` was closed by its parent for a handoff whose prepared successor is ``successor``."""
+    sealed_jobs = ((source.get("launch_compatibility_tuple") or {}).get("jobs_path") or {}).get("path")
+    if not isinstance(sealed_jobs, str) or not Path(sealed_jobs).is_absolute():
+        return False
+    try:
+        import route_parent_close
+        proof = route_parent_close.verified_owner_pin_handoff_close(dict(source), jobs=Path(sealed_jobs))
+    except (ImportError, OSError, ValueError, TypeError, KeyError):
+        return False
+    prepared = (proof or {}).get("successor")
+    return (isinstance(prepared, Mapping) and prepared.get("route_id") == successor.get("route_id")
+            and prepared.get("route_hash") == successor.get("route_hash"))
 
 
 class LineageHandover(NamedTuple):
@@ -1354,6 +1375,11 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
                     handed_over = _handed_over_routes(root, record)
                 if sibling["route_id"] in handed_over:
                     continue  # closed lineage: that branch belongs to another cycle
+                if (_unexecuted_continuation(root, sibling)
+                        and _closed_for_successor(node, path[path.index(node) + 1])):
+                    # The parent closed this route and handed its remaining work to the
+                    # next route on the path; a sibling that never ran is not a branch.
+                    continue
                 reason = "cycle-route-binding-mismatch:lineage-fork"
                 return Admission(False, reason, f"branch={node['route_id']} siblings={sibling['route_id']},{path[path.index(node)+1]['route_id']}",
                                  path, _d120_next_action(reason))

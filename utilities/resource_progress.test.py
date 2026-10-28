@@ -1599,6 +1599,29 @@ class ExperimentObservationTest(unittest.TestCase):
                 "lineage": by_session["sid-supervisor"]["lineage"]},
                 "claude-parent-runtime"), ("claude", "sid-supervisor", "sid-supervisor"))
 
+    def test_provenance_notice_follows_the_seat_successor_across_harnesses(self):
+        """A run that named only its launching session reaches whoever took that seat over."""
+        import dispatch_seat_handover as handover
+        from peer_obligations import _ordinary_notice_target
+        identity = {"jobs": "/state/jobs.log", "storage_recipient": "sid-codex",
+                    "lineage": {"kind": "provenance", "harness": "codex", "session_id": "sid-codex"}}
+        rows = {"seat-b": [{"from": "sid-codex", "sid": "sid-claude", "harness": "claude",
+                            "source": "retire", "ts": 10.0}],
+                "seat-c": [{"from": "sid-claude", "sid": "sid-claude-2", "harness": "claude",
+                            "source": "clear", "ts": 20.0}]}
+        with mock.patch.object(handover, "_lineage_seats", return_value={}):
+            self.assertEqual(handover.session_successor("sid-codex"), ("", ""))
+            self.assertEqual(_ordinary_notice_target(identity, "codex-native-queue"),
+                             ("codex", "sid-codex", "sid-codex"))
+        with mock.patch.object(handover, "_lineage_seats", return_value=rows):
+            self.assertEqual(handover.session_successor("sid-codex"), ("sid-claude-2", "claude"))
+            # Delivery keeps the record under its stored key and only changes who receives it.
+            self.assertEqual(_ordinary_notice_target(identity, "codex-native-queue"),
+                             ("claude", "sid-claude-2", "sid-codex"))
+        with mock.patch.object(handover, "_lineage_seats", side_effect=OSError("ledger")):
+            self.assertEqual(_ordinary_notice_target(identity, "codex-native-queue"),
+                             ("codex", "sid-codex", "sid-codex"))
+
     def test_terminal_observation_keeps_durable_live_checkpoint_and_adds_one_final_notice(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

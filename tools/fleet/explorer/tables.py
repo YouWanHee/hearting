@@ -1,6 +1,7 @@
 """Overview and list-view tables for the immutable explorer projection."""
 from collections.abc import Mapping
 from .grid import CellGrid
+from .style import recede_key
 
 X = 34
 GAP = 3
@@ -496,6 +497,8 @@ def _draw_route_line(grid, x0, x1, y, route, tag=True, repo=True, steward=False)
     x += title_width + GAP
     _draw_route_progress(grid, x, x1 - AGE_W - GAP, y, route)
     grid.put(x1 - _seg_width(age), y, age, "dim")
+    if route_is_history(route):
+        _recede_row(grid, y, x0, x1)
 
 
 def _draw_route_progress(grid, x, end, y, route):
@@ -668,6 +671,25 @@ def _tint_row(grid, y, x0, x1, tint):
             grid.cells[y][xx] = (glyph, key, tint)
 
 
+def route_is_history(route):
+    """A route that already ended: the sidebar tree's done/dead boundary on a list row.
+
+    A dead owner whose worker still runs (`activity == "running"`) stays in the live group;
+    a record without `activity` (stored payloads, PEERS owners) decides by state alone.
+    """
+    if str(route.get("state") or "") not in ("dead", "done"):
+        return False
+    return route.get("activity") != "running"
+
+
+def _recede_row(grid, y, x0, x1):
+    """Lower a finished row's ink: same glyphs, tints and hits — only the key moves."""
+    if 0 <= y < grid.rows:
+        for xx in range(max(0, x0), min(grid.cols, x1)):
+            glyph, key, tint = grid.cells[y][xx]
+            grid.cells[y][xx] = (glyph, recede_key(key), tint)
+
+
 _VIEW_NAMES = ("OVERVIEW", "PEERS", "ROUTES", "QUESTIONS", "HISTORY", "COMPUTE", "MEMORY", "MODELS",
                "SYSTEM")
 
@@ -709,6 +731,7 @@ def draw_routes(grid, vm, state, x=34, y=3):
         for route in mine:
             ident = str(route.get("id") or "·")
             is_open = opened == ident
+            history = route_is_history(route)
             action = (("route", ident) if getattr(state, "no_repo_group", False) else
                       ("fold", "ropen:" + state.view, ident))
             # A page's route list also links an unfolded route to its own page; that hit comes first so it wins.
@@ -822,6 +845,10 @@ def draw_routes(grid, vm, state, x=34, y=3):
                 cursor += sum(cell_width(char) for char in str(text))
             if link:
                 grid.put(x + use - 6, y, "open ▸", "accent")
+            if history and not is_open:
+                # Finished history recedes; an opened row is being read and keeps its ink.
+                _recede_row(grid, y - 1, x, right)
+                _recede_row(grid, y, x, right)
             if is_open:
                 _tint_row(grid, y - 1, x - 1, right, 236)
                 _tint_row(grid, y, x - 1, right, 236)

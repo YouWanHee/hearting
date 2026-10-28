@@ -186,6 +186,10 @@ class ZenGoV2CredentialPrecedenceTest(unittest.TestCase):
         self.data.mkdir()
         self.legacy_auth = self.data / "auth.json"
         self.usage_state = root / "usage-state"
+        self.dispatch = root / "dispatch"
+        self.dispatch.mkdir()
+        self.jobs = self.dispatch / "jobs.log"
+        self.jobs.touch()
         with sqlite3.connect(self.db) as connection:
             connection.execute(
                 "CREATE TABLE credential (id TEXT PRIMARY KEY, integration_id TEXT, label TEXT, "
@@ -196,6 +200,9 @@ class ZenGoV2CredentialPrecedenceTest(unittest.TestCase):
             "OPENCODE_DATA_DIR": str(self.data),
             "OPENCODE_AUTH": str(self.legacy_auth),
             "FLEET_USAGE_STATE_DIR": str(self.usage_state),
+            "AGENT_DISPATCH_JOBS": str(self.jobs),
+            "AGENT_RESOURCE_RUN_INDEX": str(
+                self.dispatch / "resource-runs.index.json"),
         })
         environment.start()
         self.addCleanup(environment.stop)

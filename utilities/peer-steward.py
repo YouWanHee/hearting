@@ -1918,7 +1918,7 @@ def _start_in_pane(args):
         # still runs inside the workspace claim cmd_start holds.
         opened = terminal_surface.open_pane(
             near=terminal_surface.Near(_herdr_surface(), pane=None if workspace else args.beside,
-                                       workspace=workspace),
+                                       workspace=workspace, same_tab=not workspace),
             cwd=pane_cwd)
         if opened.pane is None:
             reason = opened.notes[0] if opened.notes else "pane-layout-unavailable"

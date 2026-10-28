@@ -12,6 +12,7 @@ import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -567,11 +568,67 @@ def _native_items(admitted):
              "window": o.get("window"), "source": "native"} for o in admitted]
 
 
+_CAPACITY = None
+
+
+def _capacity_reader():
+    """`harness-capacity.py` by path: its filename is not importable.
+
+    Loaded once per process; the module reads its environment at call time, so
+    a fixture `FLEET_USAGE_STATE_DIR` still applies. Same shape as
+    `dispatch-owner.py` / `dispatch-batch.py` / `dispatch_replacement.py`.
+    """
+    global _CAPACITY
+    if _CAPACITY is None:
+        spec = importlib.util.spec_from_file_location(
+            "dispatch_capacity_harness_capacity", Path(__file__).with_name("harness-capacity.py"))
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load harness-capacity.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CAPACITY = module
+    return _CAPACITY
+
+
+def gauge_limits(now):
+    """Shared-gauge holds (`codex`/`opencode`) as `active_limits` items.
+
+    A window at 100% used with a future reset is a real usage limit, not the
+    soft ordering gate; `harness-capacity.gauge_limit_epoch` is the one reader
+    (manual score, staleness and unknown-reset keep its existing rules). A
+    missing or broken capacity reader leaves today's answer in place.
+    """
+    limits = {}
+    try:
+        capacity = _capacity_reader()
+        for harness in ("codex", "opencode"):
+            reset = capacity.gauge_limit_epoch(harness, now=now)
+            if reset:
+                limits[harness] = {"harness": harness, "window": "gauge", "model_scope": "all",
+                                   "observed_at": now, "scope_authority": "gauge",
+                                   "expired": False, "reset_epoch": reset}
+    except Exception:  # a supplementary gauge must never break the reader
+        return {}
+    return limits
+
+
+def _hold_from_gauge(states, epochs, limits):
+    """Merge gauge holds: the later known end wins and the reset labels the hold."""
+    for harness, limit in limits.items():
+        reset = limit["reset_epoch"]
+        known = epochs.get(harness)
+        if isinstance(known, (int, float)) and known >= reset:
+            continue
+        states[harness] = f"limited({_iso(reset)})"
+        epochs[harness] = reset
+
+
 def active_limits(jobs, *, profile=None, models=None, now=None, env=None, registry_lines=None, recheck=False):
     now = time.time() if now is None else now
     models = _limit_models(profile, models, env)
     native = observations(jobs, now=now, env=env, registry_lines=registry_lines)
     limits = _select_limits(native, models)
+    limits.update(gauge_limits(now))
     verdict, holder = _recheck(jobs, _native_items(_admitted(native, models)), models, env, now, recheck)
     if verdict == "ok":
         limits.pop("claude", None)
@@ -993,6 +1050,7 @@ def _usage(jobs, *, profile=None, models=None, unknown_window_min=60, now=None, 
     with _snapshot_guard(jobs, now) as snapshot:
         states, epochs, recorded = _usage_snapshot(
             snapshot, models=models, unknown_window_min=unknown_window_min, now=now, env=env)
+    _hold_from_gauge(states, epochs, gauge_limits(now))
     if not states["opencode"].startswith("limited("):
         model_state = _opencode_model_state(profile, env)
         if model_state:

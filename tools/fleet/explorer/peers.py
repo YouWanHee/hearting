@@ -2,6 +2,7 @@
 
 import re
 
+from . import tables
 from .output import cell_width
 from .tables import _clip, repo_rule_label
 
@@ -106,6 +107,9 @@ def _draw_card(grid, session, tag, bx, by, box_w, right, border, extra, owners):
                 xx = put(xx, yy, glyph, key)
             done = sum(str(stage.get("state")) == "done" for stage in stages)
             put(xx + 1, yy, f"{done}/{len(stages)}", "dim")
+            if tables.route_is_history(owner):
+                # A finished owner line recedes; the card border and its live neighbours do not.
+                tables._recede_row(grid, yy, bx + 2, br)
             yy += 1
 
 
