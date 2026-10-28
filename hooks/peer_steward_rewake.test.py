@@ -32,6 +32,9 @@ _FAKE_HERDR = r'''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
 mode = os.environ.get("FAKE_HERDR_MODE", "idle")
+if os.environ.get("FAKE_HERDR_MODE_FILE"):
+    with open(os.environ["FAKE_HERDR_MODE_FILE"]) as handle:
+        mode = handle.read().strip() or mode
 target = argv[2] if len(argv) > 2 else "-"
 shell_pid = int(os.environ["FAKE_HERDR_SHELL_PID"])
 shell_pgid = int(os.environ["FAKE_HERDR_SHELL_PGID"])
@@ -155,10 +158,10 @@ class _HookMixin:
         ).stdout
         return Path(json.loads(out)["watch_root"])
 
-    def _arm(self, mode="idle", target="peer-a", wake="hook", session_id=None):
+    def _arm(self, mode="idle", target="peer-a", wake="hook", session_id=None, env=None):
         proc = subprocess.run(
             [sys.executable, str(_PEER_STEWARD), "watch", target, "--wake", wake],
-            capture_output=True, text=True, env=self._env(mode, session_id),
+            capture_output=True, text=True, env=env or self._env(mode, session_id),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return proc.stdout.strip()
@@ -334,16 +337,47 @@ class DeliveryTest(_HookMixin, unittest.TestCase):
         self.assertEqual(json.loads(ack_path.read_text())["carrier"], "claude-async-rewake")
 
     def test_dead_watcher_rearms_exactly_once_then_delivers(self):
-        armed = self._arm(mode="held")
+        # The target's state belongs to the fake target, not to whichever process
+        # spawned an observer: the shared runner's observer recovery and the
+        # hook's rearm both restore this watch, and both must see the same target.
+        mode_file = self.root / "fake-herdr-mode"
+        mode_file.write_text("held")
+        def env(mode):
+            values = self._env(mode)
+            values["FAKE_HERDR_MODE_FILE"] = str(mode_file)
+            return values
+        armed = self._arm(env=env("held"))
         fields = self._fields(armed)
-        os.kill(int(fields["pid"]), signal.SIGKILL)
+        arm_path = self._watch_root() / f"{fields['watch_id']}.json"
+        watcher = json.loads(arm_path.read_text())["watcher"]
+        os.kill(int(watcher["pid"]), signal.SIGKILL)
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and Path(f"/proc/{fields['pid']}/stat").exists():
+        while time.monotonic() < deadline and Path(f"/proc/{watcher['pid']}/stat").exists():
             time.sleep(0.02)
-
-        proc = self._run_hook(self._payload(armed), env=self._env("idle"))
+        mode_file.write_text("idle")
+        # An observer restored before the switch is already waiting on the held
+        # target; the target turning idle releases it, whenever it started.
+        stop = threading.Event()
+        def release_waiters():
+            while not stop.wait(0.2):
+                try:
+                    fd = os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)
+                except OSError:
+                    continue
+                try:
+                    os.write(fd, b"go")
+                except OSError:
+                    pass
+                finally:
+                    os.close(fd)
+        releaser = threading.Thread(target=release_waiters, daemon=True)
+        releaser.start()
+        try:
+            proc = self._run_hook(self._payload(armed), env=env("idle"))
+        finally:
+            stop.set()
+            releaser.join(timeout=5)
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("rearmed=1", proc.stderr)
         self.assertIn("state=idle", proc.stderr)
 
         root = self._watch_root()
@@ -351,8 +385,9 @@ class DeliveryTest(_HookMixin, unittest.TestCase):
             (p, json.loads(p.read_text())) for p in root.glob("*.json")
             if not p.name.endswith((".receipt.json", ".ack.json", ".observation.json"))
         ]
-        # Retained-duty rearm replaces only the observer: the same watch id
-        # survives with a new observer generation, never a second watch row.
+        # Exactly one restore -- by the hook (`rearmed=1`) or by observer recovery
+        # before it -- replaces only the observer: the same watch id survives with
+        # a new observer generation, never a second watch row.
         self.assertEqual([p.name for p, _ in arms], [fields["watch_id"] + ".json"],
                          "exactly one rearm, same watch id")
         self.assertEqual(arms[0][1]["rearm_count"], 1)
