@@ -133,6 +133,30 @@ class SharedCacheFallbackTests(unittest.TestCase):
         self.assertEqual(C.gate_release_epoch("opencode", "live", usage_gate_used_percent=85, now=1000.0), 7000.0)
         self.assertIsNone(C.gate_release_epoch("opencode", "live", usage_gate_used_percent=95, now=1000.0))
 
+    def test_window_release_epoch_reads_both_harness_windows_at_any_gate(self):
+        cache = self._cache()
+        cache.record("codex", {"windows": [["5h", 100, 2000.0], ["7d", 90, 9000.0]]}, now=900.0)
+        self.assertEqual(C.window_release_epoch("codex", usage_gate_used_percent=100, now=1000.0), 2000.0)
+        self.assertEqual(C.window_release_epoch("codex", usage_gate_used_percent=90, now=1000.0), 9000.0)
+        # A past reset at the gate and a cache older than the staleness bound are unknown.
+        self.assertIsNone(C.window_release_epoch("codex", usage_gate_used_percent=100, now=2500.0))
+        self.assertIsNone(C.window_release_epoch("codex", usage_gate_used_percent=100, now=5000.0))
+        cache.record("opencode", {"rl_windows": [["wk", 100, 8000.0]]}, now=900.0)
+        self.assertEqual(C.window_release_epoch("opencode", usage_gate_used_percent=100, now=1000.0), 8000.0)
+
+    def test_gauge_limit_epoch_skips_manual_claude_and_unknown_answers(self):
+        cache = self._cache()
+        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_SCORES": ""}):
+            cache.record("codex", {"windows": [["7d", 100, 9000.0]]}, now=900.0)
+            self.assertEqual(C.gauge_limit_epoch("codex", now=1000.0), 9000.0)
+            cache.record("codex", {"windows": [["7d", 99, 9000.0]]}, now=900.0)
+            self.assertIsNone(C.gauge_limit_epoch("codex", now=1000.0))
+            cache.record("codex", {"windows": [["7d", 100, 9000.0]]}, now=900.0)
+            cache.record("claude", {"windows": [["7d", 100, 9000.0]]}, now=900.0)
+            self.assertIsNone(C.gauge_limit_epoch("claude", now=1000.0))
+        with mock.patch.dict(os.environ, {"HARNESS_CAPACITY_SCORES": "codex:0"}):
+            self.assertIsNone(C.gauge_limit_epoch("codex", now=1000.0))
+
     def test_stale_cache_is_not_reused_beyond_stale_after(self):
         cache = self._cache()
         cache.record("codex", {"windows": [["7d", 10, None]]}, now=0.0)
