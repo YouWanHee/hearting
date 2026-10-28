@@ -28,7 +28,7 @@ import tempfile
 import threading
 import time
 from types import MappingProxyType
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 
 VERSION_RE = re.compile(r"(?:^|\D)(\d+)\.(\d+)\.(\d+)(?:\D|$)")
@@ -312,12 +312,14 @@ def is_v2(binary: str = "opencode", version: tuple[int, int, int] | None = None,
     return bool(version and version[0] >= 2)
 
 
-def read_model_catalog(*, environ=None):
+def read_model_catalog(*, directory=None, environ=None):
     """Read the existing V2 service's catalog without starting or refreshing it.
 
     ``None`` permits the V1 cache reader. A known V2 service/version with no
     readable current snapshot stays unknown; its retained V1 cache is not current.
     Only model identities leave this boundary, never service credentials/settings.
+    The native location is the caller's cwd unless an existing caller supplies
+    a directory. An unavailable directory stays unknown, never server-default.
     """
     env = os.environ if environ is None else environ
     home = Path(env.get("HOME") or Path.home())
@@ -351,6 +353,12 @@ def read_model_catalog(*, environ=None):
     if not version or version[0] < 2:
         return unknown if is_v2(resolve_binary(environ=env), environ=env) else None
     try:
+        directory = os.getcwd() if directory is None else os.fspath(directory)
+        if not isinstance(directory, str) or not directory:
+            return unknown
+        directory = Path(directory).resolve(strict=True)
+        if not directory.is_dir():
+            return unknown
         url = service.get("url")
         if not isinstance(url, str):
             return unknown
@@ -374,7 +382,8 @@ def read_model_catalog(*, environ=None):
                 return None
 
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        request = urllib.request.Request(url.rstrip("/") + "/api/model", headers=headers)
+        query = urlencode({"location[directory]": str(directory)})
+        request = urllib.request.Request(url.rstrip("/") + "/api/model?" + query, headers=headers)
         limit = 16 * 1024 * 1024
         with opener.open(request, timeout=2.0) as response:
             if response.status != 200:
@@ -405,7 +414,7 @@ def read_model_catalog(*, environ=None):
                 models.append(identifier)
         return {"state": "available" if models else "empty", "source": source,
                 "models": tuple(models), "observed_at": time.time()}
-    except (OSError, ValueError, TypeError, http.client.HTTPException):
+    except (OSError, ValueError, TypeError, RuntimeError, http.client.HTTPException):
         return unknown
 
 
