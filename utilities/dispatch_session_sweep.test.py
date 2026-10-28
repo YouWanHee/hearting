@@ -51,6 +51,73 @@ import fixture_processes  # noqa: E402
 FIXTURE_ENV_LOG = os.environ.get("SD111_FIXTURE_ENV_LOG")
 
 
+# Emitted bytes frozen from 2854679, independent of recovery constants.
+_FROZEN_NOTICE_DELIVERY_HEADER = (
+    "Hearting notice about work you started (a paused route resumed, a remote run ended). "
+    "Report observed metrics, trend, and elapsed or ETA against the criteria and plan; state when unavailable. "
+    "Act only where a line's required_action asks for it. "
+    "Do not start Monitor, dispatch-wait, or a polling loop."
+)
+_FROZEN_GATE_DELIVERY_HEADER = (
+    "Hearting human gate awaiting your decision (SD-123/129). Read the named artifact "
+    "(an interview file or a frame summary), put the [방향 확인] card and every interview "
+    "question to the user through AskUserQuestion -- one topic at a time, in plain words, "
+    "recommended answer first -- then record the answer with `workflow-supervisor.py "
+    "release --route <route file> --gate <name> --decision proceed|revise|stop "
+    "[--answers <file from frame_interview.py answers-template>]`. The owner is waiting on "
+    "`await-release` or has paused at the gate; the release continues the work either way. "
+    "Do not start Monitor, dispatch-wait, or a polling loop."
+)
+_FROZEN_COMPLETION_DELIVERY_HEADER = (
+    "Hearting runtime delivery. Follow required_action; inspect-recovery is diagnostic. "
+    "Follow route's next-action receipt; runtime-v1 owners close/finalize. "
+    "Tracked-Workflow Continuation. Keep new failures/conflicts, unfinished work, questions; "
+    "no Monitor/dispatch-wait/polling."
+)
+_FROZEN_LEGACY_COMPLETION_DELIVERY_HEADER = (
+    "Hearting runtime delivery (SD-111 durable pending records for this session). "
+    "Follow each receipt's required_action. advance-completed confirms that attempt's "
+    "completion: read its exact result and perform already approved parent review/follow-through "
+    "this turn or its existing registered continuation. Receipt, queue consumption and ACK are not execution. "
+    "On the first user-facing close of material work, explain what changed and why, observed before/after, "
+    "checks actually run (including reused, skipped, and unrun checks), applicable commit/PR/deployment/serving, "
+    "and limits or remaining work; do not invent deployment or operating results. Follow the owning "
+    "route's next-action receipt for any remaining stages. Runtime-v1 owners have "
+    "runtime-owned close/finalize; a closed route needs no restart. "
+    "inspect-recovery is a runtime diagnostic, not a request for a user decision. "
+    "For other unresolved actions use the exact checked recovery surface. "
+    "An automatic repeat of the same exact result or cleanup-only notice after follow-through was handled "
+    "does not repeat the action or request a new user ACK; preserve new failures, conflicts, unfinished work, "
+    "and direct user questions. "
+    "Do not start Monitor, dispatch-wait, or a polling loop."
+)
+_FROZEN_LEGACY_RUNTIME_V1_FOLLOWUP = (
+    "The requested work is complete, including its declared stages and runtime workflow/route/cycle settlement. "
+    "Continue and complete the original user task itself, preserving every explicit content and output-format "
+    "requirement from that request; this receipt supplements the task and does not replace it with a receipt-only response. "
+    "Read the exact result and perform the already approved parent review/follow-through in this turn, "
+    "or run its existing registered continuation. On the first user-facing close, explain what changed and why, "
+    "the observed before/after, checks actually run (including reused, skipped, and unrun checks), applicable "
+    "commit/PR/deployment/serving state, and limits or remaining work. Do not invent deployment or operating "
+    "results. Receipt, queue consumption and ACK are not execution. No harvest, route restart, or manual "
+    "finalization is required. An automatic repeat of this exact result or a cleanup-only notice after the "
+    "follow-through is handled does not call for the same action or a new user ACK; preserve a new failure, "
+    "conflict, unfinished work, or direct user question."
+)
+
+
+def _previous_native_body(text, *, legacy=False):
+    text = text.replace(SWEEP.GATE_DELIVERY_HEADER, _FROZEN_GATE_DELIVERY_HEADER, 1)
+    text = text.replace(SWEEP.NOTICE_DELIVERY_HEADER, _FROZEN_NOTICE_DELIVERY_HEADER, 1)
+    text = text.replace(SWEEP.COMPLETION_DELIVERY_HEADER,
+                        _FROZEN_LEGACY_COMPLETION_DELIVERY_HEADER if legacy
+                        else _FROZEN_COMPLETION_DELIVERY_HEADER, 1)
+    if legacy:
+        text = text.replace(SWEEP._CURRENT_RUNTIME_V1_FOLLOWUP_PREFIX,
+                            _FROZEN_LEGACY_RUNTIME_V1_FOLLOWUP, 1)
+    return text
+
+
 def _log_fixture_env(test_file: str, home: str, xdg: str, harness: str) -> None:
     if not FIXTURE_ENV_LOG:
         return
@@ -2027,6 +2094,7 @@ console.log(JSON.stringify({prompts, logs}));
         second = PD.claim(self.root, self.SID, did, claim_owner="second-carrier",
                           lease_seconds=30, require_generation_proof=False)
         self.assertEqual((first["attempts"], second["attempts"]), (1, 2))
+        first_body = _previous_native_body(first_body)
         native = [{"info": {"sessionID": self.SID, "role": "user"},
                    "parts": [{"type": "text", "text": first_body}]}]
 
@@ -2143,6 +2211,7 @@ console.log(JSON.stringify({prompts, logs}));
             (self.root, [{**first, SWEEP.STORAGE_KEY: self.SID}])])
         self._expire_ambiguous([did])
         handed = self.cli("deliver")
+        first_body = _previous_native_body(first_body)
         native = [{"info": {"sessionID": self.SID, "role": "user"},
                    "parts": [{"type": "text", "text": first_body}]}]
 
@@ -2176,6 +2245,7 @@ console.log(JSON.stringify({prompts, logs}));
         prior_body = SWEEP.delivery_context([
             (self.root, [{**second, SWEEP.STORAGE_KEY: self.SID},
                          {**first, SWEEP.STORAGE_KEY: self.SID}])])
+        prior_body = _previous_native_body(prior_body)
         native = [{"info": {"sessionID": self.SID, "role": "user"},
                    "parts": [{"type": "text", "text": prior_body}]}]
 
@@ -2195,20 +2265,64 @@ console.log(JSON.stringify({prompts, logs}));
         self.seed_turn()
         record = self._mark_sent_ambiguous("delivery-" + "a" * 32)
         current_followup = (SWEEP._CURRENT_RUNTIME_V1_FOLLOWUP_PREFIX +
-                            "\nprior next-action handle")
+                            "\nprior next-action handle\n\n" +
+                            SWEEP.NOTICE_DELIVERY_HEADER + "\nquoted payload header")
         with mock.patch.object(SWEEP, "_followup", return_value=current_followup):
             current = SWEEP.delivery_context([(self.root, [{**record, SWEEP.STORAGE_KEY: self.SID}])])
-            legacy = SWEEP._legacy_opencode_completion_body(current, [self.root], [record])
-            messages = [{"info": {"sessionID": self.SID, "role": "user"},
-                         "parts": [{"type": "text", "text": legacy}]}]
-            accepted = SWEEP._opencode_delivery_expectations(
-                [self.root], "opencode-turn", self.SID, messages)
-            self.assertEqual(len(accepted), 1)
-            self.assertEqual(accepted[0]["text"], legacy)
-            altered = [{"info": {"sessionID": self.SID, "role": "user"},
-                        "parts": [{"type": "text", "text": legacy + " "}]}]
-            self.assertEqual(SWEEP._opencode_delivery_expectations(
-                [self.root], "opencode-turn", self.SID, altered), [])
+            previous = current.replace(SWEEP.COMPLETION_DELIVERY_HEADER,
+                                       _FROZEN_COMPLETION_DELIVERY_HEADER, 1)
+            legacy = current.replace(SWEEP.COMPLETION_DELIVERY_HEADER,
+                                     _FROZEN_LEGACY_COMPLETION_DELIVERY_HEADER, 1).replace(
+                                         SWEEP._CURRENT_RUNTIME_V1_FOLLOWUP_PREFIX,
+                                         _FROZEN_LEGACY_RUNTIME_V1_FOLLOWUP, 1)
+            for version, body in (("current", current),
+                                  ("previous-short", previous), ("legacy-long", legacy)):
+                with self.subTest(version=version):
+                    messages = [{"info": {"sessionID": self.SID, "role": "user"},
+                                 "parts": [{"type": "text", "text": body}]}]
+                    accepted = SWEEP._opencode_delivery_expectations(
+                        [self.root], "opencode-turn", self.SID, messages)
+                    self.assertEqual(len(accepted), 1)
+                    self.assertEqual(accepted[0]["text"], body)
+                    for altered in (body + " ", body.replace("prior next-action handle", "tampered"),
+                                    body.replace(SWEEP.NOTICE_DELIVERY_HEADER,
+                                                 _FROZEN_NOTICE_DELIVERY_HEADER, 1)):
+                        messages[0]["parts"][0]["text"] = altered
+                        self.assertEqual(SWEEP._opencode_delivery_expectations(
+                            [self.root], "opencode-turn", self.SID, messages), [])
+
+    def test_previous_mixed_headers_settle_exact_native_receipts_without_resend(self):
+        import session_notice
+        for version, legacy in (("previous-short", False), ("legacy-long", True)):
+            with self.subTest(version=version):
+                suffix = "a" if legacy else "b"
+                completion_id = "delivery-" + suffix * 32
+                gate_id = "delivery-" + ("c" if legacy else "d") * 32
+                self.seed_turn(delivery_id=completion_id)
+                self.seed_turn(delivery_id=gate_id, receipt={
+                    "kind": "human-gate", "route_id": "rt-example", "route_file": "/r/route.json",
+                    "owner_attempt_id": "att-owner", "gate": "frame-review",
+                    "artifact_path": "/art/frame-summary.md"})
+                notice = session_notice.notify(
+                    "opencode", self.SID, key="mixed:" + version, subject="run finished",
+                    text="run=fixture", jobs=self.root / "jobs.log")
+                ids = [completion_id, gate_id, notice["delivery_id"]]
+                records = [{**self._mark_sent_ambiguous(did), SWEEP.STORAGE_KEY: self.SID}
+                           for did in ids]
+                followup = SWEEP._CURRENT_RUNTIME_V1_FOLLOWUP_PREFIX + "\nprior next-action handle"
+                with mock.patch.object(SWEEP, "_followup", return_value=followup):
+                    current = SWEEP.delivery_context([(self.root, records)])
+                    previous = _previous_native_body(current, legacy=legacy)
+                    native = [{"info": {"sessionID": self.SID, "role": "user"},
+                               "parts": [{"type": "text", "text": previous}]}]
+                    self._expire_ambiguous(ids)
+                    result = self.deliver_in_process(messages=native)
+                    self.assertEqual(result["records"], [])
+                    self.assertEqual(result["text"], "")
+                    self.assertEqual(self.deliver_in_process(messages=native)["text"], "")
+                for did in ids:
+                    record = PD.read(self.root, self.SID, did)
+                    self.assertEqual((record["state"], record["attempts"]), ("acked", 1))
 
     def test_prior_batch_settles_open_member_after_other_member_was_acked(self):
         first_id = "delivery-" + "a" * 32
@@ -2224,6 +2338,7 @@ console.log(JSON.stringify({prompts, logs}));
         identity = PD.received_ack_identity(second, self.SID, second_id)
         PD.ack_received(self.root, self.SID, second_id, expected_identity=identity,
                         acked_by="independent-carrier")
+        prior_body = _previous_native_body(prior_body)
         native = [{"info": {"sessionID": self.SID, "role": "user"},
                    "parts": [{"type": "text", "text": prior_body}]}]
 
@@ -2247,6 +2362,7 @@ console.log(JSON.stringify({prompts, logs}));
         prior_body = SWEEP.delivery_context([
             (self.root, [{**first, SWEEP.STORAGE_KEY: self.SID},
                          {**second, SWEEP.STORAGE_KEY: self.SID}])])
+        prior_body = _previous_native_body(prior_body)
         second_marker = recipient_receipt.receipt_marker(second, self.SID)
         partial_body = prior_body[:prior_body.index(second_marker)]
         self.assertIn(recipient_receipt.receipt_marker(first, self.SID), partial_body)
@@ -2278,6 +2394,7 @@ console.log(JSON.stringify({prompts, logs}));
         prior_body = SWEEP.delivery_context([
             (self.root, [{**first, SWEEP.STORAGE_KEY: self.SID},
                          {**second, SWEEP.STORAGE_KEY: self.SID}])])
+        prior_body = _previous_native_body(prior_body)
         genuine_marker = recipient_receipt.receipt_marker(second, self.SID)
         foreign_body = prior_body.replace(genuine_marker,
                                           genuine_marker.rsplit(" ", 1)[0] + " " + "0" * 64)
