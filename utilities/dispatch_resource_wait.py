@@ -184,6 +184,125 @@ def resource_binding_matches(armed, row):
     return True
 
 
+def _pin_holder(route_file, route_id, route_hash, node, run_id, *, kind, jobs):
+    import route_parent_close
+    origin = {"route_file": route_file, "route_id": route_id, "route_hash": route_hash}
+    try:
+        return route_parent_close.pin_handoff_holder(
+            route_file, route_id, route_hash, node, run_id, kind=kind, jobs=jobs)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {"route_file": route_file, "route_id": route_id, "route_hash": route_hash,
+                "inherited": False, "origin": origin, "chain": []}
+
+
+def resource_holder(row, *, kind="resource"):
+    """The route that currently holds one resource row, with its origin address."""
+    row = row if isinstance(row, dict) else {}
+    owner = row.get("owner_wait") or {}
+    route_id = owner.get("route_id") or row.get("route_id")
+    route_hash = owner.get("route_hash") or row.get("route_hash")
+    if row.get("route") and (route_id is None or route_hash is None):
+        # Older rows name only their route file; the sealed file is the address.
+        try:
+            sealed = json.loads(Path(row["route"]).read_text(encoding="utf-8"))
+            if isinstance(sealed, dict):
+                route_id = route_id or sealed.get("route_id")
+                route_hash = route_hash or sealed.get("route_hash")
+        except (OSError, ValueError, TypeError):
+            pass
+    return _pin_holder(row.get("route"), route_id, route_hash, row.get("node"),
+                       row.get("run_id"), kind=kind, jobs=row.get("jobs"))
+
+
+def compute_holder(provenance, *, run_id=None, jobs=None):
+    """The route that currently holds one compute execution's provenance."""
+    provenance = provenance if isinstance(provenance, dict) else {}
+    identity = run_id or provenance.get("compute_run_id") or provenance.get("run_id")
+    return _pin_holder(provenance.get("route_file"), provenance.get("route_id"),
+                       provenance.get("route_hash"), provenance.get("node"), identity,
+                       kind="compute", jobs=jobs or provenance.get("jobs"))
+
+
+def current_responsibility(row, *, route, owner_attempt_id, session_id, jobs):
+    """The one q2-q4 judgement: is `row` held by `route` and this current owner?
+
+    q1 (which route/node/watch actually recorded the run) stays exact against
+    ``holder["origin"]``; this function answers only current holding, owner and
+    session. A row that no proven handoff moved keeps its exact prior checks.
+    """
+    route = route if isinstance(route, dict) else {}
+    holder = resource_holder(row)
+    if (holder.get("route_id") != route.get("route_id")
+            or holder.get("route_hash") != route.get("route_hash")):
+        return None
+    owner = (row.get("owner_wait") or {}) if isinstance(row, dict) else {}
+    expected_jobs = str(jobs) if jobs not in (None, "") else None
+    if not holder.get("inherited"):
+        # Older rows named only their route file; its sealed address and the
+        # row's own jobs record are that row's origin.
+        row_route_id = owner.get("route_id") or holder.get("route_id")
+        row_route_hash = owner.get("route_hash") or holder.get("route_hash")
+        row_jobs = owner.get("jobs") or row.get("jobs")
+        if (owner.get("parent_attempt_id") != owner_attempt_id
+                or row.get("parent_attempt_id") != owner_attempt_id
+                or owner.get("session_id") != session_id
+                or row_route_id != route.get("route_id")
+                or row_route_hash != route.get("route_hash")
+                or (expected_jobs is not None
+                    and (row_jobs or "") != expected_jobs)):
+            return None
+        return holder
+    import owner_route_binding as OWNER
+    selected = expected_jobs or owner.get("jobs")
+    try:
+        binding, _ = OWNER.resolve_owner_route_lifecycle(
+            selected, owner_attempt_id=owner_attempt_id)
+    except (OWNER.OwnerRouteBindingError, OSError, ValueError, TypeError):
+        return None
+    if binding is None or (binding.route_id, binding.route_hash, binding.route_file) != (
+            holder.get("route_id"), holder.get("route_hash"),
+            str(Path(holder.get("route_file") or "").resolve())):
+        return None
+    return holder
+
+
+def held_watches(route, jobs, node=None):
+    """Watches an ancestor route preserved for the node this successor resumes."""
+    if (route.get("continuation_contract_version") != 1
+            or not str(route.get("reason") or "").startswith("owner-pin-handoff:")):
+        return []
+    import route_lineage as RL
+    try:
+        lineage = RL.verified_route_lineage(route, observe=True)
+    except (OSError, ValueError, TypeError):
+        return []
+    sup = supervisor()
+    result, seen = [], set()
+    for ancestor in lineage[1:]:
+        try:
+            ledger = sup.ledger_for(ancestor, str(jobs))
+            watches = sup.read_resource_watches(ledger, node)
+        except (OSError, ValueError, TypeError):
+            continue
+        for armed in watches:
+            try:
+                row = json.loads(Path(armed["resource_registry"]).read_text(encoding="utf-8"))[
+                    "runs"][armed["predecessor_id"]]
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            holder = resource_holder(row)
+            if not holder.get("inherited") or (
+                    holder.get("route_id"), holder.get("route_hash")) != (
+                    route.get("route_id"), route.get("route_hash")):
+                continue
+            key = sup.resource_watch_key(armed)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append((armed, row))
+    return result
+
+
 def resource_execution_finished(row):
     from route_authority import resource_predecessor_finished
     return resource_predecessor_finished(row)
@@ -260,7 +379,7 @@ def resource_needs_attention(row, evidence):
 
 
 def context(args, control):
-    """Read only exact armed records under the current owner route and registry."""
+    """Read only exact armed records this owner route currently holds."""
     import owner_route_binding as OWNER
     import dispatch_contract as DC
     from resource_run_registry import (
@@ -283,10 +402,18 @@ def context(args, control):
             if key not in seen:
                 seen.add(key)
                 armed_rows.append(armed)
+    for armed, _row in held_watches(route, str(jobs)):
+        key = sup.resource_watch_key(armed)
+        if key not in seen:
+            seen.add(key)
+            armed_rows.append(armed)
     if not armed_rows:
         return None
     binding = None
     result = []
+    expected_jobs = str(jobs)
+    current_route = {"route_id": args.route_id, "route_hash": args.route_hash,
+                     "route_file": str(Path(route_file).resolve())}
     for armed in sorted(armed_rows, key=lambda row: (str(row.get("node")),
                                                      str(row.get("predecessor_id")))):
         node = armed["node"]
@@ -295,15 +422,18 @@ def context(args, control):
         if not isinstance(row, dict) or row.get("resource_policy") != "supervised-owner":
             continue
         owner = row.get("owner_wait") or {}
-        if owner.get("parent_attempt_id") != args.parent_attempt_id:
+        holder = resource_holder(row)
+        responsibility = current_responsibility(
+            row, route=current_route, owner_attempt_id=args.parent_attempt_id,
+            session_id=control.thread_id, jobs=expected_jobs)
+        if responsibility is None:
             continue
+        origin = holder["origin"]
         if binding is None:
             binding, _ = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=args.parent_attempt_id)
-            if (binding is None or binding.route_file != str(Path(route_file).resolve())
+            if (binding is None or binding.route_file != current_route["route_file"]
                     or binding.route_id != args.route_id or binding.route_hash != args.route_hash):
                 raise JOIN.JoinContractError("resource-owner-route-changed")
-        expected = {"parent_attempt_id": args.parent_attempt_id, "session_id": control.thread_id,
-            "route_id": args.route_id, "route_hash": args.route_hash, "jobs": str(jobs)}
         pinned_owner_identity = (str(owner.get("owner_pid", "")),
                                  str(owner.get("owner_start", "")))
         remote_identity = compute_execution_identity(row)
@@ -318,18 +448,22 @@ def context(args, control):
         if parent.status not in {"open", "running"}:
             raise JOIN.JoinContractError("resource-owner-not-open")
         OWNER._owner_row_proof(parent.raw.split("\t"), parent.metadata, route=route, environ={})
-        if (any(owner.get(key) != value for key, value in expected.items())
-                or pinned_owner_identity not in DC.attempt_identity_lineage(parent.metadata)
-                or row.get("parent_attempt_id") != args.parent_attempt_id
-                or row.get("route") != binding.route_file or row.get("node") != node
-                or row.get("jobs") != str(jobs) or not row.get("command")
+        if (row.get("route") != origin.get("route_file")
+                or row.get("route_id") not in (None, origin.get("route_id"))
+                or row.get("node") != node
+                or row.get("jobs") != expected_jobs or not row.get("command")
                 or not identity_valid
                 or (not remote_identity and row.get("pid_namespace") is not None and
                     row["pid_namespace"] != os.readlink("/proc/self/ns/pid"))
-                or armed.get("route_id") != args.route_id or armed.get("route_hash") != args.route_hash
-                or armed.get("route_file") != binding.route_file or armed.get("jobs") != str(jobs)
+                or armed.get("route_id") != origin.get("route_id")
+                or armed.get("route_hash") != origin.get("route_hash")
+                or armed.get("route_file") != origin.get("route_file")
+                or armed.get("jobs") != expected_jobs
                 or not resource_binding_matches(armed, row)
-                or armed.get("successor_external") is not True or armed.get("successor_command") is not None):
+                or armed.get("successor_external") is not True or armed.get("successor_command") is not None
+                or (not holder["inherited"]
+                    and (row.get("route") != current_route["route_file"]
+                         or pinned_owner_identity not in DC.attempt_identity_lineage(parent.metadata)))):
             raise JOIN.JoinContractError("resource-owner-binding-invalid")
         result.append((armed, row))
     return sup, route, ledger, result
@@ -445,16 +579,18 @@ def pending_prompt(path, parent, args=None, control=None):
         if row is None and found and found[3]:
             sup, route, ledger, _ = found
             for armed, prior in sup.resource_predecessors(ledger, receipt["node"]):
-                owner = prior.get("owner_wait") or {}
-                if (armed.get("route_id") == args.route_id and armed.get("route_hash") == args.route_hash
-                        and armed.get("route_file") == str(Path(args.route_file).resolve())
+                holder = resource_holder(prior)
+                origin = holder["origin"]
+                if (armed.get("route_id") == origin.get("route_id")
+                        and armed.get("route_hash") == origin.get("route_hash")
+                        and armed.get("route_file") == origin.get("route_file")
                         and armed.get("jobs") == expected["jobs"]
                         and armed.get("successor_external") is True
                         and armed.get("successor_command") is None
                         and prior.get("resource_policy") == "supervised-owner"
-                        and prior.get("parent_attempt_id") == parent
-                        and owner.get("parent_attempt_id") == parent
-                        and owner.get("session_id") == control.thread_id
+                        and current_responsibility(
+                            prior, route=route, owner_attempt_id=parent,
+                            session_id=control.thread_id, jobs=expected["jobs"]) is not None
                         and resource_key(prior) == box["key"]
                         and resource_execution_finished(prior)):
                     row = prior
@@ -508,6 +644,12 @@ def wait(args, path, control, delivered, emit, *, sleep=time.sleep):
     sup, route, ledger, candidates = found
     if control.pending():
         return "Continue the same work using the pending user correction; preserve the resource request."
+    # The first wait after a proven owner-pin handoff records the inherited
+    # watches once; later waits replay them without writing.
+    for armed, row in candidates:
+        holder = resource_holder(row)
+        if holder.get("inherited"):
+            sup.inherit_resource_watch(route, ledger, armed, holder)
     for armed, row in candidates:
         if (row.get("resource_policy") in {"verified-resume", "supervised-owner"}
                 and row.get("status") == "running"):

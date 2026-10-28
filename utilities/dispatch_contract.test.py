@@ -2,6 +2,7 @@
 import contextlib, errno, fcntl, hashlib, importlib.util, io, json, os, stat, subprocess, sys, tempfile, time, threading, types, unittest
 from unittest import mock
 from pathlib import Path
+from types import SimpleNamespace
 
 P=Path(__file__).with_name("dispatch_contract.py")
 ROOT=P.parent.parent
@@ -7650,6 +7651,122 @@ class AttemptExecutionObservationTest(unittest.TestCase):
        return_value=D.ProcessGroupObservation("empty")):
    result=D.attempt_execution_observation({"attempt_id":"att-observe","harness":"codex"})
   self.assertEqual((result.state,result.reason),("absent","attempt-tag-census-empty"))
+
+
+
+
+class ResourceStageMarkerSuccessorTest(unittest.TestCase):
+    """d1 marker currency: an inherited row admits only its current successor owner."""
+
+    def setUp(self):
+        import dispatch_resource_wait as ORD
+        import resource_resume as RESUME
+        import workflow_state as WS
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        self.jobs = self.base / "dispatch" / "jobs.log"
+        self.jobs.parent.mkdir()
+        self.jobs.write_text("")
+        self.route_id = "rt-marker-successor"
+        self.route_hash = "sha256:marker-successor"
+        self.source_id = "rt-marker-source"
+        self.source_hash = "sha256:marker-source"
+        self.route = {"route_id": self.route_id, "route_hash": self.route_hash,
+                      "artifact_root": str(self.base / ".agent_reports"),
+                      "cwd": str(self.base),
+                      "nodes": [{"id": "full-run", "kind": "resource-runner",
+                                 "outputs": ["run.json"],
+                                 "continuation": {"kind": "supervised"}}]}
+        self.registry = self.base / "runs.json"
+        self.owner_wait = {"parent_attempt_id": "att-old", "session_id": "sid-old",
+                           "route_id": self.source_id, "route_hash": self.source_hash,
+                           "jobs": str(self.jobs)}
+        self.row = {"run_id": "run-1", "route": str(self.base / "source-route.json"),
+                    "route_id": self.source_id, "node": "full-run",
+                    "jobs": str(self.jobs), "resource_policy": "supervised-owner",
+                    "owner_wait": dict(self.owner_wait)}
+        self.registry.write_text(json.dumps({"schema_version": 1, "runs": {"run-1": self.row}}))
+        self.armed = {"route_id": self.source_id, "route_hash": self.source_hash,
+                      "route_file": str(self.base / "source-route.json"),
+                      "node": "full-run", "predecessor_kind": "resource",
+                      "predecessor_id": "run-1", "resource_registry": str(self.registry),
+                      "artifact_base": str(self.base / "cycle"),
+                      "declared_outputs": ["run.json"], "jobs": str(self.jobs),
+                      "successor_external": True, "successors": ["run-verify"],
+                      "resource_binding": ORD.resource_legacy_body_digest(self.row)}
+        self.ledger = WS.WorkflowLedger(self.route_id, self.route_hash, jobs=self.jobs)
+        (self.ledger.root / "armed").mkdir(parents=True)
+        (self.ledger.root / "armed" / "full-run.json").write_text(json.dumps(self.armed))
+        self.identity = "resource-identity-fixture"
+        self.output = self.base / "cycle" / "run.json"
+        self.marker_path = self.base / "completion" / "full-run.json"
+        self.marker_path.parent.mkdir(parents=True)
+        self.marker_doc = {"sequence": 1, "resource_execution_identity": self.identity,
+                           "evidence": {"path": str(self.output)}}
+        self.marker_path.write_text(json.dumps(self.marker_doc))
+        self.evidence = {
+            "resource_execution_identity": self.identity, "identity": self.identity,
+            "resource_sha256": RESUME.row_digest(self.row),
+            "owner_attempt_id": "att-old", "owner_session_id": "sid-old",
+            "owner_successor_start": True,
+        }
+        self.ledger._append({"at": WS.now_iso(), "route_id": self.route_id,
+                             "route_hash": self.route_hash, "node": "full-run",
+                             "state": "STAGE_SUCCEEDED", "evidence": self.evidence})
+
+    def holder(self, inherited):
+        origin = {"route_file": self.row["route"], "route_id": self.source_id,
+                  "route_hash": self.source_hash}
+        if inherited:
+            return {"route_file": str(self.base / "successor-route.json"),
+                    "route_id": self.route_id, "route_hash": self.route_hash,
+                    "inherited": True, "origin": origin, "chain": []}
+        return {"route_file": self.row["route"], "route_id": self.route_id,
+                "route_hash": self.route_hash, "inherited": False,
+                "origin": origin, "chain": []}
+
+    def binding(self, route_id=None, route_hash=None):
+        return types.SimpleNamespace(route_id=route_id or self.route_id,
+                                     route_hash=route_hash or self.route_hash,
+                                     route_file=str(self.base / "successor-route.json"))
+
+    def current(self, evidence, holder, binding):
+        import dispatch_resource_wait as ORD
+        import owner_route_binding as OWNER
+        self.ledger._append({"at": self.ledger.journal()[-1]["at"], "route_id": self.route_id,
+                             "route_hash": self.route_hash, "node": "full-run",
+                             "state": "STAGE_SUCCEEDED", "evidence": evidence})
+        node = self.route["nodes"][0]
+        with mock.patch.object(ORD, "resource_holder", return_value=holder), \
+                mock.patch.object(OWNER, "resolve_owner_route_lifecycle",
+                                  return_value=(binding, "owner-route-launch-binding")):
+            return D._resource_stage_marker_current(
+                self.route, node, self.marker_doc, self.marker_path, str(self.jobs))
+
+    def test_resource_stage_marker_current_accepts_successor_owner_admission(self):
+        evidence = {**self.evidence, "owner_attempt_id": "att-successor",
+                    "owner_session_id": "sid-successor"}
+        self.assertIsNone(self.current(evidence, self.holder(True), self.binding()))
+        unrelated = self.current(
+            {**evidence, "owner_attempt_id": "att-outsider"},
+            self.holder(True), self.binding(self.source_id, self.source_hash))
+        self.assertEqual(unrelated.state, "resource-stage-not-current")
+
+    def test_resource_stage_marker_current_keeps_non_inherited_exactness(self):
+        row = {**self.row, "parent_attempt_id": "att-owner",
+               "owner_wait": {"parent_attempt_id": "att-owner", "session_id": "sid-owner",
+                              "route_id": self.route_id, "route_hash": self.route_hash,
+                              "jobs": str(self.jobs)}}
+        self.registry.write_text(json.dumps({"schema_version": 1, "runs": {"run-1": row}}))
+        evidence = {**self.evidence, "owner_attempt_id": "att-owner",
+                    "owner_session_id": "sid-owner",
+                    "resource_sha256": __import__("resource_resume").row_digest(row)}
+        self.assertIsNone(self.current(evidence, self.holder(False), self.binding()))
+        self.assertEqual(self.current(
+            {**evidence, "owner_attempt_id": "att-other"},
+            self.holder(False), self.binding()).state, "resource-stage-not-current")
 
 
 if __name__=="__main__": unittest.main()
