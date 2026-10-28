@@ -2551,8 +2551,11 @@ identity is gone. Prompt helpers in that shell's foreground group do not count
 as a live agent; unreadable identity remains unconfirmed. A refused start closes
 its own newly split pane only when the same shell is agent-free and its visible
 screen is unchanged from the stable snapshot recorded before native start.
-Retirement refuses busy sessions, open forms, drafts, unknown process identity
-or an unconfirmed shell return; it has no retry, forced kill or forced close.
+Retirement protects busy sessions, open forms, drafts, unknown process identity
+and unconfirmed shell return; it sends no repeated exit, forced kill or forced
+close. The same runner completes delayed Claude background-work confirmation
+on the booked foreground lifetime using exit-and-stop-tasks, without backgrounding
+the session, with live-dialog and foreground checks before input.
 An accepted retirement keeps the agent PID/start and shell PID/start observed
 when it was requested, including before a pane has a session. Reconnection
 compares that original lifetime before sending input. A proven-dead or reused

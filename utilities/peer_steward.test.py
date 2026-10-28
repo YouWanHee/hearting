@@ -9529,6 +9529,103 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_runner_finishes_delayed_claude_background_dialog_without_another_exit(self):
+        world = _RetireWorld(harness="claude", exits=False)
+        rc, line = self.retire(world)
+        self.assertEqual(rc, 0)
+        self.assertIn("reason=agent-still-running", line)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty = store.list()[0]
+        self.assertEqual(duty["observation"]["phase"], "exit-requested")
+        world.screen = ("Background work is running\nlocal monitor\n"
+                        "❯ 1. Exit and stop tasks\n2. Move to background and exit\n"
+                        "3. Stay\nEnter to confirm · Esc to cancel\n")
+        normal_run = world.run
+        selected = []
+
+        def finish_dialog(argv, **kwargs):
+            if argv[:3] == ["herdr", "pane", "send-text"]:
+                selected.append(argv[-1])
+            if argv[:3] == ["herdr", "pane", "send-keys"] and selected == ["1"]:
+                world.exits = True
+            return normal_run(argv, **kwargs)
+
+        world.run = finish_dialog
+        self._run_retire_runner(world, once=True)
+        settled = store.get(duty["id"])
+        self.assertEqual((settled["state"], settled["result"], settled["cleanup"]),
+                         ("complete", "normal-exit", "complete"))
+        self.assertEqual(world.actions(), [
+            ["herdr", "pane", "send-text", "w1:pOld", "/exit"],
+            ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+            ["herdr", "pane", "send-text", "w1:pOld", "1"],
+            ["herdr", "pane", "send-keys", "w1:pOld", "enter"],
+            ["herdr", "pane", "close", "w1:pOld"],
+        ])
+        self.assertTrue(any(call[:4] == ["herdr", "agent", "read", "w1:pOld"]
+                            for call in world.calls))
+
+    def test_runner_does_not_confirm_ambiguous_or_foreign_retire_dialog(self):
+        dialog = ("Background work is running\n❯ 1. Exit and stop tasks\n"
+                  "2. Move to background and exit\n3. Stay\n"
+                  "Enter to confirm · Esc to cancel\n")
+        cases = [
+            ("claude", "Do you want to proceed?\nEnter to confirm\n", None),
+            ("claude", dialog + "another prompt\n", None),
+            ("claude", dialog, {"foreground_process_group_id": 999}),
+            ("codex", dialog, None),
+            ("opencode", dialog, None),
+        ]
+        for harness, screen, changed in cases:
+            with self.subTest(harness=harness, screen=screen, changed=changed):
+                world = _RetireWorld(harness=harness, exits=False)
+                self.retire(world)
+                actions = world.actions()
+                world.screen, world.bad_process = screen, changed
+                self._run_retire_runner(world, once=True)
+                self.assertEqual(world.actions(), actions)
+                duty = peer_steward.peer_obligations.ObligationStore().list()[0]
+                self.assertEqual(duty["observation"]["phase"], "exit-requested")
+
+    def test_late_background_confirmation_keeps_failed_pane_close_for_cleanup(self):
+        world = _RetireWorld(harness="claude", exits=False)
+        self.retire(world)
+        store = peer_steward.peer_obligations.ObligationStore()
+        duty_id = store.list()[0]["id"]
+        world.screen = ("Background work is running\n❯ 1. Exit and stop tasks\n"
+                        "2. Move to background and exit\n3. Stay\n"
+                        "Enter to confirm · Esc to cancel\n")
+        world.close_error = True
+        normal_run = world.run
+
+        def finish_dialog(argv, **kwargs):
+            if argv[:3] == ["herdr", "pane", "send-keys"]:
+                world.exits = True
+            return normal_run(argv, **kwargs)
+
+        world.run = finish_dialog
+        self._run_retire_runner(world, once=True)
+        pending = store.get(duty_id)
+        self.assertEqual((pending["state"], pending["observation"]["phase"]),
+                         ("cleanup-pending", "shell-returned"))
+        before_cleanup = world.actions()
+        world.close_error = False
+        self._run_retire_runner(world, once=True)
+        self.assertEqual(store.get(duty_id)["state"], "complete")
+        self.assertEqual(world.actions(), before_cleanup + [
+            ["herdr", "pane", "close", "w1:pOld"]])
+
+    def test_inline_background_confirmation_yields_to_existing_retire_runner(self):
+        world = _RetireWorld(harness="claude", exits=False)
+        store = peer_steward.peer_obligations.ObligationStore()
+        with (store.root / "runner.lock").open("w") as lock, \
+             mock.patch.object(peer_steward, "_retire_claude_background_confirm") as confirm:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            rc, line = self.retire(world)
+            self.assertEqual(rc, 0)
+            self.assertIn("reason=retire-already-pending", line)
+            confirm.assert_not_called()
+
     def test_retire_subject_treats_only_same_birth_same_namespace_zombie_as_gone(self):
         def stat_row(state, start):
             fields = [state, *(["0"] * 18), start]
@@ -9630,7 +9727,7 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
         self._run_retire_runner(world)
         self.assertEqual(store.get(duty["id"])["state"], "complete")
 
-    def _run_retire_runner(self, world, crash_phase=None):
+    def _run_retire_runner(self, world, crash_phase=None, *, once=False):
         store = peer_steward.peer_obligations.ObligationStore()
         lock_fd = os.open(store.root / peer_steward.peer_obligations.RUNNER_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -9664,7 +9761,9 @@ class RetireTest(_TmpRootMixin, unittest.TestCase):
                  mock.patch.object(peer_steward.time, "sleep",
                                    side_effect=InterruptedError("fixture runner stopped") if crash_phase else None), \
                  mock.patch("builtins.print"):
-                if crash_phase:
+                if once:
+                    peer_steward._reconcile_obligations(store)
+                elif crash_phase:
                     with self.assertRaises(InterruptedError):
                         peer_steward.cmd_obligation_runner(
                             SimpleNamespace(state_root=self.tmp_root, lock_fd=lock_fd))
@@ -11868,6 +11967,21 @@ class RetireBackgroundDialogTest(unittest.TestCase):
                 self.assertEqual(len(keys), 1 if switch_at == 5 else 0)
                 texts = [argv[-1] for argv in calls if argv[:3] == ["herdr", "pane", "send-text"]]
                 self.assertEqual(texts, ["1"] if switch_at == 3 else ["1", "3"])
+
+    def test_confirmation_enter_is_not_sent_to_a_changed_foreground(self):
+        dialog = peer_steward._screen_lines(
+            "Background work is running\n❯ 1. Exit and stop tasks\n"
+            "2. Move to background and exit\n3. Stay\nEnter to confirm · Esc to cancel\n")
+        with mock.patch.object(peer_steward, "_read_screen", return_value=dialog), \
+             mock.patch.object(peer_steward, "_retire_foreground",
+                               side_effect=["original", "original", "replacement"]), \
+             mock.patch.object(peer_steward.subprocess, "run") as run:
+            result = peer_steward._retire_claude_background_confirm(
+                "peer", "w1:pX", "claude", {}, "original",
+                lambda reason, **kwargs: reason, None, None)
+        self.assertEqual(result, "foreground-changed")
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ["herdr", "pane", "send-text", "w1:pX", "1"]])
 
 
 class BlockingScreenClassifierTest(unittest.TestCase):

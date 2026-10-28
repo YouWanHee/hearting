@@ -2552,6 +2552,20 @@ def _resume_retire_obligation(duty, store, *, read_context=None,
                     _finish_retire_cleanup(store, claimed, ident, foreground)
             elif _retire_subject_state(duty) == "gone":
                 _complete_gone_retire(store, duty)
+            elif (ident.get("harness") == "claude" and foreground
+                    and _retire_foreground(ident["pane"], "claude") == foreground
+                    and _retire_background_dialog_lines(_read_screen(ident["pane"])) is not None):
+                requester = intent.get("requester") or {}
+
+                def finish(reason, retired=False, **kwargs):
+                    return _finish_retire(store, duty, target, ident, reason,
+                                          retired=retired, **kwargs)
+
+                # Finish the exit already sent, on its booked pane/lifetime.
+                # A late dialog needs its answer, never another /exit.
+                _retire_claude_background_confirm(
+                    ident["pane"], ident["pane"], "claude", ident, foreground, finish,
+                    requester.get("session_id"), requester.get("harness"), duty=duty)
             else:
                 store.update(duty["id"], state="pending",
                              expected_phases={"exit-requested"},
@@ -2597,6 +2611,52 @@ def _resume_retire_obligation(duty, store, *, read_context=None,
         _HERDR_SESSION = old_server
 
 
+def _finish_retire(store, duty, target, ident, reason, retired=False, handover=None,
+                   detail=None, pending=False, *, duty_id=None):
+    """Record the same retire result from the command or its retained continuation."""
+    duty_id = duty["id"] if duty else duty_id
+    tail = f" handover={handover}" if handover else ""
+    summary = f"[retire] {target} {reason}{tail}"
+    receipt = reason
+    if detail:
+        summary += f" {detail}"
+        receipt += f" {detail}"
+        print(detail, file=sys.stderr)
+    if duty:
+        current = store.get(duty["id"]) or duty
+        observation = dict(current.get("observation") or {})
+        if retired:
+            store.update(duty["id"], state="complete", result="normal-exit",
+                         delivery="completed", cleanup="complete",
+                         observation={"phase": "complete", "reason": reason})
+        elif reason == "self-target":
+            store.update(duty["id"], state="cancelled", cleanup="complete",
+                         observation={"phase": "cancelled", "reason": reason})
+        elif reason == "pane-close-failed" and observation.get("foreground"):
+            store.update(duty["id"], state="cleanup-pending",
+                         observation={**observation, "phase": "shell-returned",
+                                      "reason": reason}, cleanup="pending")
+        elif pending:
+            store.update(duty["id"], state="unknown" if reason.endswith("unknown") else "pending",
+                         expected_phases={observation.get("phase", "waiting")},
+                         observation={**observation, "reason": reason})
+    if retired and duty:
+        _mark_completed_retire_followup(
+            store, store.get(duty["id"]) or duty,
+            {"server": _HERDR_SESSION or "default", "pane": ident.get("pane"),
+             "harness": ident.get("harness"), "session_id": ident.get("session_id"),
+             "foreground": duty.get("intent", {}).get("identity", {}).get("foreground")},
+            "completed-retire", handover)
+    _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
+            to_session_id=ident["session_id"], to_pane=ident["pane"],
+            summary_text=summary, receipt=receipt,
+            status="sent" if retired else "unknown" if pending else "failed")
+    print(f"retired={str(retired).lower()} reason={reason} agent={ident['harness']} "
+          f"name={ident['name']} pane={ident['pane']}{tail}"
+          + (f" pending=true request_id={duty_id}" if pending and duty_id else ""))
+    return 0 if retired or pending else 1
+
+
 def cmd_retire(args):
     target = args.target
     ident = {"harness": "-", "session_id": "-", "name": target, "pane": "-"}
@@ -2605,46 +2665,8 @@ def cmd_retire(args):
     duty = store.get(duty_id) if duty_id else None
 
     def finish(reason, retired=False, handover=None, detail=None, pending=False):
-        tail = f" handover={handover}" if handover else ""
-        summary = f"[retire] {target} {reason}{tail}"
-        receipt = reason
-        if detail:
-            summary += f" {detail}"
-            receipt += f" {detail}"
-            print(detail, file=sys.stderr)
-        if duty:
-            current = store.get(duty["id"]) or duty
-            observation = dict(current.get("observation") or {})
-            if retired:
-                store.update(duty["id"], state="complete", result="normal-exit",
-                             delivery="completed", cleanup="complete",
-                             observation={"phase": "complete", "reason": reason})
-            elif reason == "self-target":
-                store.update(duty["id"], state="cancelled", cleanup="complete",
-                             observation={"phase": "cancelled", "reason": reason})
-            elif reason == "pane-close-failed" and observation.get("foreground"):
-                store.update(duty["id"], state="cleanup-pending",
-                             observation={**observation, "phase": "shell-returned",
-                                          "reason": reason}, cleanup="pending")
-            elif pending:
-                store.update(duty["id"], state="unknown" if reason.endswith("unknown") else "pending",
-                             expected_phases={observation.get("phase", "waiting")},
-                             observation={**observation, "reason": reason})
-        if retired and duty:
-            _mark_completed_retire_followup(
-                store, store.get(duty["id"]) or duty,
-                {"server": _HERDR_SESSION or "default", "pane": ident.get("pane"),
-                 "harness": ident.get("harness"), "session_id": ident.get("session_id"),
-                 "foreground": duty.get("intent", {}).get("identity", {}).get("foreground")},
-                "completed-retire", handover)
-        _record(to_harness=ident["harness"], to_name=ident["name"], kind="notice",
-                to_session_id=ident["session_id"], to_pane=ident["pane"],
-                summary_text=summary, receipt=receipt,
-                status="sent" if retired else "unknown" if pending else "failed")
-        print(f"retired={str(retired).lower()} reason={reason} agent={ident['harness']} "
-              f"name={ident['name']} pane={ident['pane']}{tail}"
-              + (f" pending=true request_id={duty_id}" if pending and duty_id else ""))
-        return 0 if retired or pending else 1
+        return _finish_retire(store, duty, target, ident, reason, retired, handover,
+                              detail, pending, duty_id=duty_id)
 
     if _herdr_missing():
         return finish("herdr-not-found")
@@ -2842,9 +2864,14 @@ def cmd_retire(args):
     if final_info is None:
         return finish("shell-return-unverified", pending=True)
     if harness == "claude":
-        return _retire_claude_background_confirm(
-            target, pane, harness, ident, identity, finish,
-            own_sid, own_harness, duty=duty)
+        # The retained runner uses this same lock; only one observer answers
+        # the exit dialog while the foreground command is still returning.
+        with peer_obligations.legacy_runner_lock(store) as acquired:
+            if acquired:
+                return _retire_claude_background_confirm(
+                    target, pane, harness, ident, identity, finish,
+                    own_sid, own_harness, duty=duty)
+        return finish("retire-already-pending", pending=True)
     return finish("agent-still-running", pending=True)
 
 
@@ -2921,6 +2948,8 @@ def _retire_claude_background_confirm(target, pane, harness, ident, identity, fi
         return finish("foreground-changed", pending=True)
     def observed_dialog():
         current = _read_screen(target)
+        if _retire_foreground(pane, harness) != identity:
+            return None, "foreground-changed"
         current_tasks = _retire_background_dialog_lines(current)
         if current_tasks is not None:
             return current_tasks, None
