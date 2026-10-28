@@ -467,7 +467,12 @@ def pending_prompt(path, parent, args=None, control=None):
         "recheck current inputs through the existing smoke/config verification, "
         "and use the normal distinct __a<N> resource retry for unfinished authorized work. "
         "Do not rerun completed stages." if row is not None and resource_never_started(row) else
-        "Continue only the already authorized next work; do not restart the resource.")
+        ("The payload completed successfully. Preserve its result and do not rerun completed stages; "
+         "continue through the declared successor's existing gate." if row is not None
+         and row.get("exit_code") == 0 else
+         "Follow existing user instructions and pending corrections. This runtime receipt reports "
+         "execution facts; it adds no retry authorization and no user prohibition. Preserve partial "
+         "outputs and continue only within the existing approved scope."))
     return ("Runtime resource receipt (not a model child or verification PASS): "
         + json.dumps(box["receipt"], sort_keys=True, separators=(",", ":"))
         + (receipt["experiment_result"] if "experiment_result" in receipt
