@@ -545,7 +545,10 @@ def _draw_route_progress(grid, x, end, y, route):
     kind = route.get("tree_label")
     duplicate = bool(not same and kind and name == kind)
     items = _leg_items(legs[:current + 1])
-    if not same:
+    if same and stages[0].get("st") == "active":
+        parts, _ = _stage_items(stages, lit=bool(getattr(grid, "beat", 1)))[0]
+        items[-1] = (parts[:1] + items[-1][0][1:], status)
+    elif not same:
         items[-1] = ([(str(name), "soft")], status)
     lead = items[:-1] if duplicate else items
     after = []
@@ -566,9 +569,9 @@ def _draw_route_progress(grid, x, end, y, route):
         leg = _leg_items([legs[current]])[0][0]
         cursor = _put_segments(grid, cursor, y, ([((" › "), "dim")] if cursor > x else []) + leg, end)
     elif not same and room >= _seg_width(current_stage) + 2 and stages:
-        stage_rail = _fold_items(_stage_items(stages), room)
+        stage_rail = _fold_items(_stage_items(stages, lit=bool(getattr(grid, "beat", 1))), room)
         if sum(_seg_width(text) for text, _key in stage_rail) > room:
-            stage_rail = _minimal_stage_rail(stages, stage_index, room)
+            stage_rail = _minimal_stage_rail(stages, stage_index, room, lit=bool(getattr(grid, "beat", 1)))
         opening = " › (" if duplicate and cursor > x else " (" if cursor > x else "("
         cursor = grid.put(cursor, y, opening, "dim", limit=end)
         cursor = _put_segments(grid, cursor, y, stage_rail, end)
@@ -604,13 +607,13 @@ def _stage_hue(route, step):
     return "lcgym"[names.index(step) % 5] if step in names else "g"
 
 
-def _stage_items(stages):
+def _stage_items(stages, lit=True):
     bright_hues = ("hb_opencode", "hb_claude", "grp_live", "g_idle", "hb_codex")
     dim_hues = ("version_release", "h_claude", "g_work_off", "lvl_y_dim", "h_codex")
     result = []
     for index, stage in enumerate(stages):
         status = stage.get("st")
-        if status == "active":
+        if status == "active" and lit:
             name_key = {0: "hb_opencode", 1: "hb_claude", 2: "g_work", 3: "stg3_on", 4: "eff_xhigh"}[index % len(bright_hues)]
         elif status == "failed":
             name_key = bright_hues[index % len(bright_hues)]
@@ -621,7 +624,7 @@ def _stage_items(stages):
             live = status in ("active", "failed")
             parts.append((f" R{stage['r']}", "g_idle" if live and stage.get("r", 1) >= 3 else "dim"))
         mark = {"done": (" ✓", "done"), "failed": (" ✕", "g_dead"),
-                "active": (" ●", "work")}.get(status)
+                "active": (" ●", "work" if lit else "g_work_off")}.get(status)
         if mark:
             parts.append(mark)
         if stage.get("host"):
@@ -651,8 +654,8 @@ def _fold_items(items, room):
     return build(low, high)
 
 
-def _minimal_stage_rail(stages, index, room):
-    items = _stage_items(stages)
+def _minimal_stage_rail(stages, index, room, lit=True):
+    items = _stage_items(stages, lit=lit)
     current = items[index][0]
     rail = ([ ("… ", "dim") ] if index else []) + current + ([ (" …", "dim") ] if index < len(items) - 1 else [])
     if sum(_seg_width(text) for text, _key in rail) <= room:
@@ -862,6 +865,8 @@ def draw_routes(grid, vm, state, x=34, y=3):
             for text, style in (worker[2] if len(worker) > 2 else ()):
                 if "running" in str(text):
                     style = route.get("worker_stage_key") or (hue, 1, 0)
+                    if worker_running and not getattr(grid, "beat", 1):
+                        style = (hue, 0, 1)
                 grid.put(cursor, y, text, style, limit=x + use - (9 if link else 0))
                 from .grid import cell_width
                 cursor += sum(cell_width(char) for char in str(text))

@@ -194,6 +194,7 @@ _HUE_OF = {
     # F-100c: a STEWARD session (depth −1: `steward on`, or it watched/started a session) wears
     # bright pink text: distinct from white/yellow, without a special background.
     "tag_steward": ("p", _A_B),
+    "tag_steward_dim": ("p", _A_D),
     # Badge text, NOT the glyph: plain yellow, distinct from the dim g_unused glyph so the
     # ●>○>◌ ink-weight gradient still reads.
     "g_unused_b": ("y", 0),
@@ -444,6 +445,7 @@ def _init_colors():
         _COLOR["tag_steward"] = curses.color_pair(_STEWARD_PAIR) | curses.A_BOLD
     except Exception:
         _COLOR["tag_steward"] = (_COLOR.get("h_codex", 0) & ~curses.A_DIM) | curses.A_BOLD
+    _COLOR["tag_steward_dim"] = (_COLOR["tag_steward"] & ~curses.A_BOLD) | curses.A_DIM
     _COLOR["herdr_on"] = _COLOR.get("soft", 0)
     _COLOR["grp"] = _COLOR.get("soft", 0) | curses.A_BOLD  # group card title
     _COLOR["grp_live"] = _COLOR.get("green", 0)
