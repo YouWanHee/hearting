@@ -1146,7 +1146,9 @@ def verified_owner_pin_handoff_close(route, *, jobs=None):
         changes = [row for row in changes
                    if isinstance(row.get("by"), dict)
                    and row["by"].get("harness") in AUTH.PIN_HARNESSES
-                   and row["by"].get("session_id") == metadata.get("parent_sid")
+                   and (row["by"].get("session_id") == metadata.get("parent_sid")
+                        # The parent the seat was handed to pins with the same authority.
+                        or AUTH.owns(metadata, row["by"].get("session_id"), jobs))
                    and datetime.fromisoformat(str(row.get("at", "")).replace("Z", "+00:00")) <= close_at]
         if not target_harness or not changes:
             return None
