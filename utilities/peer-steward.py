@@ -2054,6 +2054,13 @@ def _start_in_pane(args):
             started_sid = peer_message.usable_session_id(_process_session(args.pane, "codex"))
         except Exception:
             started_sid = None
+    if started and started_sid:
+        try:
+            peer_message._session_handle()  # Make the shared tools package importable.
+            from fleet.session_tags import assign_observed
+            assign_observed(args.kind, started_sid, pane_id=args.pane)
+        except Exception:
+            pass  # Numberless pending does not change a successful start.
     # A successful agent block or this pane's observed matching runtime proves the
     # start. An unresolved refusal or unparsable answer grants no role marker.
     if started and isinstance(agent_block, dict):
@@ -9221,9 +9228,19 @@ def cmd_prompt(args, *, expected_recipient=None, on_prepared=None, producer_bind
             and len(body.encode("utf-8")) > peer_message._BODY_REFERENCE_THRESHOLD):
         reference_evidence = _peer_reference_access_evidence(
             resolved_target, t_harness, t_sid, target_pane)
+    sender = {"harness": from_harness, "session_id": from_sid, "name": from_name}
+    if from_sid and from_harness in {"claude", "codex", "opencode"}:
+        try:
+            from pane_ownership import verified_pane
+            sender_pane = verified_pane(os.environ.get("HERDR_PANE_ID", ""),
+                                        from_harness, from_sid, server=_HERDR_SESSION)
+            if sender_pane:
+                sender["pane_id"] = sender_pane
+        except Exception:
+            pass
     try:
         text, transfer_ref = peer_message.prepare_peer_message(
-            body, {"harness": from_harness, "session_id": from_sid, "name": from_name},
+            body, sender,
             recipient, defer=True, refs=args.ref, receipt=input_reason or "native-pending",
             with_trailer=not args.no_trailer, reference_evidence=reference_evidence,
             first_input_process=first_input_process, producer_binding=producer_binding)

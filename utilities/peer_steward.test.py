@@ -1174,10 +1174,12 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         """A successful launch stays successful when shared identity is unknown."""
         import io
         import contextlib
+        from fleet import session_tags
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
                                 return_value=_herdr_json(_agent_json("codex", "herdr-claim", "peer-c"))), \
-             mock.patch.object(peer_steward, "_process_session", return_value=None) as resolve:
+             mock.patch.object(peer_steward, "_process_session", return_value=None) as resolve, \
+             mock.patch.object(session_tags, "assign_observed") as assign:
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
@@ -1185,21 +1187,49 @@ class StartTest(_TmpRootMixin, unittest.TestCase):
         resolve.assert_called_once_with("w1:pM", "codex")
         self.assertIn("started=true", out.getvalue())
         self.assertIn("session_id=-", out.getvalue())
+        assign.assert_not_called()
         self.assertNotIn("session_bind=", out.getvalue())
 
     def test_the_receipt_uses_only_the_shared_resolver_identity(self):
         import io
         import contextlib
+        from fleet import session_tags
         with mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
              mock.patch.object(peer_steward.subprocess, "run",
                                 return_value=_herdr_json(_agent_json("codex", "herdr-claim", "peer-c"))), \
-             mock.patch.object(peer_steward, "_process_session", return_value="proven-thread") as resolve:
+             mock.patch.object(peer_steward, "_process_session", return_value="proven-thread") as resolve, \
+             mock.patch.object(session_tags, "_inventory", side_effect=AssertionError("start census")):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = peer_steward.main(["start", "peer-c", "--kind", "codex", "--pane", "w1:pM"])
         self.assertEqual(rc, 0)
         resolve.assert_called_once_with("w1:pM", "codex")
         self.assertIn("session_id=proven-thread", out.getvalue())
+        self.assertIsNotNone(session_tags.assigned_tag("codex", "proven-thread"))
+        self.assertIsNone(session_tags.assigned_tag("codex", "herdr-claim"))
+
+    def test_exact_start_remains_successful_and_numberless_during_writer_contention(self):
+        import io
+        import contextlib
+        import fcntl
+        from fleet import session_tags
+        path = session_tags._path()
+        path.parent.mkdir(parents=True)
+        for harness in ("claude", "codex", "opencode"):
+            with path.with_suffix(".lock").open("a") as lock, \
+                 mock.patch.object(peer_steward.shutil, "which", return_value="/usr/bin/herdr"), \
+                 mock.patch.object(peer_steward.subprocess, "run", return_value=_herdr_json(
+                     _agent_json(harness, "proven-session", "peer"))), \
+                 mock.patch.object(peer_steward, "_process_session", return_value="proven-session"), \
+                 mock.patch.object(session_tags, "_inventory", side_effect=AssertionError("start census")):
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = peer_steward.main(["start", "peer", "--kind", harness, "--pane", "w1:pM"])
+            self.assertEqual(rc, 0)
+            self.assertIn("started=true", out.getvalue())
+            self.assertIn("session_id=proven-session", out.getvalue())
+            self.assertFalse(path.exists())
 
     def test_name_is_the_positional_right_after_start(self):
         """herdr `agent start <NAME> --kind --pane`: the name is a required positional.
@@ -4805,6 +4835,7 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
 
     def test_opencode_prompt_keeps_its_native_callback_path(self):
         os.environ["CLAUDE_CODE_SESSION_ID"] = "sid-steward"
+        os.environ["HERDR_PANE_ID"] = "w:sender"
         harness = "opencode"
         calls = []
         payload = _agent_json(harness, "sid-" + harness, "child", status="idle")
@@ -4819,9 +4850,20 @@ class F100cPromptAndResolutionTest(_TmpRootMixin, unittest.TestCase):
         self.assertEqual(self._pane_io_calls(calls), [])
         row = peer_steward.peer_message._read_pending(self._all_records()[-1]["transfer_ref"])
         self.assertEqual(row["state"], "pending")
+        self.assertEqual(row["from"]["pane_id"], "w:sender")
+        self.assertIn(" ; pane=w:sender ; sid=sid-steward", row["text"])
         self.assertEqual(row["to"]["session_id"], "sid-opencode")
         self.assertTrue(peer_steward.peer_message.parse_peer_trailer(
             row["text"], row["to"], include_ref=True))
+
+    def test_unproven_sender_pane_is_not_borrowed_from_recipient_or_environment(self):
+        import pane_ownership
+        with mock.patch.dict(os.environ, {"HERDR_PANE_ID": "w:inherited"}), \
+             mock.patch.object(pane_ownership, "verified_pane", return_value=""):
+            rc, _printed, row, _sent, _schedule = self._run_claude_prompt(state="busy")
+        self.assertNotIn("pane_id", row["from"])
+        self.assertIn(" ; pane=- ; sid=sid-steward", row["text"])
+        self.assertEqual(row["to"]["pane_id"], "w1:pX")
 
     def _run_claude_prompt(self, *, state="idle", screen=None,
                            consume=False, readiness=None, foregrounds=None,
