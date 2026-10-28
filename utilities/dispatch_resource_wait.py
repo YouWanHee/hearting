@@ -662,13 +662,15 @@ def pending_prompt(path, parent, args=None, control=None):
                 or RESUME.row_digest(row) != receipt.get("resource_sha256")):
             raise JOIN.JoinContractError("resource-outbox-binding-changed")
     from resource_run_registry import resource_never_started
+    # The bound receipt keeps exit guidance identical on a returning turn
+    # even when that turn has no row context. It grants no execution authority.
     next_work = ("The payload never started. Preserve this failed run, address its launch diagnostic, "
         "recheck current inputs through the existing smoke/config verification, "
         "and use the normal distinct __a<N> resource retry for unfinished authorized work. "
         "Do not rerun completed stages." if row is not None and resource_never_started(row) else
         ("The payload completed successfully. Preserve its result and do not rerun completed stages; "
-         "continue through the declared successor's existing gate." if row is not None
-         and row.get("exit_code") == 0 else
+         "continue through the declared successor's existing gate." if
+         receipt.get("exit_code") == 0 else
          "Follow existing user instructions and pending corrections. This runtime receipt reports "
          "execution facts; it adds no retry authorization and no user prohibition. Preserve partial "
          "outputs and continue only within the existing approved scope."))
