@@ -1405,6 +1405,8 @@ class CompletionMarkerTest(unittest.TestCase):
             (ROOT / "utilities" / "dispatch_state_root_rotation.test.py").resolve(),
             # Asserts dispatch-batch stops on the real gate's route-state refusal.
             (ROOT / "utilities" / "dispatch-batch.test.py").resolve(),
+            # Reproduces the real pre-repair gate refusal for preserved resources.
+            (ROOT / "utilities" / "preserved_resource_handoff.test.py").resolve(),
         }
         for adapter in ("claude", "codex", "opencode"):
             allow.add((ROOT / "adapters" / adapter / "bin" / "dispatch-headless.py").resolve())
