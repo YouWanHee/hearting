@@ -507,7 +507,7 @@ NOTICE_DELIVERY_HEADER = (
     "Hearting notice about work you started (a paused route resumed, a remote run ended). "
     "Report observed metrics, trend, and elapsed or ETA against the criteria and plan; state when unavailable. "
     "Act only where a line's required_action asks for it. "
-    "Do not start Monitor, dispatch-wait, or a polling loop."
+    "Do not start a separate harness-scheduled re-invocation, Monitor, dispatch-wait, or a polling loop."
 )
 
 
@@ -519,9 +519,32 @@ GATE_DELIVERY_HEADER = (
     "release --route <route file> --gate <name> --decision proceed|revise|stop "
     "[--answers <file from frame_interview.py answers-template>]`. The owner is waiting on "
     "`await-release` or has paused at the gate; the release continues the work either way. "
-    "Do not start Monitor, dispatch-wait, or a polling loop."
+    "Do not start a separate harness-scheduled re-invocation, Monitor, dispatch-wait, or a polling loop."
 )
 COMPLETION_DELIVERY_HEADER = (
+    "Hearting runtime delivery. Follow required_action; inspect-recovery is diagnostic. "
+    "Follow route's next-action receipt; runtime-v1 owners close/finalize. "
+    "Tracked-Workflow Continuation. Keep new failures/conflicts, unfinished work, questions; "
+    "no separate harness-scheduled re-invocation/Monitor/dispatch-wait/polling."
+)
+# Frozen headers from the previous short rendering; receipt recovery only.
+_PREVIOUS_NOTICE_DELIVERY_HEADER = (
+    "Hearting notice about work you started (a paused route resumed, a remote run ended). "
+    "Report observed metrics, trend, and elapsed or ETA against the criteria and plan; state when unavailable. "
+    "Act only where a line's required_action asks for it. "
+    "Do not start Monitor, dispatch-wait, or a polling loop."
+)
+_PREVIOUS_GATE_DELIVERY_HEADER = (
+    "Hearting human gate awaiting your decision (SD-123/129). Read the named artifact "
+    "(an interview file or a frame summary), put the [방향 확인] card and every interview "
+    "question to the user through AskUserQuestion -- one topic at a time, in plain words, "
+    "recommended answer first -- then record the answer with `workflow-supervisor.py "
+    "release --route <route file> --gate <name> --decision proceed|revise|stop "
+    "[--answers <file from frame_interview.py answers-template>]`. The owner is waiting on "
+    "`await-release` or has paused at the gate; the release continues the work either way. "
+    "Do not start Monitor, dispatch-wait, or a polling loop."
+)
+_PREVIOUS_COMPLETION_DELIVERY_HEADER = (
     "Hearting runtime delivery. Follow required_action; inspect-recovery is diagnostic. "
     "Follow route's next-action receipt; runtime-v1 owners close/finalize. "
     "Tracked-Workflow Continuation. Keep new failures/conflicts, unfinished work, questions; "
@@ -565,10 +588,31 @@ _LEGACY_RUNTIME_V1_FOLLOWUP = (
 )
 
 
+def _previous_opencode_delivery_body(text: str, *, legacy_completion: bool = False) -> str:
+    """Restore only renderer-owned block headers, keeping receipt content exact."""
+    from dispatch_recipient_receipt import OPENCODE_MARKER_LINE_RE
+    headers = {
+        GATE_DELIVERY_HEADER: _PREVIOUS_GATE_DELIVERY_HEADER,
+        NOTICE_DELIVERY_HEADER: _PREVIOUS_NOTICE_DELIVERY_HEADER,
+        COMPLETION_DELIVERY_HEADER: (_LEGACY_COMPLETION_DELIVERY_HEADER if legacy_completion
+                                     else _PREVIOUS_COMPLETION_DELIVERY_HEADER),
+    }
+    blocks = []
+    previous = None
+    for block in text.split("\n\n"):
+        header, separator, body = block.partition("\n")
+        # Gate/notice blocks end at their last receipt marker. Blank lines inside
+        # a receipt or follow-up do not turn payload text into another header.
+        if previous is None or OPENCODE_MARKER_LINE_RE.fullmatch(previous.rsplit("\n", 1)[-1]):
+            header = headers.get(header, header)
+        blocks.append(header + separator + body)
+        previous = block
+    return "\n\n".join(blocks)
+
+
 def _legacy_opencode_completion_body(text: str, roots: list[Path], records: list[dict]) -> str:
     """Render the exact previous full body for receipt recovery only."""
-    legacy = text.replace(COMPLETION_DELIVERY_HEADER,
-                          _LEGACY_COMPLETION_DELIVERY_HEADER, 1)
+    legacy = _previous_opencode_delivery_body(text, legacy_completion=True)
     for root, record in zip(roots, records):
         follow = _followup(root, record)
         if follow.startswith(_CURRENT_RUNTIME_V1_FOLLOWUP_PREFIX):
@@ -805,10 +849,11 @@ def _opencode_delivery_expectations(roots: list[Path], recipient_kind: str,
         for root, record in selected:
             grouped_selected.setdefault(root, []).append(record)
         rendered = delivery_context(list(grouped_selected.items()))
+        previous_rendered = _previous_opencode_delivery_body(rendered)
         legacy_rendered = _legacy_opencode_completion_body(
             rendered, [root for root, _record in selected],
             [record for _root, record in selected]) if rendered else ""
-        if not rendered or native_text not in {rendered, legacy_rendered}:
+        if not rendered or native_text not in {rendered, previous_rendered, legacy_rendered}:
             continue
         candidate = _opencode_expected_message(native_text, identities)
         key = (candidate["text"], tuple(candidate["bindings"]))
