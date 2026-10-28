@@ -198,7 +198,7 @@ class QueueDeliveryTest(unittest.TestCase):
             "Hearting runtime delivery. Follow required_action; inspect-recovery is diagnostic. "
             "Follow route's next-action receipt; runtime-v1 owners close/finalize. "
             "Tracked-Workflow Continuation. Keep new failures/conflicts, unfinished work, questions; "
-            "no Monitor/dispatch-wait/polling.\n" +
+            "no separate harness-scheduled re-invocation/Monitor/dispatch-wait/polling.\n" +
             "\n".join("- " + line for line in batch_lines)
         )
         self.assertEqual(QUEUE.native_client_message_id(
