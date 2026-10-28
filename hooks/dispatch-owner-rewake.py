@@ -42,6 +42,7 @@ import shared_readiness  # noqa: E402
 from frame_interview import PENDING_ANSWER_RULE  # noqa: E402
 import dispatch_seat_handover as seat_handover  # noqa: E402
 from parent_next_directive import entrypoint, resume_command, wait_command  # noqa: E402
+from peer_read_context import PeerReadContext  # noqa: E402
 from dispatch_session_sweep import (  # noqa: E402
     HUMAN_GATE_PREFIX,
     _bounded_receipt_text,
@@ -367,8 +368,16 @@ def _read_registry_lines(jobs: Path) -> list[str] | None:
 def _session_owner_rows(
     jobs: Path, session: str, *, statuses: frozenset[str] = ARM_ROW_STATUSES
 ) -> list[tuple[str, float]]:
+    """`_session_owner_states` without the status column."""
+
+    return [(attempt_id, age) for attempt_id, age, _status in _session_owner_states(jobs, session, statuses)]
+
+
+def _session_owner_states(
+    jobs: Path, session: str, statuses: frozenset[str]
+) -> list[tuple[str, float, str]]:
     """Every claimed-and-started depth-1 owner/frame/review row bound to `session`
-    whose latest status is in `statuses`, as ``(attempt_id, age_seconds)``,
+    whose latest status is in `statuses`, as ``(attempt_id, age_seconds, status)``,
     oldest first. Empty on any refusal. This is the one identity check both
     arming paths share (review R1 B1): a receipt on stdout only *names* a
     candidate; the row proves it -- exists, `parent_sid` is this session,
@@ -394,18 +403,25 @@ def _session_owner_rows(
             continue
         latest[attempt_id] = (columns[0], columns[1], metadata)
     now = time.time()
-    rows: list[tuple[str, float]] = []
+    # One read context for the whole scan, and the row's own fields before
+    # the lineage: `owns` otherwise re-read every handover snapshot and seat
+    # ledger per row, ~20ms each, so a 1,994-row registry cost every Bash
+    # call ~40s of CPU (2026-10-28).
+    read_context = PeerReadContext()
+    rows: list[tuple[str, float, str]] = []
     for attempt_id, (stamp, status, metadata) in latest.items():
-        if status not in statuses or not seat_handover.owns(metadata, session, jobs):
+        if status not in statuses:
             continue
         if any(metadata.get(key) != value for key, value in REGISTRY_DEPTH1_START.items()):
             continue
         if not _worker_type_is_depth1(metadata.get("worker_type")):
             continue
+        if not seat_handover.owns(metadata, session, jobs, read_context=read_context):
+            continue
         age = _row_age(stamp, now)
         if age is None or age < -MAXIMUM_CLOCK_SKEW_SECONDS:
             continue
-        rows.append((attempt_id, age))
+        rows.append((attempt_id, age, status))
     rows.sort(key=lambda row: -row[1])
     return rows
 
@@ -442,12 +458,13 @@ def registry_launch(payload: object) -> tuple[Launch, ArmClaim] | ArmRefusal | N
     window = _arm_window()
     named = _single(_fields(_stdout(payload.get("tool_response"))), "attempt_id")
     refusal: ArmRefusal | None = None
-    open_rows = {attempt_id for attempt_id, _age in _session_owner_rows(jobs, session)}
+    rows = _session_owner_states(jobs, session, RECEIPT_ROW_STATUSES)
+    open_rows = {attempt_id for attempt_id, _age, status in rows if status in ARM_ROW_STATUSES}
     # A row that already ran to `done` is never a *new* claim (its completion
     # is the sweep's), but one whose claim this session already holds -- a
     # spent gate wake, a dead holder, a lapse -- is still owed its wake and
     # may have finished between the release and this call (top review M1).
-    for attempt_id, age in _session_owner_rows(jobs, session, statuses=RECEIPT_ROW_STATUSES):
+    for attempt_id, age, _status in rows:
         fresh = attempt_id in open_rows and age <= window
         if stopping and not arm_path(jobs, attempt_id).exists():
             continue
