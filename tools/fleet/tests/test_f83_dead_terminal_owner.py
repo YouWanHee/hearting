@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 from tools.fleet.model import DispatchJob
 
@@ -20,6 +21,102 @@ _ROW = ("2026-07-19T00:00:00Z\tdone\t/r\t/w\t{slug}\t"
 
 
 class DeadTerminalOwnerTest(unittest.TestCase):
+    def test_closed_launch_route_does_not_hide_open_adopted_owner_route(self):
+        from datetime import datetime, timezone, timedelta
+        from route_identity import route_hash
+        from owner_route_binding import OwnerRouteBinding
+
+        with tempfile.TemporaryDirectory() as td:
+            home = os.path.join(td, "home")
+            old = Path(self._route(td, "rt-old"))
+            record = json.loads(old.read_text())
+            record["route_hash"] = route_hash(record)
+            old.write_text(json.dumps(record))
+            old.with_suffix(".outcome.json").write_text(json.dumps({
+                "route_id": "rt-old", "route_hash": record["route_hash"],
+                "terminal_gate_proven": False}))
+            current = Path(td, "current.json")
+            successor = dict(record, route_id="rt-current")
+            successor["route_hash"] = route_hash(successor)
+            current.write_text(json.dumps(successor))
+            fresh = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+            row = _ROW.format(slug="owner-advanced", rid="rt-old", rf=old,
+                              att="att-advanced", note="dead-worker-blocked")
+            row = row.replace("2026-07-19T00:00:00Z", fresh).replace(
+                "owner_route_hash=sha256:f83,",
+                "route_hash={0},owner_route_hash={0},".format(record["route_hash"]))
+            binding = OwnerRouteBinding(str(current), "rt-current", successor["route_hash"])
+            registry = dispatch._orphan_registry_module()
+            with mock.patch("owner_route_binding.resolve_owner_route_lifecycle",
+                            return_value=(binding, "owner-route-advance-current")), \
+                    mock.patch.object(registry, "resolve_owner_route",
+                                      return_value=("rt-current", str(current), "ok")):
+                jobs = self._collect(td, home, [row])
+                self.assertIn("owner-advanced", [j.slug for j in jobs])
+                current.with_suffix(".outcome.json").write_text(json.dumps({
+                    "route_id": "rt-current", "route_hash": successor["route_hash"],
+                    "terminal_gate_proven": False}))
+                jobs = self._collect(td, home, [row])
+                self.assertNotIn("owner-advanced", [j.slug for j in jobs])
+
+    def test_exact_route_closure_ends_retention_without_completing_markers(self):
+        from datetime import datetime, timezone, timedelta
+        from route_identity import route_hash
+
+        for binding in ("direct", "owner"):
+            for closure in ("closed", "missing", "malformed", "foreign-id", "foreign-hash", "pending"):
+                with self.subTest(binding=binding, closure=closure), tempfile.TemporaryDirectory() as td:
+                    home = os.path.join(td, "home")
+                    rid = "rt-f83-explicit-close"
+                    self._markers(home, rid, ["plan"])
+                    rf = Path(self._route(td, rid))
+                    record = json.loads(rf.read_text())
+                    record.update(cwd="/w", repo="/r", capability="autopilot-code",
+                                  capability_mode="dev", artifact_root=str(Path(td) / "artifacts"))
+                    record["route_hash"] = route_hash(record)
+                    rf.write_text(json.dumps(record))
+                    outcome = rf.with_suffix(".outcome.json")
+                    closed = {"route_id": rid, "route_hash": record["route_hash"],
+                              "terminal_gate_proven": False}
+                    if closure == "foreign-id":
+                        closed["route_id"] = "rt-other"
+                    if closure == "foreign-hash":
+                        closed["route_hash"] = "sha256:other"
+                    if closure == "pending":
+                        closed["inline_finish_id"] = "finish-pending"
+                    if closure != "missing":
+                        outcome.write_text("{" if closure == "malformed" else json.dumps(closed))
+                    fresh = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+                    row = _ROW.format(slug="owner-f83-closed", rid=rid, rf=rf,
+                                      att="att-f83-closed", note="dead-worker-blocked")
+                    row = row.replace("2026-07-19T00:00:00Z", fresh).replace(
+                        "owner_route_hash=sha256:f83,",
+                        "route_hash={0},owner_route_hash={0},".format(record["route_hash"]))
+                    row = row.rstrip("\n") + (
+                        ",unit=_kernel/owner,capability=autopilot-code,capability_mode=dev,"
+                        "artifact_root=" + record["artifact_root"] + "\n")
+                    if binding == "owner":
+                        row = row.replace("route_id={0},route_file={1},".format(rid, rf), "", 1)
+                    rows = [row]
+                    if binding == "owner":
+                        # Historical owner-only rows derive node context from
+                        # their exact registered children, as real owners do.
+                        rows.append(f"{fresh}\tdone\t/r\t/w\towner-f83-closed-plan\t"
+                                    "worker_type=stage,attempt_id=att-f83-plan,"
+                                    "parent=owner-f83-closed,parent_attempt_id=att-f83-closed,"
+                                    f"route_id={rid},route_file={rf},route_node=plan\n")
+                    before = {p: p.read_bytes() for p in (rf, outcome) if p.exists()}
+                    marker = Path(home) / ".dispatch/completion" / rid / "plan.json"
+                    before[marker] = marker.read_bytes()
+                    with mock.patch("inline_finish.pending_state", return_value={
+                            "inline_finish_id": "finish-pending", "state": "finishing"}):
+                        jobs = self._collect(td, home, rows)
+                    retained = [j for j in jobs if j.slug == "owner-f83-closed"]
+                    self.assertEqual(bool(retained), closure != "closed")
+                    self.assertEqual(Path(td, "jobs.log").read_text(), "".join(rows))
+                    self.assertEqual({p: p.read_bytes() for p in before}, before)
+                    self.assertFalse((marker.parent / "execute.json").exists())
+
     def test_repeated_lineage_sources_are_memoized_within_one_retention_pass(self):
         path = "/dispatch/jobs.log"
         route_file = "/routes/shared.json"

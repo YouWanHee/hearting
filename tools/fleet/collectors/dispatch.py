@@ -60,6 +60,7 @@ except Exception:  # a monitor must never fail to import over a bookkeeping help
 from dispatch_completion_join import read_supervisor_phase_state, read_join_observation  # noqa: E402
 from dispatch_subsession_advance import row_is_registered_only  # noqa: E402
 from dispatch_attempt_policy import decide_attempt, terminal_conflict_pending  # noqa: E402
+from dispatch_notice_state import route_obligation_closed  # noqa: E402
 import dispatch_registry_cache as _dispatch_registry_cache  # noqa: E402
 from codex_dispatch_terminal import terminal_envelope_observed  # noqa: E402
 from claude_project_dir import encode_project_dir  # noqa: E402
@@ -4235,6 +4236,18 @@ def _retain_dead_terminal_owners(jobs, now, jobs_path=None, *, orphan_rows_cache
         args.jobs = _Path(path)
         args.integration_ref = None
         args.now = now
+        try:
+            closure_meta = dict(row["meta"])
+            if all(closure_meta.get("owner_" + key) for key in ("route_file", "route_id", "route_hash")):
+                # Owners may also retain launch-time route_* fields. Prefer
+                # their verified lifecycle, including any adopted successor.
+                closure_meta.pop("route_file", None)
+            if route_obligation_closed(closure_meta, args.jobs):
+                drop.add(id(j))
+                continue
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            # Uncertain closure is not permission to hide unresolved work.
+            pass
         try:
             incomplete, record_status = registry.route_incomplete(
                 row, args.agent_home, rows, args.jobs

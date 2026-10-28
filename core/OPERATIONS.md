@@ -1886,6 +1886,14 @@ pending attempts. Missing, changed, advanced or still-open route bindings and
 launched owners retain the existing reconciliation rules. Fleet may remove
 the cancelled row from its active set without granting successor readiness.
 
+Fleet retains a dead terminal owner only while its exact route remains open.
+A matching, committed route outcome ends that retention even when the route
+closed with unproven terminal gates. This is a read-only display decision:
+missing markers, registry history and stored FAIL/BLOCKED reports remain
+unchanged. Missing, malformed, mismatched, or pending
+closure evidence cannot hide an otherwise retained owner. Live work keeps its
+existing visibility and process protections.
+
 **Verification owns its processes and private scratch.** A verification lease
 (`utilities/verification-background-lease.py`) creates a private directory
 beneath the final command environment's `TMPDIR` parent and passes that
