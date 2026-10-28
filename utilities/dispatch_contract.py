@@ -8804,8 +8804,11 @@ def _resource_stage_marker_current(route, node, marker, marker_path, jobs):
             return GateCurrency("resource-stage-not-current", "completion-marker-missing")
         owner_id = (row.get("owner_wait") or {}).get("parent_attempt_id")
         owner = row.get("owner_wait") or {}
+        same_owner = bool(owner_id) and evidence.get("owner_attempt_id") == owner_id
         import route_authority as AUTHORITY
-        consumer_current = AUTHORITY.resource_owner_consumer_matches(
+        # Currency reads an admitted settlement; the original owner need not
+        # still be registered or running. Different consumers retain lineage.
+        consumer_current = same_owner or AUTHORITY.resource_owner_consumer_matches(
             jobs, source_attempt_id=owner_id,
             consumer_attempt_id=evidence.get("owner_attempt_id"),
             resource_route_file=armed.get("route_file"),

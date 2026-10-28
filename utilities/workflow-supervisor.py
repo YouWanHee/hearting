@@ -1251,26 +1251,32 @@ def _owner_settlement_snapshot(route, ledger, armed, row=None):
         return None
     consumer_attempt_id = evidence.get("owner_attempt_id")
     consumer_session_id = evidence.get("owner_session_id")
+    same_owner = consumer_attempt_id == source_attempt_id
     import route_authority as AUTHORITY
-    consumer_current = AUTHORITY.resource_owner_consumer_matches(
+    # An exact original-owner settlement is historical evidence, not a new
+    # launch. Older settlements may omit the session in the stage evidence.
+    consumer_current = same_owner or AUTHORITY.resource_owner_consumer_matches(
         jobs, source_attempt_id=source_attempt_id,
         consumer_attempt_id=consumer_attempt_id,
         resource_route_file=route_file, resource_route_id=armed.get("route_id"),
         resource_route_hash=armed.get("route_hash"),
         resource_owner_pid=owner.get("owner_pid"),
-        resource_owner_start=owner.get("owner_start"))
+        resource_owner_start=owner.get("owner_start"), require_live=False)
     if (stage.get("state") != "STAGE_SUCCEEDED"
             or not (owner_successor_start or owner_terminal_settlement)
             or not source_attempt_id or owner.get("parent_attempt_id") != source_attempt_id
-            or not consumer_current or not consumer_session_id
-            or (consumer_attempt_id == source_attempt_id
+            or not consumer_current
+            or (same_owner and consumer_session_id is not None
                 and consumer_session_id != owner.get("session_id"))
+            or (not same_owner and not consumer_session_id)
             or row.get("run_id") != armed.get("predecessor_id")
             or row.get("resource_policy") != "supervised-owner"
             or row.get("status") != "succeeded" or row.get("exit_code") != 0
             or row.get("route") != route_file or row.get("node") != node_id
             or row.get("jobs") != jobs
             or jobs != canonical_jobs or route_file != canonical_route_file
+            or (same_owner and (armed.get("route_id") != route.get("route_id")
+                                or armed.get("route_hash") != route.get("route_hash")))
             or armed.get("route_id") != owner.get("route_id")
             or armed.get("route_hash") != owner.get("route_hash")
             or owner.get("jobs") != jobs or not owner.get("session_id")
