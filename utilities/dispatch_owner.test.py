@@ -18,6 +18,30 @@ from model_profile import load_config, resolve_profile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+_STATE_TMP = None
+_STATE_OLD = None
+
+
+def setUpModule():
+    # The hard usage reader now consults Fleet's shared gauge cache; keep this
+    # module off the developer's live ~/.local/state store (the host's codex
+    # weekly window can be at 100%).
+    global _STATE_TMP, _STATE_OLD
+    _STATE_TMP = tempfile.TemporaryDirectory()
+    _STATE_OLD = os.environ.get("FLEET_USAGE_STATE_DIR")
+    os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_TMP.name
+
+
+def tearDownModule():
+    if _STATE_OLD is None:
+        os.environ.pop("FLEET_USAGE_STATE_DIR", None)
+    else:
+        os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_OLD
+    _STATE_TMP.cleanup()
+
+
 SELECTOR = ROOT / "utilities" / "dispatch-owner.py"
 
 import json  # noqa: E402

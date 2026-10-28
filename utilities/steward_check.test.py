@@ -31,6 +31,7 @@ REAL_OBSERVE = SC._observe_role
 REAL_ROLE_HELD = SC._role_held
 REAL_HUMAN_WAIT = SC._human_wait_open
 REAL_ROLE_FLAGGED = SC._role_flagged
+REAL_SESSION_LIVENESS = SC._session_liveness
 T0 = 1_000_000.0
 INTERVAL = 7200
 HARNESS = "claude"
@@ -68,7 +69,7 @@ class CheckBase(unittest.TestCase):
                 ("_role_flagged", lambda h, s: self.flagged),
                 ("_observe_role", lambda h, s: {"targets": list(self.seen["targets"]),
                                                 "pending_messages": self.seen["pending_messages"]}),
-                ("_session_liveness", lambda h, s, agents=None: self.liveness),
+                ("_session_liveness", lambda h, s, agents=None, observation=None: self.liveness),
                 ("_human_wait_open", lambda h, s, now: self.human_wait),
                 ("_agents", lambda: [])):
             patch = mock.patch.object(SC, name, side_effect=replacement)
@@ -591,7 +592,8 @@ class StewardCheckReactivationTest(CheckBase):
                       "holder": {"harness": "claude", "sid": "sid-ended"}, "targets": [{"name": "w"}]}]
         with mock.patch.object(SC, "_relations", return_value=relations), \
              mock.patch.object(SC, "_session_liveness",
-                               side_effect=lambda h, s, agents=None: "ended" if s == "sid-ended" else "live"), \
+                               side_effect=lambda h, s, agents=None, observation=None:
+                                         "ended" if s == "sid-ended" else "live"), \
              mock.patch.object(peer_obligations.ObligationStore, "list",
                                side_effect=AssertionError("no store listing at runner start")):
             SC.reconcile_all(self.store)
@@ -609,6 +611,181 @@ class StewardCheckReactivationTest(CheckBase):
              mock.patch.object(peer_obligations.ObligationStore, "get",
                                side_effect=AssertionError("no record read")):
             SC.reconcile_all(self.store)
+
+
+class _StubObservation:
+    """A fixed Claude/Codex/OpenCode observation, as ``steward.end_observation()`` returns."""
+
+    def __init__(self, codex=None, opencode=None, claude=None):
+        self._codex, self._opencode, self._claude = codex, opencode, claude
+
+    def claude(self):
+        return self._claude
+
+    def codex(self):
+        return self._codex
+
+    def opencode(self):
+        return self._opencode
+
+
+class StewardCheckProcessProofTest(CheckBase):
+    """The real ``_session_liveness`` seam: an ended Codex/OpenCode holder retires its duty."""
+
+    CODEX_SID = "11111111-2222-3333-4444-555555555555"
+    OPENCODE_SID = "ses_ended0000000000000000"
+    CLAUDE_SID = "cccccccc-2222-3333-4444-555555555555"
+
+    def setUp(self):
+        super().setUp()
+        from fleet.collectors import codex, opencode, steward
+        self.steward = steward
+        registry = self.tmp / "registry"
+        env = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(registry),
+                                           "FLEET_SESSION_REGISTRY_DIR": str(registry)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.observation = _StubObservation()
+        self.factory = mock.Mock(side_effect=lambda: self.observation)
+        for target_module, name, replacement in (
+                (SC, "_session_liveness", REAL_SESSION_LIVENESS),
+                (steward, "end_observation", self.factory),
+                (codex, "exact_rollout_for_session_id", lambda sid, homes=None: "/rollout/%s" % sid),
+                (opencode, "session_activity", lambda sid: (1_000, None))):
+            patch = mock.patch.object(target_module, name, replacement)
+            patch.start()
+            self.addCleanup(patch.stop)
+        herdr = mock.patch("fleet.collectors.herdr.list_agents", return_value=[])
+        herdr.start()
+        self.addCleanup(herdr.stop)
+
+    def codex_seen(self, *, open_sids=(), complete=True):
+        self.observation = _StubObservation(codex={"complete": complete,
+                                                   "open": frozenset(open_sids)})
+
+    def opencode_seen(self, *, visible=(), complete=True, earliest=5_000):
+        self.observation = _StubObservation(opencode={
+            "complete": complete, "visible": frozenset(visible), "earliest_start_ms": earliest})
+
+    def claude_seen(self, **states):
+        """The Claude census, with each recipient's state fixed (default ``unknown``)."""
+        import recipient_lifetime
+        by_sid = {self.CLAUDE_SID if key == "main" else key: value for key, value in states.items()}
+        self.observation = _StubObservation(claude=recipient_lifetime.RecipientCensus(
+            lambda harness, sid: by_sid.get(sid, "unknown")))
+
+    def duty_of(self, harness, sid):
+        return self.store.get(SC.duty_id(harness, sid))
+
+    def due(self, harness, sid):
+        SC.register(harness, sid, now=T0, store=self.store, ensure_runner=False)
+        SC.advance(self.duty_of(harness, sid), self.store, now=T0 + INTERVAL)
+        return self.duty_of(harness, sid)
+
+    def test_s1_ended_codex_holder_retires_at_due_without_a_notice(self):
+        self.codex_seen()
+        duty = self.due("codex", self.CODEX_SID)
+        self.assertEqual((duty["state"], duty["observation"]["reason"]),
+                         ("complete", "session-ended"))
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_s2_ended_opencode_holder_retires_at_due(self):
+        self.opencode_seen()
+        duty = self.due("opencode", self.OPENCODE_SID)
+        self.assertEqual((duty["state"], duty["observation"]["reason"]),
+                         ("complete", "session-ended"))
+
+    def test_s3_codex_holder_that_ends_after_the_notice_retires_it(self):
+        self.codex_seen(open_sids=[self.CODEX_SID])
+        duty = self.due("codex", self.CODEX_SID)
+        self.assertEqual(duty["observation"]["phase"], "notified")
+        delivery_id = duty["observation"]["notice_delivery_id"]
+        self.codex_seen()
+        SC.advance(self.duty_of("codex", self.CODEX_SID), self.store, now=T0 + INTERVAL + 100)
+        duty = self.duty_of("codex", self.CODEX_SID)
+        self.assertEqual((duty["state"], duty["observation"]["reason"]),
+                         ("complete", "session-ended"))
+        self.assertEqual(SC._notice_record(self.CODEX_SID, delivery_id)["state"], "rejected")
+
+    def test_s4_incomplete_observation_keeps_the_duty(self):
+        self.codex_seen(complete=False)
+        duty = self.due("codex", self.CODEX_SID)
+        self.assertEqual(duty["state"], "pending")
+        self.assertEqual(duty["observation"]["phase"], "notified")
+        self.opencode_seen(complete=False)
+        self.assertEqual(self.due("opencode", self.OPENCODE_SID)["state"], "pending")
+
+    def test_s5_reconcile_all_shares_one_observation_and_skips_the_ended(self):
+        sids = {"codex-ended": self.CODEX_SID, "opencode-ended": self.OPENCODE_SID,
+                "codex-live": "99999999-2222-3333-4444-555555555555"}
+        self.observation = _StubObservation(
+            codex={"complete": True, "open": frozenset([sids["codex-live"]])},
+            opencode={"complete": True, "visible": frozenset(), "earliest_start_ms": 5_000})
+        relations = [{"released": False, "origin": {"harness": h, "sid": sid},
+                      "holder": {"harness": h, "sid": sid}, "targets": [{"name": "w"}]}
+                     for h, sid in (("codex", sids["codex-ended"]), ("opencode", sids["opencode-ended"]),
+                                    ("codex", sids["codex-live"]))]
+        with mock.patch.object(SC, "_relations", return_value=relations):
+            SC.reconcile_all(self.store)
+        self.assertEqual(self.factory.call_count, 1)
+        self.assertIsNone(self.duty_of("codex", sids["codex-ended"]))
+        self.assertIsNone(self.duty_of("opencode", sids["opencode-ended"]))
+        self.assertEqual(self.duty_of("codex", sids["codex-live"])["state"], "pending")
+
+    def test_s6_observe_role_reports_each_target_with_one_shared_observation(self):
+        self.observation = _StubObservation(
+            codex={"complete": True, "open": frozenset()},
+            opencode={"complete": True, "visible": frozenset([self.OPENCODE_SID]),
+                      "earliest_start_ms": 5_000})
+        targets = [{"name": "cx", "harness": "codex", "session_id": self.CODEX_SID},
+                   {"name": "oc", "harness": "opencode", "session_id": self.OPENCODE_SID}]
+        with mock.patch.object(self.steward, "role_targets", return_value=targets), \
+                mock.patch.object(self.steward, "_peer_message_module", return_value=None):
+            seen = REAL_OBSERVE(HARNESS, SID)
+        self.assertEqual({t["name"]: t["liveness"] for t in seen["targets"]},
+                         {"cx": "ended", "oc": "live"})
+        self.assertEqual(self.factory.call_count, 1)
+
+
+    def test_s7_ended_claude_holder_retires_at_due_without_a_notice(self):
+        self.claude_seen(main="ended")
+        duty = self.due("claude", self.CLAUDE_SID)
+        self.assertEqual((duty["state"], duty["observation"]["reason"]),
+                         ("complete", "session-ended"))
+        self.assertEqual(self.notify.call_count, 0)
+
+    def test_s8_claude_holder_that_ends_after_the_notice_retires_it(self):
+        self.claude_seen(main="alive")
+        duty = self.due("claude", self.CLAUDE_SID)
+        self.assertEqual(duty["observation"]["phase"], "notified")
+        delivery_id = duty["observation"]["notice_delivery_id"]
+        self.claude_seen(main="ended")
+        SC.advance(self.duty_of("claude", self.CLAUDE_SID), self.store, now=T0 + INTERVAL + 100)
+        duty = self.duty_of("claude", self.CLAUDE_SID)
+        self.assertEqual((duty["state"], duty["observation"]["reason"]),
+                         ("complete", "session-ended"))
+        self.assertEqual(SC._notice_record(self.CLAUDE_SID, delivery_id)["state"], "rejected")
+
+    def test_s9_alive_or_unknown_claude_holder_keeps_the_duty(self):
+        self.claude_seen(main="unknown")
+        duty = self.due("claude", self.CLAUDE_SID)
+        self.assertEqual((duty["state"], duty["observation"]["phase"]), ("pending", "notified"))
+        alive = "dddddddd-2222-3333-4444-555555555555"
+        self.claude_seen(**{alive: "alive"})
+        self.assertEqual(self.due("claude", alive)["state"], "pending")
+
+    def test_s10_reconcile_all_skips_the_ended_claude_holder_with_one_observation(self):
+        gone, kept, unsure = ("ended-" + "0" * 8, "alive-" + "0" * 8, "unsure-" + "0" * 8)
+        self.claude_seen(**{gone: "ended", kept: "alive"})
+        relations = [{"released": False, "origin": {"harness": "claude", "sid": sid},
+                      "holder": {"harness": "claude", "sid": sid}, "targets": [{"name": "w"}]}
+                     for sid in (gone, kept, unsure)]
+        with mock.patch.object(SC, "_relations", return_value=relations):
+            SC.reconcile_all(self.store)
+        self.assertEqual(self.factory.call_count, 1)
+        self.assertIsNone(self.duty_of("claude", gone))
+        self.assertEqual(self.duty_of("claude", kept)["state"], "pending")
+        self.assertEqual(self.duty_of("claude", unsure)["state"], "pending")
 
 
 class StewardCheckEscTest(CheckBase):

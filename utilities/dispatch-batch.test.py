@@ -21,6 +21,28 @@ from unittest import mock
 
 PATH = Path(__file__).with_name("dispatch-batch.py")
 ROOT = PATH.resolve().parents[1]
+
+
+_STATE_TMP = None
+_STATE_OLD = None
+
+
+def setUpModule():
+    # The hard usage reader now consults Fleet's shared gauge cache; keep this
+    # module off the developer's live ~/.local/state store.
+    global _STATE_TMP, _STATE_OLD
+    _STATE_TMP = tempfile.TemporaryDirectory()
+    _STATE_OLD = os.environ.get("FLEET_USAGE_STATE_DIR")
+    os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_TMP.name
+
+
+def tearDownModule():
+    if _STATE_OLD is None:
+        os.environ.pop("FLEET_USAGE_STATE_DIR", None)
+    else:
+        os.environ["FLEET_USAGE_STATE_DIR"] = _STATE_OLD
+    _STATE_TMP.cleanup()
+
 SPEC = importlib.util.spec_from_file_location("dispatch_batch", PATH)
 BATCH = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
