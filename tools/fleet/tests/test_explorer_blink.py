@@ -160,6 +160,45 @@ class StagePhaseTests(BlinkAssertions):
             expected = {(3, x) for x in range(2, 8)} if status == "active" else set()
             self.assertEqual(set(_changes(on, off)), expected)
 
+    def test_same_name_single_stage_rail_uses_stage_phase_and_keeps_metadata(self):
+        for status in ("active", "done", "todo", "failed"):
+            for leg_status in ("active", "done", "todo", "failed"):
+                for width, prefix in ((9, False), (40, True), (64, True)):
+                    with self.subTest(status=status, leg_status=leg_status, width=width):
+                        legs = [["frame", "done", "1/1"]] if prefix else []
+                        route = dict(legs=legs + [["execute", leg_status, "0/1"]],
+                                     stages=[dict(name="execute", st=status, r=3, host="gpu0")],
+                                     tree_label="execute", resume="R3")
+                        on, off = _grid(1, width, 1), _grid(0, width, 1)
+                        for grid in (on, off):
+                            tables._draw_route_progress(grid, 0, width, 0, route)
+                        mark = {"done": " ✓", "failed": " ✕"}.get(leg_status, "")
+                        text = ("frame ✓ › " if prefix else "") + "execute" + mark + "  resume R3"
+                        self.assertEqual(on.rows_text()[0], text[:width].ljust(width))
+                        self.assertEqual(on.rows_text()[0].count("execute"), 1)
+                        self.assert_structure(on, off)
+                        x = on.rows_text()[0].index("execute")
+                        bright = normalize_style("hb_opencode" if status == "active" else "title_dim")[0]
+                        self.assertEqual([on.cells[0][col][1] for col in range(x, x + 7)],
+                                         [bright] * 7)
+                        expected = {(0, col): DIM_KEYS[0] for col in range(x, x + 7)} if status == "active" else {}
+                        self.assertEqual({pos: pair[1] for pos, pair in _changes(on, off).items()}, expected)
+                        self.assert_hues(on, off)
+                        default = CellGrid(width, 1)
+                        tables._draw_route_progress(default, 0, width, 0, route)
+                        self.assertEqual(default.snapshot(), on.snapshot())
+
+    def test_leg_only_and_narrow_leg_fallback_stay_steady(self):
+        for stages in ([], [dict(name="execute", st="active")]):
+            with self.subTest(stages=stages):
+                route = dict(legs=[["code", "active", "0/1"]],
+                             stages=stages, tree_label="code" if stages else None)
+                on, off = _grid(1, 9, 1), _grid(0, 9, 1)
+                for grid in (on, off):
+                    tables._draw_route_progress(grid, 0, 9, 0, route)
+                self.assertEqual(on.rows_text()[0].strip(), "code")
+                self.assertEqual(on.snapshot(), off.snapshot())
+
 
 class SupervisorPhaseTests(BlinkAssertions):
     def test_flag_role_and_liveness_boundaries_for_each_harness(self):
@@ -307,6 +346,50 @@ class FramePhaseTests(BlinkAssertions):
         flag_y = next(y for y, line in enumerate(on.text_rows()) if "[c1] claude ⚑" in line[:32])
         flag_x = on.text_rows()[flag_y].index("⚑")
         self.assertEqual(off.cells[flag_y][flag_x][1], "tag_steward_dim")
+
+    def test_same_name_single_stage_in_routes_pinned_and_scoped_frames(self):
+        states = [NavState(view="ROUTES", title="ROUTES"), NavState(),
+                  NavState(scope="session:c1"), NavState(scope="repo:hearting")]
+        for status in ("active", "done", "todo", "failed"):
+            values = blink_view_model().to_mapping()
+            values["routes"][0].update(
+                legs=[["execute", status, "0/1"]],
+                stages=[dict(name="execute", st=status, r=3, host="gpu0")],
+                activity="ended", worker_stage="execute",
+                worker=["worker", [["codex", "hb_codex"]], [["worker ended", "dim"]]])
+            vm = ExplorerViewModel.from_mapping(values)
+            original = vm.to_mapping()
+            seed = values["sessions"][-1]
+            values["sessions"] += [dict(seed, tag=f"{i:02x}", steward=False, title="Session")
+                                   for i in range(20, 60)]
+            pinned_vm = ExplorerViewModel.from_mapping(values)
+            for cols in (140, 168):
+                for state in states:
+                    with self.subTest(status=status, cols=cols, state=state):
+                        current_vm = pinned_vm if state == NavState() else vm
+                        on, off = (draw(current_vm, state, cols, 45, beat=b) for b in (1, 0))
+                        self.assert_structure(on, off)
+                        self.assertEqual((on.cols, on.rows, on.title, on.status, on.pane_scroll, on.tree_scroll),
+                                         (off.cols, off.rows, off.title, off.status, off.pane_scroll, off.tree_scroll))
+                        # The route row owns one label; the worker's KIND stays steady.
+                        labels = [(y, match.start()) for y, line in enumerate(on.text_rows())
+                                  if "└ worker" not in line[34:]
+                                  for match in re.finditer(r"\bexecute\b", line)
+                                  if match.start() >= 34]
+                        self.assertEqual(len(labels), 1)
+                        y, x = labels[0]
+                        if state.scope == "-" and state.view == "OVERVIEW":
+                            self.assertGreater(y, 25)  # actual pinned screen-grid consumer
+                        expected = {(yy, xx): "tag_steward_dim"
+                                    for yy, line in enumerate(on.text_rows())
+                                    for xx, glyph in enumerate(line[:32]) if glyph == "⚑"}
+                        if status == "active":
+                            expected.update({(y, col): DIM_KEYS[0] for col in range(x, x + 7)})
+                            self.assertEqual(on.cells[y][x][1], "hb_opencode")
+                        self.assertEqual({pos: pair[1] for pos, pair in _changes(on, off).items()}, expected)
+                        self.assert_hues(on, off)
+                        self.assertEqual(draw(current_vm, state, cols, 45, beat=0), off)
+            self.assertEqual(vm.to_mapping(), original)
 
     def test_tree_role_release_and_invalid_liveness_do_not_pulse_a_flag(self):
         for state, role in (("idle", False), ("dead", True), ("stale", True),

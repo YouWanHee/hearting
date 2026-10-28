@@ -521,7 +521,10 @@ def _draw_route_progress(grid, x, end, y, route):
     kind = route.get("tree_label")
     duplicate = bool(not same and kind and name == kind)
     items = _leg_items(legs[:current + 1])
-    if not same:
+    if same and stages[0].get("st") == "active":
+        parts, _ = _stage_items(stages, lit=bool(getattr(grid, "beat", 1)))[0]
+        items[-1] = (parts[:1] + items[-1][0][1:], status)
+    elif not same:
         items[-1] = ([(str(name), "soft")], status)
     lead = items[:-1] if duplicate else items
     after = []
