@@ -1230,6 +1230,21 @@ def _unexecuted_continuation(root: Path, route: Mapping[str, Any]) -> bool:
         return False
 
 
+def _closed_for_successor(source: Mapping[str, Any], successor: Mapping[str, Any]) -> bool:
+    """``source`` was closed by its parent for a handoff whose prepared successor is ``successor``."""
+    sealed_jobs = ((source.get("launch_compatibility_tuple") or {}).get("jobs_path") or {}).get("path")
+    if not isinstance(sealed_jobs, str) or not Path(sealed_jobs).is_absolute():
+        return False
+    try:
+        import route_parent_close
+        proof = route_parent_close.verified_owner_pin_handoff_close(dict(source), jobs=Path(sealed_jobs))
+    except (ImportError, OSError, ValueError, TypeError, KeyError):
+        return False
+    prepared = (proof or {}).get("successor")
+    return (isinstance(prepared, Mapping) and prepared.get("route_id") == successor.get("route_id")
+            and prepared.get("route_hash") == successor.get("route_hash"))
+
+
 class LineageHandover(NamedTuple):
     """`closed`: the cycle's whole qualifying lineage tree has an outcome.
     `handed_over`: routes of that tree that begin another cycle (empty unless closed)."""
@@ -1360,9 +1375,10 @@ def cycle_route_admission(root: Path, record: Mapping[str, Any], route: Mapping[
                     handed_over = _handed_over_routes(root, record)
                 if sibling["route_id"] in handed_over:
                     continue  # closed lineage: that branch belongs to another cycle
-                if _unexecuted_continuation(root, sibling):
-                    # A continuation that never ran is not a second branch of work;
-                    # if it starts later, this executed branch refuses it instead.
+                if (_unexecuted_continuation(root, sibling)
+                        and _closed_for_successor(node, path[path.index(node) + 1])):
+                    # The parent closed this route and handed its remaining work to the
+                    # next route on the path; a sibling that never ran is not a branch.
                     continue
                 reason = "cycle-route-binding-mismatch:lineage-fork"
                 return Admission(False, reason, f"branch={node['route_id']} siblings={sibling['route_id']},{path[path.index(node)+1]['route_id']}",

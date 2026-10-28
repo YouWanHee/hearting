@@ -7422,24 +7422,30 @@ class RouteLineageBindingTest(ProducerTestBase):
                          "cycle-route-binding-mismatch:lineage-fork")
         self.assertTrue(P.cycle_route_admission(self.root, record, a).allow)  # A's own late write still allows
 
-    def test_a25_10_never_run_sibling_is_not_a_fork(self):
-        """An unused continuation of the same source does not block the branch that runs."""
+    def test_a25_10_never_run_sibling_does_not_block_a_handoff_successor(self):
+        """A parent-close handoff successor is not forked by a sibling that never ran."""
+        import route_parent_close
         a = self._root_route("lineage-a10-unused")
         self._publish_root(a)
         begun = self._begin(a)
         unused = self._continuation(a, reason="published-never-run")
         successor = self._continuation(a, reason="owner-pin-handoff")
         record = P.read_cycle_record(self.root, begun["cycle_id"])
-        self.assertTrue(P.cycle_route_admission(self.root, record, successor).allow)
-        self._ran(successor)
-        self.assertTrue(P.cycle_route_admission(self.root, record, successor).allow)
-        self.assertTrue(P.cycle_route_admission(self.root, record, successor, finalize=True).allow)
-        # The branch that ran keeps the cycle; the unused one starting later is the fork.
-        self.assertEqual(P.cycle_route_admission(self.root, record, unused).reason,
-                         "cycle-route-binding-mismatch:lineage-fork")
-        self._ran(unused)
+        # Without a verified handoff the two continuations of an open source stay a fork.
         self.assertEqual(P.cycle_route_admission(self.root, record, successor).reason,
                          "cycle-route-binding-mismatch:lineage-fork")
+        def handoff(route, *, jobs=None):
+            return {"successor": successor} if route["route_id"] == a["route_id"] else None
+        with mock.patch.object(route_parent_close, "verified_owner_pin_handoff_close",
+                               side_effect=handoff):
+            self.assertTrue(P.cycle_route_admission(self.root, record, successor).allow)
+            self.assertTrue(P.cycle_route_admission(self.root, record, successor, finalize=True).allow)
+            # The unused sibling is not the handed-off route; it stays refused.
+            self.assertEqual(P.cycle_route_admission(self.root, record, unused).reason,
+                             "cycle-route-binding-mismatch:lineage-fork")
+            self._ran(unused)
+            self.assertEqual(P.cycle_route_admission(self.root, record, successor).reason,
+                             "cycle-route-binding-mismatch:lineage-fork")
 
     # -- A-25.11 ----------------------------------------------------------
     def test_a25_11_superseded_route_cannot_seal(self):
