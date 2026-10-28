@@ -3985,8 +3985,20 @@ class SeatHandoverRewakeTest(unittest.TestCase):
         resolver = lambda meta, jobs=None: successor if meta.get("parent_sid") == "session-1" else meta.get("parent_sid")
         return (mock.patch.object(rewake.seat_handover, "effective_parent", side_effect=resolver),
                 mock.patch.object(rewake.seat_handover, "owns",
-                                  side_effect=lambda meta, session, jobs=None: meta.get("parent_sid") == session
+                                  side_effect=lambda meta, session, jobs=None, **kw: meta.get("parent_sid") == session
                                   or resolver(meta, jobs) == session))
+
+    def test_one_scan_reads_the_handover_snapshots_once_however_many_rows(self) -> None:
+        # 2026-10-28: `owns` without a shared read context re-read every
+        # snapshot and seat ledger per row, ~40s per Bash call on a live registry.
+        self.jobs.write_text("".join(
+            DispatchOwnerRewakeTest.row(attempt_id=f"att-owner-{n}", status="done" if n % 2 else "open",
+                                        route_id=f"rt-{n}", route_hash="digest")
+            for n in range(1, 21)), encoding="utf-8")
+        with mock.patch.object(rewake.seat_handover, "_all_snapshots_uncached", return_value=[]) as snapshots:
+            rows = rewake._session_owner_rows(self.jobs, "session-1", statuses=rewake.RECEIPT_ROW_STATUSES)
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(snapshots.call_count, 1)
 
     def test_the_successor_arms_the_row_the_old_window_launched_and_a_stranger_does_not(self) -> None:
         self.assertEqual(rewake._session_owner_rows(self.jobs, "session-2"), [])
