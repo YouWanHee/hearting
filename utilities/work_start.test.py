@@ -4119,6 +4119,84 @@ class ModernNeverStartedOwnerNormalStartTest(NeverStartedReplacementNormalStartT
         for path, original in preserved.items():
             self.assertEqual(path.read_bytes(), original, str(path))
 
+    def test_returned_headless_model_refusal_is_typed_and_same_claim_resumes_once(self):
+        owner_a, owner_b, owner_c, claim_cd, preserved = self._build_claim_only_operational_shape()
+        self._store(owner_b, 'Keep the approved source and existing answers.', 'input-b-2')
+        answers_before = self.owner_input.retained(self.jobs, owner_b)
+        rows_before = self.replacement._rows(self.jobs.read_text().splitlines())
+        projection_before = self.replacement.effective_attempts(self.jobs, {owner_a})
+        owner_d = claim_cd['replacement_attempt_id']
+        binding_before = self.replacement.source_binding(self.jobs, rows_before[owner_c][1])
+        self.assertEqual(binding_before, (claim_cd['family_id'], owner_d, self.replacement._digest(claim_cd)))
+        claims_before = sorted((self.replacement._directory(self.jobs) / 'claims').glob('*.json'))
+        launches_before = len(self.launches)
+        payload_starts_before = len(self.delivered_prompts)
+        # Saved producer receipt shape, without invented spawn proof or selected model ID.
+        diagnostic = (
+            'trace.2=explicit=none;authorized=0\n'
+            'trace.4=configured=codex,claude,opencode;selected=codex;source=configured-balanced;deviation_reason=none\n'
+            'route_defaults=--capability,--capability-mode,--intensity,--model-profile,--dispatch-depth,--worker-type,--owner,--assigned-contract\n'
+            'check=failed\n'
+            'reason=headless-main-session-only-model\n'
+            'detail=model selected by profile:deep is interactive dispatch-depth-0 main-session only\n'
+        )
+        returned_launches = []
+        def refuse_selected(command, **_kwargs):
+            self.assertEqual(command[command.index('--attempt-id') + 1], owner_d)
+            self.assertEqual(command[command.index('--automatic-retry-of') + 1], owner_c)
+            returned_launches.append(command)
+            return subprocess.CompletedProcess(command, 64, '', diagnostic)
+
+        refused = self._cli_start(runner=refuse_selected)
+        self.assertEqual((refused['state'], refused['reason']),
+                         ('needs-attention', 'headless-main-session-only-model'))
+        attention, = refused['replacement_attention']
+        self.assertEqual((attention['state'], attention['reason'], attention['launcher_exit']),
+                         ('needs-attention', 'headless-main-session-only-model', 64))
+        self.assertEqual((attention['source_attempt_id'], attention['attempt_id'], attention['node']),
+                         (owner_c, owner_d, '__owner__'))
+        self.assertEqual(attention['record'], claim_cd)
+        self.assertEqual(attention['launcher_diagnostic'], '\n'.join(('\n' + diagnostic).splitlines()[-20:]))
+        self.assertEqual(attention['detail'],
+                         'model selected by profile:deep is interactive dispatch-depth-0 main-session only')
+        self.assertEqual(refused['next_step'], attention['next_step'])
+        self.assertIn('parent/controller', refused['next_step'])
+        self.assertIn('model-eligibility restriction', refused['next_step'])
+        self.assertNotIn('after the exact launch settles', json.dumps(refused))
+        for receipt in (refused, attention):
+            self.assertNotIn('next_action', receipt)
+            self.assertNotIn('retry_when', receipt)
+        self.assertEqual(len(returned_launches), 1)
+        self.assertEqual(len(self.launches), launches_before)
+        self.assertEqual(len(self.delivered_prompts), payload_starts_before)
+        self.assertNotIn(owner_d, self.replacement._rows(self.jobs.read_text().splitlines()))
+        self.assertNotEqual(refused.get('owner_attempt_id'), owner_d)
+        self.assertEqual(self.replacement.effective_attempts(self.jobs, {owner_a}), projection_before)
+        self.assertEqual(self.owner_input.retained(self.jobs, owner_b), answers_before)
+        for path, original in preserved.items():
+            self.assertEqual(path.read_bytes(), original, str(path))
+
+        # A later permitted ordinary start uses the existing controlled runner and same claim.
+        resumed = self._cli_start()
+        actual = self._assert_legacy_owner_started_with_all_answers(
+            owner_a, owner_b, owner_c, resumed, expected_answers=2)
+        self.assertEqual(actual, owner_d)
+        self.assertEqual(len(self.launches), launches_before + 1)
+        self.assertEqual(len(self.delivered_prompts), payload_starts_before + 1)
+        self.assertEqual(sum(item['attempt_id'] == owner_d for item in self.launches), 1)
+        replay = self._cli_start()
+        self.assertEqual(replay['owner_attempt_id'], owner_d)
+        self.assertEqual(len(self.launches), launches_before + 1)
+        self.assertEqual(len(returned_launches), 1)
+        rows_after = self.replacement._rows(self.jobs.read_text().splitlines())
+        self.assertEqual(set(rows_after) - set(rows_before), {owner_d})
+        self.assertEqual(self.replacement.source_binding(self.jobs, rows_after[owner_c][1]), binding_before)
+        self.assertEqual(sorted((self.replacement._directory(self.jobs) / 'claims').glob('*.json')), claims_before)
+        for aid in (owner_a, owner_b, owner_c):
+            self.assertEqual(rows_after[aid], rows_before[aid])
+        for path, original in preserved.items():
+            self.assertEqual(path.read_bytes(), original, str(path))
+
     def test_silent_legacy_claim_walk_uses_each_predecessor_launch_fence(self):
         _owner_a, owner_b, owner_c, claim_cd, _preserved = self._build_claim_only_operational_shape()
         owner_d = claim_cd["replacement_attempt_id"]

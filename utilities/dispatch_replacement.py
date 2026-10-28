@@ -2616,10 +2616,31 @@ def _advance(jobs, aid, *, run=subprocess.run, authority_check=None, resume_capa
                 return _capacity_wait(jobs, aid, {**source, 'harness': harness}, hold)
         reason = ('pin-ignored-for-replacement' if diagnostic.get('reason') == 'pin-ignored-for-replacement'
                   else 'replacement-launch-pending')
-        return {'state':'needs-attention','reason':reason,
+        result = {'state':'needs-attention','reason':reason,
                 'attempt_id':replacement,'record':record,'launcher_exit':completed.returncode,
                 'launcher_diagnostic':'\n'.join(output.splitlines()[-20:]),
                 'source_attempt_id':aid,'node':source.get('route_node') or '__owner__'}
+        if completed.returncode == 64 and reason == 'replacement-launch-pending':
+            # Only the final structured check can establish this returned refusal;
+            # selection traces and an earlier failed check are not its result.
+            final_check = {}
+            for line in output.splitlines():
+                key, separator, value = line.partition('=')
+                if separator and key == 'check':
+                    final_check = {'check': value}
+                elif separator and final_check and key in {'reason', 'detail'}:
+                    final_check[key] = value
+            if (final_check.get('check') == 'failed'
+                    and final_check.get('reason') == 'headless-main-session-only-model'):
+                result.update(
+                    reason=final_check['reason'],
+                    next_step='The launcher returned headless-main-session-only-model. '
+                        'The existing parent/controller retains recovery responsibility: '
+                        'address this model-eligibility restriction through the ordinary launch path '
+                        'before resuming the same replacement claim.')
+                if 'detail' in final_check:
+                    result['detail'] = final_check['detail'][:240]
+        return result
     except (DC.DispatchContractError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         reason = getattr(exc,'reason','replacement-observation-unavailable')
         if reason == 'automatic-replacement-exhausted':
