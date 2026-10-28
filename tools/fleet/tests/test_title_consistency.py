@@ -1,4 +1,5 @@
 """Operator-language titles and stable failure fallback; no live model calls."""
+import ast
 import json
 import os
 import sqlite3
@@ -544,8 +545,16 @@ class TitleConsistencyTest(_ConfigHomeMixin, unittest.TestCase):
             self.assertEqual(rt._title_lang(), "Japanese")
 
     def test_generated_inputs_do_not_replace_the_last_real_user_language(self):
+        producer = Path(__file__).resolve().parents[3] / "utilities" / "dispatch_session_sweep.py"
+        current_header = next(
+            ast.literal_eval(node.value) for node in ast.parse(producer.read_text()).body
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "COMPLETION_DELIVERY_HEADER"
+                for target in node.targets)
+        )
         automated = ("[notice] Your peer message ref abc is still pending",
                      "Hearting runtime delivery (SD-111 durable pending records)",
+                     current_header,
                      "Hearting notice about work you started (a remote run ended)",
                      "Hearting human gate awaiting your decision (SD-123/129)",
                      "Hearting supervision needs attention. This is not workflow completion. reason=join-deadline owner=att-example.",

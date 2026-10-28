@@ -571,8 +571,11 @@ def _collect_all(harness_filter=None, jobs_path=None, usage="cache-only", fast_f
     tag_metadata = []
     try:
         from ..session_tags import assign
-        from ..session_handle import resolve_tag
         tag_metadata = assign(sessions)
+    except Exception:
+        pass
+    try:
+        from ..session_handle import resolve_tag
         for s in sessions:
             if s.harness in {"codex", "opencode"} and s.session_id:
                 s.session_tag = resolve_tag(s.harness, s.session_id)
