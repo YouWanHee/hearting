@@ -56,26 +56,49 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
 
     def fixture(self, *, multistage=False):
         if multistage:
-            original_compile = FIX.compile_fixture
-            def compile_multistage(*args, **kwargs):
-                route_doc = original_compile(*args, **kwargs)
-                resource = next(node for node in route_doc['nodes'] if node['id'] == 'full-run')
-                verify = next(node for node in route_doc['nodes'] if node['id'] == 'run-verify')
-                metrics = {'id': 'metrics', 'kind': 'pipeline-stage',
-                    'depends_on': ['full-run'],
-                    'outputs': ['summary.json', 'metrics.jsonl', 'correction.json'],
-                    'write_scope': ['summary.json', 'metrics.jsonl', 'correction.json'],
-                    'completion_gate': 'metrics', 'dispatch_depth': 0,
-                    'execution_surface': 'inline'}
-                verify.update(id='verify', depends_on=['metrics'], outputs=['verdict.json'],
-                    write_scope=['verdict.json'], completion_gate='independent-verify',
-                    terminal_gate='independent-verify', terminal=True,
-                    dispatch_depth=0, execution_surface='inline')
-                route_doc['nodes'] = [resource, metrics, verify]
-                route_module = SUP.route_module()
-                route_doc['route_hash'] = route_module.route_hash(route_doc)
-                route_doc['route_id'] = route_module.ROUTE_IDENTITY.route_id_from_hash(
-                    route_doc['route_hash'])
+            def compile_multistage(capability, capability_mode, cwd, signals):
+                router = SUP.route_module()
+                registry = router.TOPO.load_registry()
+                recipe = copy.deepcopy(router.TOPO.resolve_recipe(
+                    registry, capability, capability_mode))
+                resource = next(node for node in recipe['standard_plus']['nodes']
+                                if node['id'] == 'full-run')
+                verify = next(node for node in recipe['standard_plus']['nodes']
+                              if node['id'] == 'run-verify')
+                metrics = copy.deepcopy(next(node for node in router.TOPO.resolve_recipe(
+                    registry, capability, 'eval')['standard_plus']['nodes']
+                    if node['id'] == 'metrics'))
+                resource['depends_on'] = []
+                metrics.update(depends_on=['full-run'], inputs=['raw.json', 'run.json'],
+                    outputs=['summary.json', 'metrics.jsonl', 'correction.json'],
+                    write_scope=['summary.json', 'metrics.jsonl', 'correction.json'])
+                verify.update(id='verify', depends_on=['metrics'],
+                    inputs=['summary.json', 'metrics.jsonl', 'raw.json', 'run.json'],
+                    outputs=['reviews/verdict.json'], write_scope=['reviews/**'], terminal=True,
+                    terminal_gate=verify['completion_gate'])
+                verify.pop('continuation', None)
+                # Seal the fixture graph and its profiles together, including when
+                # its artifact-only cwd has no enclosing Git repository.
+                for node in (metrics, verify):
+                    node['profile_demand'] = {
+                        'schema_version': 1, 'judgment_requirement': 'predetermined',
+                        'execution_scope': 'short-local',
+                        'judgment_reason': 'Hash-check fixed saved CPU output.',
+                        'execution_reason': 'One bounded fixture consumer.',
+                        'evidence_refs': ['fixture:saved-output-settlement']}
+                recipe['standard_plus']['nodes'] = [resource, metrics, verify]
+                recipe['standard_plus'].pop('parallel_groups', None)
+                recipe.pop('conditional_extensions', None)
+                recipe.update(completion_gates=[node['completion_gate']
+                    for node in (resource, metrics, verify)], human_gates=[],
+                    human_gate_bindings=[], resume_retry_boundaries=['full-run', 'metrics', 'verify'])
+                route_doc = router.compile_composed_route(
+                    recipe, capability_mode, 'standard', cwd, cwd,
+                    predicates=[], signals=signals, transport='headless',
+                    transport_evidence='fixture', tracking='tracked',
+                    tracked_gate_evidence=copy.deepcopy(FIX.GATE),
+                    dispatch_evidence=FIX.dispatch_evidence(cwd))
+                router.verify_route(route_doc, expected_cwd=cwd)
                 return route_doc
             with mock.patch.object(FIX, 'compile_fixture', side_effect=compile_multistage):
                 route, path, jobs, registry, output = self._resume_fixture(ordinary=True)
@@ -222,8 +245,7 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
             worktree=str(self.base), dispatch_depth=2, parent_slug='fixture-owner',
             parent_attempt_id=owner_attempt, parent_harness='claude',
             parent_transport='headless', parent_sandbox='workspace-write', subsession_id=None)
-        with mock.patch('review_input.preview_request_nodes', return_value=frozenset()), \
-             mock.patch('subprocess.check_output', return_value=str(self.base)):
+        with mock.patch('review_input.preview_request_nodes', return_value=frozenset()):
             admitted = RA.completion_gate(start_args, 'start', ROOT, jobs,
                                            gate=DC.completion_marker_gate)
         self.assertIsNone(admitted, admitted)
@@ -255,8 +277,9 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         self.assertFalse((completion / 'full-run.json').exists(),
                          'first verifier output must not mint a success marker')
 
-        verdict_path = output / 'verdict.json'
-        transcript = output / 'independent-review.txt'
+        verdict_path = output / 'reviews/verdict.json'
+        verdict_path.parent.mkdir()
+        transcript = output / 'reviews/independent-review.txt'
         verify_code = (
             "import hashlib,json,sys; from pathlib import Path; "
             "raw=Path(sys.argv[1]).read_bytes(); receipt=Path(sys.argv[2]).read_bytes(); "
@@ -279,9 +302,9 @@ class ResourceSequenceTest(FIX.WorkflowFixture):
         module = SUP.route_module()
         module.complete_node(route, WS.route_node(route, 'full-run'), 'full-run',
                              correction_path, jobs=None)
-        inline_axes = {'attempt_schema_version': 2, 'dispatch_depth': 0,
+        inline_axes = {'attempt_schema_version': 2, 'dispatch_depth': 2,
             'transport': 'interactive', 'execution_surface': 'inline',
-            'registered_worker': False, 'fallback_hop': ''}
+            'registered_worker': False, 'fallback_hop': 'inline'}
         module.complete_node(route, WS.route_node(route, 'metrics'), 'metrics',
             summary_path, jobs=None, attempt_id='att-saved-metrics',
             explicit_attempt_metadata=inline_axes)
