@@ -21,6 +21,11 @@ _TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+_UTILITIES_DIR = os.path.join(os.path.dirname(_TOOLS_DIR), "utilities")
+if _UTILITIES_DIR not in sys.path:
+    sys.path.insert(0, _UTILITIES_DIR)
+
+import claude_process_identity                                          # noqa: E402
 from fleet.collectors import codex, opencode, procscan, steward       # noqa: E402
 
 EXPLICIT = {"harness": "unknown", "session_id": None, "name": "-", "kind": "explicit",
@@ -55,6 +60,27 @@ class _RepoFixture:
         patcher.start()
         self.addCleanup(patcher.stop)
         self.key = steward._repository_key(str(self.primary))
+        # The Claude census is stubbed: complete, and nobody claims any session. That has
+        # no existence evidence, so the proof stays "unknown" and the developer host's
+        # real /proc never leaks in.
+        self.claude_census = mock.Mock(return_value=(True, set(), set()))
+        patcher = mock.patch.object(claude_process_identity, "claude_session_census",
+                                    self.claude_census)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def claude_seen(self, holders=(), complete=True, reasons=()):
+        self.claude_census.return_value = (complete, set(holders), set(reasons))
+
+    def claude_history(self, *sids):
+        self.registry.mkdir(parents=True, exist_ok=True)
+        (self.registry / "history.jsonl").write_text(
+            "".join(json.dumps({"sessionId": sid}) + "\n" for sid in sids), encoding="utf-8")
+
+    def claude_transcript(self, sid):
+        directory = self.registry / "projects" / "p"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
 
     def row(self, sid, cwd, harness="claude"):
         return SimpleNamespace(harness=harness, session_id=sid, cwd=str(cwd))
@@ -182,6 +208,79 @@ class SessionLivenessTest(_RepoFixture, unittest.TestCase):
         observation = mock.Mock(codex=lambda: None, opencode=lambda: None)
         self.assertEqual(steward.session_liveness("opencode", "s1", agents=[],
                                                   observation=observation), "unknown")
+
+
+class SessionLivenessClaudeTest(_RepoFixture, unittest.TestCase):
+    def state(self, sid="s1", agents=()):
+        return steward.session_liveness("claude", sid, agents=list(agents))
+
+    def test_k1_a_census_holder_is_live_without_a_record_or_herdr_row(self):
+        self.claude_seen(holders={"s1"})
+        self.assertEqual(self.state(), "live")
+
+    def test_k2_a_census_holder_beats_a_dead_registry_record_of_the_same_sid(self):
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.write_record(dead.pid, "s1")
+        self.claude_seen(holders={"s1"})
+        self.assertEqual(self.state(), "live")
+
+    def test_k3_unclaimed_session_in_native_history_is_ended_and_frees_the_slot(self):
+        self.claude_history("s1")
+        self.assertEqual(self.state(), "ended")
+        markers = {("claude", "s1"): {"repository": self.key}}
+        result = self.census([], [_relation("s1")], markers=markers)
+        holder, = result["holders"]
+        self.assertEqual((holder["basis"], holder["liveness"], holder["counted"]),
+                         ("grant", "ended", False))
+        self.assertEqual(result["counted"], 0)
+
+    def test_k4_a_native_transcript_is_enough(self):
+        self.claude_transcript("s1")
+        self.assertEqual(self.state(), "ended")
+
+    def test_k5_complete_census_without_existence_evidence_is_unknown_and_counts(self):
+        self.claude_history("someone-else")
+        self.assertEqual(self.state(), "unknown")
+        result = self.census([self.row("s1", self.primary)], [_relation("s1")])
+        self.assertEqual((result["holders"][0]["liveness"], result["counted"]), ("unknown", 1))
+
+    def test_k6_incomplete_or_failed_census_is_unknown_even_with_history(self):
+        self.claude_history("s1")
+        self.claude_seen(complete=False, reasons={"pid-namespace-mismatch"})
+        self.assertEqual(self.state(), "unknown")
+        self.claude_census.side_effect = RuntimeError("no /proc")
+        self.assertEqual(self.state(), "unknown")
+
+    def test_k7_a_registry_record_still_decides_after_the_census_says_ended(self):
+        self.claude_history("s1")
+        self.write_record(os.getpid(), "s1", proc_start=str(procscan.read_proc_start(os.getpid())))
+        self.assertEqual(self.state(), "live")
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.write_record(dead.pid, "s1")
+        (self.registry / "sessions" / f"{os.getpid()}.json").unlink()
+        self.assertEqual(self.state(), "ended")
+
+    def test_k8_one_census_per_pass_and_none_when_every_holder_has_a_herdr_row(self):
+        sids = ("k-1", "k-2", "k-3")
+        rows = [self.row(sid, cwd) for sid, cwd in zip(sids, (self.primary, self.primary, self.other))]
+        relations = [_relation(sid) for sid in sids]
+        steward.supervision_by_repository(rows, limit=2, markers={}, relations=relations, agents=[])
+        self.assertEqual(self.claude_census.call_count, 1)
+        self.claude_census.reset_mock()
+        with mock.patch.object(steward, "_last_supervision", None), \
+                mock.patch.object(steward, "read_relations", return_value=relations), \
+                mock.patch.object(steward, "_registry_sessions", return_value=[]), \
+                mock.patch.object(steward, "_steward_limit", return_value=2), \
+                mock.patch("fleet.collectors.herdr.list_agents", return_value=[]):
+            steward.enrich(rows, markers={})
+        self.assertEqual(self.claude_census.call_count, 1)
+        self.claude_census.reset_mock()
+        agents = [{"agent": "claude", "agent_session": {"value": sid}} for sid in sids]
+        steward.supervision_by_repository(rows, limit=2, markers={}, relations=relations,
+                                          agents=agents)
+        self.claude_census.assert_not_called()
 
 
 CODEX_X = "aaaaaaaa-1111-2222-3333-444444444444"
@@ -364,12 +463,13 @@ class SessionLivenessCodexTest(_ProcessFixture, unittest.TestCase):
             codex._rollout_fd_paths(proc.pid)
         self.assertIsNone(codex._proc_rollout(proc.pid, str(self.primary), str(self.codex_home)))
 
-    def test_c8_claude_holders_read_no_process_table(self):
+    def test_c8_claude_holders_read_only_the_claude_census(self):
         rows, relations = self.holders("claude", "c1", "c2")
         result = self.census(rows, relations)
         self.assertEqual({h["liveness"] for h in result["holders"]}, {"unknown"})
         self.open_rollouts.assert_not_called()
         self.visibility.assert_not_called()
+        self.assertEqual(self.claude_census.call_count, 1)
 
     def test_c9_one_observation_per_pass_and_only_for_the_harness_in_use(self):
         sids = ("cx-1", "cx-2", "cx-3")
@@ -470,6 +570,122 @@ class SessionLivenessOpenCodeTest(_ProcessFixture, unittest.TestCase):
         self.put(OPENCODE_X, 1_000)
         self.opencode_proc(_HOLD, "models")
         self.assertEqual(self.state("opencode", OPENCODE_X), "ended")
+
+
+class OpenCodeV2AttributionTest(_RepoFixture, unittest.TestCase):
+    """``_native_role_sessions`` reads ``session_v2`` first, then the legacy table."""
+
+    def setUp(self):
+        super().setUp()
+        self.db = Path(self.temp.name).resolve() / "attrib.db"
+        patcher = mock.patch.object(opencode, "_db", lambda: str(self.db))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.con = sqlite3.connect(self.db)
+        self.addCleanup(self.con.close)
+
+    def tables(self, v2=True, legacy=True):
+        if v2:
+            self.con.execute("CREATE TABLE session_v2 (id TEXT, directory TEXT)")
+        if legacy:
+            self.con.execute("CREATE TABLE session (id TEXT, directory TEXT)")
+        self.con.commit()
+
+    def put(self, table, sid, directory):
+        self.con.execute("INSERT INTO %s VALUES (?, ?)" % table, (sid, directory))
+        self.con.commit()
+
+    def native(self, sid):
+        markers = {("opencode", sid): {}}
+        return {(row.session_id, row.cwd)
+                for row in steward._native_role_sessions(markers, [], ())}
+
+    def test_v1_a_v2_only_session_gets_its_directory(self):
+        self.tables()
+        self.put("session_v2", "ses_v2only", str(self.primary))
+        self.assertEqual(self.native("ses_v2only"), {("ses_v2only", str(self.primary))})
+        self.assertEqual(steward.repository_for_session("opencode", "ses_v2only", sessions=[]),
+                         self.key)
+
+    def test_v2_the_v2_row_wins_and_a_null_directory_falls_back_to_the_legacy_table(self):
+        self.tables()
+        self.put("session_v2", "ses_both", str(self.primary))
+        self.put("session", "ses_both", str(self.other))
+        self.put("session_v2", "ses_null", None)
+        self.put("session", "ses_null", str(self.other))
+        self.assertEqual(self.native("ses_both"), {("ses_both", str(self.primary))})
+        self.assertEqual(self.native("ses_null"), {("ses_null", str(self.other))})
+
+    def test_v3_a_database_without_session_v2_still_answers_from_the_legacy_table(self):
+        self.tables(v2=False)
+        self.put("session", "ses_old", str(self.primary))
+        self.assertEqual(self.native("ses_old"), {("ses_old", str(self.primary))})
+
+    def test_v4_a_v2_only_target_carries_the_role_attribution_to_its_supervisor(self):
+        self.tables()
+        self.put("session_v2", "ses_v2only", str(self.primary))
+        target = {"harness": "opencode", "session_id": "ses_v2only", "name": "worker",
+                  "kind": "watch", "source": "watch"}
+        rows = [self.row("boss", self.primary)]
+        result = self.census(rows, [_relation("boss", targets=(target,))])
+        holder, = result["holders"]
+        self.assertEqual((holder["session_id"], holder["basis"], holder["counted"]),
+                         ("boss", "role", True))
+
+
+def _chain(generation, *links):
+    """One relation per holder of a hand-over chain; ``links`` are the ordered holders and
+    each relation carries the lineage that led to it, as ``dispatch_seat_handover`` writes it."""
+    out = []
+    for index, sid in enumerate(links):
+        relation = _relation(sid, generation=generation, origin=links[0])
+        relation["lineage"] = [{"from": links[i], "to": links[i + 1], "snapshot_id": "x"}
+                               for i in range(index)]
+        out.append(relation)
+    return out
+
+
+class SameGenerationChainTest(_RepoFixture, unittest.TestCase):
+    def sids(self, relations, *names):
+        rows = [self.row(name, self.primary) for name in names]
+        return sorted(h["session_id"] for h in self.census(rows, relations)["holders"])
+
+    def test_t1_only_the_chain_end_of_one_generation_is_counted(self):
+        self.assertEqual(self.sids(_chain("G", "a", "b", "c"), "a", "b", "c"), ["c"])
+
+    def test_t2_a_fork_counts_every_end(self):
+        fork = [_relation("a", generation="G"), _relation("b", generation="G"),
+                _relation("c", generation="G")]
+        fork[1]["lineage"] = [{"from": "a", "to": "b", "snapshot_id": "x"}]
+        fork[2]["lineage"] = [{"from": "a", "to": "c", "snapshot_id": "x"}]
+        self.assertEqual(self.sids(fork, "a", "b", "c"), ["b", "c"])
+
+    def test_t3_without_lineage_every_holder_counts(self):
+        relations = [_relation(sid, generation="G") for sid in ("a", "b", "c")]
+        self.assertEqual(self.sids(relations, "a", "b", "c"), ["a", "b", "c"])
+
+    def test_t4_a_holder_that_is_mid_chain_in_one_generation_and_an_end_in_another_counts_once(self):
+        relations = _chain("G1", "a", "b") + [_relation("a", generation="G2")]
+        result = self.census([self.row(s, self.primary) for s in ("a", "b")], relations)
+        self.assertEqual(sorted(h["session_id"] for h in result["holders"]), ["a", "b"])
+        self.assertEqual(result["counted"], 2)
+
+    def test_t5_a_repository_with_only_a_mid_chain_holder_is_not_a_board_key(self):
+        rows = [self.row("a", self.other), self.row("b", self.primary)]
+        board = steward.supervision_by_repository(
+            rows, limit=2, markers={}, relations=_chain("G", "a", "b"), agents=[])
+        self.assertEqual(sorted(board), [self.key])
+        self.assertEqual([h["session_id"] for h in board[self.key]["holders"]], ["b"])
+
+    def test_t6_other_generations_are_not_merged(self):
+        relations = _chain("G1", "a", "b") + [dict(_relation("c", generation="G2"),
+                                                   lineage=[{"from": "a", "to": "c"}])]
+        self.assertEqual(self.sids(relations, "a", "b", "c"), ["b", "c"])
+
+    def test_t7_a_lineage_that_leaves_no_end_drops_nothing(self):
+        loop = [dict(_relation("a", generation="G"), lineage=[{"from": "b", "to": "a"}]),
+                dict(_relation("b", generation="G"), lineage=[{"from": "a", "to": "b"}])]
+        self.assertEqual(self.sids(loop, "a", "b"), ["a", "b"])
 
 
 class RepositoryForSessionTest(_RepoFixture, unittest.TestCase):
