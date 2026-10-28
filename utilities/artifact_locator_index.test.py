@@ -18,7 +18,9 @@ stops only operations touching it and the full check, never an unrelated
 seal).
 """
 import ast
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import random
@@ -379,6 +381,30 @@ class OutOfBandHealingTest(F.ProducerTestBase, IndexEquivalenceMixin):
         json_path.write_bytes(stale_json)
         self._sealed_cycle("two-replace-2", "two-replace")
         self.assert_index_matches_full_rebuild("after simulated json/md desync + new finalize")
+
+    def test_index_write_failure_after_seal_keeps_the_seal_and_next_refresh_heals(self):
+        # The index is a rebuildable view: a failed write after the seal's commit point leaves
+        # the close successful, and the next update of the same campaign rescans it.
+        route, route_file = self.route(slug="index-fault", gate_source="index-fault")
+        result = P.begin(self.root, route_file=route_file, capability="autopilot-code",
+                         intensity="direct", campaign_key="index-fault")
+        output = self.write_output(result)
+        self.close(route, route_file)
+        stderr = io.StringIO()
+        with mock.patch.object(loc, "_write_index_pair", side_effect=OSError("index storage unavailable")), \
+                contextlib.redirect_stderr(stderr):
+            sealed = P.finalize(self.root, cycle_id=result["cycle_id"])
+        self.assertEqual(sealed["status"], "sealed", sealed)
+        self.assertEqual(P.read_cycle_record(self.root, result["cycle_id"])["state"], "sealed")
+        self.assertIn("locator_index_update skipped", stderr.getvalue())
+        self.assertEqual(loc.resolve_path(self.root, result["cycle_id"]), Path(result["cycle_dir"]))
+        published = tuple((self.root / "campaigns" / name).read_bytes() for name in ("INDEX.json", "INDEX.md"))
+        self.assertNotEqual(published, tuple(loc.expected_index_bytes(self.root)))  # still the open row
+
+        output.write_bytes(b"plan body after\n")
+        refreshed = P.refresh_cycle(self.root, result["cycle_id"], trigger="explicit")
+        self.assertEqual(refreshed["status"], "emitted", refreshed)
+        self.assert_index_matches_full_rebuild("after a failed seal-time index write + refresh")
 
     def test_untouched_campaign_hand_renamed_heals_on_unrelated_finalize(self):
         renamed = self._sealed_cycle("rename-camp-1", "rename-camp")

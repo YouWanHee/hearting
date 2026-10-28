@@ -4,6 +4,7 @@ import math
 from collections.abc import Mapping
 from .grid import CellGrid, cell_width, clip_cells
 from .tables import repo_label
+from .style import steward_flag_key
 
 NAV_WIDTH = 32
 
@@ -618,6 +619,7 @@ def _faint_rule(grid, y, width):
 
 
 def draw_explorer(grid: CellGrid, vm, state):
+    lit = bool(getattr(grid, "beat", 1))  # retain the phase across the tree viewport wrapper
     width, height = min(NAV_WIDTH, grid.cols), grid.rows - 3
     if width <= 0 or height <= 0:
         return
@@ -789,6 +791,8 @@ def draw_explorer(grid: CellGrid, vm, state):
             grid.put(8 - shift + len(tag), y, "]", "dim")
             harness = str(session.get("harness") or "·")
             hx = grid.put(12 - shift, y, harness, "hb_" + harness)
+            if session.get("steward"):
+                hx = grid.put(hx + 1, y, "⚑", steward_flag_key(session, lit=lit))
             status = session.get("state")
             marker, marker_key = {"working": ("⠏", "g_spin_dim"), "blocked": ("●", "lvl_r_dim"),
                                   "dead": ("✕", "dead"), "done": ("✓", "done")}.get(
