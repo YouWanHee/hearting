@@ -1361,7 +1361,7 @@ def _owner_settlement_snapshot(route, ledger, armed, row=None):
             or not (owner_successor_start or owner_terminal_settlement)
             or not row_owner_id or owner.get("parent_attempt_id") != row_owner_id
             or not owner_attempt_id
-            or (not same_owner and not settling_session)
+            or (not holder.get("inherited") and not same_owner and not settling_session)
             or (not holder.get("inherited") and same_owner
                 and evidence.get("owner_session_id") is not None
                 and evidence.get("owner_session_id") != owner.get("session_id"))
