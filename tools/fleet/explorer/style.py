@@ -69,6 +69,13 @@ def style_for(key, tint=None):
     return normalize_style(key, tint)
 
 
+def steward_flag_key(session, lit=True):
+    """Pulse the existing live supervisor role independently of its model turn."""
+    if session.get("steward") and session.get("state") not in ("dead", "stale") and not lit:
+        return "tag_steward_dim"
+    return "tag_steward"
+
+
 def recede_key(key):
     """The dim rung of one painted key: the glyph, tint and hue family keep their meaning."""
     canonical, _tint = normalize_style(key)

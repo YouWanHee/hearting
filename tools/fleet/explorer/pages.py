@@ -327,6 +327,7 @@ def _stage_box(grid, x, y, w, h, index, stage):
     status = stage.get("st") if stage.get("st") in _STATE_MARK else "todo"
     verdict_text = str(stage.get("verdict") or status)
     gate = stage.get("kind") == "gate"
+    lit = status != "active" or bool(getattr(grid, "beat", 1))
     if gate:
         line = ("p", 0, 1)
     elif status == "active":
@@ -337,7 +338,8 @@ def _stage_box(grid, x, y, w, h, index, stage):
         line = ("d", 0, 1)
     narrow = w < 34
     if status == "active":
-        right = [(" ", None), ("●", "work"), (" " if narrow else " " + verdict_text + " ", "soft")]
+        right = [(" ", None), ("●", "work" if lit else "g_work_off"),
+                 (" " if narrow else " " + verdict_text + " ", "soft")]
     elif gate:
         right = [(" ✓ ", "done")] + ([] if narrow else [(verdict_text + " ", "soft")])
     else:
@@ -347,9 +349,11 @@ def _stage_box(grid, x, y, w, h, index, stage):
     rw = _width(right)
     name = str(stage.get("n"))
     if gate:
-        title = [(" ◑ ", "steward"), (clip(name, w - 8 - rw), ("p", 1, 0)), (" ", None)]
+        title = [(" ◑ ", "steward"),
+                 (clip(name, w - 8 - rw), ("p", 1, 0) if lit else "tag_steward_dim"), (" ", None)]
     else:
-        title = [(" ", None), (clip(name, w - 6 - rw), (hue, 1, 0) if status != "todo" else (hue, 0, 1)),
+        title = [(" ", None), (clip(name, w - 6 - rw),
+                               (hue, 1, 0) if status != "todo" and lit else (hue, 0, 1)),
                  (" ", None)]
     _outline(grid, x, y, w, h, line)
     grid.mark_moved()
@@ -607,6 +611,8 @@ def _current_leg(grid, x, y, stages, room):
     stage = stages[cur]
     hue = _STAGE_HUE[cur % 5]
     name_style = ("r", 1, 0) if stage.get("st") == "failed" else (hue, 1, 0)
+    if stage.get("st") == "active" and not getattr(grid, "beat", 1):
+        name_style = (hue, 0, 1)
     limit = x0 + max(0, room)
     x = grid.put(x, y, clip(str(stage.get("n") or stage.get("name")), max(0, room)),
                  name_style, limit=limit)
