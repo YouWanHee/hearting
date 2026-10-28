@@ -1705,6 +1705,12 @@ completion marker's evidence bytes are preserved. A runtime-only document
 proves execution, distinct from scientific verification. For a supervised owner it
 retains the existing next-resource wait until owner terminal settlement, so
 sequential runs stay possible without another owner-written run.json.
+If the owner is replaced, the resource row, receipt and execution identity
+remain bound to the original owner attempt. The current owner may observe and
+consume that result when the shared replacement lineage proves a launched
+successor and its owner-route ancestry includes the resource route. Ordinary
+start checks the current owner's input lease, pending corrections and exact
+resource evidence before creating the existing once-only successor claim.
 
 A missing output after an exact successful resource exit is re-observed by
 poll. When the same execution and sentinel remain proven and the output arrives,

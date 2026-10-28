@@ -8803,12 +8803,22 @@ def _resource_stage_marker_current(route, node, marker, marker_path, jobs):
         except (ImportError, KeyError, TypeError, ValueError):
             return GateCurrency("resource-stage-not-current", "completion-marker-missing")
         owner_id = (row.get("owner_wait") or {}).get("parent_attempt_id")
+        owner = row.get("owner_wait") or {}
+        import route_authority as AUTHORITY
+        consumer_current = AUTHORITY.resource_owner_consumer_matches(
+            jobs, source_attempt_id=owner_id,
+            consumer_attempt_id=evidence.get("owner_attempt_id"),
+            resource_route_file=armed.get("route_file"),
+            resource_route_id=armed.get("route_id"),
+            resource_route_hash=armed.get("route_hash"),
+            resource_owner_pid=owner.get("owner_pid"),
+            resource_owner_start=owner.get("owner_start"), require_live=False)
         output = __import__("resource_run_evidence").paths(armed).get("runtime_output")
         if (stage.get("state") != "STAGE_SUCCEEDED"
                 or evidence.get("resource_execution_identity") != resource_identity
                 or evidence.get("identity") != resource_identity
                 or evidence.get("resource_sha256") != current_digest
-                or evidence.get("owner_attempt_id") != owner_id
+                or not consumer_current
                 or not (evidence.get("owner_successor_start") is True
                         or evidence.get("owner_terminal_settlement") is True)
                 or marker.get("evidence", {}).get("path") != output):

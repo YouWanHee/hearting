@@ -1148,6 +1148,29 @@ def _owner_input_matches_locked(armed, resource_row, owner_attempt_id, owner_ses
     import dispatch_contract as DC
     parent, target = input_module._target(armed["jobs"], owner_attempt_id)
     owner = resource_row.get("owner_wait") or {}
+    source_attempt_id = resource_row.get("parent_attempt_id")
+    if source_attempt_id != owner_attempt_id:
+        import route_authority as AUTHORITY
+        if not AUTHORITY.resource_owner_consumer_matches(
+                armed["jobs"], source_attempt_id=source_attempt_id,
+                consumer_attempt_id=owner_attempt_id,
+                resource_route_file=armed.get("route_file"),
+                resource_route_id=armed.get("route_id"),
+                resource_route_hash=armed.get("route_hash"),
+                resource_owner_pid=owner.get("owner_pid"),
+                resource_owner_start=owner.get("owner_start")):
+            return False
+        return not (
+            value is None or value.get("target") != target
+            or value.get("thread_id") != owner_session_id
+            or parent.status not in {"open", "running"}
+            or parent.metadata.get("attempt_id") != owner_attempt_id
+            or parent.metadata.get("worker_type") != "owner"
+            or parent.metadata.get("dispatch_depth") != "1"
+            or parent.metadata.get("registered_worker") != "1"
+            or not input_module.supervisor_lease_is_held(armed["jobs"], parent.metadata)
+            or any(item.get("state") == "queued" for item in value.get("requests", []))
+        )
     pinned_owner_identity = (str(owner.get("owner_pid", "")),
                              str(owner.get("owner_start", "")))
     return not (
@@ -1200,7 +1223,7 @@ def _owner_settlement_snapshot(route, ledger, armed, row=None):
     owner = row.get("owner_wait") or {}
     if not isinstance(owner, dict):
         return None
-    owner_attempt_id = row.get("parent_attempt_id")
+    source_attempt_id = row.get("parent_attempt_id")
     identity = RR.compute_execution_identity(row)
     row_digest = RESOURCE_RESUME.row_digest(row)
     resource_binding = OWNER_RESOURCE.resource_body_digest(row)
@@ -1224,22 +1247,30 @@ def _owner_settlement_snapshot(route, ledger, armed, row=None):
         canonical_route_file = str(Path(route_file).resolve())
     except (OSError, ValueError, RuntimeError):
         return None
+    consumer_attempt_id = evidence.get("owner_attempt_id")
+    consumer_session_id = evidence.get("owner_session_id")
+    import route_authority as AUTHORITY
+    consumer_current = AUTHORITY.resource_owner_consumer_matches(
+        jobs, source_attempt_id=source_attempt_id,
+        consumer_attempt_id=consumer_attempt_id,
+        resource_route_file=route_file, resource_route_id=armed.get("route_id"),
+        resource_route_hash=armed.get("route_hash"),
+        resource_owner_pid=owner.get("owner_pid"),
+        resource_owner_start=owner.get("owner_start"))
     if (stage.get("state") != "STAGE_SUCCEEDED"
             or not (owner_successor_start or owner_terminal_settlement)
-            or not owner_attempt_id or owner.get("parent_attempt_id") != owner_attempt_id
-            or evidence.get("owner_attempt_id") != owner_attempt_id
-            or (evidence.get("owner_session_id") is not None
-                and evidence.get("owner_session_id") != owner.get("session_id"))
+            or not source_attempt_id or owner.get("parent_attempt_id") != source_attempt_id
+            or not consumer_current or not consumer_session_id
+            or (consumer_attempt_id == source_attempt_id
+                and consumer_session_id != owner.get("session_id"))
             or row.get("run_id") != armed.get("predecessor_id")
             or row.get("resource_policy") != "supervised-owner"
             or row.get("status") != "succeeded" or row.get("exit_code") != 0
             or row.get("route") != route_file or row.get("node") != node_id
             or row.get("jobs") != jobs
             or jobs != canonical_jobs or route_file != canonical_route_file
-            or armed.get("route_id") != route.get("route_id")
-            or armed.get("route_hash") != route.get("route_hash")
-            or owner.get("route_id") != route.get("route_id")
-            or owner.get("route_hash") != route.get("route_hash")
+            or armed.get("route_id") != owner.get("route_id")
+            or armed.get("route_hash") != owner.get("route_hash")
             or owner.get("jobs") != jobs or not owner.get("session_id")
             or not identity or identity != evidence.get("identity")
             or identity != evidence.get("resource_execution_identity")
@@ -1252,8 +1283,8 @@ def _owner_settlement_snapshot(route, ledger, armed, row=None):
             or evidence.get("sentinel_present") is not True
             or not OWNER_RESOURCE.resource_binding_matches(armed, row)
             or row.get("compute_run_id") != execution.get("run_id")
-            or provenance.get("route_id") != route.get("route_id")
-            or provenance.get("route_hash") != route.get("route_hash")):
+            or provenance.get("route_id") != armed.get("route_id")
+            or provenance.get("route_hash") != armed.get("route_hash")):
         return None
 
     artifacts = evidence.get("artifacts")
@@ -1277,7 +1308,7 @@ def _owner_settlement_snapshot(route, ledger, armed, row=None):
         "identity": identity,
         "row_digest": row_digest,
         "resource_binding": resource_binding,
-        "owner_attempt_id": owner_attempt_id,
+        "owner_attempt_id": consumer_attempt_id,
         "settlement_evidence": evidence,
         "marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
     }
@@ -1699,6 +1730,7 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
     """
     import dispatch_resource_wait as OWNER_RESOURCE
     import resource_failure_resolution
+    import route_authority as AUTHORITY
     compute_observations = compute_observations or {}
     resource_failure_resolution.reconcile(route, ledger,
         terminal_gates if terminal_gates is not None else
@@ -1725,6 +1757,18 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
                     "runs"][armed["predecessor_id"]]
             except (OSError, ValueError, KeyError, TypeError) as error:
                 raise WS.WorkflowStateError(f"resource-operation-unsettled:{node}:{armed.get('predecessor_id')}") from error
+            owner = row.get("owner_wait") or {}
+            source_attempt_id = row.get("parent_attempt_id")
+            if (not source_attempt_id or owner.get("parent_attempt_id") != source_attempt_id
+                    or not AUTHORITY.resource_owner_consumer_matches(
+                        jobs, source_attempt_id=source_attempt_id,
+                        consumer_attempt_id=owner_attempt_id,
+                        resource_route_file=armed.get("route_file"),
+                        resource_route_id=armed.get("route_id"),
+                        resource_route_hash=armed.get("route_hash"),
+                        resource_owner_pid=owner.get("owner_pid"),
+                        resource_owner_start=owner.get("owner_start"))):
+                raise WS.WorkflowStateError(f"resource-operation-owner-unsettled:{node}:{row.get('run_id')}")
             execution = row.get("execution") if isinstance(row, dict) else None
             if isinstance(execution, dict) and execution.get("kind") == "compute-hosts":
                 if (not isinstance(captured, dict) or captured.get("armed") != armed
@@ -1809,13 +1853,23 @@ def reconcile_resource_artifacts(route, ledger, owner_attempt_id, jobs, *, termi
             if row is not None:
                 resource_output_evidence(route, armed, evidence)
             current_artifacts = artifact_evidence(armed)
+            source_attempt_id = row.get("parent_attempt_id") if isinstance(row, dict) else None
+            owner = (row.get("owner_wait") or {}) if isinstance(row, dict) else {}
             if (row is None or row.get("resource_policy") != "supervised-owner"
-                    or row.get("parent_attempt_id") != owner_attempt_id
-                    or (row.get("owner_wait") or {}).get("parent_attempt_id") != owner_attempt_id
+                    or not source_attempt_id
+                    or owner.get("parent_attempt_id") != source_attempt_id
+                    or not AUTHORITY.resource_owner_consumer_matches(
+                        jobs, source_attempt_id=source_attempt_id,
+                        consumer_attempt_id=owner_attempt_id,
+                        resource_route_file=armed.get("route_file"),
+                        resource_route_id=armed.get("route_id"),
+                        resource_route_hash=armed.get("route_hash"),
+                        resource_owner_pid=owner.get("owner_pid"),
+                        resource_owner_start=owner.get("owner_start"), require_live=False)
                     or row.get("route") != armed.get("route_file") or row.get("node") != node
                     or row.get("jobs") != str(jobs) or armed.get("jobs") != str(jobs)
-                    or armed.get("route_id") != route["route_id"]
-                    or armed.get("route_hash") != route["route_hash"]
+                    or armed.get("route_id") != owner.get("route_id")
+                    or armed.get("route_hash") != owner.get("route_hash")
                     or not OWNER_RESOURCE.resource_binding_matches(armed, row)
                     or not current_artifacts.get("checked") or current_artifacts.get("missing")):
                 continue
@@ -1998,6 +2052,7 @@ def _admit_owner_resource_aggregate(route, ledger, successor, jobs, owner_attemp
                                     owner_session_id, node, initial_watches):
     """Check every current operation before the node's one existing successor claim."""
     import dispatch_owner_input as INPUT
+    import route_authority as AUTHORITY
     expected = {resource_watch_key(row): row for row in initial_watches}
     preobserved = {}
     for armed in initial_watches:
@@ -2031,17 +2086,27 @@ def _admit_owner_resource_aggregate(route, ledger, successor, jobs, owner_attemp
             except (OSError, ValueError, KeyError, TypeError) as error:
                 raise SupervisorError("resource-owner-operation-unreadable") from error
             owner = resource.get("owner_wait") or {}
+            source_attempt_id = resource.get("parent_attempt_id")
+            same_owner = source_attempt_id == owner_attempt_id
             if (resource.get("resource_policy") != "supervised-owner"
                     or resource.get("route") != armed.get("route_file")
-                    or resource.get("route_id") not in (None, route.get("route_id"))
+                    or resource.get("route_id") not in (None, armed.get("route_id"))
                     or resource.get("node") != node or resource.get("jobs") != str(Path(jobs).resolve())
-                    or resource.get("parent_attempt_id") != owner_attempt_id
-                    or owner.get("parent_attempt_id") != owner_attempt_id
-                    or owner.get("session_id") != owner_session_id
-                    or owner.get("route_id") != route.get("route_id")
-                    or owner.get("route_hash") != route.get("route_hash")
-                    or armed.get("route_id") != route.get("route_id")
-                    or armed.get("route_hash") != route.get("route_hash")
+                    or not source_attempt_id
+                    or owner.get("parent_attempt_id") != source_attempt_id
+                    or (same_owner and owner.get("session_id") != owner_session_id)
+                    or owner.get("route_id") != armed.get("route_id")
+                    or owner.get("route_hash") != armed.get("route_hash")
+                    or (not same_owner and not AUTHORITY.resource_owner_consumer_matches(
+                        jobs, source_attempt_id=source_attempt_id,
+                        consumer_attempt_id=owner_attempt_id,
+                        resource_route_file=armed.get("route_file"),
+                        resource_route_id=armed.get("route_id"),
+                        resource_route_hash=armed.get("route_hash"),
+                        resource_owner_pid=owner.get("owner_pid"),
+                        resource_owner_start=owner.get("owner_start")))
+                    or armed.get("route_id") != owner.get("route_id")
+                    or armed.get("route_hash") != owner.get("route_hash")
                     or armed.get("jobs") != str(Path(jobs).resolve())
                     or not __import__("dispatch_resource_wait").resource_binding_matches(armed, resource)
                     or armed.get("successor_external") is not True
@@ -2139,6 +2204,7 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
     if route_node is None:
         raise SupervisorError("resource-successor-route-node-missing")
     import dispatch_owner_input as INPUT
+    import route_authority as AUTHORITY
     ledger = ledger_for(route, str(jobs))
     resource_nodes = set(route_node.get("depends_on") or [])
     initial_resources = [row for row in read_resource_watches(ledger)
@@ -2215,13 +2281,24 @@ def admit_owner_successor_start(route, successor, jobs, owner_attempt_id, owner_
             elif captured_settlement is not None:
                 raise SupervisorError("resource-owner-successor-binding-conflict")
             owner = row.get("owner_wait") or {}
-            if (armed.get("route_id") != route.get("route_id")
-                    or armed.get("route_hash") != route.get("route_hash")
+            source_attempt_id = row.get("parent_attempt_id")
+            same_owner = source_attempt_id == owner_attempt_id
+            if (armed.get("route_id") != owner.get("route_id")
+                    or armed.get("route_hash") != owner.get("route_hash")
+                    or row.get("route") != armed.get("route_file")
                     or armed.get("route_file") != str(Path(armed["route_file"]).resolve())
                     or armed.get("jobs") != str(Path(jobs).resolve())
-                    or owner.get("parent_attempt_id") != owner_attempt_id
-                    or row.get("parent_attempt_id") != owner_attempt_id
-                    or owner.get("session_id") != owner_session_id
+                    or not source_attempt_id
+                    or owner.get("parent_attempt_id") != source_attempt_id
+                    or (same_owner and owner.get("session_id") != owner_session_id)
+                    or (not same_owner and not AUTHORITY.resource_owner_consumer_matches(
+                        jobs, source_attempt_id=source_attempt_id,
+                        consumer_attempt_id=owner_attempt_id,
+                        resource_route_file=armed.get("route_file"),
+                        resource_route_id=armed.get("route_id"),
+                        resource_route_hash=armed.get("route_hash"),
+                        resource_owner_pid=owner.get("owner_pid"),
+                        resource_owner_start=owner.get("owner_start")))
                     or armed.get("successor_external") is not True
                     or armed.get("successor_command") is not None):
                 raise SupervisorError("resource-owner-successor-binding-conflict")

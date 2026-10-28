@@ -295,15 +295,31 @@ def context(args, control):
         if not isinstance(row, dict) or row.get("resource_policy") != "supervised-owner":
             continue
         owner = row.get("owner_wait") or {}
-        if owner.get("parent_attempt_id") != args.parent_attempt_id:
+        source_attempt_id = row.get("parent_attempt_id")
+        same_owner = source_attempt_id == args.parent_attempt_id
+        if owner.get("parent_attempt_id") != source_attempt_id:
             continue
+        if not same_owner:
+            import route_authority as AUTHORITY
+            if not AUTHORITY.resource_owner_consumer_matches(
+                    jobs, source_attempt_id=source_attempt_id,
+                    consumer_attempt_id=args.parent_attempt_id,
+                    resource_route_file=armed.get("route_file"),
+                    resource_route_id=armed.get("route_id"),
+                    resource_route_hash=armed.get("route_hash"),
+                    resource_owner_pid=owner.get("owner_pid"),
+                    resource_owner_start=owner.get("owner_start")):
+                continue
         if binding is None:
             binding, _ = OWNER.resolve_owner_route_lifecycle(jobs, owner_attempt_id=args.parent_attempt_id)
             if (binding is None or binding.route_file != str(Path(route_file).resolve())
                     or binding.route_id != args.route_id or binding.route_hash != args.route_hash):
                 raise JOIN.JoinContractError("resource-owner-route-changed")
-        expected = {"parent_attempt_id": args.parent_attempt_id, "session_id": control.thread_id,
-            "route_id": args.route_id, "route_hash": args.route_hash, "jobs": str(jobs)}
+        expected = {"parent_attempt_id": source_attempt_id,
+            "route_id": armed.get("route_id"), "route_hash": armed.get("route_hash"),
+            "jobs": str(jobs)}
+        if same_owner:
+            expected["session_id"] = control.thread_id
         pinned_owner_identity = (str(owner.get("owner_pid", "")),
                                  str(owner.get("owner_start", "")))
         remote_identity = compute_execution_identity(row)
@@ -318,16 +334,29 @@ def context(args, control):
         if parent.status not in {"open", "running"}:
             raise JOIN.JoinContractError("resource-owner-not-open")
         OWNER._owner_row_proof(parent.raw.split("\t"), parent.metadata, route=route, environ={})
+        if same_owner:
+            source_metadata = parent.metadata
+        else:
+            source_parent = JOIN.exact_attempt_row(jobs, source_attempt_id)
+            source_metadata = source_parent.metadata
+            if (source_parent.status in {"open", "running"}
+                    or pinned_owner_identity not in DC.attempt_identity_lineage(source_metadata)):
+                raise JOIN.JoinContractError("resource-owner-source-binding-invalid")
+            import dispatch_owner_input as INPUT
+            with INPUT._locked(jobs, args.parent_attempt_id) as (_, value):
+                _current_parent, target = INPUT._target(jobs, args.parent_attempt_id)
+                if (value is None or value.get("target") != target
+                        or value.get("thread_id") != control.thread_id):
+                    raise JOIN.JoinContractError("resource-owner-input-binding-changed")
         if (any(owner.get(key) != value for key, value in expected.items())
-                or pinned_owner_identity not in DC.attempt_identity_lineage(parent.metadata)
-                or row.get("parent_attempt_id") != args.parent_attempt_id
-                or row.get("route") != binding.route_file or row.get("node") != node
+                or pinned_owner_identity not in DC.attempt_identity_lineage(source_metadata)
+                or row.get("parent_attempt_id") != source_attempt_id
+                or row.get("route") != armed.get("route_file") or row.get("node") != node
                 or row.get("jobs") != str(jobs) or not row.get("command")
                 or not identity_valid
                 or (not remote_identity and row.get("pid_namespace") is not None and
                     row["pid_namespace"] != os.readlink("/proc/self/ns/pid"))
-                or armed.get("route_id") != args.route_id or armed.get("route_hash") != args.route_hash
-                or armed.get("route_file") != binding.route_file or armed.get("jobs") != str(jobs)
+                or armed.get("jobs") != str(jobs)
                 or not resource_binding_matches(armed, row)
                 or armed.get("successor_external") is not True or armed.get("successor_command") is not None):
             raise JOIN.JoinContractError("resource-owner-binding-invalid")
