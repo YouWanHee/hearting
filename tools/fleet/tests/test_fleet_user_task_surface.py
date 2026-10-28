@@ -8,6 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 import importlib.util
 import json
+import sys
 from unittest import mock
 
 from tools.fleet import collectors, render
@@ -17,6 +18,20 @@ from tools.fleet.explorer.models import _draw_context
 from tools.fleet.explorer.grid import CellGrid
 from tools.fleet.explorer.state import NavState, reduce
 from tools.fleet.model import DispatchJob, Session, WorkProjection
+
+
+def _load_native_fixture(case, name):
+    """Scope standalone sibling imports (including lazy imports) to this case."""
+    utilities = Path(__file__).resolve().parents[3] / "utilities"
+    spec = importlib.util.spec_from_file_location(name, utilities / "human_wait_state.test.py")
+    module = importlib.util.module_from_spec(spec)
+    # Keep the standalone suite's path insertions through fixture cleanup,
+    # then restore the original list without changing the runner environment.
+    path_scope = mock.patch.object(sys, "path", [str(utilities), *sys.path])
+    path_scope.start()
+    case.addCleanup(path_scope.stop)
+    spec.loader.exec_module(module)
+    return module
 
 
 class ContractProjectionTests(unittest.TestCase):
@@ -238,11 +253,7 @@ class NativeResponseIntegrationTests(unittest.TestCase):
     response-dependent continuation, not a fresh provider/native-binary run.
     """
     def setUp(self):
-        root = Path(__file__).resolve().parents[3]
-        spec = importlib.util.spec_from_file_location(
-            "fleet_surface_native_fixture", root / "utilities/human_wait_state.test.py")
-        self.backend_tests = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.backend_tests)
+        self.backend_tests = _load_native_fixture(self, "fleet_surface_native_fixture")
         self.fixture = self.backend_tests.SelectedAnswerIntegrationTest("runTest")
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
@@ -348,11 +359,7 @@ class OpenCodeHTTPIntegrationTests(unittest.TestCase):
         from tools.fleet import interaction
         from tools.fleet.explorer.runtime import ExplorerRuntime
         from tools.fleet.refresh import fleet_answer_wait_view
-        root = Path(__file__).resolve().parents[3]
-        spec = importlib.util.spec_from_file_location(
-            "fleet_surface_http_fixture", root / "utilities/human_wait_state.test.py")
-        tests = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(tests)
+        tests = _load_native_fixture(self, "fleet_surface_http_fixture")
         fixture = tests.SelectedQuestionActionsTest("runTest")
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()

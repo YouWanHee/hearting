@@ -29,7 +29,6 @@ import threading
 import time
 from types import MappingProxyType
 from urllib.parse import quote, urlsplit
-import urllib.request
 
 
 VERSION_RE = re.compile(r"(?:^|\D)(\d+)\.(\d+)\.(\d+)(?:\D|$)")
@@ -365,6 +364,10 @@ def read_model_catalog(*, environ=None):
         if isinstance(password, str) and password:
             headers["Authorization"] = "Basic " + base64.b64encode(
                 ("opencode:" + password).encode()).decode("ascii")
+
+        # urllib.request loads platform proxy helpers. Keep that dependency at
+        # the HTTP boundary, away from shared runtime/dispatch-only imports.
+        import urllib.request
 
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *args, **kwargs):
