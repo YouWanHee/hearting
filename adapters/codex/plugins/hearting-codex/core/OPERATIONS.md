@@ -2504,6 +2504,31 @@ the pane list read once right after opening (`pane-exited`,
 `pane-list-unconfirmed`); nothing is retried or closed. A person in an
 agentless Herdr shell keeps running Fleet in the current terminal.
 
+`hearting run pane tidy` arranges the existing panes in the caller's tab once.
+It supports Herdr and tmux: two panes sit side by side, four form 2×2, six form
+3×2, and five fill two equal-height rows of three and two panes (equal widths
+within each row). The first pane marked `⚑` in screen reading order goes at
+the top left; without that mark, the caller goes first. The remaining panes
+keep their current top-to-bottom, left-to-right order. A matching grid and
+order produce no changes. Pane and terminal IDs, running processes, tab names
+and focus are preserved. A normal foreground shell can call tidy after its
+terminal and process ancestry match the live pane. Registered workers and
+callers without a live binding receive a diagnostic.
+
+Tidy uses the same workspace claim as opening. Herdr may briefly move existing
+panes through a temporary tab in the same workspace; it creates no terminal
+or process and returns those panes before finishing. A failed or interrupted
+command gathers confirmed surviving panes from its temporary tab when the
+server still answers, and reports partial or unconfirmed changes. Existing
+panes and their input stay intact. Zoomed tabs, insufficient space and unconfirmed
+caller or layout state return a diagnostic without starting rearrangement.
+The JSON result is `{surface, tab, panes, changed, notes}`; `panes` is the last
+observed screen order. Success, including an unchanged grid, exits 0; refusal,
+failure or an unconfirmed result exits 1. Hearting pane tidy is not supported
+on cmux. If desired, register the command in the terminal's key settings;
+detached key commands may lack the caller's terminal context. Hearting does
+not register keys or change user configuration.
+
 Same-seat succession uses `peer-steward.py start <name> --kind <harness>`,
 which with no `--pane` or `--beside` uses the calling pane (`HERDR_PANE_ID`)
 as its placement reference, in the Git primary checkout (the calling cwd outside
