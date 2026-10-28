@@ -26,7 +26,7 @@ class ModelCatalogTests(unittest.TestCase):
             "CODEX_HOME": str(self.root / "codex"),
             "HEARTING_MODEL_CONFIG_HOME": str(self.root / "claude"),
             "OPENCODE_CONFIG": "", "OPENCODE_CONFIG_CONTENT": "",
-            "OPENCODE_CONFIG_DIR": str(self.root / "config/opencode"),
+            "OPENCODE_CONFIG_DIR": "",
             "OPENCODE_RUNTIME_VERSION": "1.19.0",
         })
         patch.start()
