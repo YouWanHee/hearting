@@ -5,6 +5,7 @@ import re
 from . import tables
 from .output import cell_width
 from .tables import _clip, repo_rule_label
+from .style import steward_flag_key
 
 STAGE_HUES = ("l", "c", "g", "y", "m")          # blue · cyan · green · yellow · magenta
 LANE_HEAD_LEFT, LANE_HEAD_RIGHT = "◂", "▸"
@@ -31,12 +32,12 @@ def _card_height(owners, extra):
     return 3 + len(extra) + (1 + len(owners) if owners else 0)
 
 
-def _stage_mark(index, state):
+def _stage_mark(index, state, lit=True):
     hue = STAGE_HUES[index % len(STAGE_HUES)]
     if state == "done":
         return "✓", (hue, 0, 1)
     if state == "active":
-        return "●", (hue, 1, 0)
+        return "●", (hue, 1, 0) if lit else (hue, 0, 1)
     if state == "failed":
         return "✕", "lvl_r"
     return "·", (hue, 0, 1)
@@ -71,7 +72,7 @@ def _draw_card(grid, session, tag, bx, by, box_w, right, border, extra, owners):
     xx = put(xx, by, tag, "steward" if steward else "text")
     xx = put(xx, by, "]", "tag_b")
     if steward:
-        xx = put(xx + 1, by, "⚑", "steward")
+        xx = put(xx + 1, by, "⚑", steward_flag_key(session, lit=bool(getattr(grid, "beat", 1))))
     xx = put(xx, by, " ", "branch_s")
     xx = put(xx, by, harness, "hb_" + harness)
     put(xx, by, " ", "branch_s")
@@ -103,7 +104,8 @@ def _draw_card(grid, session, tag, bx, by, box_w, right, border, extra, owners):
             put(bx + 4, yy, _clip(str(owner.get("label") or ""), strip_x - bx - 5), "title_dim")
             xx = strip_x
             for index, stage in enumerate(stages):
-                glyph, key = _stage_mark(index, str(stage.get("state") or ""))
+                glyph, key = _stage_mark(index, str(stage.get("state") or ""),
+                                        lit=bool(getattr(grid, "beat", 1)))
                 xx = put(xx, yy, glyph, key)
             done = sum(str(stage.get("state")) == "done" for stage in stages)
             put(xx + 1, yy, f"{done}/{len(stages)}", "dim")
